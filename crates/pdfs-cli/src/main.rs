@@ -15,8 +15,8 @@ use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ConflictKeep, ErrorKind, LinkChange, MountKind, RefreshScope, Request as CtlRequest,
-    Response as CtlResponse, RestoreItem as CtlRestoreItem, ShareEntryKind, SyncIssue, SyncPhase,
-    daemon_outdated, pending_summary,
+    Response as CtlResponse, RestoreItem as CtlRestoreItem, ShareEntryKind, SyncFolderInfo,
+    SyncIssue, SyncPhase, daemon_outdated, pending_summary,
 };
 use pdfs_core::db::Db;
 use pdfs_core::service;
@@ -228,14 +228,19 @@ enum Command {
     /// numbered parts, and a photo's metadata often sits in a different part
     /// than the photo. Albums in the export are recreated as Proton albums, and
     /// photos already on the account (same name and same content) are skipped,
-    /// so an interrupted import can simply be run again.
+    /// so an interrupted import can simply be run again, or resumed with
+    /// `--resume` without naming the archives again.
     ImportGooglePhotos {
         /// The export's `.zip` files (e.g. `takeout-*.zip`).
-        #[arg(required = true, value_hint = ValueHint::FilePath)]
+        #[arg(required_unless_present = "resume", value_hint = ValueHint::FilePath)]
         archives: Vec<PathBuf>,
         /// Report what would be imported without uploading anything.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "resume")]
         dry_run: bool,
+        /// Start the last import again with the same archives, after it was
+        /// interrupted, stopped or failed.
+        #[arg(long, conflicts_with = "archives")]
+        resume: bool,
         /// Stay attached and print progress until the import finishes.
         #[arg(long)]
         wait: bool,
@@ -746,6 +751,42 @@ enum ConflictCmd {
     },
 }
 
+/// `pdfs sync ignore`: the patterns in `ignore_patterns`, for every synced
+/// folder, or with `--folder` the ones in that folder's own `.pdfsignore`.
+#[derive(Subcommand, Debug)]
+enum IgnoreCmd {
+    /// List the patterns every synced folder leaves out, or one folder's own.
+    List {
+        /// List the own patterns of the synced folder holding this path.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        folder: Option<PathBuf>,
+    },
+    /// Leave out files matching a gitignore-style pattern, e.g. `*.db` or `build/`.
+    Add {
+        /// The pattern; end it with `/` to match folders only.
+        pattern: String,
+        /// Add it only for the synced folder holding this path.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        folder: Option<PathBuf>,
+    },
+    /// Stop leaving out files matching a pattern.
+    Remove {
+        /// The pattern, as `sync ignore list` shows it.
+        pattern: String,
+        /// Remove it from the own patterns of the synced folder holding this path.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        folder: Option<PathBuf>,
+    },
+    /// Go back to the built-in patterns.
+    Reset,
+    /// Say whether a file in a synced folder is synced, and which pattern decides.
+    Check {
+        /// A file or folder inside a synced folder.
+        #[arg(value_hint = ValueHint::AnyPath)]
+        path: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 enum SyncCmd {
     /// Add a local folder to this machine's device and upload its contents.
@@ -843,6 +884,11 @@ enum SyncCmd {
         /// Queue id; omit to retry every failed operation.
         #[arg(add = ArgValueCandidates::new(complete::queue_id))]
         id: Option<i64>,
+    },
+    /// Show or change the patterns every synced folder leaves out, or check a path.
+    Ignore {
+        #[command(subcommand)]
+        action: IgnoreCmd,
     },
     /// Switch a folder between full-copy sync and on-demand (FUSE, no local storage).
     Mode {
@@ -1030,8 +1076,9 @@ fn main() -> Result<()> {
         Command::ImportGooglePhotos {
             archives,
             dry_run,
+            resume,
             wait,
-        } => cmd_import_google_photos(archives, dry_run, wait),
+        } => cmd_import_google_photos(archives, dry_run, resume, wait),
         Command::RedatePhotos {
             dry_run,
             limit,
@@ -1318,6 +1365,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
         SyncCmd::Issues => return cmd_sync_issues(),
         SyncCmd::Export { id, dest } => return cmd_sync_export(id, &dest),
         SyncCmd::Limit { up, down } => return cmd_sync_limit(up, down),
+        SyncCmd::Ignore { action } => return cmd_sync_ignore(action),
         SyncCmd::Discard { id, yes } => {
             if !yes {
                 confirm(&format!(
@@ -2916,24 +2964,34 @@ fn photo_count(n: usize) -> String {
     }
 }
 
-fn cmd_import_google_photos(archives: Vec<PathBuf>, dry_run: bool, wait: bool) -> Result<()> {
-    // The daemon opens the archives itself off the shared filesystem, so it gets
-    // absolute paths — the same arrangement `pdfs upload` uses.
-    let mut absolute = Vec::with_capacity(archives.len());
-    for archive in &archives {
-        let path = std::fs::canonicalize(archive)
-            .with_context(|| format!("resolve {}", archive.display()))?;
-        absolute.push(
-            path.to_str()
-                .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?
-                .to_owned(),
-        );
-    }
+fn cmd_import_google_photos(
+    archives: Vec<PathBuf>,
+    dry_run: bool,
+    resume: bool,
+    wait: bool,
+) -> Result<()> {
+    let request = if resume {
+        CtlRequest::ResumeImport
+    } else {
+        // The daemon opens the archives itself off the shared filesystem, so it
+        // gets absolute paths — the same arrangement `pdfs upload` uses.
+        let mut absolute = Vec::with_capacity(archives.len());
+        for archive in &archives {
+            let path = std::fs::canonicalize(archive)
+                .with_context(|| format!("resolve {}", archive.display()))?;
+            absolute.push(
+                path.to_str()
+                    .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?
+                    .to_owned(),
+            );
+        }
+        CtlRequest::ImportTakeout {
+            archives: absolute,
+            dry_run,
+        }
+    };
 
-    match control_request(CtlRequest::ImportTakeout {
-        archives: absolute,
-        dry_run,
-    })? {
+    match control_request(request)? {
         CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
@@ -2945,25 +3003,80 @@ fn cmd_import_google_photos(archives: Vec<PathBuf>, dry_run: bool, wait: bool) -
 
     // Poll rather than stream: the control protocol is request/response, and an
     // import runs for hours — a held-open socket would be the only long-lived
-    // connection the daemon has.
+    // connection the daemon has. A line is printed when the step changes and
+    // every few percent of it, not on every poll.
+    let mut last_line = String::new();
+    let mut last_printed = std::time::Instant::now();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
         match control_request(CtlRequest::ImportStatus)? {
             CtlResponse::ImportStatus {
                 running: true,
-                summary: _,
-            } => continue,
-            CtlResponse::ImportStatus { summary, .. } => {
-                print_import_summary(summary.as_ref());
-                return finished_run(
-                    "the import",
-                    summary.map(|s| (s.failed, s.cancelled, s.error)),
-                );
+                progress,
+                ..
+            } => {
+                let line = progress.as_ref().map(progress_line).unwrap_or_default();
+                let step_changed = line.split(':').next() != last_line.split(':').next();
+                if !line.is_empty()
+                    && line != last_line
+                    && (step_changed || last_printed.elapsed().as_secs() >= 30)
+                {
+                    println!("{line}");
+                    last_line = line;
+                    last_printed = std::time::Instant::now();
+                }
+            }
+            CtlResponse::ImportStatus {
+                summary, resumable, ..
+            } => {
+                print_import_summary(summary.as_ref(), &resumable);
+                return import_outcome(summary.as_ref());
             }
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         }
     }
+}
+
+/// One line saying where a running import is.
+fn progress_line(progress: &pdfs_core::control::ImportProgress) -> String {
+    use pdfs_core::control::ImportPhase;
+    let step = match progress.phase {
+        ImportPhase::Scanning => "Reading archives",
+        ImportPhase::Checking => "Checking for photos already on Proton",
+        ImportPhase::Uploading => "Uploading",
+        ImportPhase::Albums => "Filing photos into albums",
+    };
+    match (progress.total, &progress.current) {
+        (0, _) => format!("{step}…"),
+        (total, Some(name)) => format!("{step}: {} of {total} ({name})", progress.done),
+        (total, None) => format!("{step}: {} of {total}", progress.done),
+    }
+}
+
+/// How an import `--wait` followed ended, as the exit status: an error unless
+/// it did everything it set out to do, so a script can tell.
+fn import_outcome(summary: Option<&pdfs_core::control::ImportSummary>) -> Result<()> {
+    let Some(summary) = summary else {
+        bail!("the import ended without a result; the service may have restarted");
+    };
+    if let Some(error) = &summary.error {
+        bail!("the import failed: {error}");
+    }
+    if summary.interrupted {
+        bail!("the import was interrupted; run `pdfs import-google-photos --resume` to continue");
+    }
+    if summary.cancelled {
+        bail!("the import was cancelled");
+    }
+    if summary.failed > 0 || !summary.unreadable_archives.is_empty() {
+        bail!(
+            "the import finished, but {} photo(s) and {} archive(s) failed",
+            summary.failed,
+            summary.unreadable_archives.len()
+        );
+    }
+    Ok(())
 }
 
 fn cmd_redate_photos(
@@ -3100,11 +3213,19 @@ fn print_redate_summary(summary: Option<&pdfs_core::control::RedateSummary>) {
 
 fn cmd_import_status() -> Result<()> {
     match control_request(CtlRequest::ImportStatus)? {
-        CtlResponse::ImportStatus { running, summary } => {
+        CtlResponse::ImportStatus {
+            running,
+            summary,
+            progress,
+            resumable,
+        } => {
             if running {
-                println!("Import running. `pdfs transfers` shows its progress.");
+                match progress.as_ref() {
+                    Some(progress) => println!("Import running. {}", progress_line(progress)),
+                    None => println!("Import running."),
+                }
             }
-            print_import_summary(summary.as_ref());
+            print_import_summary(summary.as_ref(), &resumable);
         }
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
@@ -3121,18 +3242,28 @@ fn cmd_cancel_import() -> Result<()> {
     Ok(())
 }
 
-fn print_import_summary(summary: Option<&pdfs_core::control::ImportSummary>) {
+fn print_import_summary(summary: Option<&pdfs_core::control::ImportSummary>, resumable: &[String]) {
     let Some(summary) = summary else {
         println!("No import has run yet.");
         return;
     };
+    if summary.dry_run {
+        println!("Scan only; nothing was uploaded.");
+    }
     if let Some(error) = &summary.error {
-        println!("Failed           : {error}");
-        return;
+        println!("Stopped by       : {error}");
     }
     println!("Photos in export : {}", summary.found);
-    println!("Uploaded         : {}", summary.uploaded);
+    if summary.dry_run {
+        println!("Would upload     : {}", summary.to_upload);
+        println!("Bytes to upload  : {}", summary.to_upload_bytes);
+    } else {
+        println!("Uploaded         : {}", summary.uploaded);
+    }
     println!("Already on Proton: {}", summary.duplicates);
+    if summary.live_photos > 0 {
+        println!("Live photos      : {}", summary.live_photos);
+    }
     if summary.skipped_trashed > 0 {
         println!("Skipped (trash)  : {}", summary.skipped_trashed);
     }
@@ -3145,11 +3276,19 @@ fn print_import_summary(summary: Option<&pdfs_core::control::ImportSummary>) {
     if summary.failed > 0 {
         println!("Failed           : {}", summary.failed);
     }
+    for archive in &summary.unreadable_archives {
+        println!("Unreadable       : {archive}");
+    }
     if summary.bytes > 0 {
         println!("Uploaded bytes   : {}", summary.bytes);
     }
-    if summary.cancelled {
+    if summary.interrupted {
+        println!("The service stopped before the import finished.");
+    } else if summary.cancelled {
         println!("Import was cancelled before it finished.");
+    }
+    if !resumable.is_empty() {
+        println!("Run `pdfs import-google-photos --resume` to continue it.");
     }
 }
 
@@ -3600,6 +3739,173 @@ fn cmd_sync_limit(up: Option<u64>, down: Option<u64>) -> Result<()> {
         upload,
         download,
     })?)
+}
+
+fn cmd_sync_ignore(action: IgnoreCmd) -> Result<()> {
+    use pdfs_core::syncignore::{
+        DEFAULT_IGNORE_PATTERNS, FolderRules, IgnoreRules, RuleSource, Verdict, add_folder_pattern,
+        check_pattern, remove_folder_pattern,
+    };
+    let dirs = AppDirs::new()?;
+    let change = |edit: &dyn Fn(&mut Vec<String>)| -> Result<()> {
+        dirs.change_ignore_patterns(edit)?;
+        // The next pass picks the change up anyway; this only hurries it.
+        let _ = control_request(CtlRequest::SyncNow { id: None });
+        Ok(())
+    };
+    let valid = |pattern: &str| -> Result<String> {
+        let pattern = pattern.trim();
+        if pattern.is_empty() || pattern.starts_with('#') {
+            bail!("not a pattern: `{pattern}`");
+        }
+        check_pattern(pattern).map_err(|e| anyhow!("not a valid pattern: {e}"))?;
+        Ok(pattern.to_string())
+    };
+    match action {
+        IgnoreCmd::List { folder: None } => {
+            let config = dirs.load_config();
+            let list = config.resolved_ignore_patterns();
+            if list.is_empty() {
+                println!("No patterns: every file is synced.");
+            }
+            for pattern in list {
+                if DEFAULT_IGNORE_PATTERNS.contains(&pattern.as_str()) {
+                    println!("{pattern}  (built in)");
+                } else {
+                    println!("{pattern}");
+                }
+            }
+        }
+        IgnoreCmd::List {
+            folder: Some(folder),
+        } => {
+            let (_, root) = mirror_folder_of(&folder)?;
+            let rules = FolderRules::read(&root)?;
+            let patterns = rules.patterns();
+            if patterns.is_empty() {
+                println!(
+                    "{} has no own patterns; the ones for all synced folders apply.",
+                    root.display()
+                );
+            }
+            for pattern in patterns {
+                println!("{pattern}");
+            }
+        }
+        IgnoreCmd::Add {
+            pattern,
+            folder: None,
+        } => {
+            let pattern = valid(&pattern)?;
+            change(&|list| {
+                if !list.contains(&pattern) {
+                    list.push(pattern.clone());
+                }
+            })?;
+        }
+        IgnoreCmd::Add {
+            pattern,
+            folder: Some(folder),
+        } => {
+            let pattern = valid(&pattern)?;
+            let (id, root) = mirror_folder_of(&folder)?;
+            if add_folder_pattern(&root, &pattern)? {
+                let _ = control_request(CtlRequest::SyncNow { id: Some(id) });
+            } else {
+                println!("`{pattern}` is already in {}/.pdfsignore.", root.display());
+            }
+        }
+        IgnoreCmd::Remove {
+            pattern,
+            folder: None,
+        } => {
+            let pattern = pattern.trim().to_string();
+            let list = dirs.load_config().resolved_ignore_patterns();
+            if !list.contains(&pattern) {
+                bail!("`{pattern}` is not in the list; see `pdfs sync ignore list`");
+            }
+            change(&|list| list.retain(|p| *p != pattern))?;
+        }
+        IgnoreCmd::Remove {
+            pattern,
+            folder: Some(folder),
+        } => {
+            let (id, root) = mirror_folder_of(&folder)?;
+            if !remove_folder_pattern(&root, &pattern)? {
+                bail!(
+                    "`{}` is not among the own patterns of {}; see `pdfs sync ignore list --folder {}`",
+                    pattern.trim(),
+                    root.display(),
+                    root.display()
+                );
+            }
+            let _ = control_request(CtlRequest::SyncNow { id: Some(id) });
+        }
+        IgnoreCmd::Reset => change(&|list| {
+            *list = DEFAULT_IGNORE_PATTERNS
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect()
+        })?,
+        IgnoreCmd::Check { path } => {
+            let path = std::path::absolute(&path)?;
+            let folder = synced_folder_of(&path)?;
+            if folder.mode != "mirror" {
+                println!(
+                    "{} is online only; patterns apply only to folders kept on this computer.",
+                    folder.local_path
+                );
+                return Ok(());
+            }
+            let root = PathBuf::from(&folder.local_path);
+            let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
+            let globals = dirs.load_config().resolved_ignore_patterns();
+            let rules = IgnoreRules::load(&root, &globals);
+            let source = |source: &RuleSource| match source {
+                RuleSource::AllFolders => "the patterns for all synced folders".to_string(),
+                RuleSource::ThisFolder => format!("{}/.pdfsignore", root.display()),
+            };
+            match rules.explain(&rel, path.is_dir()) {
+                Verdict::Synced => println!("Synced: no pattern matches it."),
+                Verdict::Excluded { pattern, source: s } => {
+                    println!("Not synced: excluded by `{pattern}` in {}.", source(&s))
+                }
+                Verdict::Included { pattern, source: s } => {
+                    println!("Synced: `{pattern}` in {} includes it again.", source(&s))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The synced folder holding `path`: the innermost one, as the daemon lists
+/// them.
+fn synced_folder_of(path: &Path) -> Result<SyncFolderInfo> {
+    let path = std::path::absolute(path)?;
+    let folders = match control_request(CtlRequest::ListSyncFolders)? {
+        CtlResponse::SyncFolders { items } => items,
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected reply: {other:?}"),
+    };
+    folders
+        .into_iter()
+        .filter(|f| path.starts_with(&f.local_path))
+        .max_by_key(|f| f.local_path.len())
+        .ok_or_else(|| anyhow!("{} is not in a synced folder", path.display()))
+}
+
+/// The id and root of the synced folder kept on this computer that holds
+/// `path`. Own patterns mean nothing to an online-only folder.
+fn mirror_folder_of(path: &Path) -> Result<(i64, PathBuf)> {
+    let folder = synced_folder_of(path)?;
+    if folder.mode != "mirror" {
+        bail!(
+            "{} is online only; patterns apply only to folders kept on this computer",
+            folder.local_path
+        );
+    }
+    Ok((folder.id, PathBuf::from(folder.local_path)))
 }
 
 /// How long the oldest write may wait to upload before `diagnose` calls it
@@ -4507,6 +4813,86 @@ mod login_wait_tests {
         let failed = finished_run("the import", Some((0, false, Some("not a zip".into()))));
         assert!(failed.unwrap_err().to_string().contains("not a zip"));
         assert!(finished_run("the import", None).is_err());
+    }
+
+    #[test]
+    fn a_waited_for_import_that_did_not_finish_exits_with_an_error() {
+        use pdfs_core::control::ImportSummary;
+        let done = ImportSummary {
+            uploaded: 4,
+            ..Default::default()
+        };
+        assert!(import_outcome(Some(&done)).is_ok());
+        assert!(import_outcome(None).is_err());
+        for broken in [
+            ImportSummary {
+                interrupted: true,
+                ..Default::default()
+            },
+            ImportSummary {
+                unreadable_archives: vec!["/exports/takeout-002.zip".into()],
+                ..Default::default()
+            },
+            ImportSummary {
+                error: Some("check for existing photos: offline".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(import_outcome(Some(&broken)).is_err(), "{broken:?}");
+        }
+        let interrupted = import_outcome(Some(&ImportSummary {
+            interrupted: true,
+            ..Default::default()
+        }));
+        assert!(interrupted.unwrap_err().to_string().contains("--resume"));
+    }
+
+    #[test]
+    fn resume_needs_no_archives_and_excludes_them() {
+        let cli = Cli::try_parse_from(["pdfs", "import-google-photos", "--resume"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::ImportGooglePhotos { resume: true, .. }
+        ));
+        assert!(Cli::try_parse_from(["pdfs", "import-google-photos"]).is_err());
+    }
+
+    #[test]
+    fn sync_ignore_takes_a_pattern_that_looks_like_an_option_after_dashes() {
+        let cli = Cli::try_parse_from(["pdfs", "sync", "ignore", "add", "--", "-temp*"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync {
+                action: SyncCmd::Ignore {
+                    action: IgnoreCmd::Add {
+                        ref pattern,
+                        folder: None
+                    }
+                }
+            } if pattern == "-temp*"
+        ));
+        assert!(Cli::try_parse_from(["pdfs", "sync", "ignore", "add"]).is_err());
+        assert!(Cli::try_parse_from(["pdfs", "sync", "ignore", "reset"]).is_ok());
+        let cli =
+            Cli::try_parse_from(["pdfs", "sync", "ignore", "add", "*.db", "--folder", "Work"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync {
+                action: SyncCmd::Ignore {
+                    action: IgnoreCmd::Add {
+                        ref pattern,
+                        folder: Some(ref folder)
+                    }
+                }
+            } if pattern == "*.db" && folder == Path::new("Work")
+        ));
+        assert!(
+            Cli::try_parse_from(["pdfs", "sync", "ignore", "list", "--folder", "Work"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["pdfs", "import-google-photos", "--resume", "a.zip"]).is_err()
+        );
     }
 
     #[test]

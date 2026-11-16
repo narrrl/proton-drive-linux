@@ -161,6 +161,29 @@ links, copies the images and writes the sidebar. `docs/README.md` becomes the wi
 
 Never edit the wiki in the browser: the next publish replaces every page.
 
+**Screenshots.** The pictures in `images/` (except the cover) are taken by a script, from an
+invented account, so they never show anyone's files:
+
+```bash
+scripts/screenshots.sh                                      # all of them, into images/
+scripts/screenshots.sh --only photos,files                  # just these
+scripts/screenshots.sh --website ../proton-drive-linux-website   # and copy them to the website
+```
+
+It builds the app and runs it against `crates/pdfs-core/examples/demo_daemon.rs`, a stand-in
+daemon that answers the control socket with made-up files, photos, places, computers and history.
+The app runs in a headless `cage` compositor with its own HOME, XDG directories, session bus and
+keyring, so nothing touches your account, your keyring or a running service. It needs `cage`,
+`grim`, `wlr-randr`, ImageMagick, `dbus-run-session` and `gnome-keyring-daemon`, plus `wtype` for
+the launcher's query, and `fzf` and `alacritty` for its fzf variant. The demo photos come from
+[picsum.photos](https://picsum.photos) (Unsplash licence) on the first run and are cached in
+`~/.cache/pdfs-screenshots`. Dates are relative to the day you run it.
+
+Retake them before a release, and look at each one before committing. A page that grew new data
+needs a matching answer in the demo daemon; the requests it has no answer for are logged in
+`demo_daemon.log` (keep it with `--keep`). The demo daemon is built with every `cargo test` and
+`cargo clippy --all-targets`, so a change to the control protocol that breaks it fails CI.
+
 ## Releasing
 
 Releases are cut from `main` by pushing a `v*` tag. `.github/workflows/release.yml` then:

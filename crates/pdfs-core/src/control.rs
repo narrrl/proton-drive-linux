@@ -279,6 +279,11 @@ pub enum Request {
     /// and files what it has uploaded into its albums, then reports
     /// `cancelled`. Replies with [`Response::Ok`].
     CancelImport,
+    /// Start the last import again with the same archives, after it was
+    /// interrupted, cancelled or failed. Photos it already uploaded are found
+    /// on the account and skipped. Replies like [`Request::ImportTakeout`];
+    /// [`ErrorKind::NotFound`] when there is nothing to resume.
+    ResumeImport,
     /// Upload the photo at `source_path` under the given name and media type.
     ///
     /// A path, not the bytes: this protocol is line-delimited JSON, and
@@ -768,6 +773,9 @@ pub enum Topic {
     Conflicts,
     /// The activity log gained entries.
     Activity,
+    /// File thumbnails were made or fetched. A front-end asks again for the
+    /// tiles it still shows blank; the ones it already painted stay as they are.
+    Thumbnails,
     /// A topic from a newer daemon, which this front-end cannot act on.
     #[serde(other)]
     Unknown,
@@ -777,7 +785,7 @@ impl Topic {
     /// Every topic a front-end can act on. A new subscription is told all of
     /// them have changed, so it catches up on whatever happened while it was
     /// not connected.
-    pub const ALL: [Topic; 9] = [
+    pub const ALL: [Topic; 10] = [
         Topic::Files,
         Topic::Photos,
         Topic::Trash,
@@ -787,6 +795,7 @@ impl Topic {
         Topic::Queue,
         Topic::Conflicts,
         Topic::Activity,
+        Topic::Thumbnails,
     ];
 }
 
@@ -1685,10 +1694,75 @@ pub struct ImportSummary {
     pub bytes: u64,
     /// True when the run stopped early because it was cancelled.
     pub cancelled: bool,
-    /// Why the run as a whole failed, when it did, such as an archive that
-    /// is not a zip. The counts are then empty.
+    /// Why the run as a whole stopped early, when it did, such as the
+    /// account being unreachable. The counts say how far it got.
     #[serde(default)]
     pub error: Option<String>,
+    /// What kind of failure [`error`](Self::error) is, so a front-end can word
+    /// it in the user's language. The text itself is the daemon's English.
+    #[serde(default)]
+    pub error_kind: Option<ErrorKind>,
+    /// True for a scan that uploads nothing ([`Request::ImportTakeout`] with
+    /// `dry_run`). [`to_upload`](Self::to_upload) then says what an import
+    /// would upload.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Photos not yet on the account: what a dry run would upload, and what a
+    /// real run set out to upload once the duplicates were known.
+    #[serde(default)]
+    pub to_upload: usize,
+    /// Bytes of [`to_upload`](Self::to_upload).
+    #[serde(default)]
+    pub to_upload_bytes: u64,
+    /// Live and motion photos whose video was filed with its still.
+    #[serde(default)]
+    pub live_photos: usize,
+    /// True when the service stopped while the import ran (a shutdown or a
+    /// restart). [`Request::ResumeImport`] picks it up again.
+    #[serde(default)]
+    pub interrupted: bool,
+    /// Archives that could not be read and were left out, by path.
+    #[serde(default)]
+    pub unreadable_archives: Vec<String>,
+}
+
+impl ImportSummary {
+    /// Whether the run did all it set out to do.
+    pub fn complete(&self) -> bool {
+        self.error.is_none()
+            && !self.cancelled
+            && !self.interrupted
+            && self.failed == 0
+            && self.unreadable_archives.is_empty()
+    }
+}
+
+/// Which step a running Takeout import is on.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportPhase {
+    /// Reading the archives' directories and metadata.
+    #[default]
+    Scanning,
+    /// Asking the account which photos it already has.
+    Checking,
+    /// Uploading the photos that are new.
+    Uploading,
+    /// Creating albums and filing photos into them.
+    Albums,
+}
+
+/// Where a running import is ([`Response::ImportStatus`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportProgress {
+    pub phase: ImportPhase,
+    /// Steps done in this phase.
+    pub done: u64,
+    /// Steps in this phase; `0` while not yet known.
+    pub total: u64,
+    /// The photo being uploaded, during [`ImportPhase::Uploading`].
+    #[serde(default)]
+    pub current: Option<String>,
 }
 
 /// One album in a [`Response::Albums`] listing.
@@ -1792,6 +1866,11 @@ pub struct PhotoItem {
     /// the JPEG it shows is not the whole of what is stored.
     #[serde(default)]
     pub has_raw: bool,
+    /// GeoNames id of the town the photo was taken in, when its location is
+    /// known; [`crate::places::city`] names it. Older daemons omit it, and
+    /// album entries do not carry it.
+    #[serde(default)]
+    pub place_id: Option<u32>,
 }
 
 /// A daemon too old to classify a timeline entry is assumed to have served a
@@ -1872,11 +1951,26 @@ pub fn is_video_file_name(name: &str, size: Option<u64>) -> bool {
     !transport_stream || size.is_none_or(|size| size >= TS_VIDEO_MIN_BYTES)
 }
 
+/// Whether `name` is a song or other recording in a format that can carry
+/// its own cover picture: ID3 (MP3, AAC, WAV, AIFF), FLAC and Ogg pictures,
+/// MP4 `covr` (M4A, M4B), or APE tags (WavPack, Monkey's Audio).
+pub fn is_audio_file_name(name: &str) -> bool {
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    AUDIO_COVER_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+}
+
+const AUDIO_COVER_EXTENSIONS: &[&str] = &[
+    "aac", "aif", "aiff", "ape", "flac", "m4a", "m4b", "mp3", "oga", "ogg", "opus", "wav", "wv",
+];
+
 /// Whether file listings show a thumbnail for a file named `name`, of `size`
-/// bytes when known: an image [`is_thumbnail_image_name`] accepts, or a video,
-/// whose thumbnail is a frame the daemon takes with ffmpeg.
+/// bytes when known: an image [`is_thumbnail_image_name`] accepts, a video,
+/// whose thumbnail is a frame the daemon takes with ffmpeg, or a song, whose
+/// thumbnail is its cover: the picture in its tags, or a cover image beside it.
 pub fn is_thumbnail_media_name(name: &str, size: Option<u64>) -> bool {
-    is_thumbnail_image_name(name) || is_video_file_name(name, size)
+    is_thumbnail_image_name(name) || is_video_file_name(name, size) || is_audio_file_name(name)
 }
 
 /// Whether `name` is one of the concrete RAW formats handled by the exiftool
@@ -2184,8 +2278,17 @@ pub enum Response {
     /// report; `summary` is `None` when no import has run this session.
     ImportStatus {
         running: bool,
+        /// The counts so far while running, the final report after.
         #[serde(default)]
         summary: Option<ImportSummary>,
+        /// The current step, while running.
+        #[serde(default)]
+        progress: Option<ImportProgress>,
+        /// The archives of the last run, when it can be resumed with
+        /// [`Request::ResumeImport`]: it was a real import that did not
+        /// finish. Survives a restart of the service.
+        #[serde(default)]
+        resumable: Vec<String>,
     },
     /// How the photo re-date is doing (reply to [`Request::RedateStatus`]).
     /// `running` is false once it has finished, when `summary` is the final
@@ -2659,6 +2762,16 @@ mod tests {
     }
 
     #[test]
+    fn a_thumbnail_change_travels_as_its_own_topic() {
+        let line = serde_json::to_string(&Event::Changed {
+            topics: vec![Topic::Thumbnails],
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"Changed":{"topics":["thumbnails"]}}"#);
+        assert!(Topic::ALL.contains(&Topic::Thumbnails));
+    }
+
+    #[test]
     fn a_daemon_without_subscriptions_is_told_apart_from_a_dead_one() {
         let socket = fake_daemon("legacy", "{\"Error\":{\"message\":\"unknown request\"}}\n");
         let mut subscription = subscribe(&socket).unwrap();
@@ -2722,7 +2835,7 @@ mod tests {
     }
 
     #[test]
-    fn listings_thumbnail_images_and_videos() {
+    fn listings_thumbnail_images_videos_and_songs() {
         assert!(is_thumbnail_media_name("photo.JPG", Some(10)));
         assert!(is_thumbnail_media_name("camera.nef", None));
         assert!(is_thumbnail_media_name("clip.mp4", Some(10)));
@@ -2731,11 +2844,22 @@ mod tests {
             Some(64 * 1024 * 1024)
         ));
         assert!(!is_thumbnail_media_name("app.ts", Some(2048)));
-        assert!(!is_thumbnail_media_name(
-            "song.flac",
-            Some(64 * 1024 * 1024)
-        ));
+        assert!(is_thumbnail_media_name("song.flac", Some(64 * 1024 * 1024)));
+        assert!(is_thumbnail_media_name("Track 01.MP3", None));
         assert!(!is_thumbnail_media_name("notes.txt", None));
+    }
+
+    #[test]
+    fn songs_are_told_by_their_extension() {
+        for name in [
+            "a.mp3", "b.FLAC", "c.ogg", "d.oga", "e.opus", "f.m4a", "g.m4b", "h.aac", "i.wav",
+            "j.aiff", "k.aif", "l.wv", "m.ape",
+        ] {
+            assert!(is_audio_file_name(name), "{name}");
+        }
+        for name in ["mp3", "song.mp3.zip", "clip.mp4", "notes.txt", "cover.jpg"] {
+            assert!(!is_audio_file_name(name), "{name}");
+        }
     }
 
     /// Keep every extension accepted by the shared classifier covered.  Drive

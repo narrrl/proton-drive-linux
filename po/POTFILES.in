@@ -13,9 +13,12 @@ crates/pdfs-gui/src/app/pages/photo_viewer.rs
 crates/pdfs-gui/src/app/pages/photos.rs
 crates/pdfs-gui/src/app/pages/places.rs
 crates/pdfs-gui/src/app/pages/places_map.rs
+crates/pdfs-gui/src/app/pages/preferences_apps.rs
+crates/pdfs-gui/src/app/pages/preferences_sync.rs
 crates/pdfs-gui/src/app/pages/shared.rs
 crates/pdfs-gui/src/app/pages/shared_by_me.rs
 crates/pdfs-gui/src/app/pages/status.rs
+crates/pdfs-gui/src/app/pages/sync_exclusions.rs
 crates/pdfs-gui/src/app/pages/takeout.rs
 crates/pdfs-gui/src/app/pages/trash.rs
 crates/pdfs-gui/src/app/pages/verify.rs
@@ -23,7 +26,9 @@ crates/pdfs-gui/src/app/update.rs
 crates/pdfs-gui/src/app/widgets/compat.rs
 crates/pdfs-gui/src/app/widgets/details.rs
 crates/pdfs-gui/src/app/widgets/file_list.rs
+crates/pdfs-gui/src/app/widgets/ignore_dialog.rs
 crates/pdfs-gui/src/app/widgets/menu.rs
+crates/pdfs-gui/src/app/widgets/player.rs
 crates/pdfs-gui/src/app/widgets/share_dialog.rs
 crates/pdfs-gui/src/app/widgets/thumbnails.rs
 crates/pdfs-gui/src/app/widgets/versions_dialog.rs

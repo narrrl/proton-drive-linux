@@ -102,7 +102,7 @@ commands are for scripts and for cases where the mount is not available.
 
 | Command | Description |
 |---|---|
-| `pdfs pin PATH` | Download a file completely and keep it on this computer. For a folder, its files download in the background (`pdfs transfers` shows the progress). |
+| `pdfs pin PATH` | Download a file completely and keep it on this computer. For a folder, its files download in the background (`pdfs transfers` shows the progress). PATH can be under the Proton Drive mount or in an on-demand synced folder. A file in a mirror folder is already on this computer. |
 | `pdfs unpin PATH` | Release it back to online only. A file inside a folder kept offline cannot be released on its own. |
 | `pdfs pins` | List files and folders kept available offline. |
 
@@ -119,6 +119,10 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs sync reset ID` | Forget what a synced folder synced before and compare it with Proton Drive again. A file on one side only is copied to the other, and a file that differs keeps both versions. Nothing is deleted. |
 | `pdfs sync pause [--for 1h] [--folder ID]` | Pause uploads and synced folders. Reading files keeps working. `--for` ends the pause by itself (`30m`, `1h`, `2d`). |
 | `pdfs sync resume [--folder ID]` | Resume after a pause. |
+| `pdfs sync ignore list [--folder PATH]` | Print the patterns every synced folder leaves out; built-in ones are marked. With `--folder`, the own patterns of the synced folder holding `PATH`. |
+| `pdfs sync ignore add PATTERN [--folder PATH]` / `remove PATTERN [--folder PATH]` | Leave out, or stop leaving out, files matching a gitignore-style pattern such as `*.db` or `build/`, in every synced folder or, with `--folder`, in that folder's `.pdfsignore` only. A pattern starting with `-` goes after `--`. |
+| `pdfs sync ignore reset` | Use the built-in patterns again. |
+| `pdfs sync ignore check PATH` | Say whether a file in a synced folder is synced, and which pattern decides. |
 | `pdfs sync limit [--up RATE] [--down RATE]` | Cap bandwidth, for example `500K` or `2M` per second. `0` removes a cap. Without options, prints the current caps. |
 | `pdfs sync queue` | List changes that have not reached Proton Drive yet. |
 | `pdfs sync issues` | List queued changes Proton Drive refused or that keep failing, and what to do. |
@@ -196,6 +200,7 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs add-to-album UID PHOTOS...` | Add photos to an album. |
 | `pdfs remove-from-album UID PHOTOS...` | Take photos out of an album. |
 | `pdfs import-google-photos ARCHIVES... [--dry-run] [--wait]` | Import a Google Takeout export. Pass every `.zip` of the export. |
+| `pdfs import-google-photos --resume [--wait]` | Start the last import again with the same archives after it was interrupted, stopped or failed. |
 | `pdfs import-status` / `pdfs cancel-import` | Follow or stop a running import. |
 | `pdfs redate-photos [--dry-run] [--from DATE] [--to DATE] [--limit N] [--wait]` | Fix photos filed under their upload day when the file name carries the real date. |
 | `pdfs redate-status` / `pdfs cancel-redate` | Follow or stop a running re-date. |

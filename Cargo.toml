@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/pdfs-core", "crates/pdfs-fuse", "crates/pdfs-cli", "crates/pdfs-gui"]
 
 [workspace.package]
-version = "3.7.0"
+version = "3.8.0"
 edition = "2024"
 license = "MIT"
 authors = ["Nils Pukropp <contact@narl.io>"]
@@ -15,8 +15,8 @@ keywords = ["proton", "drive", "fuse", "sync", "linux"]
 categories = ["filesystem", "command-line-utilities"]
 
 [workspace.dependencies]
-proton-sdk = { version = "0.11.0" }
-proton-drive-rs = { version = "0.11.0" }
+proton-sdk = { version = "0.12.0" }
+proton-drive-rs = { version = "0.12.0" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Internal crates.
@@ -39,6 +39,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6"
 ignore = "0.4"
+# Command lines typed into Preferences, split and shown the way a shell would.
+shell-words = "1"
 sha2 = "0.11"
 # Google Takeout exports are zip sets; the importer reads their central
 # directories and streams entries out without extracting to disk first.
@@ -50,12 +52,19 @@ sha1 = "0.11"
 # formats a camera or phone actually produces — the rest of the crate's codecs
 # would be dead weight in the daemon.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp", "rayon"] }
+# Cover pictures of songs, read from their tags (ID3, FLAC, Ogg, MP4, APE) for
+# the song's thumbnail. Its default feature is required: 0.25 does not build
+# without it.
+lofty = "0.25"
 rusqlite = { version = "0.41", features = ["bundled"] }
 # keyring 4 split into `keyring-core` plus per-platform stores. The libdbus
 # Secret Service store is the one keyring 3's `sync-secret-service` wrapped, and
 # with no `target` it matches items v3 wrote, so existing logins survive.
 keyring-core = "1"
 dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+# The same Secret Service client the store wraps, used directly to replace an
+# item instead of editing it, which oo7 before 0.7.0 kept only in memory (B291).
+dbus-secret-service = { version = "4.1", features = ["crypto-rust"] }
 clap = { version = "4", features = ["derive"] }
 # `unstable-dynamic`: Tab calls `pdfs` back, so arguments complete from the
 # running service. Only `pdfs-cli/src/complete.rs` uses it.

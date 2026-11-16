@@ -15,16 +15,29 @@
 //! Import — staging is local, so a mis-drop costs nothing.
 //!
 //! The daemon owns the run itself ([`Request::ImportTakeout`]): this page only
-//! stages paths, launches, asks [`Request::ImportStatus`] for the final report,
-//! and reads live progress off the import's job in the transfer snapshot the
-//! daemon already pushes (see [`takeout_progress`]).
+//! stages paths, launches, and asks [`Request::ImportStatus`] for the step, the
+//! running counts and the final report. It asks again whenever the import's job
+//! moves in the transfer snapshot the daemon already pushes. A run the service
+//! did not get to finish can be picked up with [`Request::ResumeImport`].
 
 use crate::*;
 
 /// The title the daemon gives the import's job in [`Request::GetQueueStatus`].
-/// Matching on it is how this page borrows the progress the daemon already
-/// pushes instead of asking for it separately.
+/// Seeing it move is the cue to ask for the import's status; the Activity list
+/// shows it under its translated name ([`import_job_text`]).
 pub(crate) const IMPORT_JOB: &str = "Importing Google Photos";
+
+/// The import job's title and detail in the user's language. The daemon names
+/// its steps in English; the file being uploaded passes through as it is.
+pub(crate) fn import_job_text(detail: &str) -> (String, String) {
+    let detail = match detail {
+        "reading archives" => gettext("Reading the archives"),
+        "checking for photos you already have" => gettext("Checking for photos you already have"),
+        "sorting photos into albums" => gettext("Sorting photos into albums"),
+        other => other.to_string(),
+    };
+    (gettext("Importing from Google Photos"), detail)
+}
 
 /// What the archive list says before anything is staged. `repaint_archives`
 /// swaps in the count and total once there is something to report, and swaps
@@ -95,18 +108,19 @@ pub(crate) struct TakeoutState {
     pub(crate) progress_group: adw::PreferencesGroup,
     pub(crate) progress_label: gtk4::Label,
     pub(crate) progress_bar: gtk4::ProgressBar,
-    /// Report group for the last finished run, hidden until there is one.
+    /// The running counts, or the report for the last finished run; hidden
+    /// until there is one.
     pub(crate) summary_group: adw::PreferencesGroup,
     pub(crate) summary_rows: RefCell<Vec<adw::ActionRow>>,
+    /// Offers to resume an import the service did not get to finish.
+    pub(crate) resume_group: adw::PreferencesGroup,
+    pub(crate) resume_row: adw::ActionRow,
+    pub(crate) resume_button: gtk4::Button,
     /// One [`Request::ImportStatus`] in flight at a time, so a wedged daemon
     /// can't stack worker threads on the 2s tick.
     pub(crate) inflight: Cell<bool>,
     /// Whether the daemon reported an import running on the last poll.
     pub(crate) running: Cell<bool>,
-    /// Whether the run in flight was launched as a dry run, so the report can
-    /// say "would upload" rather than claiming photos were sent. The daemon's
-    /// summary carries no such flag — it is the same shape either way.
-    pub(crate) dry_run: Cell<bool>,
 }
 
 /// Widgets the Import page hands back for wiring.
@@ -126,6 +140,9 @@ pub(crate) struct TakeoutWidgets {
     pub(crate) progress_label: gtk4::Label,
     pub(crate) progress_bar: gtk4::ProgressBar,
     pub(crate) summary_group: adw::PreferencesGroup,
+    pub(crate) resume_group: adw::PreferencesGroup,
+    pub(crate) resume_row: adw::ActionRow,
+    pub(crate) resume_button: gtk4::Button,
 }
 
 pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
@@ -261,7 +278,23 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
         .visible(false)
         .build();
 
+    // An import cut short by a restart or a lost connection, offered back at the
+    // top of the page: picking the archives again is exactly what a reboot in
+    // the middle of a migration should not cost.
+    let resume_button = gtk4::Button::builder()
+        .label(pgettext("verb", "Resume"))
+        .valign(gtk4::Align::Center)
+        .build();
+    resume_button.add_css_class("suggested-action");
+    let resume_row = adw::ActionRow::builder()
+        .title(gettext("The last import didn't finish"))
+        .build();
+    resume_row.add_suffix(&resume_button);
+    let resume_group = adw::PreferencesGroup::builder().visible(false).build();
+    resume_group.add(&resume_row);
+
     let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    groups.append(&resume_group);
     groups.append(&dropzone);
     groups.append(&list_group);
     groups.append(&actions);
@@ -301,6 +334,9 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
         progress_label: progress_label.clone(),
         progress_bar: progress_bar.clone(),
         summary_group: summary_group.clone(),
+        resume_group,
+        resume_row,
+        resume_button,
     };
     (frame.upcast(), widgets)
 }
@@ -421,6 +457,28 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
                 _ => toast_error(
                     &ui,
                     &gettext("Couldn't stop the import"),
+                    &gettext("The Proton Drive service didn't respond."),
+                ),
+            }
+        });
+    });
+
+    let ui_resume = ui.clone();
+    widgets.resume_button.connect_clicked(move |_| {
+        let ui = ui_resume.clone();
+        ui.busy_begin();
+        let rx = spawn_request(ui.dirs.control_socket(), Request::ResumeImport);
+        glib::spawn_future_local(async move {
+            let result = rx.recv().await;
+            ui.busy_end();
+            match result {
+                Ok(Ok(Response::Ok { .. })) => import_started(&ui, false),
+                Ok(Ok(Response::Error { message, kind })) => {
+                    toast_failure(&ui, &gettext("Couldn't resume the import"), &message, kind);
+                }
+                _ => toast_error(
+                    &ui,
+                    &gettext("Couldn't resume the import"),
                     &gettext("The Proton Drive service didn't respond."),
                 ),
             }
@@ -559,6 +617,7 @@ fn sync_takeout_actions(ui: &Rc<Ui>) {
         .import_button
         .set_sensitive(has_files && !running);
     ui.takeout.clear_button.set_sensitive(has_files && !running);
+    ui.takeout.resume_button.set_sensitive(!running);
     ui.takeout.cancel_button.set_visible(running);
 }
 
@@ -577,7 +636,6 @@ fn start_import(ui: &Rc<Ui>, dry_run: bool) {
         return;
     }
 
-    ui.takeout.dry_run.set(dry_run);
     ui.busy_begin();
     let rx = spawn_request(
         ui.dirs.control_socket(),
@@ -588,27 +646,7 @@ fn start_import(ui: &Rc<Ui>, dry_run: bool) {
         let result = rx.recv().await;
         ui.busy_end();
         match result {
-            Ok(Ok(Response::Ok { .. })) => {
-                ui.takeout.running.set(true);
-                ui.gallery.import_banner.set_revealed(true);
-                ui.takeout.summary_group.set_visible(false);
-                ui.takeout.progress_group.set_visible(true);
-                ui.takeout.progress_bar.set_fraction(0.0);
-                ui.takeout.progress_label.set_text(&if dry_run {
-                    gettext("Reading archives…")
-                } else {
-                    gettext("Starting import…")
-                });
-                sync_takeout_actions(&ui);
-                toast(
-                    &ui,
-                    &if dry_run {
-                        gettext("Scanning the export…")
-                    } else {
-                        gettext("Import started — you can leave this page, it keeps running.")
-                    },
-                );
-            }
+            Ok(Ok(Response::Ok { .. })) => import_started(&ui, dry_run),
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, &gettext("Couldn't start the import"), &message, kind);
             }
@@ -621,9 +659,39 @@ fn start_import(ui: &Rc<Ui>, dry_run: bool) {
     });
 }
 
-/// Ask the daemon for the import's state, and paint the report once a run has
-/// finished. Asked on arrival and while import progress keeps arriving. Cheap
-/// and inflight-guarded.
+/// Switch the page over to reporting progress once the daemon took the run.
+fn import_started(ui: &Rc<Ui>, dry_run: bool) {
+    ui.takeout.running.set(true);
+    if !dry_run {
+        ui.gallery.import_banner.set_revealed(true);
+    }
+    ui.takeout.resume_group.set_visible(false);
+    ui.takeout.summary_group.set_visible(false);
+    ui.takeout.progress_group.set_visible(true);
+    ui.takeout.progress_group.set_title(&if dry_run {
+        gettext("Scan in progress")
+    } else {
+        gettext("Import in progress")
+    });
+    ui.takeout.progress_bar.set_fraction(0.0);
+    ui.takeout
+        .progress_label
+        .set_text(&gettext("Reading the archives…"));
+    sync_takeout_actions(ui);
+    toast(
+        ui,
+        &if dry_run {
+            gettext("Scanning the export…")
+        } else {
+            gettext("Import started — you can leave this page, it keeps running.")
+        },
+    );
+}
+
+/// Ask the daemon for the import's state and paint it: the step and counts
+/// while it runs, the report once it has ended, and the offer to resume a run
+/// that did not finish. Asked on arrival and while import progress keeps
+/// arriving. Cheap and inflight-guarded.
 pub(crate) fn refresh_takeout(ui: &Rc<Ui>) {
     if ui.takeout.inflight.get() {
         return;
@@ -634,124 +702,250 @@ pub(crate) fn refresh_takeout(ui: &Rc<Ui>) {
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.takeout.inflight.set(false);
-        let Ok(Ok(Response::ImportStatus { running, summary })) = result else {
+        let Ok(Ok(Response::ImportStatus {
+            running,
+            summary,
+            progress,
+            resumable,
+        })) = result
+        else {
             return;
         };
         let was_running = ui.takeout.running.replace(running);
-        ui.gallery.import_banner.set_revealed(running);
+        let dry = summary.as_ref().is_some_and(|s| s.dry_run);
+        ui.gallery.import_banner.set_revealed(running && !dry);
+        ui.takeout.progress_group.set_visible(running);
         if running {
-            ui.takeout.progress_group.set_visible(true);
-        } else {
-            ui.takeout.progress_group.set_visible(false);
-            // An import runs for hours, so its ending is announced rather than
-            // left to be discovered: a toast for whoever is looking at the
-            // window, and a desktop notification for whoever is not.
-            let failed = summary.as_ref().and_then(|s| s.error.clone());
-            if was_running && let Some(error) = &failed {
-                let headline = gettext("Couldn't import from Google Photos");
-                toast_error(&ui, &headline, error);
-                notify("takeout-import", &headline, error);
-            } else if was_running {
-                let dry = ui.takeout.dry_run.get();
-                let headline = if dry {
-                    gettext("Scan finished")
-                } else {
-                    gettext("Import finished")
-                };
-                toast(&ui, &headline);
-                if !dry {
-                    let body = match &summary {
-                        // Translators: {n} is the number of photos uploaded, {failed} the number that failed.
-                        Some(s) if s.failed > 0 => ngettext_f(
-                            "{n} photo added, {failed} failed.",
-                            "{n} photos added, {failed} failed.",
-                            s.uploaded as u64,
-                            &[("failed", &s.failed.to_string())],
-                        ),
-                        Some(s) if s.cancelled => ngettext_f(
-                            "Stopped after {n} photo.",
-                            "Stopped after {n} photos.",
-                            s.uploaded as u64,
-                            &[],
-                        ),
-                        Some(s) => ngettext_f(
-                            "{n} photo added to Proton Photos.",
-                            "{n} photos added to Proton Photos.",
-                            s.uploaded as u64,
-                            &[],
-                        ),
-                        None => gettext("The Google Photos import has finished."),
-                    };
-                    notify("takeout-import", &headline, &body);
-                }
-            }
+            ui.takeout.progress_group.set_title(&if dry {
+                gettext("Scan in progress")
+            } else {
+                gettext("Import in progress")
+            });
+            paint_progress(&ui, progress.as_ref());
+        } else if was_running && let Some(summary) = &summary {
+            announce_end(&ui, summary);
         }
         if was_running != running {
             sync_takeout_actions(&ui);
         }
-        match summary {
-            Some(summary) => repaint_summary(&ui, &summary),
+        match &summary {
+            Some(summary) => repaint_summary(&ui, summary, running),
             None => ui.takeout.summary_group.set_visible(false),
         }
+        paint_resume(&ui, running, summary.as_ref(), &resumable);
     });
 }
 
-/// Paint the last run's report.
-fn repaint_summary(ui: &Rc<Ui>, summary: &ImportSummary) {
+/// Tell the user how a run ended. An import runs for hours, so its ending is
+/// announced rather than left to be discovered: a toast for whoever is looking
+/// at the window, and a desktop notification for whoever is not.
+fn announce_end(ui: &Rc<Ui>, summary: &ImportSummary) {
+    if summary.dry_run {
+        toast(ui, &gettext("Scan finished"));
+        return;
+    }
+    if let Some(error) = &summary.error {
+        let kind = summary.error_kind.unwrap_or_default();
+        let headline = gettext("Couldn't import from Google Photos");
+        toast_failure(ui, &headline, error, kind);
+        notify(
+            "takeout-import",
+            &headline,
+            &gettext("You can resume it once the problem is solved."),
+        );
+        return;
+    }
+    let (headline, body) = if summary.interrupted {
+        (
+            gettext("Import interrupted"),
+            gettext("You can resume it where it stopped."),
+        )
+    } else if summary.cancelled {
+        (
+            gettext("Import stopped"),
+            ngettext_f(
+                "Stopped after {n} photo.",
+                "Stopped after {n} photos.",
+                summary.uploaded as u64,
+                &[],
+            ),
+        )
+    } else if summary.failed > 0 {
+        (
+            gettext("Import finished"),
+            // Translators: {n} is the number of photos uploaded, {failed} the number that failed.
+            ngettext_f(
+                "{n} photo added, {failed} failed.",
+                "{n} photos added, {failed} failed.",
+                summary.uploaded as u64,
+                &[("failed", &summary.failed.to_string())],
+            ),
+        )
+    } else {
+        (
+            gettext("Import finished"),
+            ngettext_f(
+                "{n} photo added to Proton Photos.",
+                "{n} photos added to Proton Photos.",
+                summary.uploaded as u64,
+                &[],
+            ),
+        )
+    };
+    toast(ui, &headline);
+    notify("takeout-import", &headline, &body);
+
+    // A complete import is done with its archives; keeping them staged would
+    // only invite running the same export again.
+    if summary.complete() {
+        ui.takeout.archives.borrow_mut().clear();
+        repaint_archives(ui);
+    }
+}
+
+/// Paint where a running import is.
+fn paint_progress(ui: &Rc<Ui>, progress: Option<&ImportProgress>) {
+    let Some(progress) = progress else {
+        ui.takeout.progress_bar.pulse();
+        return;
+    };
+    let done = progress.done.to_string();
+    let total = progress.total.to_string();
+    let current = progress.current.clone().unwrap_or_default();
+    let counted = progress.total > 0;
+    let args = [
+        ("done", done.as_str()),
+        ("total", total.as_str()),
+        ("name", current.as_str()),
+    ];
+    let text = match (progress.phase, counted) {
+        (ImportPhase::Scanning, _) => gettext("Reading the archives…"),
+        (ImportPhase::Checking, false) => gettext("Checking for photos you already have…"),
+        // Translators: {done} and {total} are counts of photos.
+        (ImportPhase::Checking, true) => gettext_f(
+            "Checking for photos you already have — {done} of {total}",
+            &args,
+        ),
+        (ImportPhase::Uploading, false) => gettext("Uploading…"),
+        (ImportPhase::Uploading, true) if current.is_empty() => {
+            // Translators: {done} and {total} are counts of photos.
+            gettext_f("Uploading {done} of {total}", &args)
+        }
+        // Translators: {done} and {total} are counts of photos; {name} is the file being uploaded.
+        (ImportPhase::Uploading, true) => gettext_f("Uploading {done} of {total} — {name}", &args),
+        (ImportPhase::Albums, false) => gettext("Sorting photos into albums…"),
+        // Translators: {done} and {total} are counts of albums.
+        (ImportPhase::Albums, true) => {
+            gettext_f("Sorting photos into albums — {done} of {total}", &args)
+        }
+    };
+    ui.takeout.progress_label.set_text(&text);
+    if counted {
+        ui.takeout
+            .progress_bar
+            .set_fraction((progress.done as f64 / progress.total as f64).min(1.0));
+    } else {
+        ui.takeout.progress_bar.pulse();
+    }
+}
+
+/// Offer to resume the last run when the service says it can be.
+fn paint_resume(ui: &Rc<Ui>, running: bool, summary: Option<&ImportSummary>, resumable: &[String]) {
+    let offer = !running && !resumable.is_empty();
+    ui.takeout.resume_group.set_visible(offer);
+    if !offer {
+        return;
+    }
+    let uploaded = summary.map_or(0, |s| s.uploaded) as u64;
+    // Translators: {n} is the number of photos uploaded before the import stopped.
+    ui.takeout.resume_row.set_subtitle(&ngettext_f(
+        "{n} photo uploaded before it stopped. Resuming skips what is already there.",
+        "{n} photos uploaded before it stopped. Resuming skips what is already there.",
+        uploaded,
+        &[],
+    ));
+}
+
+/// Paint the counts of a running import, or the report of the last one.
+fn repaint_summary(ui: &Rc<Ui>, summary: &ImportSummary, running: bool) {
     for row in ui.takeout.summary_rows.borrow_mut().drain(..) {
         ui.takeout.summary_group.remove(&row);
     }
-    let dry = ui.takeout.dry_run.get();
-    ui.takeout.summary_group.set_title(&if dry {
+    let dry = summary.dry_run;
+    ui.takeout.summary_group.set_title(&if running {
+        gettext("So far")
+    } else if dry {
         gettext("Scan result")
     } else {
         gettext("Last import")
     });
-    ui.takeout.summary_group.set_description(Some(&if let Some(error) = &summary.error {
-        // The reason is the service's own text, which is not translated. A
-        // group's description is markup, and the reason may name a path.
-        glib::markup_escape_text(&gettext_f(
-            "{what}: {detail}",
-            &[
-                ("what", &gettext("Couldn't import from Google Photos")),
-                ("detail", error),
-            ],
-        ))
-        .to_string()
+    let description = if running {
+        None
+    } else if let Some(error) = &summary.error {
+        // The reason is the service's own text, which is not translated; the
+        // headline in front of it is. A group's description is markup, and the
+        // reason may name a path.
+        let what = gettext("Couldn't import from Google Photos");
+        Some(
+            glib::markup_escape_text(&gettext_f(
+                "{what}: {detail}",
+                &[
+                    (
+                        "what",
+                        error_headline(summary.error_kind.unwrap_or_default(), &what),
+                    ),
+                    ("detail", error),
+                ],
+            ))
+            .to_string(),
+        )
     } else if dry {
-        gettext("Nothing was uploaded — this is what an import would do.")
+        Some(gettext(
+            "Nothing was uploaded — this is what an import would do.",
+        ))
+    } else if summary.interrupted {
+        Some(gettext(
+            "The Proton Drive service stopped while the import ran. Resume it to continue where it left off.",
+        ))
     } else if summary.cancelled {
-        gettext("Stopped early. Everything uploaded so far is in your timeline; run it again to continue where it left off.")
+        Some(gettext(
+            "Stopped early. Everything uploaded so far is in your timeline; run it again to continue where it left off.",
+        ))
+    } else if !summary.complete() {
+        Some(gettext(
+            "Finished with problems. Run it again to retry what didn't upload.",
+        ))
     } else {
-        gettext("Finished.")
-    }));
+        Some(gettext("Finished."))
+    };
+    ui.takeout
+        .summary_group
+        .set_description(description.as_deref());
 
     // Only lines that carry information: a run with no failures should not have
     // to show a "0 failed" row for the user to read past.
-    let mut lines: Vec<(String, String)> = vec![
-        (gettext("Photos in the export"), summary.found.to_string()),
-        (
-            if dry {
-                gettext("Would upload")
-            } else {
-                gettext("Uploaded")
-            },
-            summary.uploaded.to_string(),
-        ),
-    ];
+    let mut lines: Vec<(String, String)> =
+        vec![(gettext("Photos in the export"), summary.found.to_string())];
+    if dry {
+        lines.push((gettext("Would upload"), summary.to_upload.to_string()));
+    } else {
+        lines.push((gettext("Uploaded"), summary.uploaded.to_string()));
+    }
     if summary.duplicates > 0 {
         lines.push((
             gettext("Already in Proton Photos"),
             summary.duplicates.to_string(),
         ));
     }
+    if summary.live_photos > 0 {
+        lines.push((
+            gettext("Live photos kept together"),
+            summary.live_photos.to_string(),
+        ));
+    }
     if summary.albums_created > 0 {
         lines.push((
-            if dry {
-                gettext("Albums to create")
-            } else {
-                gettext("Albums created")
-            },
+            gettext("Albums created"),
             summary.albums_created.to_string(),
         ));
     }
@@ -767,18 +961,23 @@ fn repaint_summary(ui: &Rc<Ui>, summary: &ImportSummary) {
             summary.skipped_trashed.to_string(),
         ));
     }
-    if summary.bytes > 0 {
+    if dry && summary.to_upload_bytes > 0 {
         lines.push((
-            if dry {
-                gettext("Data to upload")
-            } else {
-                gettext("Data uploaded")
-            },
-            human_bytes(summary.bytes),
+            gettext("Data to upload"),
+            human_bytes(summary.to_upload_bytes),
         ));
+    } else if summary.bytes > 0 {
+        lines.push((gettext("Data uploaded"), human_bytes(summary.bytes)));
     }
     if summary.failed > 0 {
         lines.push((pgettext("state", "Failed"), summary.failed.to_string()));
+    }
+    for path in &summary.unreadable_archives {
+        let name = Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        lines.push((gettext("Couldn't read this archive"), name));
     }
 
     let mut rows = Vec::new();
@@ -786,6 +985,7 @@ fn repaint_summary(ui: &Rc<Ui>, summary: &ImportSummary) {
         let row = adw::ActionRow::builder()
             .title(title)
             .subtitle(value)
+            .use_markup(false)
             .build();
         row.add_css_class("property");
         ui.takeout.summary_group.add(&row);
@@ -793,36 +993,4 @@ fn repaint_summary(ui: &Rc<Ui>, summary: &ImportSummary) {
     }
     *ui.takeout.summary_rows.borrow_mut() = rows;
     ui.takeout.summary_group.set_visible(true);
-}
-
-/// Paint the import's progress from the transfer snapshot the daemon pushed,
-/// so this page costs no extra request. A job with no known total
-/// pulses instead of showing a fraction, the same as the Activity list.
-pub(crate) fn takeout_progress(ui: &Rc<Ui>, jobs: &[JobItem]) {
-    let Some(job) = jobs.iter().find(|job| job.title == IMPORT_JOB) else {
-        return;
-    };
-    ui.takeout.progress_group.set_visible(true);
-    if job.total > 0 {
-        ui.takeout
-            .progress_bar
-            .set_fraction((job.done as f64 / job.total as f64).min(1.0));
-        let done = job.done.to_string();
-        let total = job.total.to_string();
-        // Translators: progress such as "120 of 4000 — IMG_0001.jpg"; {detail} is what is being worked on.
-        let text = gettext_f(
-            "{done} of {total} — {detail}",
-            &[("done", &done), ("total", &total), ("detail", &job.detail)],
-        );
-        ui.takeout.progress_label.set_text(&text);
-    } else {
-        ui.takeout.progress_bar.pulse();
-        ui.takeout
-            .progress_label
-            .set_text(&if job.detail.is_empty() {
-                gettext("Working…")
-            } else {
-                job.detail.clone()
-            });
-    }
 }

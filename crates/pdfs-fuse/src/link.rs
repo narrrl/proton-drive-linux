@@ -286,6 +286,9 @@ impl Core {
             warn!(error = %e, "moving backed-off ops up after a reconnect failed");
         }
         self.wake_drain();
+        // Downloads for pins failed while the link was down, and the events
+        // that would have named the files are behind us (`docs/BUGS.md` B282).
+        self.recheck_all_pins();
     }
 
     /// Wait up to `budget` for the link to come back. Returns whether it is up.

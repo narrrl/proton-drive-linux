@@ -224,6 +224,49 @@ impl FileList {
             .set_visible_child_name(if list { "list" } else { "grid" });
     }
 
+    /// Bring both views back to the first entry. For a listing of something
+    /// else: [`replace_items`] keeps the scroll position, which is right for a
+    /// refresh, but another folder would open where the last one was left —
+    /// often at its bottom.
+    pub(crate) fn scroll_to_top(&self) {
+        if self.model.n_items() == 0 {
+            return;
+        }
+        self.grid.scroll_to(0, gtk4::ListScrollFlags::NONE, None);
+        self.column_view
+            .scroll_to(0, None, gtk4::ListScrollFlags::NONE, None);
+    }
+
+    /// How far the view on screen is scrolled, in px from the top.
+    pub(crate) fn scroll_offset(&self) -> f64 {
+        self.views
+            .visible_child()
+            .and_downcast::<gtk4::ScrolledWindow>()
+            .map_or(0.0, |scroll| scroll.vadjustment().value())
+    }
+
+    /// Select the entries named `selected` and scroll the view on screen to
+    /// `offset`, as they were when the folder was left. The scroll waits for
+    /// an idle, when the views have measured the rows just put in.
+    pub(crate) fn restore(&self, offset: f64, selected: &[String]) {
+        self.selection.unselect_all();
+        for i in 0..self.selection.n_items() {
+            if entry_at(Some(&self.selection), i)
+                .is_some_and(|entry| selected.contains(&entry.name))
+            {
+                self.selection.select_item(i, false);
+            }
+        }
+        let Some(scroll) = self
+            .views
+            .visible_child()
+            .and_downcast::<gtk4::ScrolledWindow>()
+        else {
+            return;
+        };
+        glib::idle_add_local_once(move || scroll.vadjustment().set_value(offset));
+    }
+
     /// Whether the list, rather than the grid, is on screen.
     pub(crate) fn shows_list(&self) -> bool {
         self.views.visible_child_name().as_deref() == Some("list")

@@ -511,6 +511,7 @@ pub(crate) fn mount_with(
         landed: Arc::new(Mutex::new(HashMap::new())),
         unadopted: Arc::new(Mutex::new(HashMap::new())),
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
+        pin_work: Arc::new(Mutex::new(Default::default())),
         shutdown: Arc::new(crate::shutdown::Shutdown::default()),
         upload_times: Arc::new(Mutex::new(HashMap::new())),
         upload_cancel: Arc::new(Mutex::new(HashMap::new())),
@@ -618,6 +619,17 @@ pub(crate) fn mount_with(
         let spawned = std::thread::Builder::new()
             .name("pdfs-online-probe".into())
             .spawn(move || probe_core.run_online_probe());
+        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
+    }
+
+    // Keep pinned files on this computer through changes made elsewhere, and
+    // fetch the ones a failed or missed download left out (`docs/BUGS.md`
+    // B282). Its own thread: a check lists folders and downloads files.
+    {
+        let keeper_core = core.clone();
+        let spawned = std::thread::Builder::new()
+            .name("pdfs-pin-keeper".into())
+            .spawn(move || keeper_core.run_pin_keeper());
         keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
     }
 

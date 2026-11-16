@@ -82,10 +82,10 @@ pub(crate) fn start_update_checks(ui: &Rc<Ui>) {
             match fetch_latest().await {
                 Ok(latest) => {
                     checked = Some(unix_now());
-                    let mut config = ui.dirs.load_config();
-                    config.update_last_checked = checked;
-                    config.update_latest = latest;
-                    if let Err(e) = ui.dirs.save_config(&config) {
+                    if let Err(e) = ui.dirs.update_config(|config| {
+                        config.update_last_checked = checked;
+                        config.update_latest = latest;
+                    }) {
                         tracing::warn!("update check: cannot save the result: {e}");
                     }
                     show_latest(&ui);

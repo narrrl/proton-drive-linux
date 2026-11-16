@@ -111,6 +111,11 @@ impl Core {
         // stale from here on, and the server may not have applied the swap yet.
         self.cache.evict(uid);
         self.evict_reader(uid);
+        // A file kept offline gets the restored content back on disk, and
+        // again when the event of the swap arrives (`docs/BUGS.md` B282).
+        if self.cache.is_pinned(uid) {
+            self.recheck_pinned(uid);
+        }
         self.log_activity(
             ActivityKind::Restore,
             name,

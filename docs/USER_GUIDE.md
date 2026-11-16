@@ -53,6 +53,8 @@ The app uses these words, and so do these pages:
 | Page | Settings |
 |---|---|
 | **General** | Start on login · Proton Drive folder location · upload and download limits · Proton theme, street map for Places, tray icon · language · check for updates |
+| **Sync** | Files and folders every synced folder leaves out · what happens to identical conflict copies |
+| **Apps** | Which program opens which kind of file · how the search launcher opens |
 | **Storage** | Cache size limit · clear the cache · files kept available offline |
 
 The account menu shows the storage you use and holds **Sign Out…**. Settings that are not in the

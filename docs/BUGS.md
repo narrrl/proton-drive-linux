@@ -109,7 +109,16 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B291](#b291--on-fedora-45s-oo7-every-saved-sign-in-is-lost-at-the-next-reboot) | On Fedora 45's oo7, every saved sign-in is lost at the next reboot |
+| [B289](#b289--the-takeout-import-mixes-in-other-services-and-drops-location-and-live-photos) | The Takeout import mixes in other services and drops location and live photos |
+| [B288](#b288--an-interrupted-takeout-import-reads-as-finished-and-one-error-ends-it) | An interrupted Takeout import reads as finished, and one error ends it |
+| [B287](#b287--a-photo-draft-left-by-an-interrupted-upload-blocks-that-name) | A photo draft left by an interrupted upload blocks that name |
+| [B286](#b286--resuming-a-takeout-import-fails-on-a-draft-with-no-content-hash) | Resuming a Takeout import fails on a draft with no content hash |
+| [B285](#b285--a-restarted-secret-service-leaves-the-process-on-a-dead-session) | A restarted Secret Service leaves the process on a dead session |
+| [B284](#b284--a-keyring-entry-reported-missing-discards-refreshed-session-tokens) | A keyring entry reported missing discards refreshed session tokens |
 | [B283](#b283--videos-have-no-thumbnail-outside-photos-and-a-ts-recording-looks-like-source-code) | Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code |
+| [B282](#b282--a-file-kept-offline-is-downloaded-again-after-a-change-made-elsewhere) | A file kept offline is downloaded again after a change made elsewhere |
+| [B281](#b281--a-file-in-a-synced-folder-cannot-be-kept-offline) | A file in a synced folder cannot be kept offline |
 | [B280](#b280--uploading-a-batch-of-large-photos-swaps-the-machine-until-the-daemon-is-killed) | Uploading a batch of large photos swaps the machine until the daemon is killed |
 | [B279](#b279--after-a-watchdog-kill-the-mount-never-comes-back) | After a watchdog kill the mount never comes back |
 | [B278](#b278--sync-list-and-devices-list-show-the-last-sync-as-epoch-seconds) | `sync list` and `devices list` show the last sync as epoch seconds |
@@ -297,6 +306,8 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B292](#b292--two-programs-changing-settings-at-once-lose-one-of-the-changes) | Two programs changing settings at once lose one of the changes |
+| [B290](#b290--reopening-the-database-right-after-closing-it-can-be-refused-as-another-daemon) | Reopening the database right after closing it can be refused as another daemon |
 | [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
 | [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
@@ -384,6 +395,283 @@ a live account since.
 
 Newest first.
 
+### B292 — Two programs changing settings at once lose one of the changes
+
+**Status:** Fixed
+
+**Found:** 2026-11-15, reading every writer of `config.json` while adding settings to Preferences.
+
+**Where:** `crates/pdfs-core/src/config.rs`, `AppDirs::save_config` and its callers in the app,
+the tray and the daemon
+
+**Repro:** Change the cache size in Preferences (the daemon writes `cache_budget`) while the app
+saves the window size or the tray hides itself. Both read the file before either wrote it, and
+the one that wrote last puts the other setting back. Not seen in the field; the window is a few
+milliseconds, but more settings in the app make it more likely.
+
+**Cause:** Every writer loaded the file, changed one field and wrote the whole file back, with
+nothing ordering them. The atomic rename kept the file whole, not the changes.
+
+**Fix:** `AppDirs::update_config` reads, changes and writes under an `flock` on
+`config.json.lock`, and every writer goes through it. It refuses an unreadable file before
+applying the change (B223). A lock held longer than 5 seconds is reported as an error instead of
+waited on.
+
+**Verified:** `cargo test -p pdfs-core config::tests` on 2026-11-15,
+`concurrent_changes_to_different_settings_are_all_kept` and
+`a_change_is_never_applied_over_an_unreadable_config`.
+
+---
+
+### B291 — On Fedora 45's oo7, every saved sign-in is lost at the next reboot
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, from the reporter's package list in
+[issue #78](https://github.com/narrrl/proton-drive-linux/issues/78): `oo7-daemon-0.7.0~beta^1.e91b98a`,
+the build Fedora 45 and 46 ship as stable, from before oo7's
+[7fb11dd](https://github.com/linux-credentials/oo7/commit/7fb11dd111c4be8fec01996e3caa31c44fa962b3)
+("server: Write item changes to the keyring file"). See
+[the investigation](ISSUE-78.md#setsecret-is-kept-only-in-memory-in-fedoras-oo7).
+**Where:** `crates/pdfs-core/src/auth.rs`, `write_stored`; `crates/pdfs-core/src/secretservice.rs`
+
+**Repro:** With oo7-daemon at e91b98a, save the session blob, save it again with a new refresh
+token, and restart oo7-daemon. The read after the restart returns the first blob. The keyring
+store writes an existing item with `SetSecret`, and that oo7 build applies `SetSecret` only to the
+item in memory; the keyring file keeps what `CreateItem` wrote. Within a boot every read returns
+the new tokens, so nothing looks wrong. After a reboot the daemon resumes with the refresh token
+of the last `pdfs login`, which Proton spent long ago: `InvalidRefreshToken`, and the user has to
+sign in again. Typing the password at login, or the fixes for B284 and B285, change nothing.
+
+**Cause:** A bug in that oo7 build, fixed in oo7 0.7.0 but not packaged by Fedora. Every token
+refresh pdfs saved went through the one call it does not persist.
+
+**Fix:** An existing entry is saved by `CreateItem` with `replace`, which that build writes to the
+file: a new item in the old one's collection, with its label and all its attributes, so the
+provider replaces the old one. A duplicate that a provider leaves behind is removed; if it cannot
+be, the new item is taken out again and the save falls back to the usual `SetSecret`. The first
+save, a locked item, two matching items, or any failure before the new item exists also fall back
+to it. The connection used for this never shows a prompt. The daemon log now has a short
+fingerprint of the refresh token at each start and each save, so a log across a reboot shows
+whether the keyring returned the last token saved.
+
+**Verified:** 2026-11-15, `real_secret_service_keeps_the_last_save_across_a_provider_restart`
+(ignored; needs a throwaway Secret Service) against oo7-daemon built at e91b98a: with the
+in-place write it reads `r1` after the restart, with this change `r3` and one item. The same test
+and `real_secret_service_survives_a_provider_restart` pass against gnome-keyring. Not yet run on
+a Fedora 45 desktop with a real account.
+
+---
+
+### B290 — Reopening the database right after closing it can be refused as another daemon
+
+**Status:** Fixed, 2026-11-15
+**Found:** 2026-11-15, CI on `chore/release-3.8.0` (fd6b2d3):
+`db::tests::what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart` failed once with
+"another Proton Drive daemon is already using /tmp/pdfs-create-sent-….db". It passes on its own.
+**Where:** `crates/pdfs-core/src/db/mod.rs`, `acquire_single_writer_lock`
+
+**Repro:** In one process, drop a `Db` and open the same file again while another thread spawns a
+child process. Rare; seen once in about 500 tests that run in parallel, several of which spawn
+processes.
+
+**Cause:** The single-writer lock is a `flock` on `<db>.lock`, and a `flock` belongs to the open
+file, not to one descriptor. A child holds a copy of every descriptor from its fork until its exec
+closes the `O_CLOEXEC` ones. A lock dropped by the parent in that moment stays held by the child,
+and an immediate reopen gets `EWOULDBLOCK`, which reads as a second daemon.
+
+**Fix:** A refused lock is retried every 20 ms for up to 500 ms before it counts as another
+daemon. That covers any fork-to-exec window. A real second daemon is still refused, half a
+second later.
+
+**Verified:** `cargo test -p pdfs-core` on 2026-11-15, including
+`a_second_writer_is_refused_while_the_first_holds_the_database`.
+
+---
+
+### B289 — The Takeout import mixes in other services and drops location and live photos
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, auditing the Google Photos import alongside
+[issue #94](https://github.com/narrrl/proton-drive-linux/issues/94).
+**Where:** `crates/pdfs-core/src/takeout.rs`; `plan` and `upload_takeout_photo` in
+`crates/pdfs-fuse/src/takeout.rs`
+
+**Repro:** Import a Takeout export that also holds `Drive/` or `YouTube/`, with Pixel motion
+photos, iPhone live photos and photos that have a place in Google Photos.
+
+**Cause.** Five gaps in what the import carried over:
+- The service folder was dropped without being checked, so media from other Google services in
+  the same export landed in the photo timeline.
+- `geoData` was never read, although `docs/PHOTOS.md` said the import takes locations from the
+  export, and the SDK had no way to upload a location.
+- The two halves of a live or motion photo uploaded as unrelated photos, the `.MOV` half usually
+  without a date, and the `.MP` half of a Pixel motion photo was skipped as unknown.
+- `creationTime`, the day the photo reached Google, outranked the date in the file name and the
+  photo's own EXIF.
+- A sidecar with `null` in `favorited`, a numeric `timestamp` or a `0` timestamp lost its other
+  fields or filed the photo under 1970.
+
+**Fix:** The Photos service is the folder whose sidecars carry `photoTakenTime`, and only it is
+imported (everything, when no folder does). `geoData`, else `geoDataExif`, becomes the photo's
+`Location` attribute through SDK 0.12.0's `PhotoUploadMetadata::location`; `0, 0` is no position.
+Stills and videos with the same stem in one folder (`IMG_1.HEIC` + `IMG_1.MOV`,
+`PXL_1.MP.jpg` + `PXL_1.MP`) are paired unless their dates are minutes apart: the still is
+tagged as a live or motion photo, the video is uploaded after it with `main_photo_uid` and takes
+its date and place. The capture time is `photoTakenTime`, then the name, then EXIF, then
+`creationTime`. Favorites are also set on photos that were already on the account.
+
+**Verified:** `takeout::tests` in `pdfs-core` (services, locations, timestamps, live keys) and
+`pdfs-fuse` (pairing, skew, folded copies). Not run against a real export and account.
+
+---
+
+### B288 — An interrupted Takeout import reads as finished, and one error ends it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, auditing the Google Photos import alongside
+[issue #94](https://github.com/narrrl/proton-drive-linux/issues/94).
+**Where:** `crates/pdfs-fuse/src/takeout.rs`; `refresh_takeout` in
+`crates/pdfs-gui/src/app/pages/takeout.rs`; `cmd_import_google_photos` in
+`crates/pdfs-cli/src/main.rs`
+
+**Repro:** Start an import of several archives, one of them damaged, and restart the service
+while it uploads.
+
+**Cause.**
+- The import state lived only in memory. After a restart `ImportStatus` had no summary, and the
+  app announced "Import finished". The archives had to be chosen again to continue.
+- A daemon shutdown broke the upload loop but still filed albums and logged a success.
+- One unreadable archive failed the scan, and a failed request in the middle of the run
+  discarded every count and skipped the albums for what had uploaded.
+- The progress total counted photos already on the account, so the bar stopped short of the
+  end; a dry run reported "Would upload: 0"; the job's phases reached the app in English.
+
+**Fix:** The last run's archives and summary are kept in `takeout-import.json` in the state
+directory. A run still marked running at start-up is `interrupted`, and `ImportStatus` lists
+its archives as `resumable`; `ResumeImport` (`pdfs import-google-photos --resume`, **Resume** in
+the app) starts it again, and the duplicate check skips what is there. An unreadable archive is
+listed in `unreadable_archives` and the rest imports. A failure keeps the counts and still files
+albums. `ImportStatus` carries the phase and its own progress, the summary says `dry_run`,
+`to_upload` and `error_kind`, and the app words them in the user's language. The inline
+timeline refresh of an empty gallery waits for a refresh already running instead of starting a
+second one (`refresh_timeline_joined`).
+
+**Verified:** `takeout::tests` in `pdfs-fuse` (saved state, resumable runs) and `pdfs-core`
+(unreadable archive), and the CLI tests for `--resume` and the exit status. Not run live.
+
+---
+
+### B287 — A photo draft left by an interrupted upload blocks that name
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, reading the SDK upload path for
+[issue #94](https://github.com/narrrl/proton-drive-linux/issues/94).
+**Where:** `upload_photo_from`, `upload_file_from_inner` and `abandon_file_draft` in
+`proton-drive-rs` (SDK 0.12.0)
+
+**Repro:** Interrupt a photo upload after its draft is created, sign in again, and upload a
+photo with the same name.
+
+**Cause.** Photo uploads replaced a leftover draft only when its `ClientUID` was the current
+session's. A new login is a new session, so the next upload of that name failed with 2500. A
+failed upload also never deleted its own draft, which the C# and TypeScript SDKs do.
+
+**Fix:** SDK 0.12.0 adds `PhotoUploadMetadata::replace_existing_draft`, which the Takeout import
+sets, and deletes the draft of a new file or photo whose upload fails. After a failed seal it
+only does so on a definite rejection, because a seal lost in transit may have been applied.
+
+**Verified:** SDK unit test `draft_cleanup_only_after_a_definite_seal_rejection`. Not run live.
+
+---
+
+### B286 — Resuming a Takeout import fails on a draft with no content hash
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, [issue #94](https://github.com/narrrl/proton-drive-linux/issues/94)
+(3.7.0, Fedora). An import stopped by a restart failed every re-run at once with
+`check for existing photos: serialization error: invalid type: null, expected a string at line
+1 column 2063`.
+**Where:** `FoundPhotoDuplicateDto` in `proton-drive-rs` (SDK 0.11.0)
+
+**Repro:** Interrupt a photo upload after its draft is created, then run the import again.
+
+**Cause.** The duplicates endpoint sends `ContentHash` (and can send `Hash`) as `null` for a
+draft, as its API schema says. The SDK declared both as `String` with `#[serde(default)]`,
+which covers a missing field but not `null`, so one draft failed the whole batch of 150 names
+and the import ended before uploading anything.
+
+**Fix:** SDK 0.12.0 makes both fields optional and skips drafts, trashed links and candidates
+without hashes, like the TypeScript SDK. Every other defaulted DTO field reads `null` as its
+default too, and an undecodable response is logged with its path.
+
+**Verified:** SDK unit tests `duplicate_response_tolerates_null_fields_and_skips_drafts` and
+`duplicate_response_tolerates_a_null_list`. Not run against the reporter's account.
+
+---
+
+### B285 — A restarted Secret Service leaves the process on a dead session
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-14, following up [issue #78](https://github.com/narrrl/proton-drive-linux/issues/78)
+(signed out after every cold boot on Fedora 45, which replaced gnome-keyring with oo7). See
+[the investigation](ISSUE-78.md#a-restarted-secret-service).
+**Where:** `crates/pdfs-core/src/auth.rs`, `with_keyring_entry`
+
+**Repro:** Write the session blob, restart the Secret Service provider
+(`gnome-keyring-daemon --replace`, or `oo7-daemon --replace`), then read or write it again from
+the same process. `dbus-secret-service-keyring-store` keeps one D-Bus connection and one Secret
+Service session for the life of the process, and pdfs installed it once. The session exists only
+in the provider's memory, so the new provider answers every `GetSecret` and `SetSecret` with
+`org.freedesktop.Secret.Error.NoSession`, for as long as the process runs. A fresh store in the
+same process reads the same entry fine. oo7's systemd unit restarts the daemon on failure, and
+both providers can be replaced, so the daemon could meet this mid-session. A token refresh after
+that point reached only memory and the kernel keyring: B61's retry kept asking on the dead
+session, and the next cold boot read the spent refresh token (`InvalidRefreshToken`).
+
+**Fix:** Every keyring call goes through `with_keyring_entry`. A platform failure (which is what
+`NoSession` and other D-Bus errors become) logs "the Secret Service failed this process's
+connection; reconnecting", drops the store unless another thread already replaced it, and makes
+the call once more on a new connection and session. A locked keyring, a dismissed prompt and a
+missing entry come back unchanged. Affects the daemon, the app and the tray alike.
+
+**Verified:** `auth::tests::a_dropped_secret_service_session_is_reconnected_and_retried`,
+`a_rotation_lands_at_once_after_the_keyring_restarts` and `a_locked_keyring_is_not_reconnected`
+on the in-memory store. The ignored `auth::tests::real_secret_service_survives_a_provider_restart`
+passes against gnome-keyring 51.1 and oo7 0.7.1 (built from its tag), each in a throwaway session
+bus and restarted with `--replace`; it checks that a reconnect actually happened. A standalone
+program holding one store, as before the fix, gets `NoSession` on read and write after the same
+restart under both providers. Whether the reporter's oo7 restarts during a session is not known.
+
+---
+
+### B284 — A keyring entry reported missing discards refreshed session tokens
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-14, investigating [issue #78](https://github.com/narrrl/proton-drive-linux/issues/78)
+after the reporter's oo7 0.7.0 retest ruled out the original persistence fix as a sufficient
+explanation. See [the investigation and isolated reproducer](ISSUE-78.md).
+**Where:** `crates/pdfs-core/src/auth.rs`, `TokenSink::flush`
+
+**Repro:** Refresh a session while the keyring lookup reports `NoEntry` for its existing blob.
+oo7 0.7.0 does this for a locked collection (upstream #614), reproduced with fake tokens on a
+private D-Bus connection. pdfs dropped the pending rotation and returned success, leaving the
+spent refresh token in the saved blob without triggering B61's retry or kernel recovery paths.
+The running session can still work, but restarting it exposes the stale saved credentials.
+
+**Fix:** Propagate the missing-session error so the rotation stays pending and is retried.
+Persistence still requires the matching existing blob; a retry never recreates a deleted
+session or overwrites a new login. This does not make a locked keyring writable, and pending
+tokens still need to reach it before power-off to survive a cold boot.
+
+**Verified:** The two regression tests
+`auth::tests::a_temporarily_missing_session_does_not_discard_a_rotation` and
+`auth::tests::retrying_a_missing_session_never_recreates_it_or_overwrites_a_new_login`
+failed before the fix and pass afterward. The oo7 fixture confirms its locked lookup behavior
+and repeated binary `SetSecret` persistence. The reporter's complete Fedora cold-boot sequence
+has not been reproduced; issue #78's precise trigger remains unconfirmed.
+
+---
+
 ### B283 — Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code
 
 **Status:** Fixed, not verified live
@@ -426,6 +714,76 @@ A `.ts` whose head lacks the 0x47 sync byte is recorded as having no thumbnail.
 videos of over 70 MiB and takes nothing from a video with an uploader's thumbnail.
 `real_video_fixture_yields_a_frame` passed on 2026-11-14 with ffmpeg 9.0 for a 46 MB MP4 with its
 index at the end, an MPEG-TS and an MKV.
+
+### B282 — A file kept offline is downloaded again after a change made elsewhere
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-13, while looking into B281. Nothing downloaded a pinned file again after the
+pin had downloaded it once.
+**Where:** `apply_event` in `crates/pdfs-fuse/src/background.rs`; the new pin keeper in
+`crates/pdfs-fuse/src/keeper.rs`
+
+**Repro:** Pin a file, then change it from another device. The event deletes the cached copy.
+The file stays listed as kept offline, `cached` is false, and the next read downloads it, or
+fails without a network. Rename or move it elsewhere and the same happens, though its content
+did not change. Add a file to a pinned folder from another device and it is never downloaded.
+A folder pin whose downloads failed while the link was down never retries them.
+
+**Cause:** A remote change to a known node called `ContentCache::evict`, which does not check
+pins, and only the pin request itself downloaded anything. The copy was also stored under the
+size the listing held at pin time. That is the ciphertext size until the size upgrade lands
+(B12), and a copy stored under it never matches the plaintext it holds.
+
+**Fix:** A remote change no longer evicts a pinned file's copy. The copy is checked against the
+revision's `(mtime, size)`, so a read of a newer revision does not take it. A rename keeps the
+revision's mtime (B123), so the copy stays valid. A pin keeper thread checks pins again and
+downloads files that are missing or stale:
+
+- the pins a batch of remote events changed, after the batch's listings are dropped;
+- a pinned folder that gets a new file;
+- every pin at startup, when the link comes back, and after the event feed loses continuity;
+- a file whose version is restored.
+
+Failed downloads are tried again with a backoff from 30 s to 30 min. Pinning settles a
+provisional size before it stores the copy.
+
+**Test:** `a_file_kept_offline_stays_on_disk_through_changes_made_elsewhere` in
+`crates/pdfs-fuse/src/sim/daemon.rs`. Another device edits a pinned file and a file in a pinned
+folder, and adds a file to that folder. The test waits until all three are cached, then reads
+them with the link down. With the keeper disabled, it fails with all three uncached.
+
+---
+
+### B281 — A file in a synced folder cannot be kept offline
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-13. An image was made available offline in the app, and it opened from the app
+with no download. `feh` opened it from a terminal and downloaded it each time. The two were not
+the same file. The app had kept `~/ProtonDrive/Pictures/photo.png`, in My files. The
+terminal opened `~/Pictures/photo.png`, in the on-demand synced folder `~/Pictures`. That
+copy is a separate node under Computers, uploaded on its own, with the same name and size but a
+different mtime. The daemon treats every program the same way: it does not look at the process
+that reads.
+**Where:** the `Pin` and `Unpin` handlers in `crates/pdfs-fuse/src/control.rs`
+
+**Repro:** Add a synced folder in on-demand mode and put a file in it. `pdfs pin` on its absolute
+path fails with "is not under the mountpoint". A relative path is resolved against My files, so
+it keeps a file of the same name there, if one exists, or fails. Reading the file in the synced
+folder then downloads it.
+
+**Cause:** Both handlers turned the path into a mount-relative one with `rel_to_mount`, which only
+knows the primary mount. B86 moved `ls`, `refresh`, `rm` and `mv` to `route_to_mount`, which finds
+the mount that serves an absolute path. Pin and unpin were left out.
+
+**Fix:** Pin and unpin route through `route_to_mount` and run on the mount that owns the path. A
+path in a mirror folder gets an error that says its files are already on this computer. The pin
+registry records the absolute local path for a pin made through an on-demand folder, so
+`pdfs pins`, the prompt and the HUD open the file through the folder it was kept from. Pins
+under the primary mount still record the path relative to it.
+
+**Test:** `pinning_a_file_in_an_on_demand_folder_keeps_that_folders_copy` in
+`crates/pdfs-fuse/src/sim/daemon.rs`. It pins a file through an on-demand folder's absolute path,
+takes the link down, and reads the file through that folder.
 
 ---
 

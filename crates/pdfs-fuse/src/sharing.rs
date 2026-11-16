@@ -105,7 +105,7 @@ impl Core {
         role: &str,
         message: Option<&str>,
     ) -> CoreResult<(usize, usize)> {
-        let uid = self.resolve_anywhere(uid)?;
+        let uid = self.resolve_shareable(uid)?;
         self.share_node_for_uid(&uid, emails, role, message)
     }
 
@@ -138,7 +138,7 @@ impl Core {
         &self,
         uid: &str,
     ) -> CoreResult<(Vec<ShareEntry>, Option<PublicLinkInfo>)> {
-        let uid = self.resolve_anywhere(uid)?;
+        let uid = self.resolve_shareable(uid)?;
         self.list_share_for_uid(&uid)
     }
 
@@ -215,7 +215,7 @@ impl Core {
         kind: ShareEntryKind,
         role: &str,
     ) -> CoreResult<()> {
-        let uid = self.resolve_anywhere(uid)?;
+        let uid = self.resolve_shareable(uid)?;
         self.update_share_role_for_uid(&uid, id, kind, role)
     }
 
@@ -278,7 +278,7 @@ impl Core {
         id: &str,
         kind: ShareEntryKind,
     ) -> CoreResult<()> {
-        let uid = self.resolve_anywhere(uid)?;
+        let uid = self.resolve_shareable(uid)?;
         self.remove_share_entry_for_uid(&uid, id, kind)
     }
 
@@ -349,7 +349,7 @@ impl Core {
         password: Option<&str>,
         expires: Option<i64>,
     ) -> CoreResult<PublicLinkInfo> {
-        let uid = self.resolve_anywhere(uid)?;
+        let uid = self.resolve_shareable(uid)?;
         self.create_public_link_for_uid(&uid, role, password, expires)
     }
 
@@ -391,7 +391,7 @@ impl Core {
         password: LinkChange<String>,
         expires: LinkChange<i64>,
     ) -> CoreResult<PublicLinkInfo> {
-        let uid = self.resolve_anywhere(uid)?;
+        let uid = self.resolve_shareable(uid)?;
         self.update_public_link_for_uid(&uid, id, role, password, expires)
     }
 
@@ -460,7 +460,7 @@ impl Core {
     /// [`Core::remove_public_link`] for a node addressed through any daemon
     /// location.
     pub(crate) fn remove_public_link_by_uid(&self, uid: &str, id: &str) -> CoreResult<()> {
-        let uid = self.resolve_anywhere(uid)?;
+        let uid = self.resolve_shareable(uid)?;
         self.remove_public_link_for_uid(&uid, id)
     }
 
@@ -486,7 +486,7 @@ impl Core {
 
     /// [`Core::stop_sharing`] for a node addressed through any daemon location.
     pub(crate) fn stop_sharing_by_uid(&self, uid: &str) -> CoreResult<StopSharingOutcome> {
-        let uid = self.resolve_anywhere(uid)?;
+        let uid = self.resolve_shareable(uid)?;
         self.stop_sharing_for_uid(&uid)
     }
 

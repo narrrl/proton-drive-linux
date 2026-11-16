@@ -204,18 +204,42 @@ fn route_to_mount(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Cor
 /// B99), so resolving one needs this too. A mirror folder has no mount to run
 /// against: a file there is an ordinary local file.
 fn route_change(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Core, PathBuf)> {
+    route_within(core, mountpoint, path, |path| {
+        format!("{path} is in a mirrored folder; change the local file there instead")
+    })
+}
+
+/// [`route_to_mount`] for keeping a node offline or releasing it. A file in an
+/// on-demand synced folder is a different Drive node from any file of the
+/// same name under the primary mount, and keeping one offline did nothing for
+/// the other: a program reading the synced folder's copy downloaded it
+/// (`docs/BUGS.md` B281). A mirror folder already holds every file on disk.
+fn route_keep(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Core, PathBuf)> {
+    route_within(core, mountpoint, path, |path| {
+        format!(
+            "{path} is in a mirrored folder, which keeps all its files on this computer already"
+        )
+    })
+}
+
+/// [`route_to_mount`], refusing a path that leaves the mount it routed to and
+/// answering a path in a mirror folder, which has no mount, with `mirrored`.
+fn route_within(
+    core: &Core,
+    mountpoint: &Path,
+    path: &str,
+    mirrored: impl FnOnce(&str) -> String,
+) -> CoreResult<(Core, PathBuf)> {
     let routed = route_to_mount(core, mountpoint, path).map_err(|e| {
         let p = Path::new(path);
-        let mirrored = core
+        let in_mirror = core
             .db
             .sync_folder_list()
             .unwrap_or_default()
             .iter()
             .any(|folder| folder.mode == "mirror" && p.starts_with(&folder.local_path));
-        if mirrored {
-            CoreError::invalid(format!(
-                "{path} is in a mirrored folder; change the local file there instead"
-            ))
+        if in_mirror {
+            CoreError::invalid(mirrored(path))
         } else {
             e
         }
@@ -228,6 +252,18 @@ fn route_change(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Core,
         Ok(routed)
     } else {
         Err(CoreError::invalid(format!("{path} escapes the mountpoint")))
+    }
+}
+
+/// The path the pin registry keeps for a pin made through `routed`: the
+/// mount-relative path on the primary mount, as it always was, and the
+/// absolute path the request named on an on-demand folder's mount, since
+/// that node is not under the primary mountpoint (`docs/BUGS.md` B281).
+fn pin_record(routed: &Core, rel: &Path, path: &str) -> PathBuf {
+    if routed.primary {
+        rel.to_path_buf()
+    } else {
+        Path::new(path).components().collect()
     }
 }
 
@@ -521,8 +557,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::Subscribe) => {
             CtlResponse::error(CoreError::invalid("a subscription is served on its own"))
         }
-        Ok(CtlRequest::Pin { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.pin(&rel) {
+        Ok(CtlRequest::Pin { path }) => match route_keep(core, mountpoint, &path) {
+            Ok((routed, rel)) => match routed.pin(&rel, &pin_record(&routed, &rel, &path)) {
                 Ok(name) => {
                     core.touch_profile();
                     CtlResponse::Ok {
@@ -533,8 +569,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::Unpin { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.unpin(&rel) {
+        Ok(CtlRequest::Unpin { path }) => match route_keep(core, mountpoint, &path) {
+            Ok((routed, rel)) => match routed.unpin(&rel) {
                 Ok(name) => {
                     core.touch_profile();
                     CtlResponse::Ok {
@@ -841,35 +877,23 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             if archives.is_empty() {
                 CtlResponse::error(CoreError::invalid("no Takeout archives given"))
             } else {
-                let paths: Vec<PathBuf> = archives.into_iter().map(PathBuf::from).collect();
-                let missing: Vec<String> = paths
-                    .iter()
-                    .filter(|path| !path.is_file())
-                    .map(|path| path.display().to_string())
-                    .collect();
-                if !missing.is_empty() {
-                    CtlResponse::error(CoreError::not_found(format!(
-                        "cannot read: {}",
-                        missing.join(", ")
-                    )))
-                } else {
-                    let count = paths.len();
-                    match core.spawn_takeout_import(paths, dry_run) {
-                        Ok(()) => CtlResponse::Ok {
-                            message: format!(
-                                "{} {count} archive(s)",
-                                if dry_run { "scanning" } else { "importing" }
-                            ),
-                        },
-                        Err(e) => CtlResponse::error(e),
-                    }
-                }
+                let paths = archives.into_iter().map(PathBuf::from).collect();
+                start_takeout_import(core, paths, dry_run)
             }
         }
         Ok(CtlRequest::ImportStatus) => {
-            let (running, summary) = crate::takeout::import_status();
-            CtlResponse::ImportStatus { running, summary }
+            let report = crate::takeout::import_status();
+            CtlResponse::ImportStatus {
+                running: report.running,
+                summary: report.summary,
+                progress: report.progress,
+                resumable: report.resumable,
+            }
         }
+        Ok(CtlRequest::ResumeImport) => match crate::takeout::resumable_archives() {
+            None => CtlResponse::error(CoreError::not_found("there is no import to resume")),
+            Some(paths) => start_takeout_import(core, paths, false),
+        },
         Ok(CtlRequest::CancelImport) => {
             if crate::takeout::cancel_import() {
                 CtlResponse::Ok {
@@ -1296,11 +1320,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             core.cache.set_budget(bytes);
             // Persist so the next mount keeps the new cap. Best-effort: a config
             // write failure is reported but the live cap is already applied.
-            match AppDirs::new().map(|dirs| {
-                let mut cfg = dirs.load_config();
-                cfg.cache_budget = Some(bytes);
-                dirs.save_config(&cfg)
-            }) {
+            match AppDirs::new()
+                .map(|dirs| dirs.update_config(|cfg| cfg.cache_budget = Some(bytes)))
+            {
                 Ok(Ok(())) => {
                     core.touch_profile();
                     CtlResponse::Ok {
@@ -1320,10 +1342,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             // Persisted like the cache budget: best-effort, the live caps are
             // already applied.
             match AppDirs::new().map(|dirs| {
-                let mut cfg = dirs.load_config();
-                cfg.upload_limit = Some(upload);
-                cfg.download_limit = Some(download);
-                dirs.save_config(&cfg)
+                dirs.update_config(|cfg| {
+                    cfg.upload_limit = Some(upload);
+                    cfg.download_limit = Some(download);
+                })
             }) {
                 Ok(Ok(())) => CtlResponse::Ok {
                     message: format!(
@@ -1970,6 +1992,31 @@ pub(crate) fn run_control_socket(
                 warn!(error = %e, "control: accept failed");
             }
         }
+    }
+}
+
+/// Check that every archive is there, then start the import in the background.
+fn start_takeout_import(core: &Core, paths: Vec<PathBuf>, dry_run: bool) -> CtlResponse {
+    let missing: Vec<String> = paths
+        .iter()
+        .filter(|path| !path.is_file())
+        .map(|path| path.display().to_string())
+        .collect();
+    if !missing.is_empty() {
+        return CtlResponse::error(CoreError::not_found(format!(
+            "cannot read: {}",
+            missing.join(", ")
+        )));
+    }
+    let count = paths.len();
+    match core.spawn_takeout_import(paths, dry_run) {
+        Ok(()) => CtlResponse::Ok {
+            message: format!(
+                "{} {count} archive(s)",
+                if dry_run { "scanning" } else { "importing" }
+            ),
+        },
+        Err(e) => CtlResponse::error(e),
     }
 }
 

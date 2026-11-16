@@ -128,8 +128,22 @@ fn follow_changes(ui: &Rc<Ui>, state: &FeedState, topics: &[Topic]) {
     if changed(Topic::Shares) {
         refresh_invitations_badge(ui, Duration::ZERO);
     }
-    match ui.stack.visible_child_name().as_deref() {
-        Some("browser") if changed(Topic::Files) => load_browser(ui),
+    // On any page: a grid, a list or a player may show a tile still blank.
+    if changed(Topic::Thumbnails) {
+        refresh_file_thumbnails(ui);
+    }
+    let page = ui.stack.visible_child_name();
+    // A timeline out of sight is read again when the user comes back to it;
+    // one on screen is left alone (below).
+    if changed(Topic::Photos) && (page.as_deref() != Some("gallery") || !photo_grid_shown(ui)) {
+        ui.gallery.timeline_stale.set(true);
+    }
+    match page.as_deref() {
+        // A search on screen is left alone: reloading would swap its hits for
+        // the folder's listing while the query stays in the box.
+        Some("browser") if changed(Topic::Files) && ui.browser.search.text().trim().is_empty() => {
+            load_browser(ui)
+        }
         // The timeline is left alone: reloading it would throw away the place
         // the user scrolled to. F5 reloads it on request.
         Some("gallery")

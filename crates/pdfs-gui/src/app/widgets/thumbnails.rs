@@ -11,6 +11,7 @@ use pdfs_core::control::{FileThumbRequest, is_thumbnail_media_name, is_video_fil
 const THUMB_BATCH: usize = 32;
 const THUMB_CACHE_MAX: usize = 256;
 const THUMB_MISSING_MAX: usize = 2048;
+const THUMB_BLANK_MAX: usize = 1024;
 const THUMB_DEBOUNCE: Duration = Duration::from_millis(40);
 const THUMB_RETRY: Duration = Duration::from_secs(2);
 
@@ -20,11 +21,26 @@ pub(crate) struct FileThumbnailState {
     missing: RefCell<HashSet<String>>,
     missing_order: RefCell<VecDeque<String>>,
     wanted: RefCell<HashMap<String, Vec<gtk4::Picture>>>,
+    /// Tiles on screen still showing their icon, by key, kept across a
+    /// cancelled request so [`refresh_file_thumbnails`] can ask for them again.
+    blank: RefCell<HashMap<String, BlankTile>>,
     queue: RefCell<VecDeque<FileThumbRequest>>,
     inflight: Cell<bool>,
     source: RefCell<Option<glib::SourceId>>,
     generation: Cell<u64>,
     generation_loading: Cell<bool>,
+}
+
+/// What a tile left blank needs to be asked for again.
+struct BlankTile {
+    request: FileThumbRequest,
+    pictures: Vec<glib::WeakRef<gtk4::Picture>>,
+}
+
+/// Whether a picture registered as blank under `key` still is: bound to that
+/// key, not painted, and in a window rather than in a list's spare pool.
+fn tile_still_blank(key: &str, bound: &str, painted: bool, attached: bool) -> bool {
+    bound == key && !painted && attached
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -55,6 +71,7 @@ impl FileThumbnailState {
             missing: RefCell::new(HashSet::new()),
             missing_order: RefCell::new(VecDeque::new()),
             wanted: RefCell::new(HashMap::new()),
+            blank: RefCell::new(HashMap::new()),
             queue: RefCell::new(VecDeque::new()),
             inflight: Cell::new(false),
             source: RefCell::new(None),
@@ -88,6 +105,85 @@ impl FileThumbnailState {
             }
         }
     }
+
+    fn remember_blank(&self, key: &str, request: &FileThumbRequest, picture: &gtk4::Picture) {
+        let mut blank = self.blank.borrow_mut();
+        if blank.len() >= THUMB_BLANK_MAX {
+            prune_blank(&mut blank);
+        }
+        let tile = blank.entry(key.to_string()).or_insert_with(|| BlankTile {
+            request: request.clone(),
+            pictures: Vec::new(),
+        });
+        if !tile
+            .pictures
+            .iter()
+            .any(|weak| weak.upgrade().as_ref() == Some(picture))
+        {
+            tile.pictures.push(picture.downgrade());
+        }
+    }
+}
+
+/// Drop the tiles that were painted, rebound to another file, or freed.
+fn prune_blank(blank: &mut HashMap<String, BlankTile>) {
+    blank.retain(|key, tile| {
+        tile.pictures.retain(|weak| {
+            weak.upgrade().is_some_and(|picture| {
+                tile_still_blank(
+                    key,
+                    &picture.widget_name(),
+                    picture.is_visible(),
+                    picture.root().is_some(),
+                )
+            })
+        });
+        !tile.pictures.is_empty()
+    });
+}
+
+/// Ask again for every tile on screen still showing its icon. Sent when the
+/// daemon says thumbnails landed, so a folder fills in while a build runs in
+/// it, or after its own requests were cancelled, without being opened again.
+pub(crate) fn refresh_file_thumbnails(ui: &Rc<Ui>) {
+    let tiles: Vec<(String, FileThumbRequest, Vec<gtk4::Picture>)> = {
+        let mut blank = ui.file_thumbs.blank.borrow_mut();
+        prune_blank(&mut blank);
+        blank
+            .iter()
+            .map(|(key, tile)| {
+                let pictures = tile.pictures.iter().filter_map(|w| w.upgrade()).collect();
+                (key.clone(), tile.request.clone(), pictures)
+            })
+            .collect()
+    };
+    if tiles.is_empty() {
+        return;
+    }
+    for (key, request, pictures) in tiles {
+        let cached = ui.file_thumbs.textures.borrow().get(&key).cloned();
+        if let Some(texture) = cached {
+            for picture in &pictures {
+                paint(picture, &key, &texture);
+            }
+            ui.file_thumbs.blank.borrow_mut().remove(&key);
+            continue;
+        }
+        // A miss from before the thumbnail landed is no verdict any more.
+        ui.file_thumbs.missing.borrow_mut().remove(&key);
+        let mut wanted = ui.file_thumbs.wanted.borrow_mut();
+        let waiters = wanted.entry(key).or_default();
+        for picture in pictures {
+            if !waiters.contains(&picture) {
+                waiters.push(picture);
+            }
+        }
+        drop(wanted);
+        let mut queue = ui.file_thumbs.queue.borrow_mut();
+        queue.retain(|item| item.uid != request.uid);
+        queue.push_back(request);
+    }
+    schedule_file_thumbs(ui);
 }
 
 /// Abandon every opportunistic ordinary-file thumbnail associated with the
@@ -230,6 +326,12 @@ pub(crate) fn bind_file_thumbnail(
         paint(&picture, &key, texture);
         return;
     }
+    let request = FileThumbRequest {
+        uid: entry.uid.clone(),
+        modified: entry.modified,
+        name: entry.name.clone(),
+    };
+    ui.file_thumbs.remember_blank(&key, &request, &picture);
     if ui.file_thumbs.missing.borrow().contains(&key) {
         return;
     }
@@ -242,11 +344,7 @@ pub(crate) fn bind_file_thumbnail(
         .push(picture);
     let mut queue = ui.file_thumbs.queue.borrow_mut();
     queue.retain(|item| item.uid != entry.uid);
-    queue.push_back(FileThumbRequest {
-        uid: entry.uid.clone(),
-        modified: entry.modified,
-        name: entry.name.clone(),
-    });
+    queue.push_back(request);
     drop(queue);
     schedule_file_thumbs(ui);
 }
@@ -387,6 +485,7 @@ fn flush_file_thumbs(ui: &Rc<Ui>) {
                             match gtk4::gdk::Texture::from_filename(&path) {
                                 Ok(texture) => {
                                     ui.file_thumbs.store_texture(&key, texture.clone());
+                                    ui.file_thumbs.blank.borrow_mut().remove(&key);
                                     if let Some(pictures) =
                                         ui.file_thumbs.wanted.borrow_mut().remove(&key)
                                     {
@@ -447,7 +546,16 @@ fn retry_file_thumbs(ui: &Rc<Ui>, items: Vec<FileThumbRequest>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplyDisposition, reply_disposition};
+    use super::{ReplyDisposition, reply_disposition, tile_still_blank};
+
+    #[test]
+    fn only_a_tile_still_showing_its_icon_is_asked_for_again() {
+        assert!(tile_still_blank("a:1", "a:1", false, true));
+        assert!(!tile_still_blank("a:1", "a:1", true, true), "painted");
+        assert!(!tile_still_blank("a:1", "b:1", false, true), "rebound");
+        assert!(!tile_still_blank("a:1", "a:2", false, true), "file changed");
+        assert!(!tile_still_blank("a:1", "a:1", false, false), "spare row");
+    }
 
     fn is_image_name(name: &str) -> bool {
         pdfs_core::control::is_thumbnail_image_name(name)

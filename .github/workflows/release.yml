@@ -119,17 +119,12 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "Building version: $VERSION"
 
-      - name: Package raw binaries (.tar.gz)
+      # Binaries plus everything around them, with install.sh for a home
+      # directory install (immutable distributions, anything without a package).
+      - name: Package the installable tarball (.tar.gz)
         run: |
-          mkdir -p dist/binaries
-          cp target/release/pdfs dist/binaries/
-          cp target/release/pdfs-tray dist/binaries/
-          cp target/release/pdfs-app dist/binaries/
-          cp target/release/pdfs-prompt dist/binaries/
-          po/build.sh dist/binaries/locale
-          
-          # Create tarball
-          tar -czf proton-drive-linux-${{ env.VERSION }}-x86_64.tar.gz -C dist/binaries .
+          tarball=$(packaging/tarball/build.sh target/release "${{ env.VERSION }}" .)
+          packaging/tarball/test.sh "$tarball"
 
       # Every crate the build needs, so COPR can build the spec without network.
       - name: Package vendored crates (.tar.xz)

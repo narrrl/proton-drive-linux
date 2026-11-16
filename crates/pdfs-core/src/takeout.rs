@@ -25,7 +25,9 @@
 //! The service folder (`Google Photos`) is localized, as are the year folders
 //! (`Photos from 2019`) and the trash folder, so nothing here matches on the
 //! service name: the first component is dropped when it is the export root, the
-//! second is the service, and the rest is `<folder>/<file>`. A folder is an
+//! second is the service, and the rest is `<folder>/<file>`. The Photos service
+//! is the one whose sidecars carry a `photoTakenTime`; other services in the same
+//! export (`Google Drive/`, `YouTube/`) are left out. A folder is an
 //! **album** when it carries an album metadata sidecar naming it; anything else
 //! is a plain bucket that imports into the timeline only. Trash is matched by
 //! name against [`TRASH_FOLDERS`] — the one place a localized name is
@@ -121,7 +123,13 @@ const MEDIA_EXTENSIONS: &[(&str, &str)] = &[
     ("m2ts", "video/mp2t"),
     ("mpg", "video/mpeg"),
     ("mpeg", "video/mpeg"),
+    // The video half of a Pixel motion photo, `PXL_….MP` beside `PXL_….MP.jpg`.
+    ("mp", "video/mp4"),
 ];
+
+/// Sidecars bigger than this are not read. A real one is a few kilobytes; a
+/// `.json` this large is some other service's data and not worth the memory.
+const SIDECAR_MAX_BYTES: u64 = 1024 * 1024;
 
 /// The media type for `name`'s extension, or `None` when it is not media this
 /// import handles.
@@ -147,6 +155,13 @@ pub enum Bucket {
     Archived,
 }
 
+/// A position in WGS 84 decimal degrees, from a sidecar's `geoData`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GeoPoint {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
 /// One media file found in the export.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TakeoutPhoto {
@@ -162,14 +177,49 @@ pub struct TakeoutPhoto {
     pub size: u64,
     /// Media type from the extension.
     pub media_type: String,
-    /// Capture time in epoch seconds, from `photoTakenTime` (falling back to
-    /// `creationTime`). `None` when the photo has no sidecar — the upload then
-    /// defaults it to now, as the SDK does.
+    /// Capture time in epoch seconds, from the sidecar's `photoTakenTime`,
+    /// else from a date in the file name. `None` when neither has one; the
+    /// importer then tries the file's EXIF, then [`creation_time`](Self::creation_time).
     pub capture_time: Option<i64>,
+    /// The sidecar's `creationTime`: when the photo reached Google Photos, not
+    /// when it was taken. Only a last resort for the capture time.
+    #[serde(default)]
+    pub creation_time: Option<i64>,
+    /// Where the photo was taken, from the sidecar's `geoData` (or
+    /// `geoDataExif`). Google writes `0, 0` for "unknown", which is dropped.
+    #[serde(default)]
+    pub location: Option<GeoPoint>,
     /// The sidecar's `favorited` flag.
     pub favorite: bool,
     /// Which bucket the file was found in.
     pub bucket: Bucket,
+    /// Pairs the halves of a live or motion photo: a still and a video in the
+    /// same folder carry the same key (`IMG_1.HEIC` + `IMG_1.MOV`,
+    /// `PXL_1.MP.jpg` + `PXL_1.MP`). `None` for media that cannot be either half.
+    #[serde(default)]
+    pub live_key: Option<String>,
+}
+
+impl TakeoutPhoto {
+    /// Whether this is the video half of a pair, as opposed to the still.
+    pub fn is_video(&self) -> bool {
+        self.media_type.starts_with("video/")
+    }
+
+    /// Whether the pair this belongs to is a Pixel motion photo (`.MP`) rather
+    /// than an Apple live photo.
+    pub fn is_motion_photo(&self) -> bool {
+        self.live_key
+            .as_deref()
+            .is_some_and(|key| key.ends_with(".mp"))
+    }
+}
+
+/// An archive the scan had to leave out, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadableArchive {
+    pub path: PathBuf,
+    pub reason: String,
 }
 
 /// Everything one scan found, ready to be turned into an import plan.
@@ -183,8 +233,16 @@ pub struct TakeoutScan {
     /// Media files skipped because they sit in the trash bucket.
     pub skipped_trashed: usize,
     /// Entries that were neither media nor a sidecar (`archive_browser.html`,
-    /// activity `.csv`s, `.mp` motion-photo parts).
+    /// activity `.csv`s), and media from other Google services in the same
+    /// export (`Google Drive/`, `YouTube/`).
     pub skipped_other: usize,
+    /// Archives that could not be opened or are not a zip. The rest of the
+    /// export is still imported.
+    #[serde(default)]
+    pub unreadable_archives: Vec<UnreadableArchive>,
+    /// Entries inside an otherwise readable archive that could not be read.
+    #[serde(default)]
+    pub unreadable_entries: usize,
 }
 
 impl TakeoutScan {
@@ -195,7 +253,7 @@ impl TakeoutScan {
 }
 
 /// Google's per-photo sidecar. Only the fields the import uses are read; the
-/// file also carries geo data, people tags and view counts.
+/// file also carries people tags, a description and view counts.
 #[derive(Debug, Default, Deserialize)]
 struct PhotoSidecar {
     #[serde(default)]
@@ -205,19 +263,69 @@ struct PhotoSidecar {
     #[serde(rename = "creationTime", default)]
     creation_time: Option<SidecarTime>,
     #[serde(default)]
-    favorited: bool,
+    favorited: Option<bool>,
+    /// The position as edited in Google Photos, else as the camera wrote it.
+    #[serde(rename = "geoData", default)]
+    geo_data: Option<SidecarGeo>,
+    #[serde(rename = "geoDataExif", default)]
+    geo_data_exif: Option<SidecarGeo>,
 }
 
-/// A sidecar timestamp: epoch seconds, as a *string*.
+impl PhotoSidecar {
+    fn location(&self) -> Option<GeoPoint> {
+        self.geo_data
+            .as_ref()
+            .and_then(SidecarGeo::point)
+            .or_else(|| self.geo_data_exif.as_ref().and_then(SidecarGeo::point))
+    }
+}
+
+/// A sidecar timestamp: epoch seconds, written as a string, sometimes a number.
 #[derive(Debug, Deserialize)]
 struct SidecarTime {
     #[serde(default)]
-    timestamp: Option<String>,
+    timestamp: Option<SidecarNumber>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SidecarNumber {
+    Number(i64),
+    Text(String),
 }
 
 impl SidecarTime {
+    /// The timestamp, when it is a real moment. `0` and negative values are
+    /// Google's "unknown" and would file the photo under 1970.
     fn epoch_seconds(&self) -> Option<i64> {
-        self.timestamp.as_ref()?.parse().ok()
+        let seconds = match self.timestamp.as_ref()? {
+            SidecarNumber::Number(seconds) => *seconds,
+            SidecarNumber::Text(text) => text.trim().parse().ok()?,
+        };
+        (seconds > 0).then_some(seconds)
+    }
+}
+
+/// `geoData` in a sidecar. All-zero means Google has no position.
+#[derive(Debug, Deserialize)]
+struct SidecarGeo {
+    #[serde(default)]
+    latitude: Option<f64>,
+    #[serde(default)]
+    longitude: Option<f64>,
+}
+
+impl SidecarGeo {
+    fn point(&self) -> Option<GeoPoint> {
+        let (latitude, longitude) = (self.latitude?, self.longitude?);
+        let on_globe = latitude.is_finite()
+            && longitude.is_finite()
+            && (-90.0..=90.0).contains(&latitude)
+            && (-180.0..=180.0).contains(&longitude);
+        (on_globe && (latitude != 0.0 || longitude != 0.0)).then_some(GeoPoint {
+            latitude,
+            longitude,
+        })
     }
 }
 
@@ -262,21 +370,58 @@ impl RawEntry {
 /// is one album, and a sidecar in part 3 is matched to its photo in part 1.
 /// Reads only the central directory and the JSON sidecars — no media bytes, so
 /// this stays fast on a 200 GB export.
+///
+/// An archive that cannot be opened is left out and listed in
+/// [`TakeoutScan::unreadable_archives`]; the rest still imports.
 pub fn scan_archives(archives: &[PathBuf]) -> CoreResult<TakeoutScan> {
-    let mut entries: Vec<RawEntry> = Vec::new();
-    let mut sidecars: HashMap<String, Vec<u8>> = HashMap::new();
+    scan_archives_until(archives, || false)
+}
+
+/// [`scan_archives`] that gives up when `stop` returns true, checked between
+/// archives and every few hundred entries.
+pub fn scan_archives_until(
+    archives: &[PathBuf],
+    stop: impl Fn() -> bool,
+) -> CoreResult<TakeoutScan> {
+    let mut entries: Vec<(String, RawEntry)> = Vec::new();
+    let mut sidecars: Vec<(String, String, Vec<u8>)> = Vec::new();
+    let mut unreadable_archives = Vec::new();
+    let mut unreadable_entries = 0;
 
     for (index, path) in archives.iter().enumerate() {
-        let file = std::fs::File::open(path)
-            .map_err(|e| CoreError::invalid(format!("cannot open {}: {e}", path.display())))?;
-        let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| {
-            CoreError::invalid(format!("{} is not a readable zip: {e}", path.display()))
-        })?;
+        if stop() {
+            return Err(CoreError::conflict("the import was cancelled"));
+        }
+        let opened = std::fs::File::open(path)
+            .map_err(|e| e.to_string())
+            .and_then(|file| {
+                zip::ZipArchive::new(std::io::BufReader::new(file))
+                    .map_err(|e| format!("not a readable zip: {e}"))
+            });
+        let mut zip = match opened {
+            Ok(zip) => zip,
+            Err(reason) => {
+                tracing::warn!(archive = %path.display(), %reason, "skipping an unreadable takeout archive");
+                unreadable_archives.push(UnreadableArchive {
+                    path: path.clone(),
+                    reason,
+                });
+                continue;
+            }
+        };
 
         for position in 0..zip.len() {
-            let mut entry = zip.by_index(position).map_err(|e| {
-                CoreError::invalid(format!("{}: unreadable entry: {e}", path.display()))
-            })?;
+            if position % 512 == 0 && stop() {
+                return Err(CoreError::conflict("the import was cancelled"));
+            }
+            let mut entry = match zip.by_index(position) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::debug!(archive = %path.display(), position, error = %e, "unreadable takeout entry");
+                    unreadable_entries += 1;
+                    continue;
+                }
+            };
             if entry.is_dir() {
                 continue;
             }
@@ -286,32 +431,92 @@ pub fn scan_archives(archives: &[PathBuf]) -> CoreResult<TakeoutScan> {
                 continue;
             };
             let name = name.to_string_lossy().replace('\\', "/");
-            let Some(relative) = strip_export_prefix(&name) else {
+            let Some((service, relative)) = strip_export_prefix(&name) else {
                 continue;
             };
+            let (service, relative) = (service.to_string(), relative.to_string());
             let size = entry.size();
 
             // Sidecars are read now, while the entry is open: they are a few
             // hundred bytes each and reopening the archive per photo later would
             // be a second full pass.
             if relative.to_ascii_lowercase().ends_with(".json") {
-                let mut body = Vec::with_capacity(size.min(64 * 1024) as usize);
-                if entry.read_to_end(&mut body).is_ok() {
-                    sidecars.insert(relative.to_string(), body);
+                if size <= SIDECAR_MAX_BYTES {
+                    let mut body = Vec::with_capacity(size as usize);
+                    if entry.read_to_end(&mut body).is_ok() {
+                        sidecars.push((service, relative, body));
+                    } else {
+                        unreadable_entries += 1;
+                    }
                 }
                 continue;
             }
-
-            entries.push(RawEntry {
-                archive: index,
-                entry: name.clone(),
-                relative: relative.to_string(),
-                size,
-            });
+            entries.push((
+                service,
+                RawEntry {
+                    archive: index,
+                    entry: name,
+                    relative,
+                    size,
+                },
+            ));
         }
     }
 
-    Ok(assemble(entries, &sidecars))
+    let (entries, sidecars, other_services) = keep_photos_services(entries, sidecars);
+    let mut scan = assemble(entries, &sidecars);
+    scan.skipped_other += other_services;
+    scan.unreadable_archives = unreadable_archives;
+    scan.unreadable_entries = unreadable_entries;
+    Ok(scan)
+}
+
+/// Drop what other Google services put into the same export.
+///
+/// A Takeout can hold `Google Drive/`, `YouTube/` and others next to
+/// `Google Photos/`, and their media must not land in the photo timeline. The
+/// service folder's name is localized (`Google Fotos`), so the Photos service
+/// is recognized by its content instead: it is the folder whose sidecars carry
+/// a `photoTakenTime`. When no folder does — an export without sidecars, or
+/// one re-zipped without the service level — everything is kept, as before.
+///
+/// Returns the entries and sidecars to import, and how many media files were
+/// left out.
+fn keep_photos_services(
+    entries: Vec<(String, RawEntry)>,
+    sidecars: Vec<(String, String, Vec<u8>)>,
+) -> (Vec<RawEntry>, HashMap<String, Vec<u8>>, usize) {
+    #[derive(Deserialize)]
+    struct Marker {
+        #[serde(rename = "photoTakenTime")]
+        photo_taken_time: Option<serde::de::IgnoredAny>,
+    }
+    let mut photos_services: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (service, _, body) in &sidecars {
+        if photos_services.contains(service.as_str()) {
+            continue;
+        }
+        if serde_json::from_slice::<Marker>(body).is_ok_and(|m| m.photo_taken_time.is_some()) {
+            photos_services.insert(service.as_str());
+        }
+    }
+    let keep = |service: &str| photos_services.is_empty() || photos_services.contains(service);
+
+    let mut skipped = 0;
+    let mut kept_entries = Vec::with_capacity(entries.len());
+    for (service, raw) in entries {
+        if keep(&service) {
+            kept_entries.push(raw);
+        } else if media_type_of(raw.file_name()).is_some() {
+            skipped += 1;
+        }
+    }
+    let kept_sidecars = sidecars
+        .iter()
+        .filter(|(service, _, _)| keep(service))
+        .map(|(_, relative, body)| (relative.clone(), body.clone()))
+        .collect();
+    (kept_entries, kept_sidecars, skipped)
 }
 
 /// Build the scan from raw entries plus the sidecar bodies keyed by their path
@@ -403,19 +608,19 @@ fn assemble(entries: Vec<RawEntry>, sidecars: &HashMap<String, Vec<u8>>) -> Take
             .unwrap_or(&file_name)
             .to_string();
 
-        // Sidecar first, then the date stamped into the name.
+        // Sidecar first, then the date stamped into the name. `creationTime`
+        // is when the photo reached Google, which for a scan or an old photo
+        // uploaded late is years off; the importer uses it only after EXIF.
         let capture_time = sidecar
             .photo_taken_time
             .as_ref()
             .and_then(SidecarTime::epoch_seconds)
-            .or_else(|| {
-                sidecar
-                    .creation_time
-                    .as_ref()
-                    .and_then(SidecarTime::epoch_seconds)
-            })
             .or_else(|| capture_time_from_name(&name))
             .or_else(|| capture_time_from_name(&file_name));
+        let creation_time = sidecar
+            .creation_time
+            .as_ref()
+            .and_then(SidecarTime::epoch_seconds);
 
         scan.photos.push(TakeoutPhoto {
             archive: raw.archive,
@@ -424,31 +629,57 @@ fn assemble(entries: Vec<RawEntry>, sidecars: &HashMap<String, Vec<u8>>) -> Take
             size: raw.size,
             media_type: media_type.to_string(),
             capture_time,
-            favorite: sidecar.favorited,
+            creation_time,
+            location: sidecar.location(),
+            favorite: sidecar.favorited.unwrap_or(false),
             bucket,
+            live_key: live_key(&folder, &file_name),
         });
     }
 
     scan
 }
 
-/// Drop the export root (`Takeout/`) and the localized service folder from a
-/// path inside the archive, leaving `<folder>/<file>` or `<file>`.
+/// Split a path inside the archive into the localized service folder and the
+/// rest, dropping the export root (`Takeout/`): `("Google Fotos",
+/// "<folder>/<file>")`.
 ///
 /// `None` for a path with no service folder at all (the export's own
 /// `archive_browser.html`), which carries nothing to import.
-fn strip_export_prefix(path: &str) -> Option<&str> {
+fn strip_export_prefix(path: &str) -> Option<(&str, &str)> {
     let mut rest = path;
-    // The root is usually `Takeout/`, but an export unzipped and re-zipped by
-    // the user may not have it — so the root is dropped only when a service
-    // folder follows it, which the component count decides.
+    // The root is `Takeout/`, but an export unzipped and re-zipped by the user
+    // may not have it. `Google Photos/<album>/<file>` then has three parts like
+    // `Takeout/Google Photos/<file>`, so the count alone cannot tell them
+    // apart: a root of another name is only taken for one with four parts.
+    let (first, after) = rest.split_once('/')?;
     let components = rest.split('/').count();
-    if components >= 3 {
-        rest = rest.split_once('/')?.1;
+    if (first.eq_ignore_ascii_case("takeout") && components >= 3) || components >= 4 {
+        rest = after;
     }
-    // Drop the service folder (`Google Photos`, `Google Fotos`, …).
-    let (_service, tail) = rest.split_once('/')?;
-    Some(tail)
+    // The service folder (`Google Photos`, `Google Fotos`, …).
+    rest.split_once('/')
+}
+
+/// The key that pairs the still and the video of one live or motion photo, or
+/// `None` when `file_name` cannot be either half.
+///
+/// Apple writes `IMG_1.HEIC` (or `.JPG`) and `IMG_1.MOV`, which share the stem.
+/// A Pixel writes `PXL_1.MP.jpg` and `PXL_1.MP`; there the still's stem is the
+/// video's whole name. The folder is part of the key so two cameras' `IMG_1`
+/// in different albums never pair.
+fn live_key(folder: &str, file_name: &str) -> Option<String> {
+    let lower = file_name.to_lowercase();
+    let (stem, ext) = lower.rsplit_once('.')?;
+    let key = match ext {
+        "heic" | "heif" | "jpg" | "jpeg" => stem,
+        // Apple's video half. A plain `.mp4` beside a photo of the same name is
+        // far more often an unrelated clip than half of a live photo.
+        "mov" => stem,
+        "mp" => lower.as_str(),
+        _ => return None,
+    };
+    (!key.is_empty()).then(|| format!("{folder}/{key}"))
 }
 
 /// Split `<folder>/<file>` into its parts; the folder is `""` at the root.
@@ -858,13 +1089,13 @@ mod tests {
         RawEntry {
             archive,
             entry: path.to_string(),
-            relative: strip_export_prefix(path).unwrap().to_string(),
+            relative: strip_export_prefix(path).unwrap().1.to_string(),
             size,
         }
     }
 
     fn sidecar(map: &mut HashMap<String, Vec<u8>>, path: &str, body: &str) {
-        let relative = strip_export_prefix(path).unwrap().to_string();
+        let relative = strip_export_prefix(path).unwrap().1.to_string();
         map.insert(relative, body.as_bytes().to_vec());
     }
 
@@ -872,12 +1103,17 @@ mod tests {
     fn strips_export_root_and_localized_service_folder() {
         assert_eq!(
             strip_export_prefix("Takeout/Google Fotos/Island 2019/IMG_1.jpg"),
-            Some("Island 2019/IMG_1.jpg")
+            Some(("Google Fotos", "Island 2019/IMG_1.jpg"))
         );
         // Already unwrapped by the user: no `Takeout/` root left.
         assert_eq!(
             strip_export_prefix("Google Photos/IMG_1.jpg"),
-            Some("IMG_1.jpg")
+            Some(("Google Photos", "IMG_1.jpg"))
+        );
+        // ... and an album keeps its folder.
+        assert_eq!(
+            strip_export_prefix("Google Photos/Iceland/IMG_1.jpg"),
+            Some(("Google Photos", "Iceland/IMG_1.jpg"))
         );
         // Nothing below a service folder is nothing to import.
         assert_eq!(strip_export_prefix("archive_browser.html"), None);
@@ -957,23 +1193,144 @@ mod tests {
     }
 
     #[test]
-    fn creation_time_is_the_fallback_capture_time() {
+    fn creation_time_is_kept_apart_as_the_last_resort() {
+        // `creationTime` is when the photo reached Google. It must not beat the
+        // date in the name, and the importer tries EXIF before it.
         let mut sidecars = HashMap::new();
         sidecar(
             &mut sidecars,
             "Takeout/Google Photos/Photos from 2019/IMG_1.jpg.json",
             r#"{"creationTime":{"timestamp":"1500000000"}}"#,
         );
+        sidecar(
+            &mut sidecars,
+            "Takeout/Google Photos/Photos from 2019/IMG_20190612_101500.jpg.json",
+            r#"{"creationTime":{"timestamp":"1700000000"}}"#,
+        );
         let scan = assemble(
-            vec![entry(
-                0,
-                "Takeout/Google Photos/Photos from 2019/IMG_1.jpg",
-                10,
-            )],
+            vec![
+                entry(0, "Takeout/Google Photos/Photos from 2019/IMG_1.jpg", 10),
+                entry(
+                    0,
+                    "Takeout/Google Photos/Photos from 2019/IMG_20190612_101500.jpg",
+                    10,
+                ),
+            ],
             &sidecars,
         );
 
-        assert_eq!(scan.photos[0].capture_time, Some(1_500_000_000));
+        assert_eq!(scan.photos[0].capture_time, None);
+        assert_eq!(scan.photos[0].creation_time, Some(1_500_000_000));
+        assert_eq!(
+            scan.photos[1].capture_time,
+            capture_time_from_name("IMG_20190612_101500.jpg")
+        );
+        assert_eq!(scan.photos[1].creation_time, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn sidecar_timestamps_tolerate_numbers_zero_and_null() {
+        let mut sidecars = HashMap::new();
+        for (name, body) in [
+            ("A.jpg", r#"{"photoTakenTime":{"timestamp":1560000000}}"#),
+            (
+                "B.jpg",
+                r#"{"photoTakenTime":{"timestamp":"0"},"favorited":null}"#,
+            ),
+            (
+                "C.jpg",
+                r#"{"photoTakenTime":{"timestamp":null},"geoData":null}"#,
+            ),
+        ] {
+            sidecar(
+                &mut sidecars,
+                &format!("Takeout/Google Photos/Photos from 2019/{name}.json"),
+                body,
+            );
+        }
+        let scan = assemble(
+            ["A.jpg", "B.jpg", "C.jpg"]
+                .iter()
+                .map(|name| {
+                    entry(
+                        0,
+                        &format!("Takeout/Google Photos/Photos from 2019/{name}"),
+                        1,
+                    )
+                })
+                .collect(),
+            &sidecars,
+        );
+
+        assert_eq!(scan.photos[0].capture_time, Some(1_560_000_000));
+        assert_eq!(scan.photos[1].capture_time, None, "0 is not 1970");
+        assert!(!scan.photos[1].favorite);
+        assert_eq!(scan.photos[2].capture_time, None);
+    }
+
+    #[test]
+    fn location_comes_from_geo_data_and_zero_means_none() {
+        let mut sidecars = HashMap::new();
+        sidecar(
+            &mut sidecars,
+            "Takeout/Google Photos/Iceland/IMG_1.jpg.json",
+            r#"{"geoData":{"latitude":64.1466,"longitude":-21.9426,"altitude":0.0}}"#,
+        );
+        sidecar(
+            &mut sidecars,
+            "Takeout/Google Photos/Iceland/IMG_2.jpg.json",
+            r#"{"geoData":{"latitude":0.0,"longitude":0.0},
+                "geoDataExif":{"latitude":63.4186,"longitude":-19.0060}}"#,
+        );
+        sidecar(
+            &mut sidecars,
+            "Takeout/Google Photos/Iceland/IMG_3.jpg.json",
+            r#"{"geoData":{"latitude":0.0,"longitude":0.0}}"#,
+        );
+        let scan = assemble(
+            (1..=3)
+                .map(|n| entry(0, &format!("Takeout/Google Photos/Iceland/IMG_{n}.jpg"), 1))
+                .collect(),
+            &sidecars,
+        );
+
+        assert_eq!(
+            scan.photos[0].location,
+            Some(GeoPoint {
+                latitude: 64.1466,
+                longitude: -21.9426
+            })
+        );
+        assert_eq!(
+            scan.photos[1].location.map(|p| p.latitude),
+            Some(63.4186),
+            "geoDataExif fills in for an empty geoData"
+        );
+        assert_eq!(scan.photos[2].location, None);
+    }
+
+    #[test]
+    fn live_and_motion_photo_halves_share_a_key() {
+        let scan = assemble(
+            vec![
+                entry(0, "Takeout/Google Photos/Trip/IMG_1.HEIC", 1),
+                entry(0, "Takeout/Google Photos/Trip/IMG_1.MOV", 1),
+                entry(0, "Takeout/Google Photos/Trip/PXL_2.MP.jpg", 1),
+                entry(0, "Takeout/Google Photos/Trip/PXL_2.MP", 1),
+                entry(0, "Takeout/Google Photos/Other/IMG_1.MOV", 1),
+                entry(0, "Takeout/Google Photos/Trip/scan.png", 1),
+            ],
+            &HashMap::new(),
+        );
+        let key = |i: usize| scan.photos[i].live_key.clone();
+
+        assert_eq!(key(0), key(1));
+        assert!(!scan.photos[0].is_motion_photo());
+        assert_eq!(key(2), key(3));
+        assert!(scan.photos[3].is_motion_photo());
+        assert!(scan.photos[3].is_video(), "the .MP half is a video");
+        assert_ne!(key(1), key(4), "another folder's IMG_1 does not pair");
+        assert_eq!(key(5), None);
     }
 
     #[test]
@@ -1387,16 +1744,77 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_a_zip_is_a_readable_error() {
-        let path =
+    fn a_file_that_is_not_a_zip_is_left_out_and_the_rest_imports() {
+        let broken =
             std::env::temp_dir().join(format!("pdfs-takeout-not-a-zip-{}", std::process::id()));
-        std::fs::write(&path, b"not a zip at all").unwrap();
-        let error = scan_archives(std::slice::from_ref(&path)).unwrap_err();
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            error.message.contains("not a readable zip"),
-            "unexpected message: {}",
-            error.message
+        std::fs::write(&broken, b"not a zip at all").unwrap();
+        let good = write_zip(
+            "beside-broken",
+            &[("Takeout/Google Photos/Photos from 2019/IMG_1.jpg", b"x")],
         );
+
+        let scan = scan_archives(&[broken.clone(), good.clone()]).unwrap();
+        let _ = std::fs::remove_file(&broken);
+        let _ = std::fs::remove_file(&good);
+
+        assert_eq!(scan.photos.len(), 1);
+        assert_eq!(scan.photos[0].archive, 1);
+        assert_eq!(scan.unreadable_archives.len(), 1);
+        assert_eq!(scan.unreadable_archives[0].path, broken);
+        assert!(
+            scan.unreadable_archives[0]
+                .reason
+                .contains("not a readable zip"),
+            "unexpected reason: {}",
+            scan.unreadable_archives[0].reason
+        );
+    }
+
+    #[test]
+    fn other_services_in_the_same_export_are_not_imported() {
+        let zip = write_zip(
+            "services",
+            &[
+                (
+                    "Takeout/Google Fotos/Fotos von 2019/IMG_1.jpg",
+                    b"x".as_slice(),
+                ),
+                (
+                    "Takeout/Google Fotos/Fotos von 2019/IMG_1.jpg.json",
+                    br#"{"photoTakenTime":{"timestamp":"1560000000"}}"#.as_slice(),
+                ),
+                ("Takeout/Drive/My Drive/holiday.jpg", b"y".as_slice()),
+                ("Takeout/YouTube/videos/clip.mp4", b"z".as_slice()),
+            ],
+        );
+
+        let scan = scan_archives(std::slice::from_ref(&zip)).unwrap();
+        let _ = std::fs::remove_file(&zip);
+
+        assert_eq!(scan.photos.len(), 1);
+        assert_eq!(scan.photos[0].name, "IMG_1.jpg");
+        assert_eq!(scan.skipped_other, 2);
+    }
+
+    #[test]
+    fn an_export_without_sidecars_keeps_every_service() {
+        let zip = write_zip(
+            "no-sidecars",
+            &[("Takeout/Google Photos/Photos from 2019/IMG_1.jpg", b"x")],
+        );
+        let scan = scan_archives(std::slice::from_ref(&zip)).unwrap();
+        let _ = std::fs::remove_file(&zip);
+        assert_eq!(scan.photos.len(), 1);
+    }
+
+    #[test]
+    fn a_stop_request_ends_the_scan() {
+        let zip = write_zip(
+            "stop",
+            &[("Takeout/Google Photos/Photos from 2019/IMG_1.jpg", b"x")],
+        );
+        let result = scan_archives_until(std::slice::from_ref(&zip), || true);
+        let _ = std::fs::remove_file(&zip);
+        assert!(result.is_err());
     }
 }

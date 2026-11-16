@@ -101,8 +101,14 @@ impl ActionMenu {
 
     /// Pop the menu up over `anchor` at `(x, y)` in its coordinates. The
     /// popover removes itself once dismissed; it waits for an idle turn, so the
-    /// item that closed it still finds its action.
-    pub(crate) fn popup_at(self, anchor: &impl IsA<gtk4::Widget>, x: f64, y: f64) {
+    /// item that closed it still finds its action. Returned for a caller that
+    /// has to know when it closes.
+    pub(crate) fn popup_at(
+        self,
+        anchor: &impl IsA<gtk4::Widget>,
+        x: f64,
+        y: f64,
+    ) -> gtk4::PopoverMenu {
         let (menu, group) = self.finish();
         let anchor = anchor.as_ref();
         let host = popover_host(anchor);
@@ -122,6 +128,7 @@ impl ActionMenu {
             glib::idle_add_local_once(move || p.unparent());
         });
         popover.popup();
+        popover
     }
 
     /// A flat ⋮ button that opens this menu.

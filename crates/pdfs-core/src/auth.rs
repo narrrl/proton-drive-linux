@@ -123,13 +123,84 @@ fn client_config() -> ProtonClientConfiguration {
     ProtonClientConfiguration::new(app_version).with_user_agent(user_agent)
 }
 
-fn keyring_entry() -> Result<Entry> {
-    // Installed lazily rather than once at startup so a session bus that was not
-    // up yet on the first attempt is retried on the next one.
-    if keyring_core::get_default_store().is_none() {
-        keyring_core::set_default_store(dbus_secret_service_keyring_store::Store::new()?);
+/// Run `op` on the session's keyring entry.
+fn with_keyring<T>(op: impl Fn(&Entry) -> keyring_core::Result<T>) -> Result<T> {
+    with_keyring_entry(KEYRING_SERVICE, KEYRING_USER, op)
+}
+
+/// Run `op` on the entry `service`/`user`, reconnecting once if the Secret
+/// Service fails the call.
+///
+/// The store holds one D-Bus connection and one Secret Service session for the
+/// whole process. The session lives in the provider's memory: once the provider
+/// restarts (oo7's unit restarts it on failure, and both oo7 and gnome-keyring
+/// can be `--replace`d), every read and write on the old session fails with
+/// `NoSession`, for as long as this process runs. A daemon then keeps refreshed
+/// tokens only in memory, and a cold boot loses them (`docs/BUGS.md` B285). A
+/// platform failure therefore drops the store, and the call is made once more
+/// on a new one. A locked keyring, a dismissed prompt or a missing entry is
+/// not the connection's fault and comes back as it is.
+fn with_keyring_entry<T>(
+    service: &str,
+    user: &str,
+    op: impl Fn(&Entry) -> keyring_core::Result<T>,
+) -> Result<T> {
+    let store = keyring_store()?;
+    match op(&Entry::new(service, user)?) {
+        Err(keyring_core::Error::PlatformFailure(e)) => {
+            tracing::warn!(
+                error = %e,
+                "the Secret Service failed this process's connection; reconnecting"
+            );
+            drop_keyring_store(&store);
+            keyring_store()?;
+            Ok(op(&Entry::new(service, user)?)?)
+        }
+        result => Ok(result?),
     }
-    Ok(Entry::new(KEYRING_SERVICE, KEYRING_USER)?)
+}
+
+/// Held while the default store is looked at and replaced, so that threads
+/// failing at the same time drop the broken store once and share its
+/// replacement.
+static KEYRING_STORE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The process's Secret Service store, connected now if there is none.
+///
+/// Connected lazily rather than once at startup so a session bus that was not
+/// up yet on the first attempt is tried again on the next one.
+fn keyring_store() -> Result<Arc<keyring_core::CredentialStore>> {
+    let _swap = KEYRING_STORE.lock();
+    if let Some(store) = keyring_core::get_default_store() {
+        return Ok(store);
+    }
+    let store = connect_keyring_store()?;
+    keyring_core::set_default_store(Arc::clone(&store));
+    Ok(store)
+}
+
+/// Forget `failed`, unless another thread has already replaced it.
+fn drop_keyring_store(failed: &Arc<keyring_core::CredentialStore>) {
+    let _swap = KEYRING_STORE.lock();
+    if keyring_core::get_default_store().is_some_and(|store| Arc::ptr_eq(&store, failed)) {
+        keyring_core::unset_default_store();
+    }
+}
+
+#[cfg(not(test))]
+fn connect_keyring_store() -> Result<Arc<keyring_core::CredentialStore>> {
+    Ok(dbus_secret_service_keyring_store::Store::new()?)
+}
+
+/// The tests' in-memory store when they set one, so a reconnect finds the
+/// same entries; the real Secret Service otherwise.
+#[cfg(test)]
+fn connect_keyring_store() -> Result<Arc<keyring_core::CredentialStore>> {
+    tests::KEYRING_CONNECTS.fetch_add(1, Ordering::SeqCst);
+    match tests::MOCK_STORE.lock().clone() {
+        Some(store) => Ok(store),
+        None => Ok(dbus_secret_service_keyring_store::Store::new()?),
+    }
 }
 
 /// What the user answered when asked for the mailbox password.
@@ -419,19 +490,54 @@ fn classify_verification_gate(e: ProtonError) -> Error {
     }
 }
 
+/// Save `stored` to the keyring.
+///
+/// An existing entry is replaced by a new item rather than edited, because
+/// oo7 before 0.7.0 keeps an edit only in memory and a reboot brings the
+/// spent refresh token back (`docs/BUGS.md` B291). The usual write is the
+/// fallback: for the first save, and whenever replacing is not possible.
 fn write_stored(stored: &StoredSession) -> Result<()> {
     let json = Zeroizing::new(serde_json::to_string(stored)?);
-    keyring_entry()?.set_password(&json)?;
-    Ok(())
+    if replace_items() {
+        match crate::secretservice::replace(KEYRING_SERVICE, KEYRING_USER, json.as_bytes()) {
+            crate::secretservice::Replaced::Saved => return Ok(()),
+            crate::secretservice::Replaced::Skipped(why) => {
+                tracing::debug!(%why, "not replacing the keyring item; writing it in place");
+            }
+        }
+    }
+    with_keyring(|entry| entry.set_password(&json))
+}
+
+/// Whether [`write_stored`] talks to the Secret Service directly: always,
+/// except in tests that use the in-memory store.
+#[cfg(not(test))]
+fn replace_items() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn replace_items() -> bool {
+    tests::MOCK_STORE.lock().is_none()
+}
+
+/// A short, one-way tag for a refresh token, for the log: enough to tell
+/// whether the token a start finds is the one the last save wrote, and
+/// nothing that helps anyone use it.
+fn fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes())[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Load the persisted session blob, or `Error::NotLoggedIn` if absent.
 pub fn load() -> Result<StoredSession> {
-    let entry = keyring_entry()?;
-    match entry.get_password() {
+    match with_keyring(|entry| entry.get_password()) {
         Ok(json) => Ok(serde_json::from_str(&json)?),
-        Err(keyring_core::Error::NoEntry) => Err(Error::NotLoggedIn),
-        Err(e) => Err(e.into()),
+        Err(Error::Keyring(keyring_core::Error::NoEntry)) => Err(Error::NotLoggedIn),
+        Err(e) => Err(e),
     }
 }
 
@@ -589,9 +695,9 @@ pub fn logout() -> Result<bool> {
         tracing::warn!(error = %e, "clearing the kernel-keyring unlock on logout failed");
     }
     let _ = kernelkey::UNSAVED_TOKENS.clear();
-    match keyring_entry()?.delete_credential() {
-        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(ended),
-        Err(e) => Err(e.into()),
+    match with_keyring(|entry| entry.delete_credential()) {
+        Ok(()) | Err(Error::Keyring(keyring_core::Error::NoEntry)) => Ok(ended),
+        Err(e) => Err(e),
     }
 }
 
@@ -634,6 +740,10 @@ fn resume_stored(stored: &StoredSession) -> Result<ProtonApiSession> {
         resumed.access_token = tokens.access_token.clone();
         resumed.refresh_token = tokens.refresh_token.clone();
     }
+    tracing::info!(
+        refresh = %fingerprint(&resumed.refresh_token),
+        "resuming the stored session"
+    );
     let session = ProtonApiSession::resume(client_config(), resumed.to_params())?;
     let sink = register_refresh_handler(&session, stored.refresh_token.clone());
     if let Some(tokens) = unsaved {
@@ -996,21 +1106,15 @@ impl TokenSink {
         }
     }
 
-    /// Write the unsaved rotation, if there is one. A blob that moved on, or
-    /// is gone with a logout, drops it: there is nothing it may still go into.
+    /// Write the unsaved rotation, if there is one. A blob that moved on drops
+    /// it. A missing blob is retried: some Secret Service providers also report
+    /// locked or temporarily hidden items as absent. Never recreate it here.
     fn flush(&self) -> Result<()> {
         let mut state = self.state.lock();
         let Some(tokens) = state.unsaved.clone() else {
             return Ok(());
         };
-        let mut stored = match load() {
-            Ok(stored) => stored,
-            Err(Error::NotLoggedIn) => {
-                state.settle();
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
+        let mut stored = load()?;
         match take_rotation(
             &mut stored,
             &self.session_id,
@@ -1019,8 +1123,11 @@ impl TokenSink {
         ) {
             Rotation::Taken => {
                 write_stored(&stored)?;
+                tracing::info!(
+                    refresh = %fingerprint(&tokens.refresh_token),
+                    "successfully auto-persisted refreshed tokens in keyring"
+                );
                 state.stored_refresh = tokens.refresh_token;
-                tracing::info!("successfully auto-persisted refreshed tokens in keyring");
             }
             Rotation::MovedOn => {
                 tracing::info!(
@@ -1213,10 +1320,178 @@ mod tests {
     /// The keyring is one store per process, so the tests that use it,
     /// through `keyring-core`'s in-memory store, take turns.
     fn mock_keyring() -> parking_lot::MutexGuard<'static, ()> {
-        static KEYRING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let turn = KEYRING.lock();
-        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        let store: Arc<keyring_core::CredentialStore> = keyring_core::mock::Store::new().unwrap();
+        *MOCK_STORE.lock() = Some(Arc::clone(&store));
+        keyring_core::set_default_store(store);
         turn
+    }
+
+    static KEYRING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// The in-memory store a reconnect hands out, so it finds the same
+    /// entries; `None` connects to the real Secret Service.
+    pub(super) static MOCK_STORE: parking_lot::Mutex<Option<Arc<keyring_core::CredentialStore>>> =
+        parking_lot::Mutex::new(None);
+
+    /// How many times a store was connected.
+    pub(super) static KEYRING_CONNECTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// The session's entry, to make its next call fail.
+    fn keyring_entry() -> Entry {
+        Entry::new(KEYRING_SERVICE, KEYRING_USER).unwrap()
+    }
+
+    /// Make the session entry's next call fail with `error`.
+    fn fail_next(error: keyring_core::Error) {
+        keyring_entry()
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .unwrap()
+            .set_error(error);
+    }
+
+    fn no_session() -> keyring_core::Error {
+        keyring_core::Error::PlatformFailure(
+            std::io::Error::other("The session does not exist (NoSession)").into(),
+        )
+    }
+
+    /// B285: a restarted Secret Service no longer knows the process's
+    /// session, and every call on it failed until the process restarted.
+    #[test]
+    fn a_dropped_secret_service_session_is_reconnected_and_retried() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+        let connects = KEYRING_CONNECTS.load(Ordering::SeqCst);
+
+        fail_next(no_session());
+        assert_eq!(load().unwrap().refresh_token, "r");
+        assert_eq!(KEYRING_CONNECTS.load(Ordering::SeqCst), connects + 1);
+
+        fail_next(no_session());
+        write_stored(&stored_with("r2")).unwrap();
+        assert_eq!(load().unwrap().refresh_token, "r2");
+        assert_eq!(KEYRING_CONNECTS.load(Ordering::SeqCst), connects + 2);
+    }
+
+    #[test]
+    fn a_rotation_lands_at_once_after_the_keyring_restarts() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+        let sink = Arc::new(TokenSink::new("s", "r".into()));
+
+        fail_next(no_session());
+        sink.rotated(tokens("a2", "r2")).unwrap();
+        assert_eq!(load().unwrap().refresh_token, "r2");
+        assert!(sink.state.lock().unsaved.is_none());
+    }
+
+    /// A locked keyring or a dismissed prompt is no fault of the connection.
+    #[test]
+    fn a_locked_keyring_is_not_reconnected() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+        let connects = KEYRING_CONNECTS.load(Ordering::SeqCst);
+
+        fail_next(keyring_core::Error::NoStorageAccess(
+            std::io::Error::other("locked").into(),
+        ));
+        assert!(matches!(
+            load(),
+            Err(Error::Keyring(keyring_core::Error::NoStorageAccess(_)))
+        ));
+        assert_eq!(KEYRING_CONNECTS.load(Ordering::SeqCst), connects);
+        assert_eq!(load().unwrap().refresh_token, "r");
+    }
+
+    /// The real Secret Service, restarted between two calls on one store.
+    ///
+    /// Run inside a throwaway session bus, never against the desktop's
+    /// keyring. With gnome-keyring:
+    ///
+    /// ```sh
+    /// echo -n pw | gnome-keyring-daemon --unlock --components=secrets
+    /// PDFS_SECRET_SERVICE_RESTART_TEST=1 \
+    /// PDFS_RESTART_PROVIDER='echo -n pw | gnome-keyring-daemon --replace --unlock --components=secrets' \
+    /// cargo test -p pdfs-core real_secret_service -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a throwaway Secret Service; see the doc comment"]
+    fn real_secret_service_survives_a_provider_restart() {
+        if std::env::var_os("PDFS_SECRET_SERVICE_RESTART_TEST").is_none() {
+            return;
+        }
+        let restart = std::env::var("PDFS_RESTART_PROVIDER").expect("PDFS_RESTART_PROVIDER");
+        let _turn = KEYRING.lock();
+        *MOCK_STORE.lock() = None;
+        keyring_core::unset_default_store();
+        let (service, user) = ("pdfs-test", "restart");
+
+        with_keyring_entry(service, user, |e| e.set_password("before")).unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", &restart])
+            .status()
+            .unwrap();
+        assert!(status.success(), "restarting the provider failed");
+        std::thread::sleep(Duration::from_secs(1));
+
+        let connects = KEYRING_CONNECTS.load(Ordering::SeqCst);
+        let read = with_keyring_entry(service, user, |e| e.get_password()).unwrap();
+        assert_eq!(read, "before");
+        assert_eq!(
+            KEYRING_CONNECTS.load(Ordering::SeqCst),
+            connects + 1,
+            "the provider kept the old session, so nothing was tested"
+        );
+        with_keyring_entry(service, user, |e| e.set_password("after")).unwrap();
+        let read = with_keyring_entry(service, user, |e| e.get_password()).unwrap();
+        assert_eq!(read, "after");
+        with_keyring_entry(service, user, |e| e.delete_credential()).unwrap();
+        keyring_core::unset_default_store();
+    }
+
+    /// B291: every save after the first replaces the keyring item, so a
+    /// provider that keeps an edited secret only in memory (oo7 before 0.7.0)
+    /// still has the last one after a restart, and only one item is left.
+    ///
+    /// Run like [`real_secret_service_survives_a_provider_restart`], in a
+    /// throwaway session bus only.
+    #[test]
+    #[ignore = "needs a throwaway Secret Service; see real_secret_service_survives_a_provider_restart"]
+    fn real_secret_service_keeps_the_last_save_across_a_provider_restart() {
+        if std::env::var_os("PDFS_SECRET_SERVICE_RESTART_TEST").is_none() {
+            return;
+        }
+        let restart = std::env::var("PDFS_RESTART_PROVIDER").expect("PDFS_RESTART_PROVIDER");
+        let _turn = KEYRING.lock();
+        *MOCK_STORE.lock() = None;
+        keyring_core::unset_default_store();
+
+        for refresh in ["r1", "r2", "r3"] {
+            write_stored(&stored_with(refresh)).unwrap();
+        }
+        let status = std::process::Command::new("sh")
+            .args(["-c", &restart])
+            .status()
+            .unwrap();
+        assert!(status.success(), "restarting the provider failed");
+        std::thread::sleep(Duration::from_secs(1));
+
+        assert_eq!(load().unwrap().refresh_token, "r3");
+        let ss =
+            dbus_secret_service::SecretService::connect(dbus_secret_service::EncryptionType::Plain)
+                .unwrap();
+        let found = ss
+            .search_items(std::collections::HashMap::from([
+                ("service", KEYRING_SERVICE),
+                ("username", KEYRING_USER),
+            ]))
+            .unwrap();
+        assert_eq!(found.unlocked.len() + found.locked.len(), 1);
+        with_keyring(|e| e.delete_credential()).unwrap();
+        keyring_core::unset_default_store();
     }
 
     fn stored_with(refresh: &str) -> StoredSession {
@@ -1273,12 +1548,7 @@ mod tests {
         write_stored(&stored_with("r")).unwrap();
         let sink = Arc::new(TokenSink::new("s", "r".into()));
 
-        let entry = keyring_entry().unwrap();
-        let cred = entry
-            .as_any()
-            .downcast_ref::<keyring_core::mock::Cred>()
-            .unwrap();
-        cred.set_error(keyring_core::Error::NoStorageAccess(
+        fail_next(keyring_core::Error::NoStorageAccess(
             std::io::Error::other("locked").into(),
         ));
         assert!(sink.rotated(tokens("a2", "r2")).is_err());
@@ -1304,6 +1574,42 @@ mod tests {
         if kept {
             assert!(kernelkey::UNSAVED_TOKENS.load().unwrap().is_none());
         }
+    }
+
+    /// oo7 0.7.0 reports a locked collection's items as absent (upstream #614).
+    /// Treating that as logout loses the only live tokens (B284, issue #78).
+    #[test]
+    fn a_temporarily_missing_session_does_not_discard_a_rotation() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+        let sink = Arc::new(TokenSink::new("s", "r".into()));
+        fail_next(keyring_core::Error::NoEntry);
+
+        assert!(sink.rotated(tokens("a2", "r2")).is_err());
+        assert!(sink.state.lock().unsaved.is_some());
+        assert_eq!(load().unwrap().refresh_token, "r");
+
+        sink.flush().unwrap();
+        assert_eq!(load().unwrap().refresh_token, "r2");
+        assert!(sink.state.lock().unsaved.is_none());
+    }
+
+    #[test]
+    fn retrying_a_missing_session_never_recreates_it_or_overwrites_a_new_login() {
+        let _turn = mock_keyring();
+        let sink = TokenSink::new("s", "r".into());
+        sink.state.lock().unsaved = Some(tokens("a2", "r2"));
+
+        assert!(matches!(sink.flush(), Err(Error::NotLoggedIn)));
+        assert!(matches!(load(), Err(Error::NotLoggedIn)));
+        assert!(sink.state.lock().unsaved.is_some());
+
+        let mut login = stored_with("fresh");
+        login.session_id = "new".into();
+        write_stored(&login).unwrap();
+        sink.flush().unwrap();
+        assert!(sink.state.lock().unsaved.is_none());
+        assert_eq!(load().unwrap().refresh_token, "fresh");
     }
 
     #[test]

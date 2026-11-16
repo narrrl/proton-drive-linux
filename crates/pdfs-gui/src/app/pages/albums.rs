@@ -225,12 +225,13 @@ fn show_album_menu(ui: &Rc<Ui>, album: &AlbumInfo, anchor: &gtk4::Widget, x: f64
 /// while the entry is blank.
 fn prompt_album_name(
     ui: &Rc<Ui>,
+    parent: Option<gtk4::Window>,
     heading: &str,
     action: &str,
     current: &str,
     on_name: impl Fn(String) + 'static,
 ) {
-    let win = ui_window(ui);
+    let win = parent.or_else(|| ui_window(ui));
     let dialog = adw::AlertDialog::builder().heading(heading).build();
     let group = adw::PreferencesGroup::new();
     let row = adw::EntryRow::builder()
@@ -260,10 +261,12 @@ fn prompt_album_name(
 }
 
 /// Ask for a name and create an album, then add `photos` to it, if any.
-pub(crate) fn prompt_new_album(ui: &Rc<Ui>, photos: Vec<String>) {
+///
+/// The dialogs open over `parent`, or over the main window without one.
+pub(crate) fn prompt_new_album(ui: &Rc<Ui>, photos: Vec<String>, parent: Option<gtk4::Window>) {
     let ui_c = ui.clone();
     let (heading, action) = (gettext("New Album"), gettext("Create"));
-    prompt_album_name(ui, &heading, &action, "", move |name| {
+    prompt_album_name(ui, parent, &heading, &action, "", move |name| {
         let rx = spawn_request(ui_c.dirs.control_socket(), Request::CreateAlbum { name });
         let ui = ui_c.clone();
         let photos = photos.clone();
@@ -296,7 +299,7 @@ pub(crate) fn prompt_new_album(ui: &Rc<Ui>, photos: Vec<String>) {
 fn prompt_rename_album(ui: &Rc<Ui>, album: &AlbumInfo) {
     let (ui_c, uid) = (ui.clone(), album.uid.clone());
     let (heading, action) = (gettext("Rename Album"), gettext("Rename"));
-    prompt_album_name(ui, &heading, &action, &album.name, move |name| {
+    prompt_album_name(ui, None, &heading, &action, &album.name, move |name| {
         run_album_request(
             &ui_c,
             Request::RenameAlbum {
@@ -368,7 +371,7 @@ fn reload_album_grid(ui: &Rc<Ui>) {
 }
 
 /// Offer our own albums to add `photos` to, plus a new one.
-pub(crate) fn prompt_add_to_album(ui: &Rc<Ui>, photos: Vec<String>) {
+pub(crate) fn prompt_add_to_album(ui: &Rc<Ui>, photos: Vec<String>, parent: Option<gtk4::Window>) {
     let rx = spawn_request(ui.dirs.control_socket(), Request::PhotoAlbums);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
@@ -390,7 +393,7 @@ pub(crate) fn prompt_add_to_album(ui: &Rc<Ui>, photos: Vec<String>) {
             }
         };
         if albums.is_empty() {
-            prompt_new_album(&ui, photos);
+            prompt_new_album(&ui, photos, parent);
             return;
         }
 
@@ -436,11 +439,11 @@ pub(crate) fn prompt_add_to_album(ui: &Rc<Ui>, photos: Vec<String>) {
                 add_to_album(&ui_c, album.uid.clone(), photos_c.clone());
             }
         });
-        let ui_c = ui.clone();
+        let (ui_c, parent_c) = (ui.clone(), parent.clone());
         dialog.connect_response(Some("new"), move |_, _| {
-            prompt_new_album(&ui_c, photos.clone())
+            prompt_new_album(&ui_c, photos.clone(), parent_c.clone())
         });
-        dialog.present(ui_window(&ui).as_ref());
+        dialog.present(parent.or_else(|| ui_window(&ui)).as_ref());
     });
 }
 
@@ -595,10 +598,7 @@ pub(crate) fn want_cover(ui: &Rc<Ui>, uid: String, picture: &gtk4::Picture) {
     if ui.gallery.photo_nothumb.borrow().contains(&uid) {
         return;
     }
-    ui.gallery
-        .thumb_wanted
-        .borrow_mut()
-        .insert(uid.clone(), picture.clone());
+    ui.gallery.await_thumb(&uid, picture);
     let mut queue = ui.gallery.thumb_queue.borrow_mut();
     if !queue.contains(&uid) {
         queue.push_back(uid);
@@ -664,12 +664,25 @@ pub(crate) fn wire_albums(ui: &Rc<Ui>) {
         }
         close_album(&ui_photos);
         close_place(&ui_photos);
-        ui_photos.gallery.filters.set_visible(true);
-        ui_photos.gallery.content.set_visible_child_name("timeline");
+        let gallery = &ui_photos.gallery;
+        gallery.filters.set_visible(true);
+        gallery.content.set_visible_child_name("timeline");
+        // An album or a place cleared the kind and the month it does not use;
+        // the filter controls still show them, so the timeline comes back
+        // filtered the way they say.
+        let kind = kind_for_tab(gallery.tabs.active() as usize);
+        let range = gallery
+            .date_ranges
+            .borrow()
+            .get(gallery.dates.selected() as usize)
+            .copied()
+            .flatten();
+        let kind_changed = gallery.kind.replace(kind) != kind;
+        let range_changed = gallery.range.replace(range) != range;
+        let refiltered = kind_changed || range_changed;
         // The timeline comes back as it was left unless an album took over the
         // model since; then it has to be reloaded.
-        if ui_photos.gallery.timeline_stale.replace(false) || ui_photos.gallery.model.n_items() == 0
-        {
+        if gallery.timeline_stale.replace(false) || refiltered || gallery.model.n_items() == 0 {
             load_gallery(&ui_photos, false);
         } else {
             update_gallery_subtitle(&ui_photos);
