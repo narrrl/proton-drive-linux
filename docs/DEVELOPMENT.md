@@ -167,6 +167,7 @@ invented account, so they never show anyone's files:
 ```bash
 scripts/screenshots.sh                                      # all of them, into images/
 scripts/screenshots.sh --only photos,files                  # just these
+scripts/screenshots.sh --debug --skip-build                  # reuse already-built debug binaries
 scripts/screenshots.sh --website ../proton-drive-linux-website   # and copy them to the website
 ```
 

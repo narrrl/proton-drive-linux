@@ -419,6 +419,10 @@ impl Tray for DriveTray {
         self.state.phase.icon().into()
     }
 
+    fn attention_icon_name(&self) -> String {
+        self.icon_name()
+    }
+
     fn status(&self) -> Status {
         match self.state.phase {
             Phase::Attention | Phase::SessionExpired => Status::NeedsAttention,
@@ -670,6 +674,22 @@ mod tests {
         assert_eq!(phase_of(false, 0, false, true), Phase::Offline);
         assert_eq!(phase_of(false, 0, true, true), Phase::Syncing);
         assert_eq!(phase_of(false, 0, true, false), Phase::Synced);
+    }
+
+    #[test]
+    fn attention_states_supply_the_icon_the_tray_requests() {
+        let mut tray = DriveTray {
+            state: status_state(&status(""), &[], &[], Path::new("/m")),
+            socket: PathBuf::new(),
+        };
+        for (phase, icon) in [
+            (Phase::Attention, "dialog-warning-symbolic"),
+            (Phase::SessionExpired, "dialog-password-symbolic"),
+        ] {
+            tray.state.phase = phase;
+            assert_eq!(tray.status(), Status::NeedsAttention);
+            assert_eq!(tray.attention_icon_name(), icon);
+        }
     }
 
     fn status(extra: &str) -> Response {

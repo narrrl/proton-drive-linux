@@ -22,6 +22,7 @@ Options:
                    with its scripts/sync-screenshots.sh
   --settle SECS    how long a page gets to load before its capture (default 3)
   --debug          use a debug build instead of a release build
+  --skip-build     reuse binaries from the selected profile
   --keep           keep the temporary directory, for a look at the logs
 
 Needs cage, grim, wlr-randr, ImageMagick, dbus-run-session and
@@ -45,8 +46,19 @@ if [[ "${1:-}" == --capture ]]; then
     output() { wlr-randr --output "$(wlr-randr | awk 'NR==1 {print $1}')" --custom-mode "$1"; }
     shoot() {
         sleep "$SETTLE"
-        grim "$OUT/$1.png"
-        echo "captured $1"
+        # Cold GTK/portal startup can leave the compositor black briefly.
+        # Wait for actual window content rather than publishing a blank PNG.
+        local capture_try
+        for capture_try in 1 2 3 4 5; do
+            grim "$OUT/$1.png"
+            if [[ "$(magick "$OUT/$1.png" -format '%[fx:standard_deviation>0.001]' info:)" == 1 ]]; then
+                echo "captured $1"
+                return
+            fi
+            sleep 1
+        done
+        echo "no window content for $1; screenshot is blank" >&2
+        return 1
     }
     # Cut the compositor's black background off a window smaller than it.
     trim() {
@@ -127,6 +139,7 @@ shots=$all
 website=
 settle=3
 profile=release
+skip_build=
 keep=
 while (($#)); do
     case "$1" in
@@ -135,6 +148,7 @@ while (($#)); do
         --website) website=$(realpath -- "${2:?}"); shift ;;
         --settle) settle=${2:?}; shift ;;
         --debug) profile=debug ;;
+        --skip-build) skip_build=1 ;;
         --keep) keep=1 ;;
         -h | --help) usage ;;
         *) echo "unknown option: $1" >&2; usage ;;
@@ -163,11 +177,17 @@ done
 
 cargo_flags=(--manifest-path "$repo/Cargo.toml" --locked)
 [[ "$profile" == release ]] && cargo_flags+=(--release)
-cargo build "${cargo_flags[@]}" -p pdfs-gui --bin pdfs-app --bin pdfs-prompt
-cargo build "${cargo_flags[@]}" -p pdfs-core --example demo_daemon
+if [[ -z "$skip_build" ]]; then
+    cargo build "${cargo_flags[@]}" -p pdfs-gui --bin pdfs-app --bin pdfs-prompt
+    cargo build "${cargo_flags[@]}" -p pdfs-core --example demo_daemon
+fi
 target=$(cargo metadata --manifest-path "$repo/Cargo.toml" --format-version 1 --no-deps |
     python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
 bin="$(mktemp -d)"
+for executable in "$target/$profile/pdfs-app" "$target/$profile/pdfs-prompt" \
+    "$target/$profile/examples/demo_daemon"; do
+    [[ -x "$executable" ]] || { echo "missing executable: $executable; run without --skip-build" >&2; exit 2; }
+done
 ln -s "$target/$profile/pdfs-app" "$target/$profile/pdfs-prompt" \
     "$target/$profile/examples/demo_daemon" "$bin/"
 
@@ -182,6 +202,9 @@ chmod 700 "$root/run"
 # The user's own fonts, so the shots look like the app does here.
 mkdir -p "$root/data/fonts"
 [[ -d "$HOME/.local/share/fonts" ]] && cp -rs "$HOME/.local/share/fonts/." "$root/data/fonts/"
+# Prefer this checkout's brand over an older icon from an installed package.
+install -Dm644 "$repo/packaging/io.narl.proton-drive-linux.svg" \
+    "$root/data/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg"
 mkdir -p "$root/config/proton-drive-linux"
 cat >"$root/config/proton-drive-linux/config.json" <<'EOF'
 {

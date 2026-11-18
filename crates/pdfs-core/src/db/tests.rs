@@ -2740,15 +2740,34 @@ fn atomic_trash_replacement_returns_owned_blobs_after_commit() {
 #[test]
 fn a_queued_trash_holds_its_name_until_it_lands() {
     let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&file("held-name", "root", "report.txt", 1))
+        .unwrap();
     let node = uid("held-name").to_string();
-    assert!(!db.has_pending_trash_named("report.txt").unwrap());
+    let root = uid("root").to_string();
+    assert!(
+        !db.has_pending_trash_named("report.txt", Some(&root))
+            .unwrap()
+    );
 
     let (trash_id, _) = db.replace_ops_with_trash(&node, "report.txt", 1).unwrap();
-    assert!(db.has_pending_trash_named("report.txt").unwrap());
-    assert!(!db.has_pending_trash_named("other.txt").unwrap());
+    assert!(
+        db.has_pending_trash_named("report.txt", Some(&root))
+            .unwrap()
+    );
+    assert!(
+        !db.has_pending_trash_named("other.txt", Some(&root))
+            .unwrap()
+    );
+    assert!(
+        !db.has_pending_trash_named("report.txt", Some(&uid("other").to_string()))
+            .unwrap()
+    );
 
     db.delete_op(trash_id).unwrap();
-    assert!(!db.has_pending_trash_named("report.txt").unwrap());
+    assert!(
+        !db.has_pending_trash_named("report.txt", Some(&root))
+            .unwrap()
+    );
 }
 
 /// A create that found its name held by a queued trash backed off. The trash
@@ -6094,7 +6113,7 @@ fn cache_eviction_candidates_are_lru_ordered_and_limited() {
     }
     db.cache_touch("other", "block", 100, 0).unwrap();
 
-    let batch = db.cache_eviction_candidates("blob", 3).unwrap();
+    let batch = db.cache_eviction_candidates("blob", 3, 0).unwrap();
     assert_eq!(batch.len(), 3, "honours the limit");
     let keys: Vec<&str> = batch.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(keys, ["k9", "k8", "k7"], "least-recently-accessed first");
@@ -6923,6 +6942,54 @@ fn two_workers_never_share_a_node() {
         Some(OP_RENAME.to_string()),
         "once the revision retires, the rename is claimable"
     );
+}
+
+#[test]
+fn trashing_a_folder_waits_for_moves_out_of_its_subtree() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        folder("source", Some("root"), "source"),
+        folder("nested", Some("source"), "nested"),
+        folder("destination", Some("root"), "destination"),
+        file("photo", "destination", "photo.jpg", 1),
+    ])
+    .unwrap();
+    let source = uid("source").to_string();
+    let destination = uid("destination").to_string();
+    let (move_id, _) = db
+        .enqueue_op(&PendingOp {
+            kind: OP_RENAME.to_string(),
+            uid: uid("photo").to_string(),
+            parent_uid: Some(destination.clone()),
+            name: Some("photo.jpg".into()),
+            blob_path: None,
+            meta_json: Some(
+                serde_json::to_string(&RenameMeta {
+                    original_parent_uid: uid("nested").to_string(),
+                    original_name: Some("photo.jpg".into()),
+                })
+                .unwrap(),
+            ),
+            next_attempt_at: 20,
+            ..bulk_op(0, &destination)
+        })
+        .unwrap();
+    assert!(db.has_pending_moves_out_of(&source).unwrap());
+    assert!(!db.has_pending_moves_out_of(&destination).unwrap());
+    assert!(
+        !db.has_pending_moves_out_of(&uid("root").to_string())
+            .unwrap()
+    );
+    let (trash_id, _) = db.replace_ops_with_trash(&source, "source", 2).unwrap();
+
+    assert!(db.claim_next_due_op(10).unwrap().is_none());
+    assert_eq!(db.earliest_due_at().unwrap(), Some(20));
+    assert_eq!(db.claim_next_due_op(20).unwrap().unwrap().id, move_id);
+    assert!(db.claim_next_due_op(20).unwrap().is_none());
+    assert_eq!(db.earliest_due_at().unwrap(), None);
+    db.delete_op(move_id).unwrap();
+    assert_eq!(db.claim_next_due_op(20).unwrap().unwrap().id, trash_id);
 }
 
 #[test]

@@ -4012,6 +4012,15 @@ impl Core {
         Ok(())
     }
 
+    fn has_pending_moves_out_of(&self, uid: &NodeUid) -> Result<bool, Errno> {
+        self.db
+            .has_pending_moves_out_of(&uid.to_string())
+            .map_err(|error| {
+                error!(%uid, %error, "checking for moves out of a trash target failed");
+                Errno::EIO
+            })
+    }
+
     /// Queue trashing a node the server knows about, and drop it from the tree
     /// now.
     ///
@@ -5390,6 +5399,11 @@ impl Core {
             &parent_uid,
         )
         .map_err(|error| self.errno_error(error, "trash access"))?;
+        if self.db.has_pending_moves_out_of(&uid.to_string())? {
+            return Err(CoreError::conflict(
+                "wait for pending moves out of this folder to sync before trashing it",
+            ));
+        }
         self.rt
             .block_on(self.drive.trash_nodes(std::slice::from_ref(&uid)))
             .and_then(batch::into_unit)
@@ -5454,10 +5468,12 @@ impl Core {
         } else {
             uid
         };
-        // Local-first or offline, or the network goes away under the call:
-        // queue the trash. The rename that follows queues as well, behind it.
+        // Local-first or offline: queue the trash and the rename that follows.
         if !self.sends_inline() {
             return self.queue_trash(uid, name, open);
+        }
+        if self.has_pending_moves_out_of(uid)? {
+            return Err(Errno::EBUSY);
         }
         self.require_uid_writable(uid)?;
         if let Err(e) = self
