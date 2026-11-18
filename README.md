@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="images/logo.svg" alt="" width="112" height="112">
+<a href="images/logo.svg"><img src="images/logo.svg" alt="Proton Drive for Linux icon" width="128" height="128"></a>
 
 # Proton Drive for Linux
 

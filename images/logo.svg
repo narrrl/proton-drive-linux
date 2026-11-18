@@ -1,36 +1,44 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Proton Drive for Linux">
-  <defs>
-    <linearGradient id="pdl-face" x1="12" y1="12" x2="116" y2="112" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#A48BFF"/>
-      <stop offset="0.55" stop-color="#7552FF"/>
-      <stop offset="1" stop-color="#5B36F2"/>
-    </linearGradient>
-    <linearGradient id="pdl-cloud" x1="0" y1="34" x2="0" y2="88" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#FFFFFF"/>
-      <stop offset="1" stop-color="#ECE6FF"/>
-    </linearGradient>
-    <!-- the cloud, with the arrow cut out of it as negative space -->
-    <mask id="pdl-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="128" height="128">
-      <g fill="#FFFFFF">
-        <circle cx="66" cy="57" r="23"/>
-        <circle cx="42" cy="68" r="16"/>
-        <circle cx="88" cy="69" r="15"/>
-        <rect x="26" y="68" width="77" height="20" rx="10"/>
-      </g>
-      <g stroke="#000000" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M64 49v26"/>
-        <path d="M54.5 65.5l9.5 9.5 9.5-9.5"/>
-      </g>
-    </mask>
-  </defs>
-
-  <!-- base: a rounded tile with a darker lower edge for depth -->
-  <rect x="12" y="16" width="104" height="100" rx="26" fill="#4424C0"/>
-  <rect x="12" y="12" width="104" height="100" rx="26" fill="url(#pdl-face)"/>
-  <rect x="12.5" y="12.5" width="103" height="99" rx="25.5" stroke="#FFFFFF" stroke-opacity="0.2"/>
-
-  <!-- cloud shadow, then the cloud itself -->
-  <rect y="3" width="128" height="128" fill="#2E1596" fill-opacity="0.3" mask="url(#pdl-cut)"/>
-  <rect width="128" height="128" fill="url(#pdl-cloud)" mask="url(#pdl-cut)"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" data-app="drive" role="img" aria-labelledby="drive-title drive-desc">
+<title id="drive-title">Proton Drive for Linux</title>
+<desc id="drive-desc">Frontal violet and pink vector icon with shallow metallic copper backing.</desc>
+<defs>
+  <linearGradient id="drive-face" x1="36" y1="212" x2="220" y2="54" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#6240DA"/><stop offset=".52" stop-color="#8056EF"/><stop offset="1" stop-color="#D58BDF"/>
+  </linearGradient>
+  <linearGradient id="drive-rear" x1="26" y1="42" x2="218" y2="220" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#8C68EE"/><stop offset="1" stop-color="#5533B5"/>
+  </linearGradient>
+  <linearGradient id="drive-paper" x1="60" y1="80" x2="180" y2="162" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#E7DFFA"/><stop offset="1" stop-color="#BDA5EF"/>
+  </linearGradient>
+  <linearGradient id="drive-copper" x1="32" y1="32" x2="232" y2="224" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#703E30"/><stop offset=".16" stop-color="#B47456"/>
+    <stop offset=".28" stop-color="#E6B296"/><stop offset=".32" stop-color="#F8D8C3"/>
+    <stop offset=".37" stop-color="#BB7C5A"/><stop offset=".56" stop-color="#8A4D36"/>
+    <stop offset=".69" stop-color="#D69B77"/><stop offset=".75" stop-color="#F2C9AA"/>
+    <stop offset=".81" stop-color="#B87956"/><stop offset="1" stop-color="#713F30"/>
+  </linearGradient>
+  <linearGradient id="drive-sun" x1="172" y1="82" x2="201" y2="112" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#8D513A"/><stop offset=".33" stop-color="#DDA581"/>
+    <stop offset=".47" stop-color="#F7D8B8"/><stop offset=".53" stop-color="#D69B74"/>
+    <stop offset="1" stop-color="#925439"/>
+  </linearGradient>
+  <linearGradient id="drive-mountain" x1="44" y1="148" x2="186" y2="218" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#D9C9FA"/><stop offset="1" stop-color="#A582E9"/>
+  </linearGradient>
+  <linearGradient id="drive-far-mountain" x1="142" y1="152" x2="211" y2="216" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#E8B4EB"/><stop offset="1" stop-color="#BB7BD7"/>
+  </linearGradient>
+  <clipPath id="drive-photo-clip"><rect x="28" y="54" width="194" height="172" rx="24"/></clipPath>
+</defs>
+<!-- Canonical vector artwork; regenerate platform assets with scripts/render-branding.py. -->
+<g id="mark">
+<path d="M48 48H91Q99 48 105 54L117 66Q123 72 132 72H208Q228 72 228 92V200Q228 220 208 220H48Q28 220 28 200V68Q28 48 48 48Z" fill="url(#drive-copper)" transform="translate(6 -6)" stroke="#7D4936" stroke-width=".8" stroke-linejoin="round"/>
+<path d="M48 48H91Q99 48 105 54L117 66Q123 72 132 72H208Q228 72 228 92V200Q228 220 208 220H48Q28 220 28 200V68Q28 48 48 48Z" fill="url(#drive-rear)" stroke="#5E3CBD" stroke-width=".8"/>
+<rect x="72" y="82" width="132" height="112" rx="10" fill="url(#drive-paper)" stroke="#EFE9FC" stroke-width="1"/>
+<rect x="51" y="97" width="140" height="109" rx="10" fill="url(#drive-paper)" stroke="#EFE9FC" stroke-width="1"/>
+<path d="M48 94H89Q97 94 103 100L115 112Q121 118 130 118H208Q228 118 228 138V206Q228 226 208 226H48Q28 226 28 206V114Q28 94 48 94Z" fill="url(#drive-copper)" transform="translate(6 -6)" stroke="#7D4936" stroke-width=".8" stroke-linejoin="round"/>
+<path d="M48 94H89Q97 94 103 100L115 112Q121 118 130 118H208Q228 118 228 138V206Q228 226 208 226H48Q28 226 28 206V114Q28 94 48 94Z" fill="url(#drive-face)" stroke="#5936B7" stroke-width=".9"/>
+<path d="M32 113Q32 98 48 98H89Q95 98 100 103L112 115Q120 122 130 122H208Q224 122 224 138" fill="none" stroke="#F3DDF9" stroke-opacity=".52" stroke-width="1.5" stroke-linecap="round"/>
+</g>
 </svg>
