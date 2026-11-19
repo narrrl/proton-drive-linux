@@ -396,10 +396,10 @@ fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
     use CtlRequest as R;
     match request {
         R::Pin { .. } | R::Unpin { .. } => &[Topic::Files],
+        // Unlock affects private requests only. Publishing the lock notification
+        // here for Unlock as well could close the view that just opened.
         R::DriveGallery {
-            action:
-                pdfs_core::control::GalleryAction::Lock
-                | pdfs_core::control::GalleryAction::Unlock { .. },
+            action: pdfs_core::control::GalleryAction::Lock,
         } => &[Topic::GalleryVisibility],
         R::CreateAlbum { .. }
         | R::RenameAlbum { .. }

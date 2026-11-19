@@ -138,7 +138,7 @@ fn follow_changes(ui: &Rc<Ui>, state: &FeedState, topics: &[Topic]) {
     let page = ui.stack.visible_child_name();
     if changed(Topic::GalleryVisibility) || changed(Topic::GalleryVisibilitySynced) {
         if let Some(browser) = ui.drive_galleries.borrow().upgrade() {
-            browser.refresh_visibility();
+            browser.refresh_visibility(changed(Topic::GalleryVisibility));
         }
         for window in gtk4::Window::list_toplevels() {
             if let Ok(window) = window.downcast::<gtk4::Window>()

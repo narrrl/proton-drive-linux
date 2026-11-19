@@ -180,7 +180,10 @@ pub(crate) fn collection_card(
     card.append(&name);
     card.append(&count);
 
-    let button = gtk4::Button::builder().child(&card).build();
+    let button = gtk4::Button::builder()
+        .child(&card)
+        .halign(gtk4::Align::Start)
+        .build();
     button.add_css_class("flat");
     button.add_css_class("album-card");
     button.set_tooltip_text(Some(title));

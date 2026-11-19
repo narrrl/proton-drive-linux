@@ -113,7 +113,7 @@ impl Browser {
         sync_header(&self.ui);
     }
 
-    pub(crate) fn refresh_visibility(self: &Rc<Self>) {
+    pub(crate) fn refresh_visibility(self: &Rc<Self>, locked: bool) {
         self.thumbnails.borrow_mut().clear();
         self.root.remove_all();
         self.load_root();
@@ -124,7 +124,17 @@ impl Browser {
             preview.force_close();
         }
         if self.unlocked.get() {
-            self.close();
+            if locked {
+                self.close();
+            } else {
+                // The first private listing can also discover a newer visibility
+                // snapshot. Rebuild from the private root so a folder that is no
+                // longer hidden cannot leave its title or contents on screen.
+                self.trail.borrow_mut().clear();
+                self.cover.borrow_mut().take();
+                self.thumb_pending.borrow_mut().clear();
+                self.load(0, 0.0);
+            }
         } else {
             self.load(0, self.scroll.vadjustment().value());
         }
@@ -214,7 +224,6 @@ impl Browser {
             },
             (width, width.min(200)),
         );
-        button.set_halign(gtk4::Align::Start);
         wire_thumbnail(self, &picture, album.cover.as_deref(), private, None);
         button
     }

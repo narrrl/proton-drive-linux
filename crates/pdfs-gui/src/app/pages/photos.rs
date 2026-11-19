@@ -845,6 +845,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .max_children_per_line(8)
         .valign(gtk4::Align::Start)
         .build();
+    albums.add_css_class("photo-album-grid");
     let albums_status = adw::StatusPage::builder()
         .icon_name("pdfs-album-symbolic")
         .vexpand(true)
@@ -874,6 +875,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .max_children_per_line(8)
         .valign(gtk4::Align::Start)
         .build();
+    drive_galleries.add_css_class("photo-album-grid");
     let drive_status = gtk4::Label::builder().xalign(0.0).wrap(true).build();
     drive_status.add_css_class("dim-label");
     let add_gallery = gtk4::Button::with_label(&gettext("Add gallery"));

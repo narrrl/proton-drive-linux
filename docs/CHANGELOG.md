@@ -31,6 +31,11 @@ Schema: **46**. Photos adds a local database migration for incremental metadata 
 - Photo grids defer work for off-screen tiles and keep the viewed photo anchored
   during zoom.
 
+### Fixed
+
+- Unlocking Hidden albums keeps the private view open while its albums load.
+- Hovering over an album highlights its card without shading the surrounding grid cell.
+
 ## [3.8.1] — 2026-11-19
 
 Schema: **45**. No database migration in this release.

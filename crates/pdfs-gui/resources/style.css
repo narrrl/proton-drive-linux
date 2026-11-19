@@ -118,6 +118,9 @@ scale.browser-status-meter trough { min-width: 140px; min-height: 6px; }
 .memory-card { padding: 0; border-radius: 12px; }
 .memory-cover { border-radius: 12px; background: alpha(currentColor, 0.06); }
 .memory-label { font-weight: 700; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; background: linear-gradient(to top, rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0)); }
+/* The button handles hover and clicks. The FlowBox cell can be wider than it. */
+flowbox.photo-album-grid > flowboxchild:hover,
+flowbox.photo-album-grid > flowboxchild:active { background: transparent; }
 .album-card { padding: 0; border-radius: 16px; transition: background 180ms ease; }
 .album-card:hover { background: alpha(currentColor, 0.07); }
 .album-cover { border-radius: 16px; background: alpha(currentColor, 0.06); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32); transition: box-shadow 180ms ease; }
