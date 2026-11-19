@@ -1,7 +1,7 @@
 //! The photos timeline: a flat, date-ordered projection of the photo share,
 //! persisted so the gallery opens instantly instead of re-enumerating on launch.
 
-use rusqlite::params;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use std::collections::{HashMap, HashSet};
 
@@ -278,15 +278,285 @@ fn stored_photo(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPhoto> {
     })
 }
 
+const PHOTOS_GENERATION: &str = "photos_projection_generation";
+const PHOTOS_SYNCED: &str = "photos_synced_ms";
+const PHOTOS_AVAILABLE: &str = "photos_available";
+const PHOTOS_RECONCILE: &str = "photos_reconcile";
+
+pub(super) fn photos_generation(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT coalesce((SELECT CAST(value AS INTEGER) FROM sync_state WHERE key=?1),0)",
+        [PHOTOS_GENERATION],
+        |row| row.get(0),
+    )
+}
+
+pub(super) fn gallery_state(
+    conn: &Connection,
+    key: &str,
+    value: impl rusqlite::ToSql,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO sync_state(key,value) VALUES (?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn photos_delete_tx(tx: &Transaction<'_>, uids: &[String]) -> Result<usize> {
+    let mut removed = 0;
+    for uid in uids {
+        tx.execute(
+            "INSERT OR IGNORE INTO photo_tombstones(uid) VALUES (?1)",
+            [uid],
+        )?;
+        removed += tx.execute("DELETE FROM photos WHERE uid=?1", [uid])?;
+        tx.execute("DELETE FROM albums WHERE uid=?1", [uid])?;
+        tx.execute("DELETE FROM album_photos WHERE album_uid=?1", [uid])?;
+        tx.execute(
+            "UPDATE albums SET photo_count=max(photo_count-1,0)
+             WHERE cover_uid=?1 OR uid IN (SELECT album_uid FROM album_photos WHERE uid=?1)",
+            [uid],
+        )?;
+        tx.execute("DELETE FROM album_photos WHERE uid=?1", [uid])?;
+        tx.execute(
+            "UPDATE albums SET cover_uid=(SELECT uid FROM album_photos
+               WHERE album_uid=albums.uid ORDER BY seq LIMIT 1) WHERE cover_uid=?1",
+            [uid],
+        )?;
+    }
+    tx.execute(
+        "UPDATE photos SET group_key=NULL WHERE group_key IS NOT NULL
+         AND group_key NOT IN (SELECT uid FROM photos)",
+        [],
+    )?;
+    Ok(removed)
+}
+
 impl Db {
+    pub fn photo_projection_generation(&self) -> Result<i64> {
+        Ok(photos_generation(&self.read())?)
+    }
+
+    /// One transaction records the deletion, stale metadata, listing work and feed position.
+    pub fn photos_apply_events(
+        &self,
+        cursor_key: &str,
+        cursor: &str,
+        gone: &[String],
+        touched: &[String],
+        gap: bool,
+        seed: bool,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        if !gone.is_empty() {
+            photos_delete_tx(&tx, gone)?;
+        }
+        for uid in touched {
+            tx.execute("DELETE FROM photo_tombstones WHERE uid=?1", [uid])?;
+            tx.execute("UPDATE photos SET resolved_at=NULL WHERE uid=?1", [uid])?;
+            tx.execute("UPDATE album_photos SET resolved=0 WHERE uid=?1", [uid])?;
+        }
+        if gap {
+            tx.execute("UPDATE photos SET resolved_at=NULL", [])?;
+            tx.execute("UPDATE album_photos SET resolved=0", [])?;
+            gallery_state(&tx, PHOTOS_RECONCILE, 1)?;
+        }
+        if seed || gap || !gone.is_empty() || !touched.is_empty() {
+            let generation = photos_generation(&tx)?;
+            gallery_state(&tx, PHOTOS_GENERATION, generation + 1)?;
+            tx.execute(
+                "DELETE FROM sync_state WHERE key='albums_synced_ms'
+                 OR key GLOB 'album_synced_ms:*'",
+                [],
+            )?;
+        }
+        if seed || gap || !touched.is_empty() {
+            tx.execute("DELETE FROM sync_state WHERE key=?1", [PHOTOS_SYNCED])?;
+        }
+        gallery_state(&tx, cursor_key, cursor)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn photos_invalidate(&self) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let generation = photos_generation(&tx)?;
+        gallery_state(&tx, PHOTOS_GENERATION, generation + 1)?;
+        tx.execute("DELETE FROM sync_state WHERE key=?1", [PHOTOS_SYNCED])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn photos_need_work(&self) -> Result<bool> {
+        let conn = self.read();
+        Ok(conn.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM sync_state WHERE key=?1)
+             OR EXISTS(SELECT 1 FROM photos WHERE resolved_at IS NULL)",
+            [PHOTOS_SYNCED],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn photos_pending(&self) -> Result<Vec<String>> {
+        let conn = self.read();
+        let mut stmt =
+            conn.prepare("SELECT uid FROM photos WHERE resolved_at IS NULL ORDER BY seq")?;
+        Ok(stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn photo_removed(&self, uid: &str) -> Result<bool> {
+        Ok(self.read().query_row(
+            "SELECT EXISTS(SELECT 1 FROM photo_tombstones WHERE uid=?1)",
+            [uid],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn photos_contains(&self, uid: &str, album: Option<&str>) -> Result<bool> {
+        let conn = self.read();
+        Ok(match album {
+            Some(album) => conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM album_photos WHERE album_uid=?1 AND uid=?2)",
+                params![album, uid],
+                |r| r.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM photos WHERE uid=?1)
+                 OR EXISTS(SELECT 1 FROM album_photos WHERE uid=?1)",
+                [uid],
+                |r| r.get(0),
+            )?,
+        })
+    }
+
+    /// Persist one enrichment batch. The generation check and UPDATE share the
+    /// writer transaction with deletion, so a stale batch cannot restore a row.
+    pub fn photos_resolve_at(&self, generation: i64, rows: &[TimelineRow]) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        if photos_generation(&tx)? != generation {
+            return Ok(false);
+        }
+        {
+            let mut update = tx.prepare(
+                "UPDATE photos SET name=?2, media_type=?3, kind=?4, favorite=?5,
+                    similar_hash=CASE WHEN content_hash IS ?6 THEN similar_hash ELSE NULL END,
+                    content_hash=?6, main_uid=?7, latitude=?8, longitude=?9, place_id=?10,
+                    resolved_at=?11 WHERE uid=?1",
+            )?;
+            for row in rows.iter().filter(|row| row.resolved_at.is_some()) {
+                let kind = crate::control::PhotoKind::classify(
+                    row.name.as_deref(),
+                    row.media_type.as_deref(),
+                );
+                update.execute(params![
+                    row.uid,
+                    row.name,
+                    row.media_type,
+                    kind.as_i64(),
+                    row.favorite.unwrap_or(false),
+                    row.content_hash,
+                    row.main_uid,
+                    row.location.map(|p| p.0),
+                    row.location.map(|p| p.1),
+                    row.location
+                        .and_then(|(lat, lon)| crate::places::nearest(lat, lon))
+                        .map(|city| city.id),
+                    row.resolved_at
+                ])?;
+            }
+        }
+        if !rows.is_empty() {
+            let (entries, existing): (Vec<_>, Vec<Option<String>>) = {
+                let mut stmt = tx.prepare(
+                    "SELECT uid,kind,main_uid,strftime('%Y-%m-%d',capture_time,'unixepoch','localtime'),
+                     name,group_key FROM photos ORDER BY seq",
+                )?;
+                stmt.query_map([], |r| {
+                    let name: Option<String> = r.get(4)?;
+                    Ok((
+                        Grouped {
+                            uid: r.get(0)?,
+                            kind: crate::control::PhotoKind::from_i64(r.get(1)?),
+                            main_uid: r.get(2)?,
+                            day: r.get(3)?,
+                            stem: name_stem(name.as_deref()),
+                        },
+                        r.get(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .unzip()
+            };
+            let mut update = tx.prepare("UPDATE photos SET group_key=?2 WHERE uid=?1")?;
+            for ((entry, old), group) in entries.iter().zip(existing).zip(group_photos(&entries)) {
+                if old.as_deref() != Some(group.as_str()) {
+                    update.execute(params![entry.uid, group])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Replace the timeline wholesale. A row whose `resolved_at` is `Some` was
     /// read from the server in this pass, so its fields are taken as they are —
     /// a `None` there means the server no longer reports that value. A row whose
     /// `resolved_at` is `None` was skipped or failed to resolve, and keeps
     /// whatever is already stored rather than having it silently cleared.
     pub fn photos_replace(&self, items: &[TimelineRow]) -> Result<()> {
+        self.photos_replace_impl(items, None).map(|_| ())
+    }
+
+    pub fn photos_replace_at(
+        &self,
+        items: &[TimelineRow],
+        generation: i64,
+        available: bool,
+        now: i64,
+    ) -> Result<bool> {
+        self.photos_replace_impl(items, Some((generation, available, now)))
+    }
+
+    fn photos_replace_impl(
+        &self,
+        items: &[TimelineRow],
+        stamp: Option<(i64, bool, i64)>,
+    ) -> Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
+        let mut tombstones = HashSet::new();
+        if let Some((generation, _, _)) = stamp {
+            if photos_generation(&tx)? != generation {
+                return Ok(false);
+            }
+            let repairing = tx
+                .query_row(
+                    "SELECT 1 FROM sync_state WHERE key=?1",
+                    [PHOTOS_RECONCILE],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if repairing {
+                let mut remove = tx.prepare("DELETE FROM photo_tombstones WHERE uid=?1")?;
+                for row in items {
+                    remove.execute([&row.uid])?;
+                }
+                tx.execute("DELETE FROM sync_state WHERE key=?1", [PHOTOS_RECONCILE])?;
+            }
+            let mut stmt = tx.prepare("SELECT uid FROM photo_tombstones")?;
+            tombstones = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+        }
         // `name` and `media_type` are learned-and-kept like the ratio and thumb
         // verdict: the timeline DTO carries only the uid and capture time, so the
         // daemon may not know them when it replaces the timeline — because the
@@ -325,6 +595,7 @@ impl Db {
         // Everything the insert and the grouping need, resolved once per photo.
         let resolved: Vec<(&TimelineRow, Learned, crate::control::PhotoKind)> = items
             .iter()
+            .filter(|row| !tombstones.contains(&row.uid))
             .map(|row| {
                 let mut carried = learned.get(&row.uid).cloned().unwrap_or(Learned {
                     thumb_state: THUMB_UNKNOWN,
@@ -414,8 +685,12 @@ impl Db {
                 ])?;
             }
         }
+        if let Some((_, available, now)) = stamp {
+            gallery_state(&tx, PHOTOS_AVAILABLE, available as i64)?;
+            gallery_state(&tx, PHOTOS_SYNCED, now)?;
+        }
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// The uids whose node metadata is already resolved, so a refresh can skip
@@ -458,8 +733,16 @@ impl Db {
     /// refresh. For a continuity loss, where the daemon cannot know what it
     /// missed, and for an explicit `refresh photos --full`.
     pub fn photos_mark_all_unresolved(&self) -> Result<usize> {
-        let conn = self.conn.lock();
-        Ok(conn.execute("UPDATE photos SET resolved_at = NULL", [])?)
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let marked = tx.execute("UPDATE photos SET resolved_at=NULL", [])?;
+        tx.execute("UPDATE album_photos SET resolved=0", [])?;
+        let generation = photos_generation(&tx)?;
+        gallery_state(&tx, PHOTOS_GENERATION, generation + 1)?;
+        gallery_state(&tx, PHOTOS_RECONCILE, 1)?;
+        tx.execute("DELETE FROM sync_state WHERE key=?1", [PHOTOS_SYNCED])?;
+        tx.commit()?;
+        Ok(marked)
     }
 
     /// Forget photos that have been trashed, so the gallery does not show them
@@ -474,23 +757,9 @@ impl Db {
         }
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let mut removed = 0;
-        {
-            let mut photos = tx.prepare("DELETE FROM photos WHERE uid = ?1")?;
-            let mut albums = tx.prepare("DELETE FROM album_photos WHERE uid = ?1")?;
-            for uid in uids {
-                removed += photos.execute([uid])?;
-                albums.execute([uid])?;
-            }
-        }
-        // A group whose representative went is left pointing at nothing, which
-        // drops its other files off every page. Make them stand alone until the
-        // next refresh groups them again.
-        tx.execute(
-            "UPDATE photos SET group_key = NULL WHERE group_key IS NOT NULL \
-             AND group_key NOT IN (SELECT uid FROM photos)",
-            [],
-        )?;
+        let removed = photos_delete_tx(&tx, uids)?;
+        let generation = photos_generation(&tx)?;
+        gallery_state(&tx, PHOTOS_GENERATION, generation + 1)?;
         tx.commit()?;
         Ok(removed)
     }
@@ -514,23 +783,41 @@ impl Db {
         favorites: bool,
         not_in_album: bool,
     ) -> Result<Vec<StoredPhoto>> {
+        self.photos_page_visible(offset, limit, kind, range, favorites, not_in_album, "[]")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn photos_page_visible(
+        &self,
+        offset: usize,
+        limit: usize,
+        kind: Option<crate::control::PhotoKind>,
+        range: Option<(i64, i64)>,
+        favorites: bool,
+        not_in_album: bool,
+        excluded: &str,
+    ) -> Result<Vec<StoredPhoto>> {
         let conn = self.read();
         // Built up so any combination of the optional filters is one indexed
         // query rather than a statement per case.
         let mut sql = String::from(PHOTO_SELECT);
-        let mut binds: Vec<i64> = Vec::new();
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
         let mut conds: Vec<String> = Vec::new();
+        if excluded != "[]" {
+            binds.push(excluded.to_owned().into());
+            conds.push("p.uid NOT IN (SELECT value FROM json_each(?1))".to_owned());
+        }
         if kind != Some(crate::control::PhotoKind::Raw) {
             conds.push("p.uid = COALESCE(p.group_key, p.uid)".to_string());
         }
         if let Some(k) = kind {
-            binds.push(k.as_i64());
+            binds.push((k.as_i64()).into());
             conds.push(format!("p.kind = ?{}", binds.len()));
         }
         if let Some((from, to)) = range {
-            binds.push(from);
+            binds.push((from).into());
             conds.push(format!("p.capture_time >= ?{}", binds.len()));
-            binds.push(to);
+            binds.push((to).into());
             conds.push(format!("p.capture_time < ?{}", binds.len()));
         }
         if favorites {
@@ -549,9 +836,9 @@ impl Db {
             sql.push_str(" WHERE ");
             sql.push_str(&conds.join(" AND "));
         }
-        binds.push(limit as i64);
+        binds.push((limit as i64).into());
         let limit_pos = binds.len();
-        binds.push(offset as i64);
+        binds.push((offset as i64).into());
         let offset_pos = binds.len();
         sql.push_str(&format!(
             " ORDER BY p.seq LIMIT ?{limit_pos} OFFSET ?{offset_pos}"
@@ -580,6 +867,25 @@ impl Db {
         Ok(rows)
     }
 
+    /// Include associated files so a public preview cannot reveal a hidden
+    /// RAW, JPEG or Live Photo through another part of the same shot.
+    pub fn photo_group_members_for(&self, uids: &HashSet<String>) -> Result<HashSet<String>> {
+        if uids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let ids = serde_json::to_string(uids).expect("file identifiers serialize");
+        let conn = self.read();
+        let mut query = conn.prepare(
+            "SELECT uid FROM photos WHERE COALESCE(group_key, uid) IN (
+               SELECT COALESCE(group_key, uid) FROM photos
+               WHERE uid IN (SELECT value FROM json_each(?1))
+             )",
+        )?;
+        Ok(query
+            .query_map([ids], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The whole persisted timeline, in stored order — every file, not one row
     /// per group. Only for whole-library passes (the photo re-date); the gallery
     /// pages with [`Db::photos_page`].
@@ -602,26 +908,37 @@ impl Db {
         &self,
         kind: Option<crate::control::PhotoKind>,
     ) -> Result<Vec<(i32, i32, usize)>> {
+        self.photos_months_visible(kind, "[]")
+    }
+
+    pub fn photos_months_visible(
+        &self,
+        kind: Option<crate::control::PhotoKind>,
+        excluded: &str,
+    ) -> Result<Vec<(i32, i32, usize)>> {
         let conn = self.read();
         // The scrubber has to agree with the page it scrubs, so it counts what
         // the page shows: groups everywhere except on the Raw tab.
-        let (filter, binds): (&str, Vec<i64>) = match kind {
-            Some(crate::control::PhotoKind::Raw) => (" WHERE kind = 2", Vec::new()),
-            Some(k) => (
-                " WHERE uid = COALESCE(group_key, uid) AND kind = ?1",
-                vec![k.as_i64()],
-            ),
-            None => (" WHERE uid = COALESCE(group_key, uid)", Vec::new()),
+        let filter = match kind {
+            Some(crate::control::PhotoKind::Raw) => "kind = ?2",
+            Some(_) => "uid = COALESCE(group_key, uid) AND kind = ?2",
+            None => "uid = COALESCE(group_key, uid) AND ?2 IS NULL",
         };
         let sql = format!(
-            "SELECT CAST(strftime('%Y', capture_time, 'unixepoch', 'localtime') AS INTEGER) AS y, \
+            "WITH hidden_groups AS (
+                 SELECT COALESCE(group_key, uid) FROM photos
+                 WHERE uid IN (SELECT value FROM json_each(?1))
+             )
+             SELECT CAST(strftime('%Y', capture_time, 'unixepoch', 'localtime') AS INTEGER) AS y, \
                     CAST(strftime('%m', capture_time, 'unixepoch', 'localtime') AS INTEGER) AS m, \
                     COUNT(*) \
-             FROM photos{filter} GROUP BY y, m ORDER BY y DESC, m DESC"
+             FROM photos WHERE {filter}
+                 AND COALESCE(group_key, uid) NOT IN (SELECT * FROM hidden_groups)
+             GROUP BY y, m ORDER BY y DESC, m DESC"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(binds), |r| {
+            .query_map(params![excluded, kind.map(|kind| kind.as_i64())], |r| {
                 Ok((
                     r.get::<_, i32>(0)?,
                     r.get::<_, i32>(1)?,
@@ -637,6 +954,15 @@ impl Db {
     /// pick the date, and its own year is left out, because today's photos are
     /// what the timeline already opens on. One row per group, like the timeline.
     pub fn photos_on_this_day(&self, today: i64, limit: usize) -> Result<Vec<StoredPhoto>> {
+        self.photos_on_this_day_visible(today, limit, "[]")
+    }
+
+    pub fn photos_on_this_day_visible(
+        &self,
+        today: i64,
+        limit: usize,
+        excluded: &str,
+    ) -> Result<Vec<StoredPhoto>> {
         let conn = self.read();
         let sql = format!(
             "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) \
@@ -644,11 +970,12 @@ impl Db {
                  = strftime('%m-%d', ?1, 'unixepoch', 'localtime') \
              AND strftime('%Y', p.capture_time, 'unixepoch', 'localtime') \
                  < strftime('%Y', ?1, 'unixepoch', 'localtime') \
+             AND p.uid NOT IN (SELECT value FROM json_each(?3))
              ORDER BY p.seq LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![today, limit as i64], stored_photo)?
+            .query_map(params![today, limit as i64, excluded], stored_photo)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -657,6 +984,10 @@ impl Db {
     /// cover, most photographed first. Counted per group, like the timeline;
     /// photos without a location, or taken far from any town, are in none.
     pub fn photo_places(&self) -> Result<Vec<StoredPlace>> {
+        self.photo_places_visible("[]")
+    }
+
+    pub fn photo_places_visible(&self, excluded: &str) -> Result<Vec<StoredPlace>> {
         let rows: Vec<(u32, usize, String)> = {
             let conn = self.read();
             // SQLite fills the bare `uid` from the row `MIN(seq)` picked, which
@@ -664,9 +995,10 @@ impl Db {
             let mut stmt = conn.prepare(
                 "SELECT place_id, COUNT(*), uid, MIN(seq) FROM photos \
                  WHERE uid = COALESCE(group_key, uid) AND place_id IS NOT NULL \
+                 AND uid NOT IN (SELECT value FROM json_each(?1))
                  GROUP BY place_id ORDER BY COUNT(*) DESC, MIN(seq)",
             )?;
-            stmt.query_map([], |r| {
+            stmt.query_map([excluded], |r| {
                 Ok((r.get(0)?, r.get::<_, i64>(1)? as usize, r.get(2)?))
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -696,14 +1028,28 @@ impl Db {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<StoredPhoto>> {
+        self.photos_at_place_visible(id, offset, limit, "[]")
+    }
+
+    pub fn photos_at_place_visible(
+        &self,
+        id: u32,
+        offset: usize,
+        limit: usize,
+        excluded: &str,
+    ) -> Result<Vec<StoredPhoto>> {
         let conn = self.read();
         let sql = format!(
-            "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) AND p.place_id = ?1 \
+            "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) AND p.place_id = ?1
+             AND p.uid NOT IN (SELECT value FROM json_each(?4))
              ORDER BY p.seq LIMIT ?2 OFFSET ?3"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![id, limit as i64, offset as i64], stored_photo)?
+            .query_map(
+                params![id, limit as i64, offset as i64, excluded],
+                stored_photo,
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -884,6 +1230,10 @@ impl Db {
 
     /// Per-tab counts for the Photos page subtitle: `(photos, videos, raw)`.
     pub fn photos_counts(&self) -> Result<(usize, usize, usize)> {
+        self.photos_counts_visible("[]")
+    }
+
+    pub fn photos_counts_visible(&self, excluded: &str) -> Result<(usize, usize, usize)> {
         use crate::control::PhotoKind;
         let conn = self.read();
         // Photos and Videos count groups — one shot is one entry, however many
@@ -891,9 +1241,12 @@ impl Db {
         // them individually.
         let mut stmt = conn.prepare(
             "SELECT kind, COUNT(*) FROM photos \
-             WHERE uid = COALESCE(group_key, uid) OR kind = 2 GROUP BY kind",
+             WHERE (uid = COALESCE(group_key, uid) OR kind = 2)
+             AND uid NOT IN (SELECT value FROM json_each(?1)) GROUP BY kind",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map([excluded], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
         let (mut photos, mut videos, mut raw) = (0usize, 0usize, 0usize);
         for row in rows {
             let (kind, n) = row?;

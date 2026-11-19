@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 
 use super::drive::RevisionRead;
 use super::{
-    Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, TIMELINE_TTL, WriteAuthority,
+    Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, WriteAuthority, link,
     node_size, now_ms, parse_uid,
 };
 
@@ -1144,18 +1144,6 @@ impl Drop for ProgressGuard<'_> {
     }
 }
 
-/// What a timeline enrichment pass resolves for one photo, beyond what the
-/// timeline listing already carries.
-#[derive(Clone, Debug)]
-struct PhotoMeta {
-    name: Option<String>,
-    media_type: Option<String>,
-    favorite: bool,
-    content_hash: Option<String>,
-    /// Where the photo was taken, as its uploader recorded it.
-    location: Option<(f64, f64)>,
-}
-
 impl Core {
     /// [`upload_thumbnails`] for a file about to upload, staging any RAW copy
     /// under this cache. Blocking.
@@ -1175,6 +1163,7 @@ impl Core {
             .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn photos_timeline(
         &self,
         offset: usize,
@@ -1183,21 +1172,29 @@ impl Core {
         range: Option<(i64, i64)>,
         favorites: bool,
         not_in_album: bool,
+        excluded: &str,
     ) -> CoreResult<Option<Vec<PhotoItem>>> {
         let count = self.db.photos_count().map_err(CoreError::from)?;
-        if count == 0 {
-            // Nothing to serve, so this one request has to wait for the fetch —
-            // unless we already know the account has no photos volume and the
-            // answer is a fresh "no".
-            let known_empty = self.db.state_i64(PHOTOS_AVAILABLE).ok().flatten() == Some(0);
-            if known_empty && !self.listing_stale(PHOTOS_SYNCED_MS, TIMELINE_TTL) {
-                return Ok(None);
+        let listed = self
+            .db
+            .state_i64(PHOTOS_SYNCED_MS)
+            .map_err(CoreError::from)?
+            .is_some();
+        if !listed {
+            if count == 0 {
+                if !self.refresh_timeline_joined()? {
+                    return Ok(None);
+                }
+            } else {
+                self.spawn_timeline_refresh();
             }
-            if !self.refresh_timeline_joined()? {
-                return Ok(None);
-            }
-        } else if self.listing_stale(PHOTOS_SYNCED_MS, TIMELINE_TTL) {
-            self.spawn_timeline_refresh();
+        } else if self
+            .db
+            .state_i64(PHOTOS_AVAILABLE)
+            .map_err(CoreError::from)?
+            == Some(0)
+        {
+            return Ok(None);
         }
         // The filter is only as good as the album contents on disk, and those
         // are fetched lazily, per album opened. Fill in the missing ones before
@@ -1208,7 +1205,15 @@ impl Core {
 
         let page = self
             .db
-            .photos_page(offset, limit, kind, range, favorites, not_in_album)
+            .photos_page_visible(
+                offset,
+                limit,
+                kind,
+                range,
+                favorites,
+                not_in_album,
+                excluded,
+            )
             .map_err(CoreError::from)?;
         Ok(Some(page.into_iter().map(|p| self.photo_item(p)).collect()))
     }
@@ -1365,8 +1370,11 @@ impl Core {
     /// The towns the photos were taken in, as wire items. A town the bundled
     /// table no longer knows (the stored id came from an older table) is left
     /// out rather than shown without a name.
-    pub(crate) fn photo_places(&self) -> CoreResult<Vec<PlaceInfo>> {
-        let places = self.db.photo_places().map_err(CoreError::from)?;
+    pub(crate) fn photo_places(&self, excluded: &str) -> CoreResult<Vec<PlaceInfo>> {
+        let places = self
+            .db
+            .photo_places_visible(excluded)
+            .map_err(CoreError::from)?;
         Ok(places
             .into_iter()
             .filter_map(|place| {
@@ -1390,10 +1398,11 @@ impl Core {
         id: u32,
         offset: usize,
         limit: usize,
+        excluded: &str,
     ) -> CoreResult<Vec<PhotoItem>> {
         let photos = self
             .db
-            .photos_at_place(id, offset, limit)
+            .photos_at_place_visible(id, offset, limit, excluded)
             .map_err(CoreError::from)?;
         Ok(photos.into_iter().map(|p| self.photo_item(p)).collect())
     }
@@ -1417,13 +1426,17 @@ impl Core {
     /// Photos taken on today's date in earlier years, as wire items. Served
     /// from the stored timeline only: the strip is a nicety, not worth a wait
     /// on the network, and the timeline's own load keeps that store fresh.
-    pub(crate) fn photos_on_this_day(&self, limit: usize) -> CoreResult<Vec<PhotoItem>> {
+    pub(crate) fn photos_on_this_day(
+        &self,
+        limit: usize,
+        excluded: &str,
+    ) -> CoreResult<Vec<PhotoItem>> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
         let photos = self
             .db
-            .photos_on_this_day(now, limit)
+            .photos_on_this_day_visible(now, limit, excluded)
             .map_err(CoreError::from)?;
         Ok(photos.into_iter().map(|p| self.photo_item(p)).collect())
     }
@@ -2477,162 +2490,113 @@ impl Core {
         }
     }
 
-    /// Whether the listing stamped under `key` is older than `ttl` (or was never
-    /// fetched).
+    /// Commit the lightweight listing before resolving pending nodes. The
+    /// feed generation fences both commits against events received in flight.
     pub(crate) async fn refresh_timeline(&self) -> CoreResult<bool> {
         let started = Instant::now();
+        let generation = self
+            .db
+            .photo_projection_generation()
+            .map_err(CoreError::from)?;
         let photos = self.photos();
-        if photos
-            .get_photos_root()
-            .await
-            .map_err(|e| CoreError::from_api(&e, "photos root"))?
+        if self
+            .db
+            .state_i64(PHOTOS_SYNCED_MS)
+            .map_err(CoreError::from)?
             .is_none()
         {
-            let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 0);
-            let _ = self.db.set_state_i64(PHOTOS_SYNCED_MS, now_ms());
+            let available = link::bounded(photos.get_photos_root())
+                .await
+                .map_err(|e| CoreError::from_api(&e, "photos root"))?
+                .is_some();
+            let items = if available {
+                link::bounded_by(super::BATCH_CALL_TIMEOUT, photos.enumerate_timeline())
+                    .await
+                    .map_err(|e| CoreError::from_api(&e, "timeline"))?
+                    .into_iter()
+                    .map(|item| db::TimelineRow::new(item.uid.to_string(), item.capture_time))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if !self
+                .db
+                .photos_replace_at(&items, generation, available, now_ms())
+                .map_err(CoreError::from)?
+            {
+                return Err(CoreError::remote(
+                    "Photos changed during the refresh. Try again shortly.",
+                ));
+            }
+            if !available {
+                return Ok(false);
+            }
+        } else if self
+            .db
+            .state_i64(PHOTOS_AVAILABLE)
+            .map_err(CoreError::from)?
+            == Some(0)
+        {
             return Ok(false);
         }
-        let items = photos
-            .enumerate_timeline()
-            .await
-            .map_err(|e| CoreError::from_api(&e, "timeline"))?;
 
-        // The timeline DTO carries only a uid and capture time, but the gallery
-        // has to split into its tabs — which needs each photo's name and media
-        // type. Resolve those in batches off the request path. Best-effort: a
-        // photo whose node we fail to resolve keeps whatever was learned before
-        // (or classifies from nothing, i.e. a still photo), so a partial resolve
-        // never blanks the timeline.
-        //
-        // Only photos the daemon has never read, and ones a remote event marked
-        // stale, are read. Resolving all of them every time is what made a
-        // 12k-photo refresh take minutes (`docs/BUGS.md` B92): this metadata does
-        // not change on its own, and when it does change the event feed names the
-        // uid that changed (`Db::photos_mark_unresolved`).
-        let known: HashSet<String> = self
-            .db
-            .photos_resolved()
-            .map_err(CoreError::from)?
-            .into_iter()
-            .collect();
-        let uids: Vec<NodeUid> = items
-            .iter()
-            .filter(|it| !known.contains(&it.uid.to_string()))
-            .map(|it| it.uid.clone())
-            .collect();
-        let resolved_at = now_ms();
-        let mut meta: HashMap<String, PhotoMeta> = HashMap::new();
-        // A main photo names its related photos rather than the other way round,
-        // so the relation is recorded from whichever end resolves — the two ends
-        // can land in different chunks, and one of them may not resolve at all.
-        let mut main_of: HashMap<String, String> = HashMap::new();
-        let mut stopped = false;
-        // Photos read before count as done, so the bar picks up where an
-        // interrupted pass left off. Cleared however the pass ends.
-        let skipped = items.len() - uids.len();
+        let pending = self.db.photos_pending().map_err(CoreError::from)?;
+        let total = self.db.photos_count().map_err(CoreError::from)?;
+        let skipped = total.saturating_sub(pending.len());
+        let mut resolved = 0;
         let progress = ProgressGuard(&self.timeline_progress);
-        if !uids.is_empty() {
-            *progress.0.lock() = Some((skipped, items.len()));
-        }
-        for (index, chunk) in uids.chunks(TIMELINE_ENRICH_CHUNK).enumerate() {
-            // Teardown cancels the runtime under this loop, and every chunk
-            // still in flight then fails its decrypt task — a burst of
-            // "skipping undecryptable photo ... task was cancelled" warnings
-            // that read like corruption and are only a shutdown. Stop asking
-            // for chunks instead. What resolved so far is kept below; the rest
-            // stay unresolved and are read by the next refresh.
+        for (index, chunk) in pending.chunks(TIMELINE_ENRICH_CHUNK).enumerate() {
             if self.shutdown.is_stopping() {
-                stopped = true;
                 break;
             }
-            match photos.enumerate_nodes(chunk).await {
-                Ok(nodes) => {
-                    for node in nodes {
-                        let media_type = match &node.kind {
-                            NodeKind::File { media_type, .. } => Some(media_type.clone()),
-                            NodeKind::Folder => None,
-                        };
-                        // The favorite state is a tag on the photo node, so it
-                        // rides along with the metadata resolve rather than
-                        // costing a listing of its own.
-                        let favorite = node
-                            .photo
-                            .as_ref()
-                            .is_some_and(|p| p.tags.contains(&PhotoTag::Favorite));
-                        let key = node.uid.to_string();
-                        let content_hash = node.photo.as_ref().and_then(|p| p.content_hash.clone());
-                        let location = node
-                            .photo
-                            .as_ref()
-                            .and_then(|p| p.location)
-                            .map(|l| (l.latitude, l.longitude));
-                        if let Some(photo) = node.photo.as_ref() {
-                            if let Some(main) = photo.main_photo_uid.as_ref() {
-                                main_of.insert(key.clone(), main.to_string());
-                            }
-                            for related in &photo.related_photo_uids {
-                                main_of.insert(related.to_string(), key.clone());
-                            }
-                        }
-                        meta.insert(
-                            key,
-                            PhotoMeta {
-                                name: Some(node.name),
-                                media_type,
-                                favorite,
-                                content_hash,
-                                location,
-                            },
-                        );
+            *progress.0.lock() = Some((skipped + index * TIMELINE_ENRICH_CHUNK, total));
+            let uids: Vec<_> = chunk.iter().filter_map(|uid| parse_uid(uid)).collect();
+            let nodes = link::bounded(photos.enumerate_nodes(&uids))
+                .await
+                .map_err(|e| CoreError::from_api(&e, "read photo metadata"))?;
+            let rows: Vec<_> = nodes
+                .into_iter()
+                .filter_map(|node| {
+                    let NodeKind::File { media_type, .. } = node.kind else {
+                        return None;
+                    };
+                    if node.trashed {
+                        return None;
                     }
-                }
-                Err(e) => warn!(error = %e, "resolving photo metadata for a timeline chunk failed"),
+                    let photo = node.photo.as_ref();
+                    Some(db::TimelineRow {
+                        name: Some(node.name),
+                        media_type: Some(media_type),
+                        favorite: Some(photo.is_some_and(|p| p.tags.contains(&PhotoTag::Favorite))),
+                        content_hash: photo.and_then(|p| p.content_hash.clone()),
+                        location: photo
+                            .and_then(|p| p.location)
+                            .map(|l| (l.latitude, l.longitude)),
+                        main_uid: photo
+                            .and_then(|p| p.main_photo_uid.as_ref())
+                            .map(ToString::to_string),
+                        resolved_at: Some(now_ms()),
+                        ..db::TimelineRow::new(node.uid.to_string(), 0)
+                    })
+                })
+                .collect();
+            if !self
+                .db
+                .photos_resolve_at(generation, &rows)
+                .map_err(CoreError::from)?
+            {
+                return Err(CoreError::remote(
+                    "Photos changed during the refresh. Try again shortly.",
+                ));
             }
-            let done = (skipped + (index + 1) * TIMELINE_ENRICH_CHUNK).min(items.len());
-            *progress.0.lock() = Some((done, items.len()));
+            resolved += rows.len();
         }
-        drop(progress);
-
-        let rows: Vec<db::TimelineRow> = items
-            .iter()
-            .map(|it| {
-                let key = it.uid.to_string();
-                let main_uid = main_of.get(&key).cloned();
-                // An unresolved photo keeps whatever was learned before, for the
-                // favorite flag as much as for the name and media type.
-                match meta.get(&key).cloned() {
-                    Some(m) => db::TimelineRow {
-                        name: m.name,
-                        media_type: m.media_type,
-                        favorite: Some(m.favorite),
-                        content_hash: m.content_hash,
-                        location: m.location,
-                        main_uid,
-                        resolved_at: Some(resolved_at),
-                        ..db::TimelineRow::new(key, it.capture_time)
-                    },
-                    None => db::TimelineRow {
-                        main_uid,
-                        ..db::TimelineRow::new(key, it.capture_time)
-                    },
-                }
-            })
-            .collect();
-        self.db.photos_replace(&rows).map_err(CoreError::from)?;
-        let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 1);
-        let _ = self.db.set_state_i64(PHOTOS_SYNCED_MS, now_ms());
-        // How long this took is the first thing to know when a refresh looks
-        // like it never happened, and the chunk count is what it scales with.
         info!(
-            photos = rows.len(),
-            // `resolved` is what came back, which is short of `wanted` when
-            // shutdown cut the pass off or a chunk failed.
-            resolved = meta.len(),
-            wanted = uids.len(),
-            skipped = rows.len().saturating_sub(uids.len()),
-            chunks = uids.len().div_ceil(TIMELINE_ENRICH_CHUNK),
+            photos = total,
+            resolved,
+            wanted = pending.len(),
+            skipped,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            stopped,
             "photos timeline refreshed"
         );
         Ok(true)
@@ -2656,7 +2620,11 @@ impl Core {
             // A refresh that landed stamped the timeline fresh. One that failed
             // did not, and the caller gets this refresh's own error instead of
             // an empty timeline.
-            if !self.listing_stale(PHOTOS_SYNCED_MS, TIMELINE_TTL)
+            if self
+                .db
+                .state_i64(PHOTOS_SYNCED_MS)
+                .map_err(CoreError::from)?
+                .is_some()
                 || self.timeline_refreshing.swap(true, Ordering::SeqCst)
             {
                 return Ok(self.db.state_i64(PHOTOS_AVAILABLE).ok().flatten() != Some(0));

@@ -2696,6 +2696,7 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
         db,
         pdfs_fuse::MountOptions {
             username,
+            gallery_session: Some(session.clone()),
             sweep_mode: config.resolved_conflict_sweep(),
             upload_limit: config.upload_limit.unwrap_or(0),
             download_limit: config.download_limit.unwrap_or(0),

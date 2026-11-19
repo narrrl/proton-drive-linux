@@ -14,12 +14,20 @@ pdfs-core.workspace = true
 zip.workspace = true
 sha1.workspace = true
 proton-drive-rs.workspace = true
+pg-app.workspace = true
+pg-core.workspace = true
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+getrandom = "0.4"
+zeroize.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 fuser.workspace = true
 libc.workspace = true
+rustix = { version = "1", features = ["net", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true

@@ -7,6 +7,7 @@ pkgbase = proton-drive-for-linux-bin
 	arch = x86_64
 	license = MIT
 	depends = fuse3
+	depends = polkit
 	depends = gtk4
 	depends = libadwaita
 	depends = webkitgtk-6.0

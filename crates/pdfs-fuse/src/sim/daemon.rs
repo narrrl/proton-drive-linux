@@ -89,6 +89,7 @@ impl Daemon {
                         db,
                         MountOptions {
                             username: "sim".into(),
+                            gallery_session: None,
                             sweep_mode: AppConfig::default().resolved_conflict_sweep(),
                             upload_limit: 0,
                             download_limit: 0,

@@ -91,6 +91,7 @@ mod drive;
 use drive::{DriveApi, RevisionRead};
 mod events;
 mod filesystem;
+mod gallery;
 mod keeper;
 mod link;
 pub use filesystem::ProtonFs;
@@ -499,6 +500,7 @@ struct Core {
     /// The concrete client, for what [`DriveApi`] does not cover: sharing,
     /// Photos, devices, invitations and public links.
     client: ProtonDriveClient,
+    gallery: Option<Arc<gallery::Gallery>>,
     rt: tokio::runtime::Handle,
     /// The daemon's My Files root. Forked on-demand sessions retain this value
     /// so ownership checks never mistake their own mount root for account scope.
@@ -5770,7 +5772,7 @@ impl Core {
     /// Drop the persisted photos timeline's freshness stamp, so the next timeline
     /// read fetches rather than serving what it already has.
     fn invalidate_photos(&self) {
-        let _ = self.db.clear_state(PHOTOS_SYNCED_MS);
+        let _ = self.db.photos_invalidate();
     }
 
     /// Drop one folder's cached child listing (`rel` is mountpoint-relative), so

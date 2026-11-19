@@ -337,6 +337,10 @@ fn places_group_photos_by_the_nearest_town() {
         .map(|p| p.uid)
         .collect();
     assert_eq!(berlin, ["b2", "b1-jpeg"]);
+    let visible = db.photo_places_visible(r#"["b2","p1"]"#).unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].count, 1);
+    assert_eq!(visible[0].cover.uid, "b1-jpeg");
 }
 
 /// A town's photos come with where each was taken, one per RAW+JPEG shot.
@@ -7165,6 +7169,29 @@ fn a_raw_and_its_jpeg_are_one_entry_in_the_grid() {
         ["jpeg", "raw"]
     );
     assert_eq!(db.photos_group("alone").unwrap().len(), 1);
+
+    let hidden = db
+        .photo_group_members_for(&["raw".to_owned()].into_iter().collect())
+        .unwrap();
+    assert_eq!(
+        hidden,
+        ["raw".to_owned(), "jpeg".to_owned()].into_iter().collect()
+    );
+    let excluded = serde_json::to_string(&hidden).unwrap();
+    assert_eq!(db.photos_counts_visible(&excluded).unwrap(), (1, 0, 0));
+    let months = db.photos_months_visible(None, &excluded).unwrap();
+    assert_eq!(months.len(), 1);
+    assert_eq!(months[0].2, 1);
+    let public = db
+        .photos_page_visible(0, 1, None, None, false, false, &excluded)
+        .unwrap();
+    assert_eq!(
+        public
+            .iter()
+            .map(|photo| photo.uid.as_str())
+            .collect::<Vec<_>>(),
+        ["alone"]
+    );
 }
 
 /// Pixel names the two files of one raw capture after the role each plays, so
@@ -7844,4 +7871,88 @@ fn migration_v45_keeps_existing_device_folders_and_location_ids() {
     );
     db.migrate().unwrap();
     assert_eq!(db.mount_list().unwrap().len(), 2);
+}
+
+#[test]
+fn photo_feed_failure_keeps_the_cursor_and_a_stale_listing_cannot_restore_deleted_rows() {
+    let db = Db::open_in_memory().unwrap();
+    let rows = vec![TimelineRow::new("gone", 200), TimelineRow::new("keep", 100)];
+    db.photos_replace(&rows).unwrap();
+    db.albums_replace(&[StoredAlbum {
+        uid: "album".into(),
+        name: "Test album".into(),
+        photo_count: 2,
+        cover_uid: Some("gone".into()),
+        last_activity: None,
+        shared: false,
+    }])
+    .unwrap();
+    db.album_photos_replace(
+        "album",
+        &[
+            ("gone".into(), 200, None, None),
+            ("keep".into(), 100, None, None),
+        ],
+    )
+    .unwrap();
+    db.set_state_str("photos-cursor-test", "old").unwrap();
+    let stale = db.photo_projection_generation().unwrap();
+    db.conn.lock().execute_batch(
+        "CREATE TEMP TRIGGER reject_cursor BEFORE INSERT ON sync_state WHEN NEW.key='photos-cursor-test'
+         BEGIN SELECT RAISE(ABORT, 'simulated cursor failure'); END;",
+    ).unwrap();
+
+    let gone = ["gone".into()];
+    assert!(
+        db.photos_apply_events("photos-cursor-test", "next", &gone, &[], false, false)
+            .is_err()
+    );
+    assert_eq!(
+        db.state_str("photos-cursor-test").unwrap().as_deref(),
+        Some("old")
+    );
+    assert_eq!(db.photos_count().unwrap(), 2);
+    assert!(db.photos_contains("gone", Some("album")).unwrap());
+    db.conn
+        .lock()
+        .execute("DROP TRIGGER reject_cursor", [])
+        .unwrap();
+
+    db.photos_apply_events("photos-cursor-test", "next", &gone, &[], false, false)
+        .unwrap();
+    assert_eq!(
+        db.state_str("photos-cursor-test").unwrap().as_deref(),
+        Some("next")
+    );
+    assert!(!db.photos_contains("gone", None).unwrap());
+    assert_eq!(
+        db.albums_list().unwrap()[0].cover_uid.as_deref(),
+        Some("keep")
+    );
+    assert!(!db.photos_replace_at(&rows, stale, true, 1).unwrap());
+    assert!(
+        !db.album_photos_replace_at("album", &[("gone".into(), 200, None, None)], stale, 1)
+            .unwrap()
+    );
+    assert!(!db.photos_contains("gone", None).unwrap());
+
+    db.photos_apply_events("photos-cursor-test", "restore", &[], &gone, false, false)
+        .unwrap();
+    let current = db.photo_projection_generation().unwrap();
+    assert!(db.photos_replace_at(&rows, current, true, 2).unwrap());
+    assert!(db.photos_contains("gone", None).unwrap());
+}
+
+#[test]
+fn warm_photo_months_exclude_hidden_groups_with_thirteen_thousand_rows() {
+    let db = Db::open_in_memory().unwrap();
+    let mut rows: Vec<_> = (0..13_000)
+        .map(|i| TimelineRow::new(format!("volume~{i}"), 1_700_000_000 + i))
+        .collect();
+    rows[1].main_uid = Some(rows[0].uid.clone());
+    db.photos_replace(&rows).unwrap();
+    let started = std::time::Instant::now();
+    let months = db.photos_months_visible(None, r#"["volume~1"]"#).unwrap();
+    assert_eq!(months.iter().map(|month| month.2).sum::<usize>(), 12_998);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }

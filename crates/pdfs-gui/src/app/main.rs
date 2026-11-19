@@ -160,6 +160,7 @@ struct Ui {
     pub(crate) details: DetailsState,
     pub(crate) trash: TrashState,
     pub(crate) gallery: GalleryState,
+    drive_galleries: RefCell<std::rc::Weak<pages::drive_galleries::Browser>>,
     pub(crate) shared: SharedState,
     pub(crate) shared_by_me: SharedByMeState,
     pub(crate) devices: DevicesState,
@@ -459,6 +460,7 @@ fn build_window(app: &adw::Application) {
         nav: split.clone(),
         narrow: Cell::new(false),
         file_thumbs: FileThumbnailState::new(),
+        drive_galleries: RefCell::default(),
         login: login_widgets,
         status: StatusState {
             status_inflight: Cell::new(false),
@@ -559,6 +561,10 @@ fn build_window(app: &adw::Application) {
         gallery: GalleryState {
             model: gallery_widgets.model.clone(),
             groups: gallery_widgets.groups.clone(),
+            row_by_photo: RefCell::default(),
+            rendered_layout: Cell::new(None),
+            rendered_photos: Cell::new(0),
+            align_tick: RefCell::default(),
             row_height: Cell::new(ROW_DEFAULT),
             scrolling_down: Cell::new(true),
             scroll_offset: Cell::new(0.0),
@@ -615,6 +621,10 @@ fn build_window(app: &adw::Application) {
             memory_cards: gallery_widgets.memory_cards.clone(),
             has_memories: Cell::new(false),
             date_suppress: Cell::new(false),
+            months_loading: Cell::new(false),
+            months_pending: Cell::new(false),
+            changes_pending: Cell::new(false),
+            viewer: RefCell::new(std::rc::Weak::new()),
             reload_pending: Cell::new(false),
             loading: Cell::new(false),
             has_more: Cell::new(false),
@@ -626,12 +636,14 @@ fn build_window(app: &adw::Application) {
             photo_nothumb: RefCell::new(HashSet::new()),
             thumb_wanted: RefCell::new(HashMap::new()),
             thumb_queue: RefCell::new(VecDeque::new()),
-            thumb_inflight: Cell::new(false),
+            thumb_inflight: RefCell::default(),
+            thumb_generation: Cell::new(0),
             decode_queue: RefCell::new(VecDeque::new()),
             decode_idle: Cell::new(false),
             thumb_source: RefCell::new(None),
             relayout_source: RefCell::new(None),
             bound: RefCell::new(BTreeMap::new()),
+            visible_tiles_pending: Cell::new(0),
             tile_pools: RefCell::new(HashMap::new()),
             list: gallery_widgets.list.clone(),
             selecting: Cell::new(false),
@@ -787,6 +799,11 @@ fn build_window(app: &adw::Application) {
         // thumbnail generation as it paints.
         cancel_file_thumbnails(&ui_nav);
         sync_sidebar(&ui_nav);
+        if st.visible_child_name().as_deref() != Some("gallery")
+            && let Some(browser) = ui_nav.drive_galleries.borrow().upgrade()
+        {
+            browser.close();
+        }
         match st.visible_child_name().as_deref() {
             Some("browser") => reload_browser_view(&ui_nav),
             // The Albums and Places listings are re-read in place. Loading the
@@ -796,7 +813,7 @@ fn build_window(app: &adw::Application) {
             // sight (see `follow_changes`) or nothing is loaded yet.
             Some("gallery") if !ui_nav.gallery.in_collection() => {
                 match ui_nav.gallery.view_switch.active() {
-                    VIEW_ALBUMS => load_albums(&ui_nav),
+                    VIEW_ALBUMS => show_albums(&ui_nav),
                     VIEW_PLACES => load_places(&ui_nav),
                     _ if ui_nav.gallery.timeline_stale.replace(false)
                         || ui_nav.gallery.model.n_items() == 0 =>
@@ -833,6 +850,14 @@ fn build_window(app: &adw::Application) {
         .height_request(WindowState::MIN_HEIGHT)
         .content(&toasts)
         .build();
+    pages::drive_galleries::wire(
+        &ui,
+        &window,
+        &gallery_widgets.drive_galleries,
+        &gallery_widgets.drive_status,
+        &gallery_widgets.add_gallery,
+        &gallery_widgets.hidden_albums,
+    );
     remember_window_state(&ui, app, &window);
     // A wide window docks the details pane beside the files instead of laying it
     // over them.
@@ -1673,7 +1698,9 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
         let on_trash = page.as_deref() == Some("trash");
         let on_gallery = page.as_deref() == Some("gallery");
         // Pages with a level to go back to, besides My files' own history.
-        let in_collection = on_gallery && ui.gallery.in_collection();
+        let in_collection = on_gallery
+            && (ui.gallery.in_collection()
+                || ui.gallery.content.visible_child_name().as_deref() == Some("drive-galleries"));
         let in_shared_folder =
             page.as_deref() == Some("shared") && !ui.shared.nav.borrow().is_empty();
         let in_device_folder =

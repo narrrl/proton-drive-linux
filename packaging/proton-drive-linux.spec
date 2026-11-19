@@ -2,7 +2,7 @@
 #
 # - From a checkout (local builds and the release workflow). From the repository root:
 #     rpmbuild -bb packaging/proton-drive-linux.spec --define "git_dir $PWD" ...
-#   %build needs network so cargo can fetch crates.io (same trade-off as the Arch PKGBUILD).
+#   %build needs network so Cargo can fetch crates.io and Git dependencies.
 # - From the release tarballs (COPR, .github/workflows/copr.yml), when git_dir is not
 #   defined. Source1 holds every crate, so the build runs offline.
 
@@ -10,7 +10,7 @@
 # Match Arch PKGBUILD `!lto` — LTO has broken some GTK/Rust links in practice.
 %global _lto_cflags %{nil}
 
-%{!?version: %global version 3.8.0}
+%{!?version: %global version 3.9.0}
 %global forge https://github.com/narrrl/proton-drive-linux
 # Files come from the checkout, or from the unpacked tag archive.
 %global src %{?git_dir}%{!?git_dir:.}
@@ -39,6 +39,7 @@ BuildRequires:  glib2-devel
 BuildRequires:  webkitgtk6.0-devel
 BuildRequires:  gettext
 
+Requires:       polkit
 Requires:       fuse3
 Requires:       gtk4
 Requires:       libadwaita
@@ -72,16 +73,19 @@ system tray and search launcher. Unofficial and not affiliated with Proton AG.
 test -f %{git_dir}/Cargo.toml
 cp -a %{git_dir}/LICENSE .
 %else
-# -a 1 unpacks the vendored crates into vendor/ inside the source tree.
+# -a 1 unpacks the vendored crates and their source mappings.
 %autosetup -n %{name}-%{version} -a 1
-mkdir -p .cargo
-cat > .cargo/config.toml <<'EOF'
+# Older vendor tarballs contained only crates.io dependencies.
+if [ ! -f .cargo/config.toml ]; then
+  mkdir -p .cargo
+  cat > .cargo/config.toml <<'EOF'
 [source.crates-io]
 replace-with = "vendored-sources"
 
 [source.vendored-sources]
 directory = "vendor"
 EOF
+fi
 %endif
 
 %build
@@ -111,6 +115,8 @@ install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux-tray.desktop \
   %{buildroot}%{_sysconfdir}/xdg/autostart/io.narl.proton-drive-linux-tray.desktop
 install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux.svg \
   %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
+install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux.policy \
+  %{buildroot}/usr/share/polkit-1/actions/io.narl.proton-drive-linux.policy
 install -D -m0644 %{src}/packaging/proton-drive.service \
   %{buildroot}/usr/lib/systemd/user/proton-drive.service
 %{src}/po/build.sh %{buildroot}%{_datadir}/locale
@@ -149,6 +155,7 @@ fi
 %{_sysconfdir}/xdg/autostart/io.narl.proton-drive-linux-tray.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
 /usr/lib/systemd/user/proton-drive.service
+%{_datadir}/polkit-1/actions/io.narl.proton-drive-linux.policy
 %{_datadir}/locale/*/LC_MESSAGES/pdfs.mo
 %{_datadir}/bash-completion/completions/pdfs
 %{_datadir}/zsh/site-functions/_pdfs

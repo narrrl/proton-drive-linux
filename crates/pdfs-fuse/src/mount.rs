@@ -310,6 +310,7 @@ enum Start {
 pub struct MountOptions {
     /// Proton account the session belongs to, for display and per-user paths.
     pub username: String,
+    pub gallery_session: Option<proton_drive_rs::proton_sdk::session::ProtonApiSession>,
     /// What the background conflict sweep may do. See `docs/BUGS.md` B71.
     pub sweep_mode: SweepMode,
     /// Upload and download caps in bytes per second (`0` = no cap).
@@ -456,6 +457,7 @@ pub(crate) fn mount_with(
 ) -> std::io::Result<MountOutcome> {
     let MountOptions {
         username,
+        gallery_session,
         sweep_mode,
         upload_limit,
         download_limit,
@@ -480,9 +482,13 @@ pub(crate) fn mount_with(
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<sync::SyncMsg>();
 
     let paused_until = pause::load_paused_until(&db);
+    let gallery_dir = control_socket.with_file_name("gallery-catalog");
+    let gallery =
+        gallery_session.map(|session| Arc::new(super::gallery::Gallery::new(gallery_dir, session)));
     let core = Core {
         drive,
         client,
+        gallery,
         rt: rt.clone(),
         maintenance: Arc::new(Mutex::new(Default::default())),
         primary_root_uid: root.uid.clone(),
@@ -636,6 +642,9 @@ pub(crate) fn mount_with(
     // Keep the launcher prompt's "This computer" index fresh. Its own thread:
     // the walk is I/O-heavy and must never sit in front of a FUSE callback.
     if matches!(host, Host::Daemon) {
+        if let Some(gallery) = &core.gallery {
+            rt.spawn(gallery.clone().poll(core.clone()));
+        }
         let db = core.db.clone();
         let indexing = core.indexing.clone();
         let transfers = core.transfers.clone();
@@ -954,6 +963,9 @@ fn keep_or_abandon(
 /// Signal every worker to stop, then join them up to [`WORKER_JOIN_DEADLINE`].
 fn halt_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::JoinHandle<()>>) {
     core.shutdown.stop();
+    if let Some(gallery) = &core.gallery {
+        gallery.cancel();
+    }
     core.wake_drain();
     let _ = core.sync_tx.send(sync::SyncMsg::Stop);
     // Connect while the socket still exists — that is the whole point of the

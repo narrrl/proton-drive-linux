@@ -1,5 +1,39 @@
 # Photos
 
+## How Photos is organized
+
+Timeline, Albums, and Places share the same Photos workspace. The Timeline opens
+with the media type, Filters, and, where available, **On this day**. Albums
+contains the two collections **Proton albums** and **Drive galleries**. Add a
+gallery by choosing a folder from **My files**. Opening it or any subfolder
+keeps you in Photos. Back or Escape returns to the parent and its scroll
+position.
+
+**Hidden albums** opens with your Linux sign-in. The app uses the desktop
+polkit prompt, so it needs a running authentication agent and the installed
+polkit policy. Existing hidden albums remain hidden after upgrading. This view
+includes hidden Proton albums and hidden Drive folders, including folders
+inside public galleries. Leaving Hidden albums or switching away from the
+window locks it and closes its previews.
+
+For a system package, the policy is installed with the app. For a source build
+or a per-user tarball install, have your system administrator install
+`packaging/io.narl.proton-drive-linux.policy` (or the corresponding file under the
+tarball's `share/polkit-1/actions/`) into the system polkit actions directory.
+On NixOS, enable `security.polkit` and install the package system-wide to
+register its policy.
+
+GTK pages Timeline, Proton albums, and Places through the Drive daemon's Photos
+control requests backed by its SQLite database. Saved Drive galleries come from
+the shared Proton Gallery catalog, which the daemon hosts for the signed-in
+account. Photos applies that catalog's visibility rules to public queries.
+Hidden albums use separate, unlock-gated requests. Thumbnails in the hidden
+view are kept in memory and cleared on lock.
+
+Ctrl+mousewheel changes timeline tile size. GTK updates only the changed row
+range and keeps the visible photo in place. As you scroll, each new page
+updates the last affected section and adds new sections below it.
+
 The **Photos** page of the app shows your Proton Photos library. Photos are stored apart from
 My files, so they do not appear in `~/ProtonDrive`.
 

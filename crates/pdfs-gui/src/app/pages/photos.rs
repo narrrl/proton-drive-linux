@@ -12,6 +12,10 @@ pub(crate) struct GalleryState {
     /// 1,600 photos (a Takeout import lands one) would otherwise be 1,600
     /// widgets built in a single bind.
     pub(crate) groups: gio::ListStore,
+    pub(crate) row_by_photo: RefCell<HashMap<String, (u32, i64)>>,
+    pub(crate) rendered_layout: Cell<Option<(i32, i32, bool)>>,
+    pub(crate) rendered_photos: Cell<u32>,
+    pub(crate) align_tick: RefCell<Option<gtk4::TickCallbackId>>,
     /// Target row height in px, retuned by Ctrl+scroll / Ctrl+± (see
     /// [`zoom_gallery`]). Each row is filled with photos at their own aspect
     /// ratios and then scaled to the content width, so this is the height a row
@@ -28,6 +32,10 @@ pub(crate) struct GalleryState {
     /// spans (newest first).
     pub(crate) scrubber: Scrubber,
     pub(crate) months: RefCell<Vec<PhotoMonth>>,
+    pub(crate) months_loading: Cell<bool>,
+    pub(crate) months_pending: Cell<bool>,
+    pub(crate) changes_pending: Cell<bool>,
+    pub(crate) viewer: RefCell<std::rc::Weak<Viewer>>,
     /// The pending jump the scrubber debounces to.
     pub(crate) scrub_source: RefCell<Option<glib::SourceId>>,
     /// A scrubber jump in progress: the end of the month it is headed for.
@@ -175,7 +183,8 @@ pub(crate) struct GalleryState {
     pub(crate) scrolling_down: Cell<bool>,
     /// The scroll offset the direction was last decided at.
     pub(crate) scroll_offset: Cell<f64>,
-    pub(crate) thumb_inflight: Cell<bool>,
+    pub(crate) thumb_inflight: RefCell<HashSet<String>>,
+    pub(crate) thumb_generation: Cell<u64>,
     /// Thumbnails on disk waiting to be turned into textures, as `(uid, path)`.
     /// Decoding happens on the GTK thread (textures are not `Send`), so it is fed
     /// a few at a time from an idle callback rather than in one blocking burst
@@ -193,7 +202,8 @@ pub(crate) struct GalleryState {
     /// model has to be rebuilt — this is what lets the rebuild put the user
     /// back where they were. The ListView realises rows beyond both edges of
     /// the viewport, so the widget is what tells which of them is on screen.
-    pub(crate) bound: RefCell<BTreeMap<u32, (Option<String>, gtk4::Box)>>,
+    pub(crate) bound: RefCell<BTreeMap<u32, BoundRow>>,
+    pub(crate) visible_tiles_pending: Cell<u32>,
     /// The tile widgets each row box has built, rebound to new photos as the
     /// ListView recycles the row rather than built afresh on every bind.
     pub(crate) tile_pools: RefCell<HashMap<gtk4::Box, Vec<TileWidget>>>,
@@ -397,6 +407,12 @@ pub(crate) enum GalleryRow {
     },
 }
 
+pub(crate) struct BoundRow {
+    anchor: Option<String>,
+    widget: gtk4::Box,
+    item: glib::WeakRef<gtk4::ListItem>,
+}
+
 /// A section heading row.
 #[derive(Clone, PartialEq)]
 pub(crate) struct SectionHeading {
@@ -452,6 +468,15 @@ impl GalleryRow {
                     && a.len() == b.len()
                     && a.iter().zip(b).all(|(x, y)| {
                         x.photo.uid == y.photo.uid
+                            && x.photo.capture_time == y.photo.capture_time
+                            && x.photo.name == y.photo.name
+                            && x.photo.thumb_path == y.photo.thumb_path
+                            && x.photo.no_thumb == y.photo.no_thumb
+                            && x.photo.kind == y.photo.kind
+                            && x.photo.group_size == y.photo.group_size
+                            && x.photo.has_raw == y.photo.has_raw
+                            && x.photo.ratio == y.photo.ratio
+                            && x.photo.place_id == y.photo.place_id
                             && x.width == y.width
                             && x.height == y.height
                             && x.selecting == y.selecting
@@ -467,6 +492,10 @@ impl GalleryRow {
 
 /// The widgets [`build_gallery_page`] hands back to [`build_window`].
 pub(crate) struct GalleryWidgets {
+    pub(crate) drive_galleries: gtk4::FlowBox,
+    pub(crate) drive_status: gtk4::Label,
+    pub(crate) add_gallery: gtk4::Button,
+    pub(crate) hidden_albums: gtk4::Button,
     /// Flat, newest-first list of every loaded photo. Backs the lightbox's
     /// prev/next navigation; the visible sections are derived from it.
     pub(crate) model: gio::ListStore,
@@ -737,8 +766,9 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let filters = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     filters.set_hexpand(true);
     let tabs_scroll = scroll_sideways(&tabs.widget());
-    tabs_scroll.set_hexpand(true);
-    tabs_scroll.set_propagate_natural_width(false);
+    filters.set_halign(gtk4::Align::Start);
+    tabs_scroll.set_propagate_natural_width(true);
+    tabs_scroll.set_max_content_width(520);
     filters.append(&tabs_scroll);
     filters.append(&filter_btn);
 
@@ -815,11 +845,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .max_children_per_line(8)
         .valign(gtk4::Align::Start)
         .build();
-    let albums_scroll = gtk4::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .child(&albums)
-        .build();
+    albums.add_css_class("photo-album-grid");
     let albums_status = adw::StatusPage::builder()
         .icon_name("pdfs-album-symbolic")
         .vexpand(true)
@@ -827,7 +853,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     albums_status.add_css_class("compact");
     let albums_stack = gtk4::Stack::new();
     albums_stack.set_vexpand(true);
-    albums_stack.add_named(&albums_scroll, Some("grid"));
+    albums_stack.add_named(&albums, Some("grid"));
     albums_stack.add_named(&albums_status, Some("status"));
     let new_album = gtk4::Button::builder()
         .child(
@@ -840,9 +866,47 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .action_name("win.new-album")
         .build();
     new_album.add_css_class("pill");
-    let albums_page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    albums_page.append(&new_album);
-    albums_page.append(&albums_stack);
+    let drive_galleries = gtk4::FlowBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .homogeneous(true)
+        .row_spacing(12)
+        .column_spacing(12)
+        .min_children_per_line(1)
+        .max_children_per_line(8)
+        .valign(gtk4::Align::Start)
+        .build();
+    drive_galleries.add_css_class("photo-album-grid");
+    let drive_status = gtk4::Label::builder().xalign(0.0).wrap(true).build();
+    drive_status.add_css_class("dim-label");
+    let add_gallery = gtk4::Button::with_label(&gettext("Add gallery"));
+    add_gallery.add_css_class("pill");
+    let hidden_albums = gtk4::Button::builder()
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name("changes-prevent-symbolic")
+                .label(gettext("Hidden albums"))
+                .build(),
+        )
+        .halign(gtk4::Align::Start)
+        .build();
+    hidden_albums.add_css_class("flat");
+    let album_sections = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+    album_sections.append(&hidden_albums);
+    album_sections.append(&album_section_header(&gettext("Proton albums"), &new_album));
+    album_sections.append(&albums_stack);
+    album_sections.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    album_sections.append(&album_section_header(
+        &gettext("Drive galleries"),
+        &add_gallery,
+    ));
+    album_sections.append(&drive_status);
+    album_sections.append(&drive_galleries);
+    albums_stack.set_vexpand(false);
+    let albums_page = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&album_sections)
+        .build();
 
     // The place grid: the same cards, one per town the photos were taken in.
     let places = gtk4::FlowBox::builder()
@@ -944,6 +1008,10 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     (
         frame.upcast(),
         GalleryWidgets {
+            drive_galleries,
+            drive_status,
+            add_gallery,
+            hidden_albums,
             model,
             groups,
             content,
@@ -992,6 +1060,19 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             filters,
         },
     )
+}
+
+fn album_section_header(title: &str, action: &gtk4::Button) -> gtk4::Box {
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let heading = gtk4::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    heading.add_css_class("title-3");
+    header.append(&heading);
+    header.append(action);
+    header
 }
 
 /// Selection mode's controls, hidden until it starts: the count and Cancel
@@ -1049,8 +1130,9 @@ fn build_selection_bar() -> SelectionBar {
 pub(crate) fn sync_header(ui: &Rc<Ui>) {
     let gallery = &ui.gallery;
     let selecting = gallery.selecting.get();
-    let collection = gallery.in_collection();
-    let timeline = collection || gallery.view_switch.active() == VIEW_TIMELINE;
+    let galleries = gallery.content.visible_child_name().as_deref() == Some("drive-galleries");
+    let collection = gallery.in_collection() || galleries;
+    let timeline = !galleries && (collection || gallery.view_switch.active() == VIEW_TIMELINE);
     gallery
         .view_switch
         .widget()
@@ -1058,7 +1140,7 @@ pub(crate) fn sync_header(ui: &Rc<Ui>) {
     gallery.title.set_visible(!selecting && collection);
     gallery.back.set_visible(!selecting && collection);
     gallery.upload.set_visible(!selecting && !collection);
-    gallery.more.set_visible(!selecting);
+    gallery.more.set_visible(!selecting && !galleries);
     gallery.select_btn.set_visible(!selecting && timeline);
     gallery.selection.title.set_visible(selecting);
     gallery.selection.cancel.set_visible(selecting);
@@ -1148,15 +1230,24 @@ fn sync_filter_badge(ui: &Rc<Ui>) {
 /// caller pairs this with a fresh timeline load. Off the UI thread; a failure
 /// just leaves the dropdown as it was.
 pub(crate) fn refresh_photo_months(ui: &Rc<Ui>) {
-    let rx = spawn_request(
-        ui.dirs.control_socket(),
-        Request::PhotoMonths {
-            kind: ui.gallery.kind.get(),
-        },
-    );
+    if ui.gallery.months_loading.replace(true) {
+        ui.gallery.months_pending.set(true);
+        return;
+    }
+    let kind = ui.gallery.kind.get();
+    let rx = spawn_request(ui.dirs.control_socket(), Request::PhotoMonths { kind });
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        let Ok(Ok(Response::PhotoMonths { months })) = rx.recv().await else {
+        let reply = rx.recv().await;
+        ui.gallery.months_loading.set(false);
+        let kind_changed = ui.gallery.kind.get() != kind;
+        if ui.gallery.months_pending.replace(false) || kind_changed {
+            refresh_photo_months(&ui);
+        }
+        if kind_changed {
+            return;
+        }
+        let Ok(Ok(Response::PhotoMonths { months })) = reply else {
             return;
         };
         let mut labels = vec![gettext("All dates")];
@@ -1250,6 +1341,71 @@ pub(crate) fn wire_gallery_empty(ui: &Rc<Ui>, upload: &gtk4::Button, import: &gt
     import.connect_clicked(move |_| ui_import.stack.set_visible_child_name("takeout"));
 }
 
+/// GTK binds a large window of list rows to estimate the scroll range. Give
+/// those rows their height up front and build tile widgets near the viewport.
+fn schedule_visible_tiles(ui: &Rc<Ui>) {
+    // Keep checking through allocations triggered by zoom and anchor restore.
+    if ui.gallery.visible_tiles_pending.replace(3) > 0 {
+        return;
+    }
+    let weak = Rc::downgrade(ui);
+    ui.gallery.list.add_tick_callback(move |list, _| {
+        let Some(ui) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let height = list.height() as f32;
+        let rows: Vec<_> = ui
+            .gallery
+            .bound
+            .borrow()
+            .values()
+            .filter_map(|row| {
+                if row.anchor.is_none()
+                    || row.widget.first_child().is_some()
+                    || !row.widget.is_mapped()
+                {
+                    return None;
+                }
+                let bounds = row.widget.compute_bounds(list)?;
+                let near = bounds.height() > 0.0
+                    && bounds.y() < height + 180.0
+                    && bounds.y() + bounds.height() > -180.0;
+                near.then(|| (row.widget.clone(), row.item.upgrade()))
+                    .and_then(|(widget, item)| {
+                        let row = item?.item()?.downcast::<BoxedAnyObject>().ok()?;
+                        Some((widget, row))
+                    })
+            })
+            .collect();
+        if !rows.is_empty() {
+            let mut pools = ui.gallery.tile_pools.borrow_mut();
+            for (widget, row) in rows {
+                let row = row.borrow::<GalleryRow>();
+                let GalleryRow::Tiles { tiles, .. } = &*row else {
+                    continue;
+                };
+                let pool = pools.entry(widget.clone()).or_default();
+                while pool.len() < tiles.len() {
+                    pool.push(TileWidget::new(&ui));
+                }
+                for (tile_widget, tile) in pool.iter().zip(tiles) {
+                    tile_widget.bind(&ui, tile);
+                    widget.append(&tile_widget.button);
+                }
+            }
+            schedule_thumbs(&ui);
+        }
+        let pending = &ui.gallery.visible_tiles_pending;
+        let remaining = pending.get().saturating_sub(1);
+        pending.set(remaining);
+        if remaining == 0 {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
 pub(crate) fn wire_gallery(
     ui: &Rc<Ui>,
     list: &gtk4::ListView,
@@ -1279,6 +1435,10 @@ pub(crate) fn wire_gallery(
             row_box.remove(&child);
         }
         row_box.set_halign(gtk4::Align::Start);
+        row_box.set_height_request(match &*row {
+            GalleryRow::Tiles { tiles, .. } => tiles.first().map_or(1, |tile| tile.height),
+            _ => -1,
+        });
         match &*row {
             GalleryRow::Memories => {
                 // One strip widget, moved into whichever row box shows it.
@@ -1296,31 +1456,21 @@ pub(crate) fn wire_gallery(
                 row_box.set_margin_bottom(0);
                 row_box.append(&section_heading_widget(&ui_bind, heading));
             }
-            GalleryRow::Tiles { tiles, last, .. } => {
+            GalleryRow::Tiles { last, .. } => {
                 row_box.set_margin_top(0);
                 // The last row of a day carries the gap to the next heading.
                 row_box.set_margin_bottom(if *last { 4 } else { TILE_GAP });
-                let mut pools = ui_bind.gallery.tile_pools.borrow_mut();
-                let pool = pools.entry(row_box.clone()).or_default();
-                for widget in pool.iter() {
-                    widget.release(&ui_bind);
-                }
-                while pool.len() < tiles.len() {
-                    pool.push(TileWidget::new(&ui_bind));
-                }
-                for (widget, tile) in pool.iter().zip(tiles) {
-                    widget.bind(&ui_bind, tile);
-                    row_box.append(&widget.button);
-                }
-                drop(pools);
-                schedule_thumbs(&ui_bind);
+                schedule_visible_tiles(&ui_bind);
             }
         }
-        ui_bind
-            .gallery
-            .bound
-            .borrow_mut()
-            .insert(item.position(), (row.anchor(), row_box.clone()));
+        ui_bind.gallery.bound.borrow_mut().insert(
+            item.position(),
+            BoundRow {
+                anchor: row.anchor(),
+                widget: row_box,
+                item: item.downgrade(),
+            },
+        );
     });
 
     // ListView recycles row widgets, so a scrolled-away row must give up its
@@ -1334,22 +1484,18 @@ pub(crate) fn wire_gallery(
         let Some(row_box) = item.child() else {
             return;
         };
+        ui_unbind
+            .gallery
+            .bound
+            .borrow_mut()
+            .retain(|_, row| row.widget.upcast_ref::<gtk4::Widget>() != &row_box);
+        let pools = ui_unbind.gallery.tile_pools.borrow();
+        if let Some(pool) = row_box
+            .downcast_ref::<gtk4::Box>()
+            .and_then(|row| pools.get(row))
         {
-            let mut bound = ui_unbind.gallery.bound.borrow_mut();
-            if bound
-                .get(&item.position())
-                .is_some_and(|(_, row)| row.upcast_ref::<gtk4::Widget>() == &row_box)
-            {
-                bound.remove(&item.position());
-            }
-        }
-        if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>()
-            && let GalleryRow::Tiles { tiles, .. } = &*obj.borrow::<GalleryRow>()
-        {
-            for tile in tiles {
-                ui_unbind
-                    .gallery
-                    .release_thumb(&tile.photo.uid, |picture| picture.is_ancestor(&row_box));
+            for widget in pool {
+                widget.release(&ui_unbind);
             }
         }
     });
@@ -1382,6 +1528,7 @@ pub(crate) fn wire_gallery(
     // end, so scrolling at a normal pace never reaches it.
     let ui_scroll = ui.clone();
     scroll.vadjustment().connect_value_changed(move |adj| {
+        schedule_visible_tiles(&ui_scroll);
         let last = ui_scroll.gallery.scroll_offset.replace(adj.value());
         if (adj.value() - last).abs() > 1.0 {
             ui_scroll.gallery.scrolling_down.set(adj.value() > last);
@@ -1398,9 +1545,10 @@ pub(crate) fn wire_gallery(
     // one screen. Nothing scrolls then, so the scrolling above never asks for
     // the next page: ask whenever the content shrinks under the viewport.
     let ui_fill = ui.clone();
-    scroll
-        .vadjustment()
-        .connect_changed(move |_| fill_viewport(&ui_fill));
+    scroll.vadjustment().connect_changed(move |_| {
+        schedule_visible_tiles(&ui_fill);
+        fill_viewport(&ui_fill);
+    });
     wire_scrubber(ui);
     wire_drag_select(ui);
 
@@ -1710,7 +1858,8 @@ fn sync_float_heading(ui: &Rc<Ui>) {
     let top = scrolled
         .then(|| {
             let bound = ui.gallery.bound.borrow();
-            bound.iter().find_map(|(position, (_, row))| {
+            bound.iter().find_map(|(position, row)| {
+                let row = &row.widget;
                 let rect = row.compute_bounds(list)?;
                 (row.is_mapped() && rect.y() + rect.height() > 0.0).then_some(*position)
             })
@@ -2203,16 +2352,15 @@ pub(crate) fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec
 /// The narrowest and the widest shape a tile may take, as width over height.
 /// A panorama at its own shape would be a ribbon, and a screenshot of a phone
 /// a thread; past these the thumbnail is cropped to fit.
-pub(crate) const TILE_RATIO_MIN: f64 = 0.5;
-pub(crate) const TILE_RATIO_MAX: f64 = 2.5;
+#[cfg(test)]
+const TILE_RATIO_MIN: f64 = 0.5;
+#[cfg(test)]
+const TILE_RATIO_MAX: f64 = 2.5;
 
 /// The shape a photo's tile takes: its own, clamped, or square while the
 /// daemon has not seen a thumbnail of it yet.
 pub(crate) fn tile_ratio(ratio: Option<f64>) -> f64 {
-    ratio
-        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
-        .unwrap_or(1.0)
-        .clamp(TILE_RATIO_MIN, TILE_RATIO_MAX)
+    pg_core::grid::tile_ratio(ratio.unwrap_or(1.0))
 }
 
 /// The justified layout math: tiles of the given shapes, in order, broken into
@@ -2225,64 +2373,33 @@ pub(crate) fn tile_ratio(ratio: Option<f64>) -> f64 {
 /// two photos from one day stay two photos at the target height, not two
 /// photos as tall as the window.
 pub(crate) fn plan_justified(ratios: &[f64], width: i32, target: i32) -> Vec<Vec<(i32, i32)>> {
-    let width = width.max(1);
-    let target = f64::from(target.clamp(ROW_MIN, ROW_MAX));
-    let gap = f64::from(TILE_GAP);
-    // The height that makes `ratios` span the width exactly.
-    let fit = |ratios: &[f64]| {
-        let gaps = gap * (ratios.len() as f64 - 1.0);
-        (f64::from(width) - gaps).max(1.0) / ratios.iter().sum::<f64>()
+    let Ok(grid) = pg_core::grid::plan_sections(
+        ratios,
+        &[],
+        width.clamp(1, 32_768) as u32,
+        target.clamp(ROW_MIN, ROW_MAX) as u32,
+        TILE_GAP as u32,
+    ) else {
+        return Vec::new();
     };
-    let mut rows = Vec::new();
-    let mut start = 0;
-    while start < ratios.len() {
-        let mut end = start + 1;
-        while end < ratios.len() && fit(&ratios[start..end]) > target {
-            end += 1;
-        }
-        let full = fit(&ratios[start..end]) <= target;
-        // Giving the last photo back leaves the row taller than the target;
-        // keeping it, shorter. Whichever misses by less wins.
-        if full
-            && end - start > 1
-            && fit(&ratios[start..end - 1]) - target < target - fit(&ratios[start..end])
-        {
-            end -= 1;
-        }
-        let row = &ratios[start..end];
-        rows.push(if full {
-            size_row(row, fit(row), Some(width))
-        } else {
-            size_row(row, target, None)
-        });
-        start = end;
-    }
-    rows
-}
-
-/// Tile sizes for one row of shapes at `height`. With `span`, the widths are
-/// rounded so the row, gaps included, is exactly that wide: each tile ends
-/// where its share of the row ends, so no rounding error piles up at the end.
-fn size_row(ratios: &[f64], height: f64, span: Option<i32>) -> Vec<(i32, i32)> {
-    let tile_height = (height.round() as i32).max(1);
-    let Some(span) = span else {
-        return ratios
-            .iter()
-            .map(|ratio| (((ratio * height).round() as i32).max(1), tile_height))
-            .collect();
-    };
-    let content = f64::from(span - TILE_GAP * (ratios.len() as i32 - 1));
-    let total: f64 = ratios.iter().sum();
-    let mut sizes = Vec::with_capacity(ratios.len());
-    let mut done = 0.0;
-    let mut left = 0;
-    for ratio in ratios {
-        done += ratio;
-        let right = (content * done / total).round() as i32;
-        sizes.push(((right - left).max(1), tile_height));
-        left = right;
-    }
-    sizes
+    let ends = grid
+        .row_starts
+        .iter()
+        .copied()
+        .skip(1)
+        .chain(std::iter::once(grid.widths.len() as u32));
+    grid.row_starts
+        .iter()
+        .copied()
+        .zip(ends)
+        .zip(grid.row_heights)
+        .map(|((start, end), height)| {
+            grid.widths[start as usize..end as usize]
+                .iter()
+                .map(|width| (*width as i32, height as i32))
+                .collect()
+        })
+        .collect()
 }
 
 /// The layout math: how many square tiles of about `target` px fit across
@@ -2832,17 +2949,19 @@ fn drag_scroll_speed(ui: &Rc<Ui>, y: f64) -> f64 {
 /// a heading or a gap between rows.
 fn tile_at(ui: &Rc<Ui>, x: f64, y: f64) -> Option<String> {
     let list = &ui.gallery.list;
-    let (position, row) =
-        ui.gallery
-            .bound
-            .borrow()
-            .iter()
-            .find_map(|(position, (anchor, row))| {
-                anchor.as_ref()?;
-                let rect = row.compute_bounds(list)?;
-                let (top, bottom) = (f64::from(rect.y()), f64::from(rect.y() + rect.height()));
-                (row.is_mapped() && y >= top && y < bottom).then(|| (*position, row.clone()))
-            })?;
+    let (position, row) = ui
+        .gallery
+        .bound
+        .borrow()
+        .iter()
+        .find_map(|(position, bound)| {
+            let anchor = &bound.anchor;
+            let row = &bound.widget;
+            anchor.as_ref()?;
+            let rect = row.compute_bounds(list)?;
+            let (top, bottom) = (f64::from(rect.y()), f64::from(rect.y() + rect.height()));
+            (row.is_mapped() && y >= top && y < bottom).then(|| (*position, row.clone()))
+        })?;
     let mut index = 0;
     let mut child = row.first_child();
     let mut i = 0;
@@ -3126,19 +3245,20 @@ pub(crate) fn want_thumb(ui: &Rc<Ui>, photo: &PhotoItem, picture: &gtk4::Picture
 
     ui.gallery.await_thumb(&photo.uid, picture);
 
-    match photo.thumb_path.as_deref() {
-        Some(path) => {
-            ui.gallery
-                .decode_queue
-                .borrow_mut()
-                .push_back((photo.uid.clone(), path.to_string()));
-            schedule_decode(ui);
-        }
-        None => {
-            let mut queue = ui.gallery.thumb_queue.borrow_mut();
-            if !queue.contains(&photo.uid) {
-                queue.push_back(photo.uid.clone());
-            }
+    let mut decode = ui.gallery.decode_queue.borrow_mut();
+    if decode.iter().any(|(uid, _)| uid == &photo.uid)
+        || ui.gallery.thumb_inflight.borrow().contains(&photo.uid)
+    {
+        return;
+    }
+    if let Some(path) = &photo.thumb_path {
+        decode.push_back((photo.uid.clone(), path.clone()));
+        drop(decode);
+        schedule_decode(ui);
+    } else {
+        let mut queue = ui.gallery.thumb_queue.borrow_mut();
+        if !queue.contains(&photo.uid) {
+            queue.push_back(photo.uid.clone());
         }
     }
 }
@@ -3149,7 +3269,11 @@ pub(crate) fn want_thumb(ui: &Rc<Ui>, photo: &PhotoItem, picture: &gtk4::Picture
 /// dropped by [`flush_thumbs`] like any other queued uid.
 pub(crate) fn retry_pending_thumbs(ui: &Rc<Ui>, uids: Vec<String>) {
     let ui = ui.clone();
+    let generation = ui.gallery.thumb_generation.get();
     glib::timeout_add_local_once(THUMB_RETRY, move || {
+        if generation != ui.gallery.thumb_generation.get() {
+            return;
+        }
         {
             let mut queue = ui.gallery.thumb_queue.borrow_mut();
             for uid in uids {
@@ -3165,7 +3289,8 @@ pub(crate) fn retry_pending_thumbs(ui: &Rc<Ui>, uids: Vec<String>) {
 /// Ask the daemon for the queued thumbnails after a short pause, so a fast scroll
 /// coalesces into one batch per settle rather than one per row it flew past.
 pub(crate) fn schedule_thumbs(ui: &Rc<Ui>) {
-    if ui.gallery.thumb_queue.borrow().is_empty() || ui.gallery.thumb_inflight.get() {
+    if ui.gallery.thumb_queue.borrow().is_empty() || !ui.gallery.thumb_inflight.borrow().is_empty()
+    {
         return;
     }
     if let Some(id) = ui.gallery.thumb_source.borrow_mut().take() {
@@ -3182,48 +3307,44 @@ pub(crate) fn schedule_thumbs(ui: &Rc<Ui>) {
 /// Send one [`Request::PhotoThumbs`] batch for the tiles on screen, topped up
 /// with the tiles just beyond them.
 ///
-/// A queued uid whose tile has scrolled away is dropped while the queue is long,
-/// because during a fast scroll what the user is looking at *now* is the only
-/// thing worth the round trip. Once the queue is short the scroll has settled,
-/// and those near misses are the tiles one flick away — fetching them costs one
-/// batch and saves a blank tile, and the reply lands in the texture cache
-/// whether or not a widget still wants it.
+/// Drop queued tiles that are offscreen. The prefetch step then fills spare
+/// room in a visible batch with tiles ahead of the viewport.
 pub(crate) fn flush_thumbs(ui: &Rc<Ui>) {
-    if ui.gallery.thumb_inflight.get() {
+    if !ui.gallery.thumb_inflight.borrow().is_empty() {
         return;
     }
     let uids: Vec<String> = {
         let mut queue = ui.gallery.thumb_queue.borrow_mut();
         let wanted = ui.gallery.thumb_wanted.borrow();
-        let settled = queue.len() <= THUMB_BATCH * 2;
-        let mut batch = Vec::new();
-        let mut skipped = VecDeque::new();
-        while batch.len() < THUMB_BATCH {
-            let Some(uid) = queue.pop_front() else { break };
-            if wanted.contains_key(&uid) || settled {
-                batch.push(uid);
-            } else {
-                skipped.push_back(uid);
-            }
-        }
-        // Anything skipped over stays queued behind what was taken: the scroll
-        // may still come back to it.
-        for uid in skipped.into_iter().rev() {
-            queue.push_front(uid);
-        }
-        batch
+        let cached = ui.gallery.photo_tex.borrow();
+        queue.retain(|uid| {
+            wanted
+                .get(uid)
+                .is_some_and(|tiles| tiles.iter().any(WidgetExt::is_mapped))
+                && !cached.contains_key(uid)
+        });
+        let take = queue.len().min(THUMB_BATCH);
+        queue.drain(..take).collect()
     };
     let uids = prefetch_thumbs(ui, uids);
     if uids.is_empty() {
         return;
     }
 
-    ui.gallery.thumb_inflight.set(true);
+    ui.gallery
+        .thumb_inflight
+        .borrow_mut()
+        .extend(uids.iter().cloned());
+    let generation = ui.gallery.thumb_generation.get();
     let rx = spawn_request(ui.dirs.control_socket(), Request::PhotoThumbs { uids });
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
-        ui.gallery.thumb_inflight.set(false);
+        ui.gallery.thumb_inflight.borrow_mut().clear();
+        if generation != ui.gallery.thumb_generation.get() {
+            schedule_thumbs(&ui);
+            return;
+        }
         match result {
             Ok(Ok(Response::Thumbs { items })) => {
                 let mut decode = ui.gallery.decode_queue.borrow_mut();
@@ -3284,7 +3405,7 @@ fn prefetch_thumbs(ui: &Rc<Ui>, mut batch: Vec<String>) -> Vec<String> {
 
     let cached = ui.gallery.photo_tex.borrow();
     let nothumb = ui.gallery.photo_nothumb.borrow();
-    let mut queue = ui.gallery.thumb_queue.borrow_mut();
+    let queue = ui.gallery.thumb_queue.borrow();
     let mut warmed = 0;
     for index in ahead {
         if warmed >= THUMB_PREFETCH || batch.len() >= THUMB_BATCH {
@@ -3308,11 +3429,10 @@ fn prefetch_thumbs(ui: &Rc<Ui>, mut batch: Vec<String>) -> Vec<String> {
                 continue;
             }
             warmed += 1;
-            if batch.len() < THUMB_BATCH {
-                batch.push(uid.clone());
-            } else {
-                queue.push_back(uid.clone());
+            if batch.len() == THUMB_BATCH {
+                break;
             }
+            batch.push(uid.clone());
         }
     }
     batch
@@ -3331,9 +3451,37 @@ pub(crate) fn schedule_decode(ui: &Rc<Ui>) {
     glib::idle_add_local(move || {
         let batch: Vec<(String, String)> = {
             let mut queue = ui.gallery.decode_queue.borrow_mut();
-            (0..4).filter_map(|_| queue.pop_front()).collect()
+            let wanted = ui.gallery.thumb_wanted.borrow();
+            let list = &ui.gallery.list;
+            let visible = |uid: &str| {
+                wanted.get(uid).is_some_and(|pictures| {
+                    pictures.iter().any(|picture| {
+                        if !picture.is_mapped() {
+                            return false;
+                        }
+                        !picture.is_ancestor(list)
+                            || picture.compute_bounds(list).is_some_and(|bounds| {
+                                bounds.y() + bounds.height() > 0.0
+                                    && bounds.y() < list.height() as f32
+                            })
+                    })
+                })
+            };
+            queue.retain(|(uid, _)| wanted.contains_key(uid));
+            (0..4)
+                .filter_map(|_| {
+                    queue
+                        .iter()
+                        .position(|(uid, _)| visible(uid))
+                        .and_then(|index| queue.remove(index))
+                        .or_else(|| queue.pop_front())
+                })
+                .collect()
         };
         for (uid, path) in batch {
+            if ui.gallery.photo_tex.borrow().contains_key(&uid) {
+                continue;
+            }
             let texture = match gtk4::gdk::Texture::from_filename(&path) {
                 Ok(texture) => texture,
                 Err(e) => {
@@ -3382,19 +3530,19 @@ pub(crate) fn schedule_relayout(ui: &Rc<Ui>) {
 pub(crate) fn relayout_gallery(ui: &Rc<Ui>) {
     // At the very top there is nothing to hold on to: the first photo row sits
     // under a heading, and anchoring on it would scroll that heading away.
-    let at_top = ui
-        .gallery
-        .list
-        .vadjustment()
-        .is_none_or(|adj| adj.value() < 1.0);
-    let anchor = if at_top { None } else { top_anchor(ui) };
+    if let Some(tick) = ui.gallery.align_tick.borrow_mut().take() {
+        tick.remove();
+    }
+    let scroll = ui.gallery.list.vadjustment().map_or(0.0, |adj| adj.value());
+    let anchor = (scroll >= 1.0).then(|| top_anchor(ui)).flatten();
     repaint_gallery(ui);
     let Some((anchor, offset)) = anchor else {
         return;
     };
-    let Some(row) = row_of_photo(&ui.gallery.groups, &anchor) else {
+    let Some(row) = row_of_photo(&ui.gallery, &anchor) else {
         return;
     };
+    tracing::debug!(scroll, row, offset, "Restore Photos zoom anchor");
     // Scrolling to a row only brings it into view, anywhere in it; the rows
     // are laid out over the next frames, so the fine alignment follows them.
     ui.gallery
@@ -3410,59 +3558,76 @@ const ALIGN_FRAMES: u32 = 4;
 /// Scroll so the top of row `position` sits `offset` px below the top of the
 /// viewport, re-checking for a few frames while the rows around it settle.
 fn align_row(ui: &Rc<Ui>, position: u32, offset: f32) {
+    if let Some(tick) = ui.gallery.align_tick.borrow_mut().take() {
+        tick.remove();
+    }
     let ui = ui.clone();
     let frames = Cell::new(0);
-    ui.gallery.list.clone().add_tick_callback(move |list, _| {
+    let during_tick = ui.clone();
+    let tick = ui.gallery.list.add_tick_callback(move |list, _| {
+        let ui = &during_tick;
         frames.set(frames.get() + 1);
         let top = ui
             .gallery
             .bound
             .borrow()
             .get(&position)
-            .filter(|(_, row)| row.is_mapped())
-            .and_then(|(_, row)| row.compute_bounds(list))
-            .map(|rect| rect.y());
-        if let (Some(top), Some(adjustment)) = (top, list.vadjustment()) {
+            .filter(|row| {
+                row.item
+                    .upgrade()
+                    .is_some_and(|item| item.position() == position)
+            })
+            .filter(|row| row.widget.is_mapped())
+            .and_then(|row| row.widget.compute_bounds(list))
+            .filter(|rect| rect.y() + rect.height() >= 0.0 && rect.y() <= list.height() as f32)
+            .map(|rect| (rect.y(), rect.height()));
+        if let (Some((top, height)), Some(adjustment)) = (top, list.vadjustment()) {
+            let offset = offset.max(16.0_f32.min(height) - height);
             let delta = f64::from(top - offset);
             if delta.abs() >= 1.0 {
                 adjustment.set_value(adjustment.value() + delta);
             }
+        } else if frames.get() < ALIGN_FRAMES {
+            list.scroll_to(position, gtk4::ListScrollFlags::NONE, None);
         }
         if frames.get() >= ALIGN_FRAMES {
+            ui.gallery.align_tick.borrow_mut().take();
+            schedule_visible_tiles(ui);
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue
         }
     });
+    *ui.gallery.align_tick.borrow_mut() = Some(tick);
 }
 
-/// The first photo of the topmost photo row that reaches into the viewport,
-/// and how far below the top of the viewport that row starts (negative when it
-/// is partly scrolled off).
-///
-/// Not simply the first bound row: the ListView keeps rows bound well outside
-/// the viewport (unmapped, with their last allocation), and scrolling one of
-/// those "back" to the top is a jump. Falls back to the first bound photo row
-/// while the list isn't on screen.
+/// Find the first photo row GTK actually hit-tests in the viewport. It can
+/// keep other rows bound at an old allocation during scrolling or rebinding.
 fn top_anchor(ui: &Rc<Ui>) -> Option<(String, f32)> {
     let list = &ui.gallery.list;
-    let bound = ui.gallery.bound.borrow();
-    let mut photo_rows = bound
-        .values()
-        .filter_map(|(uid, row)| uid.as_ref().map(|uid| (uid, row)));
-    let first = photo_rows.clone().next().map(|(uid, _)| (uid.clone(), 0.0));
-    photo_rows
-        .find_map(|(uid, row)| {
-            let rect = row.compute_bounds(list)?;
-            (row.is_mapped() && rect.y() + rect.height() > 0.0).then(|| (uid.clone(), rect.y()))
-        })
-        .or(first)
+    let rows = ui.gallery.bound.borrow();
+    let flags = gtk4::PickFlags::NON_TARGETABLE | gtk4::PickFlags::INSENSITIVE;
+    for y in (1..list.height()).step_by(16) {
+        let Some(hit) = list.pick(6.0, f64::from(y), flags) else {
+            continue;
+        };
+        let row = rows.values().find(|row| {
+            row.anchor.is_some()
+                && (hit.is_ancestor(&row.widget) || row.widget.parent().as_ref() == Some(&hit))
+        });
+        if let Some(row) = row
+            && let Some(rect) = row.widget.compute_bounds(list)
+        {
+            return row.anchor.clone().map(|uid| (uid, rect.y()));
+        }
+    }
+    None
 }
 
 /// Scroll the grid just far enough to show photo `uid`, as the lightbox
 /// closes: paging with the arrow keys may have left the grid far behind.
 pub(crate) fn reveal_photo(ui: &Rc<Ui>, uid: &str) {
-    if let Some(row) = row_of_photo(&ui.gallery.groups, uid) {
+    if let Some(row) = row_of_photo(&ui.gallery, uid) {
         ui.gallery
             .list
             .scroll_to(row, gtk4::ListScrollFlags::NONE, None);
@@ -3470,16 +3635,19 @@ pub(crate) fn reveal_photo(ui: &Rc<Ui>, uid: &str) {
 }
 
 /// Which row of the rendered model holds `uid`, if any.
-fn row_of_photo(store: &gio::ListStore, uid: &str) -> Option<u32> {
-    (0..store.n_items()).find(|i| {
+fn row_of_photo(gallery: &GalleryState, uid: &str) -> Option<u32> {
+    let (row, _) = *gallery.row_by_photo.borrow().get(uid)?;
+    let position = row + memory_prefix(&gallery.groups);
+    (position < gallery.groups.n_items()).then_some(position)
+}
+
+fn memory_prefix(store: &gio::ListStore) -> u32 {
+    u32::from(
         store
-            .item(*i)
+            .item(0)
             .and_downcast::<BoxedAnyObject>()
-            .is_some_and(|obj| match &*obj.borrow::<GalleryRow>() {
-                GalleryRow::Memories | GalleryRow::Heading(_) => false,
-                GalleryRow::Tiles { tiles, .. } => tiles.iter().any(|t| t.photo.uid == uid),
-            })
-    })
+            .is_some_and(|row| matches!(*row.borrow::<GalleryRow>(), GalleryRow::Memories)),
+    )
 }
 
 /// Step the target row height by `delta` px and re-flow, clamped to the zoom
@@ -3499,52 +3667,119 @@ pub(crate) fn set_gallery_tile(ui: &Rc<Ui>, tile: i32) {
     schedule_relayout(ui);
 }
 
-/// Rebuild the ListView's row model from the flat photo model: each day becomes
-/// a heading row followed by its grid rows, laid out to the current width and
-/// zoom.
-///
-/// The rows are diffed into the existing store rather than replacing it: a "load
-/// more" only really changes the last day (the one the new page continues) and
-/// appends after it, and clearing the store instead would scroll the user back
-/// to the top of the timeline at the exact moment they asked for more.
+/// Publish one model update, keeping the existing GTK objects for equal rows.
 pub(crate) fn repaint_gallery(ui: &Rc<Ui>) {
-    let rows = build_rows(ui);
-    let store = &ui.gallery.groups;
-
-    for (i, row) in rows.iter().enumerate() {
-        let i = i as u32;
-        let unchanged = store
-            .item(i)
-            .and_downcast::<BoxedAnyObject>()
-            .is_some_and(|old| row.same_as(&old.borrow::<GalleryRow>()));
-        if unchanged {
-            continue;
-        }
-        let boxed = BoxedAnyObject::new(clone_row(row));
-        if i < store.n_items() {
-            store.splice(i, 1, &[boxed]);
-        } else {
-            store.append(&boxed);
-        }
-    }
-    if store.n_items() > rows.len() as u32 {
-        let len = rows.len() as u32;
-        store.splice(len, store.n_items() - len, &[] as &[BoxedAnyObject]);
-    }
-
-    update_gallery_subtitle(ui);
+    repaint_rows(ui, None);
 }
 
-/// Flatten the loaded photos into the rows the ListView renders.
-fn build_rows(ui: &Rc<Ui>) -> Vec<GalleryRow> {
+fn repaint_rows(ui: &Rc<Ui>, append_from: Option<u32>) {
+    let started = std::time::Instant::now();
+    let gallery = &ui.gallery;
+    let store = &gallery.groups;
     let width = gallery_width(ui);
+    let layout = (width, gallery.row_height.get(), gallery.square.get());
+    let memories = u32::from(shows_memories(ui));
+    let tail = append_from
+        .filter(|offset| {
+            *offset == gallery.rendered_photos.get()
+                && gallery.rendered_layout.get() == Some(layout)
+        })
+        .filter(|_| memory_prefix(store) == memories)
+        .and_then(|offset| {
+            (0..store.n_items()).rev().find_map(|index| {
+                let item = store.item(index).and_downcast::<BoxedAnyObject>()?;
+                match &*item.borrow::<GalleryRow>() {
+                    GalleryRow::Heading(heading) => {
+                        Some((index, offset.saturating_sub(heading.uids.len() as u32)))
+                    }
+                    _ => None,
+                }
+            })
+        });
+    let (first_row, first_photo) = tail.unwrap_or((0, 0));
+    let mut rows = build_rows(ui, width, first_photo);
+    if tail.is_none() && memories == 1 {
+        rows.insert(0, GalleryRow::Memories);
+    }
+    gallery.rendered_layout.set(Some(layout));
+    gallery.rendered_photos.set(gallery.model.n_items());
+
+    {
+        let mut index = gallery.row_by_photo.borrow_mut();
+        if tail.is_none() {
+            index.clear();
+        }
+        for (position, row) in rows.iter().enumerate() {
+            if let GalleryRow::Tiles { tiles, .. } = row {
+                let position = first_row + position as u32 - memories;
+                index.extend(
+                    tiles
+                        .iter()
+                        .map(|tile| (tile.photo.uid.clone(), (position, tile.photo.capture_time))),
+                );
+            }
+        }
+    }
+
+    let before = store.n_items() - first_row;
+    let after = rows.len() as u32;
+    let mut matched = 0;
+    let objects: Vec<_> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if let Some(old) = store
+                .item(first_row + index as u32)
+                .and_downcast::<BoxedAnyObject>()
+                && row.same_as(&old.borrow::<GalleryRow>())
+            {
+                matched += 1;
+                return (true, old);
+            }
+            (false, BoxedAnyObject::new(row))
+        })
+        .collect();
+    if before != after || matched != after {
+        let prefix = objects.iter().take_while(|(same, _)| *same).count();
+        let suffix = if before == after {
+            objects[prefix..]
+                .iter()
+                .rev()
+                .take_while(|(same, _)| *same)
+                .count()
+        } else {
+            0
+        };
+        let update: Vec<_> = objects
+            .into_iter()
+            .skip(prefix)
+            .take(after as usize - prefix - suffix)
+            .map(|(_, row)| row)
+            .collect();
+        let planning_ms = started.elapsed().as_millis() as u64;
+        store.splice(
+            first_row + prefix as u32,
+            before - (prefix + suffix) as u32,
+            &update,
+        );
+        tracing::debug!(
+            photos = gallery.rendered_photos.get(),
+            layout_ms = started.elapsed().as_millis() as u64,
+            planning_ms,
+            bound_rows = gallery.bound.borrow().len(),
+            first_photo,
+            rows_before = before,
+            rows_after = after,
+            "Updated Photos rows"
+        );
+    }
+}
+
+fn build_rows(ui: &Rc<Ui>, width: i32, first: u32) -> Vec<GalleryRow> {
     let mut rows = Vec::new();
     let grouping = grouping_for(ui.gallery.row_height.get());
-    if shows_memories(ui) {
-        rows.push(GalleryRow::Memories);
-    }
     let selecting = ui.gallery.selecting.get();
-    for group in group_photos(&ui.gallery.model, grouping) {
+    for group in group_photos_from(&ui.gallery.model, grouping, first) {
         let uids: Vec<String> = group.photos.iter().map(|photo| photo.uid.clone()).collect();
         let selected = selecting && {
             let picked = ui.gallery.selected.borrow();
@@ -3567,22 +3802,6 @@ fn build_rows(ui: &Rc<Ui>) -> Vec<GalleryRow> {
         }
     }
     rows
-}
-
-fn clone_row(row: &GalleryRow) -> GalleryRow {
-    match row {
-        GalleryRow::Memories => GalleryRow::Memories,
-        GalleryRow::Heading(heading) => GalleryRow::Heading(heading.clone()),
-        GalleryRow::Tiles {
-            section,
-            tiles,
-            last,
-        } => GalleryRow::Tiles {
-            section: section.clone(),
-            tiles: tiles.clone(),
-            last: *last,
-        },
-    }
 }
 
 /// "1,204 photos" under the page title.
@@ -3630,21 +3849,32 @@ pub(crate) fn update_gallery_subtitle(ui: &Rc<Ui>) {
     });
 }
 
-pub(crate) fn group_photos(model: &gio::ListStore, grouping: Grouping) -> Vec<PhotoGroup> {
+fn group_photos_from(model: &gio::ListStore, grouping: Grouping, first: u32) -> Vec<PhotoGroup> {
     let mut groups: Vec<PhotoGroup> = Vec::new();
-    for i in 0..model.n_items() {
+    let mut previous = None;
+    let timezone = glib::TimeZone::local();
+    for i in first..model.n_items() {
         let Some(obj) = model.item(i) else { continue };
         let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() else {
             continue;
         };
         let photo = boxed.borrow::<PhotoItem>().clone();
-        let heading = section_heading(photo.capture_time, grouping);
-        match groups.last_mut() {
-            Some(group) if group.heading == heading => group.photos.push(photo),
-            _ => groups.push(PhotoGroup {
-                heading,
+        let day = glib::DateTime::from_unix_utc(photo.capture_time)
+            .and_then(|timestamp| timestamp.to_timezone(&timezone))
+            .ok();
+        let period = day.as_ref().map(|date| match grouping {
+            Grouping::Day => (date.year(), date.month(), date.day_of_month()),
+            Grouping::Month => (date.year(), date.month(), 0),
+            Grouping::Year => (date.year(), 0, 0),
+        });
+        if let Some(group) = groups.last_mut().filter(|_| previous == period) {
+            group.photos.push(photo);
+        } else {
+            groups.push(PhotoGroup {
+                heading: section_heading(photo.capture_time, grouping),
                 photos: vec![photo],
-            }),
+            });
+            previous = period;
         }
     }
     groups
@@ -3820,8 +4050,8 @@ pub(crate) fn sync_scrubber(ui: &Rc<Ui>) {
 const MEMORIES_LIMIT: usize = 200;
 
 /// Size of an "On this day" card's cover, in px.
-const MEMORY_CARD_WIDTH: i32 = 180;
-const MEMORY_CARD_HEIGHT: i32 = 120;
+const MEMORY_CARD_WIDTH: i32 = 144;
+const MEMORY_CARD_HEIGHT: i32 = 92;
 
 /// Ask the daemon for photos taken on today's date in earlier years, and fill
 /// the "On this day" strip with a card per year. A failure leaves the strip
@@ -3953,10 +4183,7 @@ fn shows_memories(ui: &Rc<Ui>) -> bool {
 /// one row changes, so the rest of the list keeps its widgets and position.
 fn sync_memories(ui: &Rc<Ui>) {
     let store = &ui.gallery.groups;
-    let shown = store
-        .item(0)
-        .and_downcast::<BoxedAnyObject>()
-        .is_some_and(|obj| matches!(*obj.borrow::<GalleryRow>(), GalleryRow::Memories));
+    let shown = memory_prefix(store) == 1;
     match (shown, shows_memories(ui)) {
         (false, true) => store.insert(0, &BoxedAnyObject::new(GalleryRow::Memories)),
         (true, false) => store.remove(0),
@@ -3980,11 +4207,7 @@ fn sync_scrubber_position(ui: &Rc<Ui>) {
     let Some((uid, _)) = top_anchor(ui) else {
         return;
     };
-    let Some(capture_time) = find_photo_index(&ui.gallery.model, &uid)
-        .and_then(|idx| ui.gallery.model.item(idx))
-        .and_downcast::<BoxedAnyObject>()
-        .map(|boxed| boxed.borrow::<PhotoItem>().capture_time)
-    else {
+    let Some((_, capture_time)) = ui.gallery.row_by_photo.borrow().get(&uid).copied() else {
         return;
     };
     let months = ui.gallery.months.borrow();
@@ -4074,7 +4297,7 @@ fn continue_jump(ui: &Rc<Ui>) {
     else {
         return;
     };
-    let Some(row) = row_of_photo(&ui.gallery.groups, &uid) else {
+    let Some(row) = row_of_photo(&ui.gallery, &uid) else {
         return;
     };
     // Land on the day heading above the photo when it opens a day.
@@ -4256,6 +4479,27 @@ pub(crate) fn photo_grid_shown(ui: &Ui) -> bool {
 }
 
 pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
+    load_gallery_page(ui, append, None);
+}
+
+pub(crate) fn refresh_visible_photos(ui: &Rc<Ui>) {
+    if ui.gallery.loading.get() {
+        ui.gallery.changes_pending.set(true);
+        return;
+    }
+    if !photo_grid_shown(ui) {
+        ui.gallery.timeline_stale.set(true);
+        return;
+    }
+    let scroll = ui
+        .gallery
+        .list
+        .vadjustment()
+        .map_or(0.0, |adjustment| adjustment.value());
+    load_gallery_page(ui, false, Some(scroll));
+}
+
+fn load_gallery_page(ui: &Rc<Ui>, append: bool, keep_scroll: Option<f64>) {
     sync_filter_badge(ui);
     // A load would put the grid, or its status page, on screen in place of
     // the Albums or Places view the user is looking at. Leave the timeline to
@@ -4280,7 +4524,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
     let album = ui.gallery.album.borrow().as_ref().map(|a| a.uid.clone());
     let place = ui.gallery.place.borrow().as_ref().map(|p| p.id);
     let collection = album.is_some() || place.is_some();
-    if !append {
+    if !append && keep_scroll.is_none() {
         // A scrubber jump looks for a month of the listing being replaced:
         // another filter, album or place has its own months, if any.
         ui.gallery.jump.set(None);
@@ -4306,8 +4550,17 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         }
         sync_memories(ui);
     }
-    let offset = ui.gallery.model.n_items() as usize;
-    let limit = if ui.gallery.burst.replace(false) {
+    if keep_scroll.is_some() && !collection && ui.gallery.range.get().is_none() {
+        refresh_photo_months(ui);
+    }
+    let offset = if append {
+        ui.gallery.model.n_items() as usize
+    } else {
+        0
+    };
+    let limit = if keep_scroll.is_some() {
+        (ui.gallery.model.n_items() as usize).clamp(PHOTOS_PAGE, 1000)
+    } else if ui.gallery.burst.replace(false) {
         JUMP_PAGE
     } else {
         PHOTOS_PAGE
@@ -4337,6 +4590,10 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         ui.gallery.pager.set_visible(false);
         if ui.gallery.reload_pending.take() {
             load_gallery(&ui, false);
+            return;
+        }
+        if ui.gallery.changes_pending.replace(false) {
+            refresh_visible_photos(&ui);
             return;
         }
         // Whoever waited on this page runs once the reply below has put it in
@@ -4387,14 +4644,24 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                         nothumb.insert(item.uid.clone());
                     }
                 }
-                for item in &items {
-                    ui.gallery.model.append(&BoxedAnyObject::new(item.clone()));
+                let items: Vec<_> = items.into_iter().map(BoxedAnyObject::new).collect();
+                let old = if append {
+                    0
+                } else {
+                    ui.gallery.model.n_items()
+                };
+                ui.gallery.model.splice(offset as u32, old, &items);
+                repaint_rows(&ui, append.then_some(offset as u32));
+                if let (Some(scroll), Some(adjustment)) =
+                    (keep_scroll, ui.gallery.list.vadjustment())
+                {
+                    glib::idle_add_local_once(move || adjustment.set_value(scroll));
                 }
-                repaint_gallery(&ui);
                 // The rows are swapped in place, which keeps the old scroll
                 // offset; a fresh load (another kind, month, album or place)
                 // reads from its newest photo.
                 if !append
+                    && keep_scroll.is_none()
                     && ui
                         .gallery
                         .list
@@ -4452,6 +4719,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                 ui.gallery.content.set_visible_child_name("timeline");
                 fill_viewport(&ui);
             }
+            _ if keep_scroll.is_some() && ui.gallery.model.n_items() > 0 => {}
             // A failed *next* page keeps the photos already on screen — the failure
             // goes to a toast rather than wiping the timeline for a status page.
             Ok(Ok(Response::Error { message, .. })) if append => {

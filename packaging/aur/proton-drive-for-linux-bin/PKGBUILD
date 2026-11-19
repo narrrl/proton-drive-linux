@@ -8,7 +8,7 @@ arch=('x86_64')
 url="https://proton-drive.narl.io"
 _repo="https://github.com/narrrl/proton-drive-linux"
 license=('MIT')
-depends=('fuse3' 'gtk4' 'libadwaita' 'webkitgtk-6.0' 'dbus' 'gcc-libs' 'glibc'
+depends=('fuse3' 'polkit' 'gtk4' 'libadwaita' 'webkitgtk-6.0' 'dbus' 'gcc-libs' 'glibc'
          'hicolor-icon-theme')
 optdepends=('perl-image-exiftool: thumbnails for camera RAW files'
             'ffmpeg: video thumbnails'

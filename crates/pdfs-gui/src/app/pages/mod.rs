@@ -3,6 +3,7 @@ pub(crate) mod activity_text;
 pub(crate) mod albums;
 pub(crate) mod browser;
 pub(crate) mod devices;
+pub(crate) mod drive_galleries;
 pub(crate) mod duplicates;
 pub(crate) mod locations;
 pub(crate) mod login;
