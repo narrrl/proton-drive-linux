@@ -11,18 +11,25 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.9.0] — 2026-11-19
+
+Schema: **46**. Photos adds a local database migration for incremental metadata sync.
+
 ### Added
 
 - Open **Drive galleries** in Photos → Albums to browse saved My files folders and their
   subfolders, choose album covers, and manage public links. Saved galleries and
   covers sync with Proton Gallery on desktop and Android.
+- Unlock hidden albums from the Albums view with the local Gallery passphrase.
 
 ### Changed
 
 - Photos uses Proton Gallery's justified row planner. The Photos viewer starts
   and seeks through supported videos without caching the whole original.
 - Gallery-hidden albums and their contents are filtered from Photos and Drive
-  Galleries. Unlock them with the local Gallery passphrase.
+  Galleries until unlocked.
+- Photo grids defer work for off-screen tiles and keep the viewed photo anchored
+  during zoom.
 
 ## [3.8.1] — 2026-11-19
 
@@ -2385,6 +2392,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[3.9.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.9.0
 [3.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.8.1
 [3.5.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.5.0
 [3.4.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.1
