@@ -92,6 +92,12 @@ pub enum Request {
     PhotoGroup {
         uid: String,
     },
+    /// Check the cached photo or its membership in the viewer's open album.
+    PhotoPresence {
+        uid: String,
+        #[serde(default)]
+        album: Option<String>,
+    },
     /// The months the timeline spans (newest first, with per-month counts) so a
     /// front-end can build a date scrubber without paging the whole library.
     /// `kind` scopes the counts to one tab when set.
@@ -241,15 +247,21 @@ pub enum Request {
     /// Open a revision for playback in the local viewer.
     OpenGalleryVideo {
         uid: String,
+        #[serde(default)]
+        private: bool,
     },
     OpenGalleryImage {
         uid: String,
+        #[serde(default)]
+        private: bool,
     },
     CloseGalleryVideo {
         token: String,
     },
     GalleryThumbnail {
         uid: String,
+        #[serde(default)]
+        private: bool,
     },
     DriveGallery {
         action: GalleryAction,
@@ -2016,6 +2028,12 @@ pub enum GalleryAction {
         offset: usize,
         limit: usize,
     },
+    PrivateList {
+        album: Option<GalleryPlace>,
+        proton: bool,
+        offset: usize,
+        limit: usize,
+    },
     Folders {
         parent: Option<String>,
     },
@@ -2047,6 +2065,8 @@ pub struct GalleryFolder {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GalleryAlbum {
     pub place: GalleryPlace,
+    #[serde(default)]
+    pub proton: bool,
     pub folder: GalleryFolder,
     pub cover: Option<String>,
     pub items: u64,
@@ -2548,6 +2568,9 @@ pub enum Response {
         running: bool,
         #[serde(default)]
         summary: Option<RedateSummary>,
+    },
+    PhotoPresence {
+        present: bool,
     },
     /// The months the timeline spans (reply to [`Request::PhotoMonths`]),
     /// newest first.

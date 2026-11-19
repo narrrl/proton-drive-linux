@@ -18,6 +18,9 @@ const COVER_EDGE: i32 = 200;
 pub(crate) fn show_albums(ui: &Rc<Ui>) {
     show_album_grid(ui);
     load_albums(ui);
+    if let Some(browser) = ui.drive_galleries.borrow().upgrade() {
+        browser.load_root();
+    }
 }
 
 /// Switch to the album grid as it was last filled, keeping its scroll
@@ -102,7 +105,7 @@ fn fill_albums(ui: &Rc<Ui>, albums: &[AlbumInfo]) {
         ui.gallery.albums.remove(&child);
     }
     *ui.gallery.album_list.borrow_mut() = albums.to_vec();
-    if ui.gallery.album.borrow().is_none() {
+    if ui.gallery.content.visible_child_name().as_deref() == Some("albums") {
         ui.gallery.title.set_subtitle(&ngettext_f(
             "{n} album",
             "{n} albums",
@@ -125,7 +128,12 @@ fn fill_albums(ui: &Rc<Ui>, albums: &[AlbumInfo]) {
 /// One album as a clickable card: its cover, its name, and how many photos it
 /// holds. An album shared with us says so — it lives on someone else's volume,
 /// and that is worth knowing before opening it.
-fn album_card(ui: &Rc<Ui>, album: &AlbumInfo) -> gtk4::Button {
+pub(crate) fn collection_card(
+    title: &str,
+    subtitle: &str,
+    icon: &str,
+    (width, height): (i32, i32),
+) -> (gtk4::Button, gtk4::Picture) {
     let picture = gtk4::Picture::builder()
         // Fills and crops the cover square, like a timeline tile.
         .content_fit(gtk4::ContentFit::Cover)
@@ -136,7 +144,7 @@ fn album_card(ui: &Rc<Ui>, album: &AlbumInfo) -> gtk4::Button {
     picture.add_css_class("photo-thumb");
 
     let placeholder = gtk4::Image::builder()
-        .icon_name("pdfs-album-symbolic")
+        .icon_name(icon)
         .pixel_size(32)
         .halign(gtk4::Align::Center)
         .valign(gtk4::Align::Center)
@@ -146,12 +154,12 @@ fn album_card(ui: &Rc<Ui>, album: &AlbumInfo) -> gtk4::Button {
     let cover = gtk4::Overlay::new();
     cover.set_child(Some(&placeholder));
     cover.add_overlay(&picture);
-    cover.set_size_request(COVER_EDGE, COVER_EDGE);
+    cover.set_size_request(width, height);
     cover.set_overflow(gtk4::Overflow::Hidden);
     cover.add_css_class("album-cover");
 
     let name = gtk4::Label::builder()
-        .label(&album.name)
+        .label(title)
         .halign(gtk4::Align::Start)
         .xalign(0.0)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
@@ -159,7 +167,7 @@ fn album_card(ui: &Rc<Ui>, album: &AlbumInfo) -> gtk4::Button {
     name.add_css_class("heading");
 
     let count = gtk4::Label::builder()
-        .label(album_subtitle(album))
+        .label(subtitle)
         .halign(gtk4::Align::Start)
         .xalign(0.0)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
@@ -175,7 +183,17 @@ fn album_card(ui: &Rc<Ui>, album: &AlbumInfo) -> gtk4::Button {
     let button = gtk4::Button::builder().child(&card).build();
     button.add_css_class("flat");
     button.add_css_class("album-card");
-    button.set_tooltip_text(Some(&album.name));
+    button.set_tooltip_text(Some(title));
+    (button, picture)
+}
+
+fn album_card(ui: &Rc<Ui>, album: &AlbumInfo) -> gtk4::Button {
+    let (button, picture) = collection_card(
+        &album.name,
+        &album_subtitle(album),
+        "pdfs-album-symbolic",
+        (COVER_EDGE, COVER_EDGE),
+    );
 
     if let Some(uid) = album.cover_uid.clone() {
         want_cover(ui, uid, &picture);
@@ -693,6 +711,12 @@ pub(crate) fn wire_albums(ui: &Rc<Ui>) {
     // where it was, instead of reloading it.
     let ui_back = ui.clone();
     ui.gallery.back.clone().connect_clicked(move |_| {
+        if ui_back.gallery.content.visible_child_name().as_deref() == Some("drive-galleries") {
+            if let Some(browser) = ui_back.drive_galleries.borrow().upgrade() {
+                browser.back();
+            }
+            return;
+        }
         if ui_back.gallery.place.borrow().is_some() {
             show_place_grid(&ui_back);
             return;

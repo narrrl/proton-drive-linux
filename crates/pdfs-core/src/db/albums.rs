@@ -31,8 +31,30 @@ pub struct StoredAlbum {
 impl Db {
     /// Replace the album listing wholesale, in the given order.
     pub fn albums_replace(&self, albums: &[StoredAlbum]) -> Result<()> {
+        self.albums_replace_impl(albums, None).map(|_| ())
+    }
+
+    pub fn albums_replace_at(
+        &self,
+        albums: &[StoredAlbum],
+        generation: i64,
+        now: i64,
+    ) -> Result<bool> {
+        self.albums_replace_impl(albums, Some((generation, now)))
+    }
+
+    fn albums_replace_impl(
+        &self,
+        albums: &[StoredAlbum],
+        stamp: Option<(i64, i64)>,
+    ) -> Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
+        if let Some((generation, _)) = stamp
+            && super::photos::photos_generation(&tx)? != generation
+        {
+            return Ok(false);
+        }
         // Contents of an album that no longer exists (unshared, deleted) go with
         // it — otherwise they would linger forever, keyed by an album uid no
         // listing mentions again.
@@ -56,7 +78,11 @@ impl Db {
             let mut stmt = tx.prepare(
                 "INSERT INTO albums
                    (uid, name, photo_count, cover_uid, last_activity, shared, seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 SELECT ?1,?2,?3,
+                    CASE WHEN EXISTS(SELECT 1 FROM photo_tombstones WHERE uid=?4)
+                    THEN (SELECT uid FROM album_photos WHERE album_uid=?1 ORDER BY seq LIMIT 1) ELSE ?4 END,
+                    ?5,?6,?7
+                 WHERE NOT EXISTS(SELECT 1 FROM photo_tombstones WHERE uid=?1)",
             )?;
             for (seq, album) in albums.iter().enumerate() {
                 stmt.execute(params![
@@ -70,8 +96,11 @@ impl Db {
                 ])?;
             }
         }
+        if let Some((_, now)) = stamp {
+            super::photos::gallery_state(&tx, "albums_synced_ms", now)?;
+        }
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// The persisted album listing, in stored order.
@@ -111,15 +140,44 @@ impl Db {
         album_uid: &str,
         items: &[(String, i64, Option<String>, Option<String>)],
     ) -> Result<()> {
+        self.album_photos_replace_impl(album_uid, items, None)
+            .map(|_| ())
+    }
+
+    pub fn album_photos_replace_at(
+        &self,
+        album_uid: &str,
+        items: &[(String, i64, Option<String>, Option<String>)],
+        generation: i64,
+        now: i64,
+    ) -> Result<bool> {
+        self.album_photos_replace_impl(album_uid, items, Some((generation, now)))
+    }
+
+    fn album_photos_replace_impl(
+        &self,
+        album_uid: &str,
+        items: &[(String, i64, Option<String>, Option<String>)],
+        stamp: Option<(i64, i64)>,
+    ) -> Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let learned: HashMap<String, (Option<f64>, i64, Option<String>)> = {
+        if let Some((generation, _)) = stamp
+            && super::photos::photos_generation(&tx)? != generation
+        {
+            return Ok(false);
+        }
+        type StoredPhotoMetadata = (Option<f64>, i64, Option<String>, Option<String>);
+        let learned: HashMap<String, StoredPhotoMetadata> = {
             let mut stmt = tx.prepare(
-                "SELECT uid, ratio, thumb_state, media_type FROM album_photos
+                "SELECT uid, ratio, thumb_state, media_type, name FROM album_photos
                  WHERE album_uid = ?1",
             )?;
             let rows = stmt.query_map([album_uid], |r| {
-                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
+                ))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -128,15 +186,17 @@ impl Db {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO album_photos
-                   (album_uid, uid, capture_time, name, media_type, kind, ratio, thumb_state, seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                   (album_uid, uid, capture_time, name, media_type, kind, ratio, thumb_state, seq, resolved)
+                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10
+                 WHERE NOT EXISTS(SELECT 1 FROM photo_tombstones WHERE uid IN (?1,?2))",
             )?;
             for (seq, (uid, capture_time, name, media_type)) in items.iter().enumerate() {
-                let (ratio, thumb_state, learned_media) =
-                    learned
-                        .get(uid)
-                        .cloned()
-                        .unwrap_or((None, THUMB_UNKNOWN, None));
+                let (ratio, thumb_state, learned_media, learned_name) = learned
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or((None, THUMB_UNKNOWN, None, None));
+                let resolved = name.is_some();
+                let name = name.clone().or(learned_name);
                 let media_type = media_type.clone().or(learned_media);
                 let kind =
                     crate::control::PhotoKind::classify(name.as_deref(), media_type.as_deref());
@@ -150,11 +210,32 @@ impl Db {
                     ratio,
                     thumb_state,
                     seq as i64,
+                    resolved,
                 ])?;
             }
         }
+        if let Some((_, now)) = stamp {
+            super::photos::gallery_state(&tx, &format!("album_synced_ms:{album_uid}"), now)?;
+        }
         tx.commit()?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Reuse current timeline metadata and resolved album-only metadata.
+    pub fn album_photo_metadata(
+        &self,
+        album: &str,
+    ) -> Result<HashMap<String, (String, Option<String>)>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT uid,name,media_type FROM album_photos
+               WHERE album_uid=?1 AND resolved=1 AND name IS NOT NULL
+             UNION ALL SELECT uid,name,media_type FROM photos
+               WHERE resolved_at IS NOT NULL AND name IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map([album], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// One page of an album's photos, in stored order.

@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 45;
+pub(super) const SCHEMA_VERSION: i64 = 46;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -488,6 +488,17 @@ impl Db {
                 if has_mounts {
                     tx.execute_batch(MIGRATION_V45_MOUNTS)?;
                 }
+            }
+        }
+        if current < 46 {
+            tx.execute_batch(MIGRATION_V46)?;
+            let has_resolved: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('album_photos') WHERE name='resolved')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_resolved {
+                tx.execute_batch(MIGRATION_V46_ALBUM_PHOTOS)?;
             }
         }
         tx.execute(
@@ -1458,4 +1469,14 @@ AFTER UPDATE OF kind ON sync_folder
 BEGIN
   UPDATE mount SET kind = NEW.kind WHERE sync_folder_id = NEW.id;
 END;
+";
+
+/// Keep deletion evidence across listing races and remember unresolved album metadata.
+const MIGRATION_V46: &str = "
+CREATE TABLE IF NOT EXISTS photo_tombstones(uid TEXT PRIMARY KEY);
+";
+
+const MIGRATION_V46_ALBUM_PHOTOS: &str = "
+ALTER TABLE album_photos ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0;
+UPDATE album_photos SET resolved=1 WHERE name IS NOT NULL;
 ";

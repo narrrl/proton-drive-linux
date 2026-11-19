@@ -17,8 +17,8 @@ categories = ["filesystem", "command-line-utilities"]
 [workspace.dependencies]
 proton-sdk = { version = "0.12.1" }
 proton-drive-rs = { version = "0.12.1" }
-pg-app = { git = "https://github.com/narrrl/proton-gallery.git", rev = "72d83a29ad2836c698b18e2f5189a423c60c2399" }
-pg-core = { git = "https://github.com/narrrl/proton-gallery.git", rev = "72d83a29ad2836c698b18e2f5189a423c60c2399" }
+pg-app = { git = "https://github.com/narrrl/proton-gallery.git", rev = "b841c37ad57694470f499f575f7a956425c28ade" }
+pg-core = { git = "https://github.com/narrrl/proton-gallery.git", rev = "b841c37ad57694470f499f575f7a956425c28ade" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Internal crates.

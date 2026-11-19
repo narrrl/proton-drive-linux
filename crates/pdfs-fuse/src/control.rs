@@ -557,6 +557,42 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
     // Registered before the request is even parsed, so a handler that wedges
     // inside the daemon shows up by name in `pdfs diagnostics`.
     let _inflight = super::diagnostics::InflightGuard::new(super::diagnostics::request_kind(&line));
+    if let Ok(CtlRequest::PhotoMonths { kind }) = &request {
+        let started = std::time::Instant::now();
+        let visibility = core.cached_gallery_visibility();
+        let visibility_ms = started.elapsed().as_millis() as u64;
+        let mut database_ms = None;
+        let mut response_started = std::time::Instant::now();
+        let response = match visibility {
+            Ok(visibility) => {
+                let excluded = serde_json::to_string(&visibility.media)
+                    .expect("a set of file identifiers serializes");
+                let query = std::time::Instant::now();
+                let months = core.db.photos_months_visible(*kind, &excluded);
+                response_started = std::time::Instant::now();
+                database_ms = Some(response_started.duration_since(query).as_millis() as u64);
+                match months {
+                    Ok(months) => CtlResponse::PhotoMonths {
+                        months: months
+                            .into_iter()
+                            .map(|(year, month, count)| PhotoMonth { year, month, count })
+                            .collect(),
+                    },
+                    Err(error) => CtlResponse::error(error.into()),
+                }
+            }
+            Err(error) => CtlResponse::error(error),
+        };
+        write_response(stream, response);
+        tracing::info!(
+            visibility_ms,
+            database_ms,
+            response_ms = response_started.elapsed().as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "PhotoMonths timings"
+        );
+        return;
+    }
     let visibility = if matches!(
         &request,
         Ok(CtlRequest::PhotosTimeline { .. }
@@ -569,9 +605,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             | CtlRequest::PhotoGroup { .. }
             | CtlRequest::PhotoAlbums
             | CtlRequest::AlbumPhotos { .. }
-            | CtlRequest::PhotoMonths { .. }
             | CtlRequest::PhotoThumbs { .. }
-            | CtlRequest::OpenGalleryImage { .. }
+            | CtlRequest::OpenGalleryImage { private: false, .. }
             | CtlRequest::OpenPhoto { .. })
     ) {
         core.gallery_visibility()
@@ -659,7 +694,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         // A full refresh is "forget what you know", not a second code
                         // path: the ordinary refresh then finds every photo stale.
                         if let Some(Err(e)) = full.then(|| core.db.photos_mark_all_unresolved()) {
-                            warn!(error = %e, "marking the whole timeline unresolved failed");
+                            return write_response(stream, CtlResponse::error(e.into()));
                         }
                         // Whatever changed the timeline can just as easily have
                         // changed an album; one scope covers the whole photos view.
@@ -838,17 +873,22 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 core.remove_from_album(album, photos)
             })
         }
-        Ok(CtlRequest::PhotoMonths { kind }) => {
-            match core.db.photos_months_visible(kind, &excluded) {
-                Ok(months) => CtlResponse::PhotoMonths {
-                    months: months
-                        .into_iter()
-                        .map(|(year, month, count)| PhotoMonth { year, month, count })
-                        .collect(),
-                },
-                Err(e) => CtlResponse::error(e.into()),
+        Ok(CtlRequest::PhotoPresence { uid, album }) => match core.cached_gallery_visibility() {
+            Ok(visibility)
+                if visibility.media.contains(&uid)
+                    || album
+                        .as_ref()
+                        .is_some_and(|uid| visibility.albums.contains(uid)) =>
+            {
+                CtlResponse::PhotoPresence { present: false }
             }
-        }
+            Ok(_) => match core.db.photos_contains(&uid, album.as_deref()) {
+                Ok(present) => CtlResponse::PhotoPresence { present },
+                Err(error) => CtlResponse::error(error.into()),
+            },
+            Err(error) => CtlResponse::error(error),
+        },
+        Ok(CtlRequest::PhotoMonths { .. }) => unreachable!("handled before visibility requests"),
         Ok(CtlRequest::PhotoThumbs { uids }) => {
             let parsed: Vec<NodeUid> = uids
                 .iter()
@@ -915,10 +955,16 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::DriveGallery { action }) => core
             .drive_gallery(action)
             .unwrap_or_else(CtlResponse::error),
-        Ok(CtlRequest::OpenGalleryVideo { uid }) => core
-            .open_gallery_video(&uid)
+        Ok(CtlRequest::OpenGalleryVideo { uid, private }) => core
+            .open_gallery_video(&uid, private)
             .unwrap_or_else(CtlResponse::error),
-        Ok(CtlRequest::OpenGalleryImage { uid }) => match visibility
+        Ok(CtlRequest::OpenGalleryImage { uid, private: true }) => {
+            core.gallery_image(&uid).unwrap_or_else(CtlResponse::error)
+        }
+        Ok(CtlRequest::OpenGalleryImage {
+            uid,
+            private: false,
+        }) => match visibility
             .permits(&uid)
             .and_then(|()| core.open_shared_file(&uid))
         {
@@ -930,8 +976,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::CloseGalleryVideo { token }) => core
             .close_gallery_video(&token)
             .unwrap_or_else(CtlResponse::error),
-        Ok(CtlRequest::GalleryThumbnail { uid }) => core
-            .gallery_thumbnail(&uid)
+        Ok(CtlRequest::GalleryThumbnail { uid, private }) => core
+            .gallery_thumbnail(&uid, private)
             .unwrap_or_else(CtlResponse::error),
         // The scan alone walks every archive's central directory, so even the
         // dry run goes to a background thread and is read back through
@@ -1049,7 +1095,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                             // timeline, and the GUI reloads the gallery the moment this
                             // reply lands — so refresh now rather than leaving it to a
                             // background pass that would land just after that reload.
-                            if let Err(e) = core.rt.block_on(core.refresh_timeline()) {
+                            core.invalidate_photos();
+                            if let Err(e) = core.refresh_timeline_joined() {
                                 warn!(error = %e, "timeline refresh after upload failed");
                             }
                             CtlResponse::Ok {

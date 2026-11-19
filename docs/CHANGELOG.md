@@ -13,7 +13,7 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ### Added
 
-- Open **Drive Galleries** from Photos to browse saved My files folders and their
+- Open **Drive galleries** in Photos → Albums to browse saved My files folders and their
   subfolders, choose album covers, and manage public links. Saved galleries and
   covers sync with Proton Gallery on desktop and Android.
 

@@ -1,8 +1,12 @@
 use crate::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use pdfs_core::control::{GalleryAction, GalleryAlbum, GalleryFolder, GalleryPlace};
+use std::collections::VecDeque;
 
 const PAGE: usize = 150;
+const THUMB_CACHE: usize = 256;
+type ThumbnailKey = (u64, bool, String);
+type ThumbnailTarget = (glib::WeakRef<gtk4::Picture>, glib::WeakRef<gtk4::Image>);
 
 #[derive(Clone)]
 enum Row {
@@ -19,14 +23,23 @@ struct Place {
 
 pub(crate) struct Browser {
     ui: Rc<Ui>,
-    window: glib::WeakRef<gtk4::Window>,
+    root: gtk4::FlowBox,
+    root_status: gtk4::Label,
+    root_loading: Cell<bool>,
+    root_loaded: Cell<bool>,
+    root_generation: Cell<u64>,
+    root_reload: Cell<bool>,
+    preview: glib::WeakRef<adw::Dialog>,
+    unlock_pending: Cell<bool>,
     rows: gio::ListStore,
     scroll: gtk4::ScrolledWindow,
     title: adw::WindowTitle,
     status: gtk4::Label,
     choose: gtk4::Button,
+    unlock: gtk4::Button,
+    more: gtk4::Button,
     trail: RefCell<Vec<Place>>,
-    chooser: RefCell<Option<Vec<GalleryFolder>>>,
+    chooser: RefCell<Option<Vec<(GalleryFolder, f64)>>>,
     cover: RefCell<Option<GalleryPlace>>,
     albums: RefCell<Vec<GalleryAlbum>>,
     items: RefCell<Vec<PhotoItem>>,
@@ -36,21 +49,174 @@ pub(crate) struct Browser {
     loading: Cell<bool>,
     unlocked: Cell<bool>,
     thumbnail_slots: tokio::sync::Semaphore,
+    thumbnails: RefCell<VecDeque<(bool, String, gtk4::gdk::Texture)>>,
+    thumb_pending: RefCell<HashMap<ThumbnailKey, Vec<ThumbnailTarget>>>,
 }
 
 impl Browser {
+    pub(crate) fn reset(&self) {
+        self.close();
+        self.root_generation
+            .set(self.root_generation.get().wrapping_add(1));
+        self.root_loading.set(false);
+        self.root_loaded.set(false);
+        self.root_reload.set(false);
+        self.root.remove_all();
+        self.root_status.set_label("");
+        self.next_request();
+        self.thumbnails.borrow_mut().clear();
+        self.thumb_pending.borrow_mut().clear();
+    }
+
     pub(crate) fn close(&self) {
-        if let Some(window) = self.window.upgrade() {
-            window.close();
+        if !self.active() {
+            return;
         }
+        self.next_request();
+        self.loading.set(false);
+        self.total.set(0);
+        if self.unlocked.replace(false) || self.unlock_pending.get() {
+            self.lock();
+        }
+        if let Some(preview) = self.preview.upgrade() {
+            preview.force_close();
+        }
+        self.thumbnails
+            .borrow_mut()
+            .retain(|(private, _, _)| !private);
+        self.thumb_pending.borrow_mut().clear();
+        self.trail.borrow_mut().clear();
+        self.chooser.borrow_mut().take();
+        self.cover.borrow_mut().take();
+        self.albums.borrow_mut().clear();
+        self.items.borrow_mut().clear();
+        self.rows.remove_all();
+        self.ui.gallery.title.set_subtitle("");
+        self.ui
+            .gallery
+            .content
+            .set_visible_child_full("albums", gtk4::StackTransitionType::None);
+        sync_header(&self.ui);
+    }
+
+    fn active(&self) -> bool {
+        self.ui.gallery.content.visible_child_name().as_deref() == Some("drive-galleries")
+    }
+
+    fn enter(&self) {
+        self.title.set_subtitle("");
+        self.ui.gallery.filters.set_visible(false);
+        self.ui
+            .gallery
+            .content
+            .set_visible_child_full("drive-galleries", gtk4::StackTransitionType::None);
+        sync_header(&self.ui);
     }
 
     pub(crate) fn refresh_visibility(self: &Rc<Self>) {
-        if self.chooser.borrow().is_none() {
-            self.trail.borrow_mut().clear();
-            self.cover.borrow_mut().take();
-            self.load(0, 0.0);
+        self.thumbnails.borrow_mut().clear();
+        self.root.remove_all();
+        self.load_root();
+        if !self.active() || self.chooser.borrow().is_some() || self.unlock_pending.get() {
+            return;
         }
+        if let Some(preview) = self.preview.upgrade() {
+            preview.force_close();
+        }
+        if self.unlocked.get() {
+            self.close();
+        } else {
+            self.load(0, self.scroll.vadjustment().value());
+        }
+    }
+
+    pub(crate) fn load_root(self: &Rc<Self>) {
+        if self.root_loading.replace(true) {
+            self.root_reload.set(true);
+            return;
+        }
+        let generation = self.root_generation.get();
+        if !self.root_loaded.get() {
+            self.root_status.set_label(&gettext("Loading galleries…"));
+        }
+        let rx = spawn_request(
+            self.ui.dirs.control_socket(),
+            Request::DriveGallery {
+                action: GalleryAction::List {
+                    album: None,
+                    offset: 0,
+                    limit: PAGE,
+                },
+            },
+        );
+        let browser = self.clone();
+        glib::spawn_future_local(async move {
+            let response = rx.recv().await;
+            if generation != browser.root_generation.get() {
+                return;
+            }
+            browser.root_loading.set(false);
+            if browser.root_reload.replace(false) {
+                browser.load_root();
+            }
+            let Ok(Ok(Response::GalleryPage { albums, .. })) = response else {
+                browser.root_status.set_label(&match response {
+                    Ok(Ok(Response::Error { message, .. })) => message,
+                    _ => gettext("Couldn’t load Drive galleries."),
+                });
+                return;
+            };
+            browser.root_loaded.set(true);
+            browser.root_status.set_label(&if albums.is_empty() {
+                gettext("No Drive galleries yet.")
+            } else {
+                String::new()
+            });
+            browser.root.remove_all();
+            for album in albums {
+                let card = browser.album_tile(&album, 185, false);
+                let weak = Rc::downgrade(&browser);
+                card.connect_clicked(move |_| {
+                    if let Some(browser) = weak.upgrade() {
+                        browser.enter();
+                        browser.trail.borrow_mut().push(Place {
+                            album: album.clone(),
+                            parent_offset: 0.0,
+                        });
+                        browser.load(0, 0.0);
+                    }
+                });
+                browser.root.append(&card);
+            }
+        });
+    }
+
+    fn album_tile(
+        self: &Rc<Self>,
+        album: &GalleryAlbum,
+        width: i32,
+        private: bool,
+    ) -> gtk4::Button {
+        let items = ngettext_f("{n} item", "{n} items", album.items, &[]);
+        let count = if album.folders > 0 {
+            let folders = ngettext_f("{n} folder", "{n} folders", album.folders, &[]);
+            format!("{items} · {folders}")
+        } else {
+            items
+        };
+        let (button, picture) = super::albums::collection_card(
+            &album.folder.name,
+            &count,
+            if album.proton {
+                "pdfs-album-symbolic"
+            } else {
+                "folder-symbolic"
+            },
+            (width, width.min(200)),
+        );
+        button.set_halign(gtk4::Align::Start);
+        wire_thumbnail(self, &picture, album.cover.as_deref(), private, None);
+        button
     }
 
     fn current(&self) -> Option<GalleryAlbum> {
@@ -64,34 +230,57 @@ impl Browser {
     }
 
     fn load(self: &Rc<Self>, offset: usize, restore: f64) {
+        self.load_page(offset, restore, false);
+    }
+
+    fn load_page(self: &Rc<Self>, offset: usize, restore: f64, keep: bool) {
         self.choose.set_visible(false);
+        self.unlock.set_visible(false);
+        self.more.set_visible(true);
         self.loading.set(true);
         let generation = if offset == 0 {
-            self.total.set(0);
-            self.albums.borrow_mut().clear();
-            self.items.borrow_mut().clear();
-            self.rows.remove_all();
+            if !keep {
+                self.total.set(0);
+                self.albums.borrow_mut().clear();
+                self.items.borrow_mut().clear();
+                self.rows.remove_all();
+            }
             self.next_request()
         } else {
             self.generation.get()
         };
         let album = self.current();
-        self.title.set_title(
-            album
-                .as_ref()
-                .map_or_else(|| gettext("Drive Galleries"), |a| a.folder.name.clone())
-                .as_str(),
-        );
+        let private = self.unlocked.get();
+        self.title.set_title(&album.as_ref().map_or_else(
+            || {
+                if private {
+                    gettext("Hidden albums")
+                } else {
+                    gettext("Drive galleries")
+                }
+            },
+            |a| a.folder.name.clone(),
+        ));
         self.status.set_label(&gettext("Loading…"));
+        let proton = album.as_ref().is_some_and(|a| a.proton);
+        let place = album.map(|a| a.place);
+        let action = if private {
+            GalleryAction::PrivateList {
+                album: place,
+                proton,
+                offset,
+                limit: PAGE,
+            }
+        } else {
+            GalleryAction::List {
+                album: place,
+                offset,
+                limit: PAGE,
+            }
+        };
         let rx = spawn_request(
             self.ui.dirs.control_socket(),
-            Request::DriveGallery {
-                action: GalleryAction::List {
-                    album: album.map(|a| a.place),
-                    offset,
-                    limit: PAGE,
-                },
-            },
+            Request::DriveGallery { action },
         );
         let browser = self.clone();
         glib::spawn_future_local(async move {
@@ -108,6 +297,7 @@ impl Browser {
                 })) => {
                     if offset == 0 {
                         *browser.albums.borrow_mut() = albums;
+                        browser.items.borrow_mut().clear();
                     }
                     browser.items.borrow_mut().extend(items);
                     browser.total.set(total);
@@ -115,16 +305,17 @@ impl Browser {
                     let message = if browser.cover.borrow().is_some() {
                         gettext("Choose a photo or video as the album cover.")
                     } else if empty {
-                        gettext("This gallery is empty.")
+                        if private && browser.current().is_none() {
+                            gettext("No hidden albums.")
+                        } else {
+                            gettext("This gallery is empty.")
+                        }
                     } else {
                         String::new()
                     };
                     browser.status.set_label(&message);
                     browser.rebuild();
-                    if restore > 0.0 {
-                        let scroll = browser.scroll.clone();
-                        glib::idle_add_local_once(move || scroll.vadjustment().set_value(restore));
-                    }
+                    browser.restore_offset(generation, restore);
                 }
                 Ok(Ok(Response::Error { message, .. })) => browser.status.set_label(&message),
                 _ => browser
@@ -134,14 +325,20 @@ impl Browser {
         });
     }
 
-    fn browse_folders(self: &Rc<Self>) {
+    fn browse_folders(self: &Rc<Self>, restore: f64) {
         let Some(trail) = self.chooser.borrow().clone() else {
             return;
         };
         let generation = self.next_request();
-        let parent = trail.last().map(|folder| folder.uid.clone());
+        let parent = trail.last().map(|(folder, _)| folder.uid.clone());
+        self.more.set_visible(false);
+        self.unlock.set_visible(false);
         self.choose.set_visible(parent.is_some());
-        self.title.set_title(&gettext("Choose a Drive Folder"));
+        self.title.set_title(&trail.last().map_or_else(
+            || gettext("Choose a Drive folder"),
+            |(folder, _)| folder.name.clone(),
+        ));
+        self.status.set_label(&gettext("Loading folders…"));
         self.rows.remove_all();
         let rx = spawn_request(
             self.ui.dirs.control_socket(),
@@ -160,11 +357,12 @@ impl Browser {
                     browser
                         .status
                         .set_label(&gettext("Open a folder, then choose Add This Folder."));
-                    for folder in folders {
-                        browser
-                            .rows
-                            .append(&BoxedAnyObject::new(Row::Folder(folder)));
-                    }
+                    let rows: Vec<_> = folders
+                        .into_iter()
+                        .map(|folder| BoxedAnyObject::new(Row::Folder(folder)))
+                        .collect();
+                    browser.rows.splice(0, browser.rows.n_items(), &rows);
+                    browser.restore_offset(generation, restore);
                 }
                 Ok(Ok(Response::Error { message, .. })) => browser.status.set_label(&message),
                 _ => browser
@@ -174,15 +372,30 @@ impl Browser {
         });
     }
 
+    fn restore_offset(self: &Rc<Self>, generation: u64, restore: f64) {
+        let browser = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(browser) = browser.upgrade()
+                && generation == browser.generation.get()
+            {
+                browser.scroll.vadjustment().set_value(restore);
+            }
+        });
+    }
+
     fn change(self: &Rc<Self>, action: GalleryAction) {
         let unlock = matches!(action, GalleryAction::Unlock { .. });
-        let lock = matches!(action, GalleryAction::Lock);
-        if lock {
-            self.trail.borrow_mut().clear();
-            self.cover.borrow_mut().take();
-            self.items.borrow_mut().clear();
-            self.rows.remove_all();
+        let update_root = matches!(
+            action,
+            GalleryAction::Add { .. }
+                | GalleryAction::Remove { .. }
+                | GalleryAction::Refresh
+                | GalleryAction::Cover { .. }
+        );
+        if unlock && self.unlock_pending.replace(true) {
+            return;
         }
+        self.unlock.set_visible(false);
         let generation = self.next_request();
         self.status.set_label(&gettext("Updating gallery…"));
         let rx = spawn_request(
@@ -192,6 +405,14 @@ impl Browser {
         let browser = self.clone();
         glib::spawn_future_local(async move {
             let result = rx.recv().await;
+            if unlock {
+                browser.unlock_pending.set(false);
+                browser.unlock.set_visible(
+                    browser.active()
+                        && browser.generation.get() == generation
+                        && !matches!(result, Ok(Ok(Response::Ok { .. }))),
+                );
+            }
             if browser.generation.get() != generation {
                 if unlock && matches!(result, Ok(Ok(Response::Ok { .. }))) {
                     browser.lock();
@@ -200,11 +421,24 @@ impl Browser {
             }
             match result {
                 Ok(Ok(Response::Ok { .. })) => {
-                    if unlock || lock {
-                        browser.unlocked.set(unlock);
+                    if unlock {
+                        browser.unlocked.set(true);
+                    }
+                    let added = browser.chooser.borrow().is_some();
+                    if update_root {
+                        browser.load_root();
+                    }
+                    if added || (!browser.unlocked.get() && browser.current().is_none()) {
+                        browser.close();
+                        return;
                     }
                     browser.chooser.borrow_mut().take();
-                    browser.load(0, 0.0);
+                    let restore = if update_root {
+                        browser.scroll.vadjustment().value()
+                    } else {
+                        0.0
+                    };
+                    browser.load_page(0, restore, update_root);
                 }
                 Ok(Ok(Response::Error { message, .. })) => browser.status.set_label(&message),
                 _ => browser
@@ -224,7 +458,10 @@ impl Browser {
     }
 
     fn prompt_unlock(self: &Rc<Self>) {
-        let Some(parent) = self.window.upgrade() else {
+        if self.unlock_pending.get() {
+            return;
+        }
+        let Some(parent) = ui_window(&self.ui) else {
             return;
         };
         let dialog = adw::AlertDialog::builder()
@@ -244,26 +481,24 @@ impl Browser {
             if response == "unlock"
                 && let Some(browser) = browser.upgrade()
             {
+                browser.enter();
+                browser.more.set_visible(false);
+                browser.title.set_title(&gettext("Hidden albums"));
                 browser.change(GalleryAction::Unlock { passphrase });
             }
         });
         dialog.present(Some(&parent));
     }
 
-    fn back(self: &Rc<Self>) {
+    pub(crate) fn back(self: &Rc<Self>) {
         let choosing = self.chooser.borrow().is_some();
         if choosing {
-            let went_up = self
-                .chooser
-                .borrow_mut()
-                .as_mut()
-                .and_then(Vec::pop)
-                .is_some();
-            if went_up {
-                self.browse_folders();
+            let previous = self.chooser.borrow_mut().as_mut().and_then(Vec::pop);
+            if let Some((_, offset)) = previous {
+                self.browse_folders(offset);
             } else {
                 self.chooser.borrow_mut().take();
-                self.load(0, 0.0);
+                self.close();
             }
             return;
         }
@@ -279,10 +514,12 @@ impl Browser {
             return;
         }
         let previous = self.trail.borrow_mut().pop();
-        if let Some(previous) = previous {
+        if let Some(previous) = previous
+            && (self.unlocked.get() || self.current().is_some())
+        {
             self.load(0, previous.parent_offset);
-        } else if let Some(window) = self.window.upgrade() {
-            window.close();
+        } else {
+            self.close();
         }
     }
 
@@ -323,10 +560,17 @@ impl Browser {
 
     fn preview(self: &Rc<Self>, item: PhotoItem) {
         let video = item.kind == PhotoKind::Video;
+        let private = self.unlocked.get();
         let request = if video {
-            Request::OpenGalleryVideo { uid: item.uid }
+            Request::OpenGalleryVideo {
+                uid: item.uid,
+                private,
+            }
         } else {
-            Request::OpenGalleryImage { uid: item.uid }
+            Request::OpenGalleryImage {
+                uid: item.uid,
+                private,
+            }
         };
         let reply = spawn_request(self.ui.dirs.control_socket(), request);
         let browser = self.clone();
@@ -339,31 +583,30 @@ impl Browser {
                     Request::CloseGalleryVideo { token },
                 );
             };
-            let parent = browser
-                .window
-                .upgrade()
-                .filter(|_| generation == browser.generation.get());
+            let parent = ui_window(&browser.ui)
+                .filter(|_| browser.active() && generation == browser.generation.get());
             let Some(parent) = parent else {
                 if let Ok(Ok(Response::GalleryVideo { token, .. })) = result {
                     close(token);
                 }
                 return;
             };
-            let preview = gtk4::Window::builder()
-                .transient_for(&parent)
-                .destroy_with_parent(true)
+            let preview = adw::Dialog::builder()
                 .title(item.name.unwrap_or_else(|| gettext("Preview")))
-                .default_width(850)
-                .default_height(600)
+                .content_width(850)
+                .content_height(600)
                 .build();
-            preview.add_css_class("photo-viewer-window");
+            let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            content.append(&adw::HeaderBar::new());
+            preview.set_child(Some(&content));
             match result {
                 Ok(Ok(Response::GalleryVideo { url, token, .. })) => {
                     let player = gtk4::Video::builder().autoplay(true).build();
                     player.set_file(Some(&gio::File::for_uri(&url)));
-                    preview.set_child(Some(&player));
+                    player.set_vexpand(true);
+                    content.append(&player);
                     let socket = browser.ui.dirs.control_socket();
-                    preview.connect_close_request(move |_| {
+                    preview.connect_closed(move |_| {
                         player.set_media_stream(gtk4::MediaStream::NONE);
                         let _ = spawn_request(
                             socket.clone(),
@@ -371,12 +614,23 @@ impl Browser {
                                 token: token.clone(),
                             },
                         );
-                        glib::Propagation::Proceed
                     });
                 }
                 Ok(Ok(Response::FilePath { path })) => {
                     let picture = gtk4::Picture::for_filename(path);
-                    preview.set_child(Some(&picture));
+                    picture.set_vexpand(true);
+                    content.append(&picture);
+                }
+                Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) if private => {
+                    let Some(texture) = decode_thumbnail(&data) else {
+                        browser
+                            .status
+                            .set_label(&gettext("Couldn't open the photo."));
+                        return;
+                    };
+                    let picture = gtk4::Picture::for_paintable(&texture);
+                    picture.set_vexpand(true);
+                    content.append(&picture);
                 }
                 Ok(Ok(Response::Error { message, .. })) => {
                     browser.status.set_label(&message);
@@ -389,37 +643,32 @@ impl Browser {
                     return;
                 }
             }
-            preview.present();
+            browser.preview.set(Some(&preview));
+            preview.present(Some(&parent));
         });
     }
 }
 
-pub(crate) fn open(ui: &Rc<Ui>) {
-    if let Some(browser) = ui.drive_galleries.borrow().upgrade()
-        && let Some(window) = browser.window.upgrade()
-    {
-        window.present();
-        return;
-    }
-    let Some(parent) = ui_window(ui) else { return };
-    let window = gtk4::Window::builder()
-        .transient_for(&parent)
-        .default_width(1020)
-        .default_height(760)
-        .build();
-    let title = adw::WindowTitle::new(&gettext("Drive Galleries"), "");
-    let header = adw::HeaderBar::builder().title_widget(&title).build();
-    let back = gtk4::Button::from_icon_name("go-previous-symbolic");
-    back.set_tooltip_text(Some(&gettext("Back")));
-    header.pack_start(&back);
-    let add = gtk4::Button::with_label(&gettext("Add Gallery"));
+pub(crate) fn wire(
+    ui: &Rc<Ui>,
+    window: &adw::ApplicationWindow,
+    root: &gtk4::FlowBox,
+    root_status: &gtk4::Label,
+    add: &gtk4::Button,
+    hidden: &gtk4::Button,
+) {
+    let title = ui.gallery.title.clone();
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header.set_halign(gtk4::Align::End);
     let choose = gtk4::Button::with_label(&gettext("Add This Folder"));
     choose.set_visible(false);
-    header.pack_end(&add);
-    header.pack_end(&choose);
+    header.append(&choose);
     let more = gtk4::Button::from_icon_name("view-more-symbolic");
     more.set_tooltip_text(Some(&gettext("Gallery Options")));
-    header.pack_end(&more);
+    let unlock = gtk4::Button::with_label(&gettext("Unlock"));
+    unlock.set_visible(false);
+    header.append(&unlock);
+    header.append(&more);
     let rows = gio::ListStore::new::<BoxedAnyObject>();
     let factory = gtk4::SignalListItemFactory::new();
     let list = gtk4::ListView::builder()
@@ -438,15 +687,30 @@ pub(crate) fn open(ui: &Rc<Ui>) {
     content.append(&header);
     content.append(&status);
     content.append(&scroll);
-    window.set_child(Some(&content));
+    ui.gallery
+        .content
+        .add_named(&content, Some("drive-galleries"));
+    for label in [&status, root_status] {
+        label.set_visible(false);
+        label.connect_label_notify(|label| label.set_visible(!label.label().is_empty()));
+    }
     let browser = Rc::new(Browser {
         ui: ui.clone(),
-        window: window.downgrade(),
+        root: root.clone(),
+        root_status: root_status.clone(),
+        root_loaded: Cell::new(false),
+        root_generation: Cell::new(0),
+        root_reload: Cell::new(false),
+        root_loading: Cell::new(false),
+        preview: glib::WeakRef::new(),
+        unlock_pending: Cell::new(false),
         rows,
         scroll: scroll.clone(),
         title,
         status,
         choose: choose.clone(),
+        unlock: unlock.clone(),
+        more: more.clone(),
         trail: RefCell::new(Vec::new()),
         chooser: RefCell::new(None),
         cover: RefCell::new(None),
@@ -458,18 +722,37 @@ pub(crate) fn open(ui: &Rc<Ui>) {
         loading: Cell::new(false),
         unlocked: Cell::new(false),
         thumbnail_slots: tokio::sync::Semaphore::new(8),
+        thumbnails: RefCell::default(),
+        thumb_pending: RefCell::default(),
     });
     *ui.drive_galleries.borrow_mut() = Rc::downgrade(&browser);
-    window.connect_close_request({
-        let browser = browser.clone();
-        move |_| {
-            *browser.ui.drive_galleries.borrow_mut() = std::rc::Weak::new();
-            browser.next_request();
-            if browser.unlocked.get() {
-                browser.lock();
-            }
-            glib::Propagation::Proceed
+    let weak = Rc::downgrade(&browser);
+    window.connect_is_active_notify(move |window| {
+        if !window.is_active()
+            && let Some(browser) = weak.upgrade()
+            && (browser.unlocked.get() || browser.unlock_pending.get())
+        {
+            browser.close();
         }
+    });
+    let weak = Rc::downgrade(&browser);
+    window.connect_close_request(move |_| {
+        if let Some(browser) = weak.upgrade() {
+            browser.close();
+        }
+        glib::Propagation::Proceed
+    });
+    unlock.connect_clicked({
+        let weak = Rc::downgrade(&browser);
+        move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.prompt_unlock();
+            }
+        }
+    });
+    hidden.connect_clicked({
+        let browser = browser.clone();
+        move |_| browser.prompt_unlock()
     });
     let weak = Rc::downgrade(&browser);
     factory.connect_bind(move |_, item| {
@@ -502,9 +785,9 @@ pub(crate) fn open(ui: &Rc<Ui>) {
                     move |_| {
                         if let Some(browser) = weak.upgrade() {
                             if let Some(trail) = browser.chooser.borrow_mut().as_mut() {
-                                trail.push(folder.clone());
+                                trail.push((folder.clone(), browser.scroll.vadjustment().value()));
                             }
-                            browser.browse_folders();
+                            browser.browse_folders(0.0);
                         }
                     }
                 });
@@ -512,25 +795,7 @@ pub(crate) fn open(ui: &Rc<Ui>) {
             }
             Row::Albums(albums, width) => {
                 for album in albums {
-                    let items = ngettext_f("{n} item", "{n} items", album.items, &[]);
-                    let mut detail = if album.folders > 0 {
-                        let folders = ngettext_f("{n} folder", "{n} folders", album.folders, &[]);
-                        format!("{items} · {folders}")
-                    } else {
-                        items
-                    };
-                    if album.hidden {
-                        detail = format!("{detail} · {}", gettext("Hidden"));
-                    }
-                    let button = tile(
-                        &browser,
-                        &album.folder.name,
-                        album.cover.as_deref(),
-                        *width,
-                        130,
-                        Some(&detail),
-                        false,
-                    );
+                    let button = browser.album_tile(album, *width, browser.unlocked.get());
                     button.connect_clicked({
                         let weak = Rc::downgrade(&browser);
                         let album = album.clone();
@@ -554,10 +819,9 @@ pub(crate) fn open(ui: &Rc<Ui>) {
                         &browser,
                         item.name.as_deref().unwrap_or(""),
                         Some(&item.uid),
-                        *width,
-                        *height,
-                        None,
+                        (*width, *height),
                         item.kind == PhotoKind::Video,
+                        browser.unlocked.get(),
                     );
                     button.connect_clicked({
                         let weak = Rc::downgrade(&browser);
@@ -587,23 +851,12 @@ pub(crate) fn open(ui: &Rc<Ui>) {
             item.set_child(gtk4::Widget::NONE);
         }
     });
-    back.connect_clicked({
-        let weak = Rc::downgrade(&browser);
-        move |_| {
-            if let Some(browser) = weak.upgrade() {
-                browser.back();
-            }
-        }
-    });
     add.connect_clicked({
-        let weak = Rc::downgrade(&browser);
-        let choose = choose.clone();
+        let browser = browser.clone();
         move |_| {
-            if let Some(browser) = weak.upgrade() {
-                choose.set_visible(true);
-                *browser.chooser.borrow_mut() = Some(Vec::new());
-                browser.browse_folders();
-            }
+            browser.enter();
+            *browser.chooser.borrow_mut() = Some(Vec::new());
+            browser.browse_folders(0.0);
         }
     });
     choose.connect_clicked({
@@ -615,7 +868,7 @@ pub(crate) fn open(ui: &Rc<Ui>) {
                     .borrow()
                     .as_ref()
                     .and_then(|trail| trail.last())
-                    .map(|f| f.uid.clone());
+                    .map(|(folder, _)| folder.uid.clone());
                 if let Some(uid) = uid {
                     button.set_visible(false);
                     browser.change(GalleryAction::Add { uid });
@@ -635,15 +888,15 @@ pub(crate) fn open(ui: &Rc<Ui>) {
                 if browser.unlocked.get() {
                     menu.item(&gettext("Lock Hidden Albums"), {
                         let browser = browser.clone();
-                        move || browser.change(GalleryAction::Lock)
+                        move || browser.close()
                     });
                 } else {
-                    menu.item(&gettext("Unlock Hidden Albums"), {
+                    menu.item(&gettext("Refresh galleries"), {
                         let browser = browser.clone();
-                        move || browser.prompt_unlock()
+                        move || browser.change(GalleryAction::Refresh)
                     });
                 }
-                if let Some(album) = browser.current() {
+                if let Some(album) = browser.current().filter(|album| !album.proton) {
                     menu.item(&gettext("Choose Cover"), {
                         let browser = browser.clone();
                         let place = album.place.clone();
@@ -654,33 +907,40 @@ pub(crate) fn open(ui: &Rc<Ui>) {
                             ));
                         }
                     });
-                    menu.item(&gettext("Public Link"), {
-                        let browser = browser.clone();
-                        let folder = album.folder.clone();
-                        move || {
-                            open_share_dialog_over(
-                                &browser.ui,
-                                &DirEntry {
-                                    uid: folder.uid.clone(),
-                                    name: folder.name.clone(),
-                                    is_dir: true,
-                                    ..DirEntry::default()
-                                },
-                                browser.window.upgrade(),
-                            )
-                        }
-                    });
-                    if browser.trail.borrow().len() == 1 {
-                        menu.item(&gettext("Remove Gallery"), {
+                    if !browser.unlocked.get() {
+                        menu.item(&gettext("Public Link"), {
                             let browser = browser.clone();
+                            let folder = album.folder.clone();
                             move || {
-                                browser.trail.borrow_mut().clear();
-                                browser.change(GalleryAction::Remove {
-                                    gallery: album.place.gallery.clone(),
-                                });
+                                open_share_dialog_over(
+                                    &browser.ui,
+                                    &DirEntry {
+                                        uid: folder.uid.clone(),
+                                        name: folder.name.clone(),
+                                        is_dir: true,
+                                        ..DirEntry::default()
+                                    },
+                                    ui_window(&browser.ui),
+                                )
                             }
                         });
+                        if album.place.gallery == album.place.album {
+                            menu.item(&gettext("Remove Gallery"), {
+                                let browser = browser.clone();
+                                move || {
+                                    browser.trail.borrow_mut().clear();
+                                    browser.change(GalleryAction::Remove {
+                                        gallery: album.place.gallery.clone(),
+                                    });
+                                }
+                            });
+                        }
                     }
+                } else if !browser.unlocked.get() && browser.chooser.borrow().is_none() {
+                    menu.item(&gettext("Unlock Hidden Albums"), {
+                        let browser = browser.clone();
+                        move || browser.prompt_unlock()
+                    });
                 }
                 menu.popup_at(
                     button,
@@ -718,105 +978,177 @@ pub(crate) fn open(ui: &Rc<Ui>) {
             glib::ControlFlow::Continue
         }
     });
-    window.present();
-    browser.load(0, 0.0);
 }
 
 fn tile(
     browser: &Rc<Browser>,
     title: &str,
     uid: Option<&str>,
-    width: i32,
-    height: i32,
-    detail: Option<&str>,
+    (width, height): (i32, i32),
     video: bool,
+    private: bool,
 ) -> gtk4::Button {
     let picture = gtk4::Picture::builder()
         .content_fit(gtk4::ContentFit::Cover)
         .can_shrink(true)
-        .width_request(if detail.is_some() {
-            (width - 24).max(1)
-        } else {
-            width
-        })
-        .height_request(height)
         .build();
     let label = gtk4::Label::new(Some(title));
     label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     label.set_max_width_chars((width / 9).max(1));
-    let box_ = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-    let cover = gtk4::Overlay::new();
-    cover.set_child(Some(&picture));
-    let icon = gtk4::Image::from_icon_name(if detail.is_some() {
-        "folder-symbolic"
-    } else {
-        "image-x-generic-symbolic"
-    });
-    icon.set_halign(gtk4::Align::Center);
-    icon.set_valign(gtk4::Align::Center);
-    icon.set_pixel_size(32);
+    label.add_css_class("photo-caption");
+    label.set_valign(gtk4::Align::End);
+    let icon = gtk4::Image::builder()
+        .icon_name(if video {
+            "video-x-generic-symbolic"
+        } else {
+            "image-x-generic-symbolic"
+        })
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Center)
+        .pixel_size(32)
+        .build();
     icon.add_css_class("dim-label");
-    cover.add_overlay(&icon);
+    let cover = gtk4::Overlay::new();
+    cover.set_child(Some(&icon));
+    cover.set_size_request(width, height);
+    cover.add_overlay(&picture);
+    cover.add_overlay(&label);
+    cover.add_css_class("photo-placeholder");
     cover.set_overflow(gtk4::Overflow::Hidden);
-    let button = gtk4::Button::builder().tooltip_text(title).build();
-    if let Some(detail) = detail {
-        box_.append(&cover);
-        box_.append(&label);
-        let caption = gtk4::Label::new(Some(detail));
-        caption.add_css_class("dim-label");
-        caption.add_css_class("caption");
-        caption.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        box_.append(&caption);
-        button.set_width_request(width);
-        button.set_child(Some(&box_));
-    } else {
-        button.add_css_class("photo-tile");
-        cover.add_css_class("photo-placeholder");
-        label.add_css_class("photo-caption");
-        label.set_valign(gtk4::Align::End);
-        cover.add_overlay(&label);
-        if video {
-            let play = gtk4::Image::from_icon_name("media-playback-start-symbolic");
-            play.add_css_class("photo-video-badge");
-            play.add_css_class("photo-video-badge-small");
-            play.set_halign(gtk4::Align::End);
-            play.set_valign(gtk4::Align::Start);
-            play.set_margin_end(8);
-            play.set_margin_top(8);
-            cover.add_overlay(&play);
-        }
-        button.set_child(Some(&cover));
+    if video {
+        let play = gtk4::Image::from_icon_name("media-playback-start-symbolic");
+        play.add_css_class("photo-video-badge");
+        play.add_css_class("photo-video-badge-small");
+        play.set_halign(gtk4::Align::End);
+        play.set_valign(gtk4::Align::Start);
+        play.set_margin_end(8);
+        play.set_margin_top(8);
+        cover.add_overlay(&play);
     }
-    if let Some(uid) = uid {
-        let browser = browser.clone();
-        let generation = browser.generation.get();
-        let uid = uid.to_owned();
-        let picture = picture.downgrade();
-        let icon = icon.downgrade();
+    let button = gtk4::Button::builder()
+        .tooltip_text(title)
+        .child(&cover)
+        .build();
+    button.add_css_class("photo-tile");
+    wire_thumbnail(browser, &picture, uid, private, Some(&icon));
+    button
+}
+
+fn wire_thumbnail(
+    browser: &Rc<Browser>,
+    picture: &gtk4::Picture,
+    uid: Option<&str>,
+    private: bool,
+    icon: Option<&gtk4::Image>,
+) {
+    let Some(uid) = uid else {
+        return;
+    };
+    let browser = Rc::downgrade(browser);
+    let uid = uid.to_owned();
+    let icon = icon.map_or_else(glib::WeakRef::new, ObjectExt::downgrade);
+    picture.connect_map(move |picture| {
+        if picture.paintable().is_none()
+            && let Some(browser) = browser.upgrade()
+        {
+            browser.want_thumbnail(&uid, private, picture, &icon);
+        }
+    });
+}
+
+fn decode_thumbnail(data: &str) -> Option<gtk4::gdk::Texture> {
+    let bytes = STANDARD.decode(data).ok()?;
+    gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+}
+
+impl Browser {
+    fn want_thumbnail(
+        self: &Rc<Self>,
+        uid: &str,
+        private: bool,
+        picture: &gtk4::Picture,
+        icon: &glib::WeakRef<gtk4::Image>,
+    ) {
+        if private && !self.unlocked.get() {
+            return;
+        }
+        {
+            let mut cache = self.thumbnails.borrow_mut();
+            if let Some(index) = cache
+                .iter()
+                .position(|(p, id, _)| *p == private && id == uid)
+            {
+                let cached = cache.remove(index).unwrap();
+                picture.set_paintable(Some(&cached.2));
+                if let Some(icon) = icon.upgrade() {
+                    icon.set_visible(false);
+                }
+                cache.push_back(cached);
+                return;
+            }
+        }
+        let key = (self.generation.get(), private, uid.to_owned());
+        {
+            let mut pending = self.thumb_pending.borrow_mut();
+            let started = pending.contains_key(&key);
+            let targets = pending.entry(key.clone()).or_default();
+            targets.retain(|(target, _)| target.upgrade().is_some_and(|seen| seen != *picture));
+            targets.push((picture.downgrade(), icon.clone()));
+            if started {
+                return;
+            }
+        }
+        let browser = self.clone();
         glib::spawn_future_local(async move {
             let Ok(_permit) = browser.thumbnail_slots.acquire().await else {
                 return;
             };
-            if picture.upgrade().is_none() || generation != browser.generation.get() {
+            let visible = browser
+                .thumb_pending
+                .borrow()
+                .get(&key)
+                .is_some_and(|targets| {
+                    targets
+                        .iter()
+                        .any(|(picture, _)| picture.upgrade().is_some_and(|p| p.is_mapped()))
+                });
+            if !visible || key.0 != browser.generation.get() {
+                browser.thumb_pending.borrow_mut().remove(&key);
                 return;
             }
             let request = spawn_request(
                 browser.ui.dirs.control_socket(),
-                Request::GalleryThumbnail { uid },
+                Request::GalleryThumbnail {
+                    uid: key.2.clone(),
+                    private,
+                },
             );
             let response = request.recv().await;
-            if generation == browser.generation.get()
-                && let (Some(picture), Ok(Ok(Response::GalleryThumbnail { data: Some(data) }))) =
-                    (picture.upgrade(), response)
-                && let Ok(bytes) = STANDARD.decode(data)
-                && let Ok(texture) = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+            let targets = browser
+                .thumb_pending
+                .borrow_mut()
+                .remove(&key)
+                .unwrap_or_default();
+            if key.0 != browser.generation.get() || private && !browser.unlocked.get() {
+                return;
+            }
+            if let Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) = response
+                && let Some(texture) = decode_thumbnail(&data)
             {
-                picture.set_paintable(Some(&texture));
-                if let Some(icon) = icon.upgrade() {
-                    icon.set_visible(false);
+                for (picture, icon) in targets {
+                    if let Some(picture) = picture.upgrade() {
+                        picture.set_paintable(Some(&texture));
+                    }
+                    if let Some(icon) = icon.upgrade() {
+                        icon.set_visible(false);
+                    }
                 }
+                let mut cache = browser.thumbnails.borrow_mut();
+                if cache.len() >= THUMB_CACHE {
+                    cache.pop_front();
+                }
+                cache.push_back((private, key.2, texture));
             }
         });
     }
-    button
 }

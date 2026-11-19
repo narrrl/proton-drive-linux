@@ -26,6 +26,7 @@ const STOCK: &[&str] = &[
     // Adwaita
     "application-x-executable-symbolic",
     "audio-x-generic-symbolic",
+    "changes-prevent-symbolic",
     "checkbox-checked-symbolic",
     "checkbox-symbolic",
     "computer-symbolic",

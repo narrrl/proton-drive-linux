@@ -3711,7 +3711,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg-app"
 version = "0.2.0"
-source = "git+https://github.com/narrrl/proton-gallery.git?rev=72d83a29ad2836c698b18e2f5189a423c60c2399#72d83a29ad2836c698b18e2f5189a423c60c2399"
+source = "git+https://github.com/narrrl/proton-gallery.git?rev=b841c37ad57694470f499f575f7a956425c28ade#b841c37ad57694470f499f575f7a956425c28ade"
 dependencies = [
  "async-trait",
  "hex",
@@ -3731,7 +3731,7 @@ dependencies = [
 [[package]]
 name = "pg-core"
 version = "0.2.0"
-source = "git+https://github.com/narrrl/proton-gallery.git?rev=72d83a29ad2836c698b18e2f5189a423c60c2399#72d83a29ad2836c698b18e2f5189a423c60c2399"
+source = "git+https://github.com/narrrl/proton-gallery.git?rev=b841c37ad57694470f499f575f7a956425c28ade#b841c37ad57694470f499f575f7a956425c28ade"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-trait",
@@ -3751,7 +3751,7 @@ dependencies = [
 [[package]]
 name = "pg-drive"
 version = "0.2.0"
-source = "git+https://github.com/narrrl/proton-gallery.git?rev=72d83a29ad2836c698b18e2f5189a423c60c2399#72d83a29ad2836c698b18e2f5189a423c60c2399"
+source = "git+https://github.com/narrrl/proton-gallery.git?rev=b841c37ad57694470f499f575f7a956425c28ade#b841c37ad57694470f499f575f7a956425c28ade"
 dependencies = [
  "async-trait",
  "hex",
@@ -5139,7 +5139,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

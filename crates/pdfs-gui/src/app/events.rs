@@ -100,6 +100,9 @@ fn on_feed(ui: &Rc<Ui>, state: &Rc<FeedState>, feed: Feed, hidden: bool) {
             follow_takeout(ui, state, &jobs);
         }
         Feed::Event(Event::Changed { topics }) if hidden => {
+            if topics.contains(&Topic::Photos) {
+                check_photo_viewer(ui);
+            }
             state.deferred.borrow_mut().extend(topics);
         }
         Feed::Event(Event::Changed { topics }) => follow_changes(ui, state, &topics),
@@ -133,12 +136,10 @@ fn follow_changes(ui: &Rc<Ui>, state: &FeedState, topics: &[Topic]) {
         refresh_file_thumbnails(ui);
     }
     let page = ui.stack.visible_child_name();
-    if changed(Topic::GalleryVisibilitySynced)
-        && let Some(browser) = ui.drive_galleries.borrow().upgrade()
-    {
-        browser.refresh_visibility();
-    }
     if changed(Topic::GalleryVisibility) || changed(Topic::GalleryVisibilitySynced) {
+        if let Some(browser) = ui.drive_galleries.borrow().upgrade() {
+            browser.refresh_visibility();
+        }
         for window in gtk4::Window::list_toplevels() {
             if let Ok(window) = window.downcast::<gtk4::Window>()
                 && window.has_css_class("photo-viewer-window")
@@ -146,23 +147,34 @@ fn follow_changes(ui: &Rc<Ui>, state: &FeedState, topics: &[Topic]) {
                 window.close();
             }
         }
+        ui.gallery
+            .thumb_generation
+            .set(ui.gallery.thumb_generation.get().wrapping_add(1));
+        ui.gallery.thumb_queue.borrow_mut().clear();
+        ui.gallery.decode_queue.borrow_mut().clear();
+        ui.gallery.thumb_wanted.borrow_mut().clear();
         ui.gallery.photo_tex.borrow_mut().clear();
         ui.gallery.photo_tex_order.borrow_mut().clear();
         ui.gallery.model.remove_all();
         ui.gallery.groups.remove_all();
+        ui.gallery.row_by_photo.borrow_mut().clear();
         ui.gallery.timeline_stale.set(true);
         if page.as_deref() == Some("gallery") {
             match ui.gallery.content.visible_child_name().as_deref() {
                 Some("albums") => load_albums(ui),
+                Some("drive-galleries") => {}
                 Some("places") => load_places(ui),
                 _ => load_gallery(ui, false),
             }
         }
     }
-    // A timeline out of sight is read again when the user comes back to it;
-    // one on screen is left alone (below).
-    if changed(Topic::Photos) && (page.as_deref() != Some("gallery") || !photo_grid_shown(ui)) {
-        ui.gallery.timeline_stale.set(true);
+    if changed(Topic::Photos) {
+        check_photo_viewer(ui);
+        if page.as_deref() != Some("gallery") || !photo_grid_shown(ui) {
+            ui.gallery.timeline_stale.set(true);
+        } else {
+            refresh_visible_photos(ui);
+        }
     }
     match page.as_deref() {
         // A search on screen is left alone: reloading would swap its hits for
@@ -170,8 +182,6 @@ fn follow_changes(ui: &Rc<Ui>, state: &FeedState, topics: &[Topic]) {
         Some("browser") if changed(Topic::Files) && ui.browser.search.text().trim().is_empty() => {
             load_browser(ui)
         }
-        // The timeline is left alone: reloading it would throw away the place
-        // the user scrolled to. F5 reloads it on request.
         Some("gallery")
             if changed(Topic::Photos)
                 && ui.gallery.content.visible_child_name().as_deref() == Some("albums") =>

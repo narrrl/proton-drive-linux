@@ -685,7 +685,7 @@ pub(crate) fn sign_out(ui: &Rc<Ui>) {
         move || {
             let galleries = ui.drive_galleries.borrow().upgrade();
             if let Some(galleries) = galleries {
-                galleries.close();
+                galleries.reset();
             }
             // systemctl and the keyring both block, so run them on a worker.
             let ui = ui.clone();

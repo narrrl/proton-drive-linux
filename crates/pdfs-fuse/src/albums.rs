@@ -12,7 +12,7 @@
 //! than looked up in our own timeline, where a shared album's photos never
 //! appear.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use pdfs_core::control::{AlbumInfo, PhotoItem, Topic};
@@ -24,8 +24,8 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::warn;
 
 use super::{
-    ALBUM_SYNCED_PREFIX, ALBUMS_SYNCED_MS, Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS,
-    TIMELINE_ENRICH_CHUNK, TIMELINE_TTL, now_ms, parse_uid,
+    ALBUM_SYNCED_PREFIX, ALBUMS_SYNCED_MS, Core, PHOTOS_AVAILABLE, TIMELINE_ENRICH_CHUNK,
+    TIMELINE_TTL, link, now_ms, parse_uid,
 };
 
 impl Core {
@@ -34,7 +34,13 @@ impl Core {
     /// [`Core::photos_timeline`] gives.
     pub(crate) fn albums(&self) -> CoreResult<Option<Vec<AlbumInfo>>> {
         let count = self.db.albums_count().map_err(CoreError::from)?;
-        if count == 0 {
+        if count == 0
+            && self
+                .db
+                .state_i64(ALBUMS_SYNCED_MS)
+                .map_err(CoreError::from)?
+                .is_none()
+        {
             // Nothing on disk, so this one request waits for the fetch — unless
             // the account is already known to have no photos volume.
             let known_empty = self.db.state_i64(PHOTOS_AVAILABLE).ok().flatten() == Some(0);
@@ -56,77 +62,71 @@ impl Core {
     /// the persisted listing. Returns false when the account has no photos
     /// volume.
     pub(crate) async fn refresh_albums(&self) -> CoreResult<bool> {
+        let generation = self
+            .db
+            .photo_projection_generation()
+            .map_err(CoreError::from)?;
         let photos = self.photos();
-        if photos
-            .get_photos_root()
+        if link::bounded(photos.get_photos_root())
             .await
             .map_err(|e| CoreError::from_api(&e, "photos root"))?
             .is_none()
         {
-            let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 0);
-            let _ = self.db.set_state_i64(PHOTOS_SYNCED_MS, now_ms());
-            let _ = self.db.set_state_i64(ALBUMS_SYNCED_MS, now_ms());
+            self.db
+                .albums_replace_at(&[], generation, now_ms())
+                .map_err(CoreError::from)?;
             return Ok(false);
         }
-
-        let mut uids = photos
-            .enumerate_album_node_uids()
+        let mut uids = link::bounded(photos.enumerate_album_node_uids())
             .await
             .map_err(|e| CoreError::from_api(&e, "albums"))?;
+        let shared = link::bounded(photos.enumerate_shared_with_me_album_uids())
+            .await
+            .map_err(|e| CoreError::from_api(&e, "shared albums"))?;
+        let shared_keys: HashSet<_> = shared.iter().map(ToString::to_string).collect();
+        uids.extend(shared);
+        let mut unique = HashSet::new();
+        uids.retain(|uid| unique.insert(uid.clone()));
 
-        // Shared-with-me albums are a separate listing on the sharer's volume.
-        // Best-effort: an account whose sharing listing fails still gets its own
-        // albums rather than an error page.
-        let shared: HashSet<String> = match photos.enumerate_shared_with_me_album_uids().await {
-            Ok(shared) => {
-                let keys = shared.iter().map(|u| u.to_string()).collect();
-                uids.extend(shared);
-                keys
-            }
-            Err(e) => {
-                warn!(error = %e, "enumerating shared-with-me albums failed");
-                HashSet::new()
-            }
-        };
-
-        // The listings carry uids only; the name, photo count and cover come from
-        // the album nodes themselves. A chunk that fails to resolve drops those
-        // albums from this refresh rather than failing the whole listing.
-        let mut albums: Vec<StoredAlbum> = Vec::with_capacity(uids.len());
+        let mut albums = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(TIMELINE_ENRICH_CHUNK) {
-            match photos.enumerate_nodes(chunk).await {
-                Ok(nodes) => {
-                    for node in nodes {
-                        let key = node.uid.to_string();
-                        let props = node.album.as_ref();
-                        albums.push(StoredAlbum {
-                            shared: shared.contains(&key),
-                            uid: key,
-                            name: node.name,
-                            photo_count: props.map_or(0, |a| a.photo_count.max(0) as usize),
-                            cover_uid: props
-                                .and_then(|a| a.cover_photo_uid.as_ref())
-                                .map(|u| u.to_string()),
-                            last_activity: props.and_then(|a| a.last_activity_time),
-                        });
-                    }
-                }
-                Err(e) => warn!(error = %e, "resolving an album chunk failed"),
+            let nodes = link::bounded(photos.enumerate_nodes(chunk))
+                .await
+                .map_err(|e| CoreError::from_api(&e, "album metadata"))?;
+            if nodes.len() != chunk.len() {
+                return Err(CoreError::remote(
+                    "Some album details are still unavailable.",
+                ));
+            }
+            for node in nodes.into_iter().filter(|node| !node.trashed) {
+                let uid = node.uid.to_string();
+                let props = node.album.as_ref();
+                albums.push(StoredAlbum {
+                    shared: shared_keys.contains(&uid),
+                    uid,
+                    name: node.name,
+                    photo_count: props.map_or(0, |a| a.photo_count.max(0) as usize),
+                    cover_uid: props
+                        .and_then(|a| a.cover_photo_uid.as_ref())
+                        .map(ToString::to_string),
+                    last_activity: props.and_then(|a| a.last_activity_time),
+                });
             }
         }
-
-        // Newest activity first, and albums the server gave no activity time for
-        // last — an album nobody has touched belongs below the ones in use. Ties
-        // fall back to the name so the order is stable between refreshes.
         albums.sort_by(|a, b| {
             b.last_activity
                 .cmp(&a.last_activity)
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-
-        self.db.albums_replace(&albums).map_err(CoreError::from)?;
-        let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 1);
-        let _ = self.db.set_state_i64(ALBUMS_SYNCED_MS, now_ms());
+        if !self
+            .db
+            .albums_replace_at(&albums, generation, now_ms())
+            .map_err(CoreError::from)?
+        {
+            return Err(CoreError::remote(
+                "Photos changed during the album refresh. Try again shortly.",
+            ));
+        }
         Ok(true)
     }
 
@@ -157,9 +157,18 @@ impl Core {
         excluded: &str,
     ) -> CoreResult<Vec<PhotoItem>> {
         let key = album.to_string();
+        if self.db.photo_removed(&key).map_err(CoreError::from)? {
+            return Ok(Vec::new());
+        }
         let stamp = format!("{ALBUM_SYNCED_PREFIX}{key}");
         let count = self.db.album_photos_count(&key).map_err(CoreError::from)?;
-        if count == 0 {
+        if count == 0
+            && self
+                .db
+                .state_i64(&stamp)
+                .map_err(CoreError::from)?
+                .is_none()
+        {
             self.rt.block_on(self.refresh_album(album))?;
         } else if self.listing_stale(&stamp, TIMELINE_TTL) {
             let core = self.clone();
@@ -214,47 +223,56 @@ impl Core {
 
     /// Re-enumerate one album's photos and replace its persisted contents.
     pub(crate) async fn refresh_album(&self, album: &NodeUid) -> CoreResult<()> {
+        let generation = self
+            .db
+            .photo_projection_generation()
+            .map_err(CoreError::from)?;
         let photos = self.photos();
-        let items = photos
-            .enumerate_album(album)
+        let items = link::bounded(photos.enumerate_album(album))
             .await
             .map_err(|e| CoreError::from_api(&e, "album"))?;
-
-        // Same enrichment as the timeline: the listing carries a uid and a
-        // capture time, and the gallery needs a name and media type to classify
-        // each entry. Best-effort per chunk.
-        let uids: Vec<NodeUid> = items.iter().map(|it| it.uid.clone()).collect();
-        let mut meta: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        let key = album.to_string();
+        let mut meta = self
+            .db
+            .album_photo_metadata(&key)
+            .map_err(CoreError::from)?;
+        let uids: Vec<NodeUid> = items
+            .iter()
+            .filter(|item| !meta.contains_key(&item.uid.to_string()))
+            .map(|item| item.uid.clone())
+            .collect();
         for chunk in uids.chunks(TIMELINE_ENRICH_CHUNK) {
-            match photos.enumerate_nodes(chunk).await {
-                Ok(nodes) => {
-                    for node in nodes {
-                        let media_type = match &node.kind {
-                            NodeKind::File { media_type, .. } => Some(media_type.clone()),
-                            NodeKind::Folder => None,
-                        };
-                        meta.insert(node.uid.to_string(), (Some(node.name), media_type));
-                    }
-                }
-                Err(e) => warn!(error = %e, "resolving album photo metadata failed"),
+            let nodes = link::bounded(photos.enumerate_nodes(chunk))
+                .await
+                .map_err(|e| CoreError::from_api(&e, "album photo metadata"))?;
+            for node in nodes.into_iter().filter(|node| !node.trashed) {
+                let media_type = match node.kind {
+                    NodeKind::File { media_type, .. } => Some(media_type),
+                    NodeKind::Folder => None,
+                };
+                meta.insert(node.uid.to_string(), (node.name, media_type));
             }
         }
-
-        let rows: Vec<(String, i64, Option<String>, Option<String>)> = items
-            .iter()
-            .map(|it| {
-                let key = it.uid.to_string();
-                let (name, media_type) = meta.get(&key).cloned().unwrap_or((None, None));
-                (key, it.capture_time, name, media_type)
+        let rows: Vec<_> = items
+            .into_iter()
+            .map(|item| {
+                let uid = item.uid.to_string();
+                let (name, media_type) = meta
+                    .get(&uid)
+                    .map(|(name, mime)| (Some(name.clone()), mime.clone()))
+                    .unwrap_or_default();
+                (uid, item.capture_time, name, media_type)
             })
             .collect();
-        let key = album.to_string();
-        self.db
-            .album_photos_replace(&key, &rows)
-            .map_err(CoreError::from)?;
-        let _ = self
+        if !self
             .db
-            .set_state_i64(&format!("{ALBUM_SYNCED_PREFIX}{key}"), now_ms());
+            .album_photos_replace_at(&key, &rows, generation, now_ms())
+            .map_err(CoreError::from)?
+        {
+            return Err(CoreError::remote(
+                "Photos changed during the album refresh. Try again shortly.",
+            ));
+        }
         Ok(())
     }
 
@@ -284,7 +302,7 @@ impl Core {
             .block_on(self.photos().delete_album(album, delete_photos))
             .map_err(|e| CoreError::from_api(&e, "delete album"))?;
         let key = album.to_string();
-        if let Err(error) = self.db.album_photos_replace(&key, &[]) {
+        if let Err(error) = self.db.photos_delete(&[key]) {
             warn!(%album, %error, "a deleted album's photos could not be dropped");
         }
         self.after_album_change(None);

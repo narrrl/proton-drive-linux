@@ -33,6 +33,9 @@ pub(crate) struct Viewer {
     pub(crate) video: gtk4::Video,
     video_token: RefCell<Option<String>>,
     load_generation: Cell<u64>,
+    presence_loading: Cell<bool>,
+    presence_pending: Cell<bool>,
+    album: Option<String>,
     pub(crate) spinner: Spinner,
     pub(crate) status: gtk4::Label,
     pub(crate) title: gtk4::Label,
@@ -307,7 +310,10 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
     }
 
     let request = if is_video {
-        Request::OpenGalleryVideo { uid: uid.clone() }
+        Request::OpenGalleryVideo {
+            uid: uid.clone(),
+            private: false,
+        }
     } else {
         Request::OpenPhoto { uid: uid.clone() }
     };
@@ -1237,6 +1243,43 @@ fn build_strip(ui: &Rc<Ui>) -> (gtk4::ListView, gtk4::SingleSelection) {
 ///
 /// Returns the lightbox's window, for a caller that has to put the page
 /// behind it back once it closes.
+pub(crate) fn check_photo_viewer(ui: &Rc<Ui>) {
+    let Some(viewer) = ui.gallery.viewer.borrow().upgrade() else {
+        return;
+    };
+    if !viewer.window.is_visible() {
+        return;
+    }
+    if viewer.presence_loading.replace(true) {
+        viewer.presence_pending.set(true);
+        return;
+    }
+    let uid = viewer.uid.borrow().clone();
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::PhotoPresence {
+            uid: uid.clone(),
+            album: viewer.album.clone(),
+        },
+    );
+    let ui = ui.clone();
+    let viewer = Rc::downgrade(&viewer);
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        let Some(viewer) = viewer.upgrade() else {
+            return;
+        };
+        viewer.presence_loading.set(false);
+        if *viewer.uid.borrow() == uid
+            && matches!(result, Ok(Ok(Response::PhotoPresence { present: false })))
+        {
+            viewer.window.close();
+        } else if viewer.presence_pending.replace(false) {
+            check_photo_viewer(&ui);
+        }
+    });
+}
+
 pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Window {
     let parent = ui.stack.root().and_downcast::<gtk4::Window>().unwrap();
 
@@ -1502,6 +1545,14 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         video,
         video_token: RefCell::new(None),
         load_generation: Cell::new(0),
+        presence_loading: Cell::new(false),
+        presence_pending: Cell::new(false),
+        album: ui
+            .gallery
+            .album
+            .borrow()
+            .as_ref()
+            .map(|album| album.uid.clone()),
         spinner,
         status: status_label,
         title: title_label,
@@ -1544,6 +1595,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         toasts,
     });
 
+    *ui.gallery.viewer.borrow_mut() = Rc::downgrade(&viewer);
     let initial_idx = find_photo_index(&ui.gallery.model, &initial_uid).unwrap_or(0);
     let capture_time = viewer_item(ui, &viewer, &initial_uid).map_or(0, |item| item.capture_time);
     show_photo_position(ui, &viewer, initial_idx, capture_time);

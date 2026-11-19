@@ -5772,7 +5772,7 @@ impl Core {
     /// Drop the persisted photos timeline's freshness stamp, so the next timeline
     /// read fetches rather than serving what it already has.
     fn invalidate_photos(&self) {
-        let _ = self.db.clear_state(PHOTOS_SYNCED_MS);
+        let _ = self.db.photos_invalidate();
     }
 
     /// Drop one folder's cached child listing (`rel` is mountpoint-relative), so

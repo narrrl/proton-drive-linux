@@ -517,32 +517,15 @@ pub(super) async fn run_event_sync(
     }
 }
 
-/// The state key holding the photos volume's event cursor. Separate from the
-/// Drive cursor because the two volumes have their own event streams, and one
-/// cursor cannot address both.
-const PHOTOS_EVENT_CURSOR: &str = "photos_event_cursor";
-
-/// Poll the photos volume's event stream, so a photo deleted or added on another
-/// device shows up in the gallery within one poll instead of on the timeline's
-/// freshness window.
-///
-/// Deliberately much smaller than [`run_event_sync`]: the photos volume is not
-/// part of the FUSE mount, so there is no inode space to converge and nothing to
-/// invalidate in the kernel. A trash or a delete removes the rows behind the
-/// gallery; anything else only drops the timeline's freshness stamp, and the
-/// next read re-enumerates. Getting that wrong costs a stale tile, not a wrong
-/// file.
+/// Follow the Photos volume and commit changes with its durable event cursor.
 pub(super) async fn run_photos_event_sync(core: Core) {
     let photos = core.photos();
     // The photos volume only exists once the user has used Photos at all, and
     // the daemon may well start before the network does.
     let scope = loop {
-        match photos.get_photos_root().await {
+        match link::bounded(photos.get_photos_root()).await {
             Ok(Some(root)) => break root.tree_event_scope_id(),
-            Ok(None) => {
-                debug!("no photos volume; photo event sync not started");
-                return;
-            }
+            Ok(None) => core.next_poll(POLL_INTERVAL).await,
             Err(error) if session_revoked(&error) => {
                 core.mark_session_expired("read the photos root", &error);
                 return;
@@ -554,37 +537,69 @@ pub(super) async fn run_photos_event_sync(core: Core) {
         }
     };
 
-    let mut cursor: Option<DriveEventId> = core
-        .db
-        .state_str(PHOTOS_EVENT_CURSOR)
-        .ok()
-        .flatten()
-        .map(DriveEventId::from);
-    info!(?cursor, "photo event sync started");
+    let key = format!("photos_event_cursor:{}", scope.volume_id());
+    let mut cursor = loop {
+        match core.db.state_str(&key) {
+            Ok(cursor) => break cursor.map(DriveEventId::from),
+            Err(error) => {
+                warn!(%error, "reading the photo event checkpoint failed");
+                core.next_poll(POLL_INTERVAL).await;
+            }
+        }
+    };
+    info!("photo event sync started");
 
     loop {
-        core.next_poll(POLL_INTERVAL).await;
         let events = match link::bounded(photos.enumerate_events(&scope, cursor.as_ref())).await {
             Ok(events) => events,
-            Err(error) if core.lost_link(&error, "poll photo events") => continue,
             Err(error) => {
-                warn!(%error, "photo event poll failed; retrying after interval");
+                if !core.lost_link(&error, "poll photo events") {
+                    warn!(%error, "photo event poll failed; retrying after interval");
+                }
+                core.next_poll(POLL_INTERVAL).await;
                 continue;
             }
         };
-        let Some(head) = events.last().map(|event| event.id().clone()) else {
-            continue;
-        };
-        apply_photo_events(&core, &events);
-        core.events.publish(&[Topic::Photos]);
-        // One cursor write per batch, after the batch is applied: a crash in
-        // between replays events whose effects are idempotent.
-        if let Err(error) = core.db.set_state_str(PHOTOS_EVENT_CURSOR, head.as_str()) {
-            warn!(%error, "persisting the photo event cursor failed");
-            continue;
+        if let Some(head) = events.last().map(|event| event.id().clone()) {
+            if let Err(error) = invalidate_photo_events(&core, &events).await {
+                warn!(%error, "invalidating photo event metadata failed");
+                core.next_poll(POLL_INTERVAL).await;
+                continue;
+            }
+            // A failed database write must replay all changes, including echoes.
+            let plan = classify_photo_events(&events, |_| false);
+            if let Err(error) = core.db.photos_apply_events(
+                &key,
+                head.as_str(),
+                &plan.gone,
+                &plan.touched,
+                plan.full,
+                cursor.is_none(),
+            ) {
+                warn!(%error, "committing the photo event checkpoint failed");
+                core.next_poll(POLL_INTERVAL).await;
+                continue;
+            }
+            cursor = Some(head);
+            if !plan.is_empty() {
+                core.events.publish(&[Topic::Photos]);
+            }
         }
-        cursor = Some(head);
+        if core.db.photos_need_work().unwrap_or(true) {
+            core.spawn_timeline_refresh();
+        }
+        core.next_poll(POLL_INTERVAL).await;
     }
+}
+
+async fn invalidate_photo_events(
+    core: &Core,
+    events: &[DriveEvent],
+) -> proton_drive_rs::proton_sdk::error::Result<()> {
+    for event in events {
+        core.client.invalidate_caches_for_event(event).await?;
+    }
+    Ok(())
 }
 
 /// What one batch of photos-volume events asks the gallery's tables to do.
@@ -616,14 +631,22 @@ fn classify_photo_events(
     mut is_echo: impl FnMut(&NodeUid) -> bool,
 ) -> PhotoEventPlan {
     let mut plan = PhotoEventPlan::default();
-    for event in events {
+    let mut seen = HashSet::new();
+    for event in events.iter().rev() {
         match event {
-            DriveEvent::NodeDeleted { node_uid, .. } => plan.gone.push(node_uid.to_string()),
+            DriveEvent::NodeDeleted { node_uid, .. } => {
+                if seen.insert(node_uid) {
+                    plan.gone.push(node_uid.to_string());
+                }
+            }
             DriveEvent::NodeUpdated {
                 node_uid,
                 is_trashed,
                 ..
             } => {
+                if !seen.insert(node_uid) {
+                    continue;
+                }
                 if *is_trashed {
                     plan.gone.push(node_uid.to_string());
                 } else if !is_echo(node_uid) {
@@ -641,45 +664,9 @@ fn classify_photo_events(
             DriveEvent::CursorAdvanced { .. } | DriveEvent::SharedWithMeUpdated { .. } => {}
         }
     }
+    plan.gone.reverse();
+    plan.touched.reverse();
     plan
-}
-
-/// Apply one batch of photos-volume events to the gallery's tables.
-fn apply_photo_events(core: &Core, events: &[DriveEvent]) {
-    let plan = classify_photo_events(events, |uid| core.take_self_change(uid));
-    let PhotoEventPlan {
-        gone,
-        touched,
-        full,
-    } = &plan;
-    if !gone.is_empty() {
-        match core.db.photos_delete(gone) {
-            Ok(removed) if removed > 0 => {
-                debug!(removed, "photos removed by a remote event");
-            }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "removing remotely deleted photos failed"),
-        }
-    }
-    // A stale mark is what makes the next refresh cheap: it reads these photos'
-    // nodes and carries every other photo's metadata as it stands.
-    if !touched.is_empty() {
-        match core.db.photos_mark_unresolved(touched) {
-            Ok(marked) if marked > 0 => debug!(marked, "photos changed by a remote event"),
-            Ok(_) => {}
-            Err(error) => warn!(%error, "marking remotely changed photos failed"),
-        }
-    }
-    if *full {
-        match core.db.photos_mark_all_unresolved() {
-            Ok(marked) => debug!(marked, "the photo event stream lost continuity"),
-            Err(error) => warn!(%error, "marking the whole timeline unresolved failed"),
-        }
-    }
-    if !plan.is_empty() {
-        core.invalidate_photos();
-        core.invalidate_albums();
-    }
 }
 
 /// Keep the local-file index fresh for the launcher prompt's "This computer"
