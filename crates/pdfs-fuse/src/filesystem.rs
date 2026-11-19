@@ -2372,17 +2372,19 @@ impl ProtonFs {
                 }
             }
         }
-        // Offline: queue it. Trashing is the one mutation a user expects to work
-        // regardless — the file is gone from their point of view the moment the
-        // command returns. The same when the network goes
-        // away under the remote call below.
+        // Queue a folder trash while Drive still holds children that were moved
+        // out locally. The drain waits for those moves before sending it.
         let queue_it = |reply: ReplyEmpty| match self.core.queue_trash(&uid, name, open_now) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         };
         if !self.core.sends_inline() {
-            queue_it(reply);
-            return;
+            return queue_it(reply);
+        }
+        match self.core.has_pending_moves_out_of(&uid) {
+            Ok(false) => {}
+            Ok(true) => return queue_it(reply),
+            Err(error) => return reply.error(error),
         }
         if let Err(e) = self.core.require_uid_writable(&uid) {
             reply.error(e);

@@ -11,6 +11,16 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.8.1] — 2026-11-19
+
+### Added
+
+- **Branding** icons updated, screenshots updated
+
+### Fixed
+
+- **Cache Eviction** fixed an issue where it didn't scan past pinned files and now also reapplies the limit at startup.
+
 ## [3.8.0] — 2026-11-14
 
 Schema: **45**. Synced folders now tell device backups apart from folders attached to My files.

@@ -1349,7 +1349,11 @@ impl Core {
         parent: Option<&NodeUid>,
         name: &str,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        if self.db.has_pending_trash_named(name)? {
+        let parent_uid = parent.map(NodeUid::to_string);
+        if self
+            .db
+            .has_pending_trash_named(name, parent_uid.as_deref())?
+        {
             return Ok(true);
         }
         if op.attempts >= NAME_HOLD_ATTEMPTS {

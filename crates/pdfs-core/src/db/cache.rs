@@ -108,7 +108,8 @@ impl Db {
         Ok(total.max(0) as u64)
     }
 
-    /// The `limit` least-recently-accessed entries of `kind`, oldest first.
+    /// The `limit` least-recently-accessed entries of `kind` after `offset`,
+    /// oldest first.
     ///
     /// Eviction wants a handful of victims, not the whole table. Bounded so a
     /// pass over a large cache does not read every row to drop a few, and so the
@@ -118,13 +119,14 @@ impl Db {
         &self,
         kind: &str,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<(String, u64)>> {
         let conn = self.read();
         let mut stmt = conn.prepare_cached(
             "SELECT cache_key, size_bytes FROM cache_entries
-             WHERE kind = ?1 ORDER BY last_accessed ASC LIMIT ?2",
+             WHERE kind = ?1 ORDER BY last_accessed ASC LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![kind, limit as i64], |r| {
+        let rows = stmt.query_map(params![kind, limit as i64, offset as i64], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
         })?;
         let mut out = Vec::new();

@@ -252,9 +252,32 @@ const UID_NOW: &str = "COALESCE((SELECT uid FROM nodes WHERE lid = pending_op.li
 const PARENT_NOW: &str =
     "COALESCE((SELECT uid FROM nodes WHERE lid = pending_op.parent_lid), parent_uid)";
 
+/// Whether any queued move takes a node out of the folder `source.uid`.
+/// A move updates the local node tree immediately, so its original parent
+/// comes from the queue, including while a worker is sending it to Drive.
+const MOVES_OUT_OF_FOLDER: &str = "
+    COALESCE((SELECT is_dir FROM nodes WHERE uid = source.uid), 1) = 1
+    AND EXISTS (
+        WITH RECURSIVE folders(uid, lid) AS (
+            SELECT source.uid, (SELECT lid FROM nodes WHERE uid = source.uid)
+            UNION
+            SELECT n.uid, n.lid FROM nodes n JOIN folders f
+              ON n.parent_lid = f.lid OR (n.parent_lid IS NULL AND n.parent_uid = f.uid)
+            WHERE n.is_dir = 1
+        )
+        SELECT 1 FROM pending_op AS move
+        WHERE move.kind = 'rename'
+          AND CASE WHEN json_valid(move.meta_json)
+                   THEN json_extract(move.meta_json, '$.original_parent_uid') END
+              IN (SELECT uid FROM folders)
+          AND move.parent_uid IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM folders f
+                          WHERE f.lid = move.parent_lid OR f.uid = move.parent_uid)
+    )";
+
 /// The `WHERE` terms for a row a drain worker may claim once it falls due: not
-/// claimed already, no other claimed op on the same node, and not under a
-/// folder that has yet to land.
+/// claimed already, no other claimed op on the same node, no pending creation
+/// of its parent, and no moves that still need a folder we are about to trash.
 ///
 /// One fragment for [`Db::claim_next_due_op`] and [`Db::earliest_due_at`]. A
 /// row the claim skips but the wait counts is due "now" for as long as it is
@@ -265,7 +288,9 @@ fn claimable() -> String {
          AND (parent_uid IS NULL OR substr({PARENT_NOW}, 1, {n}) <> '{v}~')
          AND uid NOT IN (SELECT uid FROM pending_op WHERE claimed_at <> 0)
          AND (lid IS NULL OR lid NOT IN (
-           SELECT lid FROM pending_op WHERE claimed_at <> 0 AND lid IS NOT NULL))",
+           SELECT lid FROM pending_op WHERE claimed_at <> 0 AND lid IS NOT NULL))
+         AND (kind <> 'trash' OR NOT EXISTS (
+           SELECT 1 FROM (SELECT {UID_NOW} AS uid) AS source WHERE {MOVES_OUT_OF_FOLDER}))",
         v = LOCAL_VOLUME,
         n = LOCAL_VOLUME.len() + 1,
     )
@@ -475,19 +500,40 @@ pub struct AttachedBlob {
 }
 
 impl Db {
-    /// Whether a queued trash still holds `name` somewhere.
+    /// A folder can look empty locally while Drive still holds the queued
+    /// moves' source files. A trash has to go through the drain in that case.
+    pub fn has_pending_moves_out_of(&self, uid: &str) -> Result<bool> {
+        let conn = self.read();
+        Ok(conn
+            .prepare_cached(&format!(
+                "SELECT EXISTS (SELECT 1 FROM (SELECT ?1 AS uid) AS source
+                                WHERE {MOVES_OUT_OF_FOLDER})"
+            ))?
+            .query_row(params![uid], |row| row.get(0))?)
+    }
+
+    /// Whether a queued trash still holds `name` in `parent_uid`.
     ///
     /// A replacing rename or a delete-then-recreate queues the trash of the old
     /// node ahead of the op that wants its name. With several drain workers the
     /// later op can run first and find the name still taken; this tells it to
-    /// wait for the trash rather than land under a conflict name.
-    pub fn has_pending_trash_named(&self, name: &str) -> Result<bool> {
+    /// wait for the trash rather than land under a conflict name. Older rows
+    /// whose node and parent are unknown are matched by name alone.
+    pub fn has_pending_trash_named(&self, name: &str, parent_uid: Option<&str>) -> Result<bool> {
         let conn = self.read();
         conn.query_row(
             "SELECT EXISTS(
-                SELECT 1 FROM pending_op WHERE kind = ?1 AND name = ?2
-             )",
-            params![OP_TRASH, name],
+                    SELECT 1 FROM pending_op AS p
+                    WHERE p.kind = ?1 AND p.name = ?2
+                      AND (?3 IS NULL OR ?3 = COALESCE(
+                          (SELECT uid FROM nodes WHERE lid = p.parent_lid),
+                          p.parent_uid,
+                          (SELECT COALESCE(parent.uid, n.parent_uid)
+                           FROM nodes n LEFT JOIN nodes parent ON parent.lid = n.parent_lid
+                           WHERE n.uid = p.uid),
+                          ?3))
+                 )",
+            params![OP_TRASH, name, parent_uid],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -1219,7 +1265,7 @@ impl Db {
     /// the claim is a column: a row is offered to exactly one worker, and the
     /// worker that took it is the only one that may retire, defer or fail it.
     ///
-    /// Two exclusions on top of [`next_due_op`](Self::next_due_op)'s:
+    /// The selected row must also satisfy [`claimable`]:
     ///
     /// * `claimed_at = 0` — not already in flight somewhere else.
     /// * no *other* claimed op shares this `uid`. Ordering only has to hold per
@@ -1229,6 +1275,8 @@ impl Db {
     ///   pending entry. `ORDER BY id` plus this exclusion gives per-uid serial
     ///   order for free — the older op is claimed first and the newer one is
     ///   invisible until it retires.
+    /// * its destination folder already exists remotely.
+    /// * a folder trash waits for pending moves out of that folder's subtree.
     ///
     /// Select and mark are one transaction, so two workers cannot both see the
     /// row as unclaimed.

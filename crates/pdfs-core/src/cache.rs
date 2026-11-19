@@ -579,6 +579,7 @@ impl ContentCache {
         // the disk.
         cache.reseed_totals();
         cache.import_legacy_pins()?;
+        cache.set_budget(max_bytes);
         Ok(cache)
     }
 
@@ -1153,16 +1154,18 @@ impl ContentCache {
         };
         let mut skipped = 0usize;
         while running > cap {
-            // Fetch a batch past whatever we have already skipped as exempt.
-            let want = skipped + EVICT_BATCH;
-            let Ok(batch) = self.db.cache_eviction_candidates(kind, want) else {
+            // A whole batch can be pinned. Keep looking until the index has
+            // no entries past the ones we have skipped.
+            let Ok(batch) = self
+                .db
+                .cache_eviction_candidates(kind, EVICT_BATCH, skipped)
+            else {
                 break;
             };
-            if batch.len() <= skipped {
-                break; // nothing new to consider
+            if batch.is_empty() {
+                break;
             }
-            let mut evicted_any = false;
-            for (key, size) in batch.into_iter().skip(skipped) {
+            for (key, size) in batch {
                 if running <= cap {
                     break;
                 }
@@ -1170,14 +1173,18 @@ impl ContentCache {
                     skipped += 1; // counts toward the total, never a victim
                     continue;
                 }
-                let _ = std::fs::remove_file(dir.join(&key));
+                if let Err(error) = std::fs::remove_file(dir.join(&key))
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    skipped += 1;
+                    continue;
+                }
                 let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
-                let _ = self.db.cache_remove(&key);
+                if self.db.cache_remove(&key).is_err() {
+                    skipped += 1;
+                    continue;
+                }
                 running = running.saturating_sub(size);
-                evicted_any = true;
-            }
-            if !evicted_any {
-                break; // every remaining candidate is exempt
             }
         }
         // The index is the truth; realign the fast path with it.
@@ -1405,7 +1412,7 @@ impl ContentCache {
             .collect();
         let content_dir = self.content_dir.clone();
         // Force pool enforcement ignoring current cap check to free disk space immediately
-        let Ok(list) = self.db.cache_eviction_candidates(KIND_BLOB, 10) else {
+        let Ok(list) = self.db.cache_eviction_candidates(KIND_BLOB, 10, 0) else {
             return;
         };
         for (key, bytes) in list {
@@ -1883,13 +1890,13 @@ impl ContentCache {
         // Pinned blobs (by cache key) are exempt from eviction. Resolves direct
         // pins plus every descendant of a recursively-pinned folder, hashed into
         // cache keys to match on-disk filenames.
-        let pinned: HashSet<String> = self
-            .db
-            .pinned_uids()
-            .unwrap_or_default()
-            .iter()
-            .map(|uid| Self::key_str(uid))
-            .collect();
+        let pinned = match self.db.pinned_uids() {
+            Ok(uids) => uids.iter().map(|uid| Self::key_str(uid)).collect(),
+            Err(error) => {
+                tracing::warn!(%error, "reading pins for cache eviction failed");
+                return;
+            }
+        };
         let content_dir = self.content_dir.clone();
         self.enforce_pool(KIND_BLOB, &content_dir, Some(&pinned));
     }
@@ -2010,8 +2017,7 @@ impl ContentCache {
     }
 
     /// Retune the soft byte cap (`0` = unlimited) at runtime and immediately
-    /// enforce it: blobs and blocks are LRU-evicted back under the new cap (a
-    /// lower cap frees space now; a higher one is a no-op until the next store).
+    /// enforce it across all three pools.
     /// Called by the daemon when the Settings page changes the cache budget.
     pub fn set_budget(&self, bytes: u64) {
         self.max_bytes.store(bytes, Ordering::Relaxed);
@@ -2245,19 +2251,50 @@ mod tests {
         // crash) but the same on-disk cache: reconcile repopulates from disk.
         let db2 = Arc::new(Db::open_in_memory().unwrap());
         assert!(db2.cache_entries_by_kind("blob").unwrap().is_empty());
-        let c = ContentCache::open(content, pins, 8, db2.clone()).unwrap();
+        let c = ContentCache::open(content, pins, 0, db2.clone()).unwrap();
         assert_eq!(db2.cache_entries_by_kind("blob").unwrap().len(), 3);
 
-        // With the index rebuilt, a further store enforces the budget against the
-        // reconciled entries instead of leaking them.
-        c.store(&uid("d"), 1, 4, b"dddd").unwrap();
-        let total: u64 = db2
-            .cache_entries_by_kind("blob")
-            .unwrap()
-            .iter()
-            .map(|(_, s)| s)
-            .sum();
-        assert!(total <= 8, "budget enforced after reconcile, total={total}");
+        assert_eq!(c.usage(), 12);
+    }
+
+    #[test]
+    fn reopening_trims_all_cache_pools_even_when_the_oldest_batch_is_pinned() {
+        let (c, _dir) = cache();
+        for i in 0..EVICT_BATCH {
+            let u = uid(&format!("pinned-{i}"));
+            c.store(&u, 1, 1, b"p").unwrap();
+            c.add_pin(&u, Path::new("pinned"), false).unwrap();
+            std::fs::File::open(c.blob_path(&u))
+                .unwrap()
+                .set_modified(UNIX_EPOCH)
+                .unwrap();
+        }
+
+        let unpinned = uid("unpinned");
+        let payload = [0u8; 64];
+        let size = payload.len() as u64;
+        c.store(&unpinned, 1, size, &payload).unwrap();
+        c.store_block(&unpinned, 1, size, blk(size, 0), &payload)
+            .unwrap();
+        c.store_thumbnail(&unpinned, 1, 1, &payload).unwrap();
+        let recovery = c.recovery_dir.join("recovered.bin");
+        std::fs::write(&recovery, b"recovered write").unwrap();
+
+        let budget = (EVICT_BATCH as u64 * 100).div_ceil(SPLIT_BLOB);
+        let reopened = ContentCache::open(
+            c.content_dir.clone(),
+            c.pins_path.clone(),
+            budget,
+            c.db.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(reopened.usage(), EVICT_BATCH as u64);
+        assert!(!reopened.blob_path(&unpinned).exists());
+        for i in 0..EVICT_BATCH {
+            assert!(reopened.is_cached(&uid(&format!("pinned-{i}")), 1, 1));
+        }
+        assert_eq!(std::fs::read(recovery).unwrap(), b"recovered write");
     }
 
     /// An eviction removes the blob, then its tag. A crash in between, or a
