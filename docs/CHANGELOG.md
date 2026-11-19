@@ -20,7 +20,7 @@ Schema: **46**. Photos adds a local database migration for incremental metadata 
 - Open **Drive galleries** in Photos → Albums to browse saved My files folders and their
   subfolders, choose album covers, and manage public links. Saved galleries and
   covers sync with Proton Gallery on desktop and Android.
-- Unlock hidden albums from the Albums view with the local Gallery passphrase.
+- Unlock hidden albums from the Albums view with your Linux sign-in.
 
 ### Changed
 

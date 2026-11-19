@@ -2019,9 +2019,7 @@ pub struct MappingProgress {
 /// Actions on saved Drive folder galleries.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum GalleryAction {
-    Unlock {
-        passphrase: String,
-    },
+    AuthenticateHidden,
     Lock,
     List {
         album: Option<GalleryPlace>,

@@ -156,6 +156,7 @@ jobs:
           cp packaging/io.narl.proton-drive-linux.desktop deb/usr/share/applications/
           cp packaging/io.narl.proton-drive-linux-tray.desktop deb/etc/xdg/autostart/
           cp packaging/io.narl.proton-drive-linux.svg deb/usr/share/icons/hicolor/scalable/apps/
+          install -Dm644 packaging/io.narl.proton-drive-linux.policy deb/usr/share/polkit-1/actions/io.narl.proton-drive-linux.policy
           cp packaging/proton-drive.service deb/usr/lib/systemd/user/
           cp LICENSE deb/usr/share/licenses/proton-drive-linux/
           po/build.sh deb/usr/share/locale
@@ -175,7 +176,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Maintainer: Nils Pukropp <contact@narl.io>
-          Depends: fuse3, libgtk-4-1 (>= 4.12.0), libadwaita-1-0 (>= 1.5.0), libsecret-1-0, libwebkitgtk-6.0-4, libimage-exiftool-perl
+          Depends: polkitd, fuse3, libgtk-4-1 (>= 4.12.0), libadwaita-1-0 (>= 1.5.0), libsecret-1-0, libwebkitgtk-6.0-4, libimage-exiftool-perl
           Installed-Size: ${INSTALLED_SIZE}
           Homepage: https://proton-drive.narl.io
           Description: Unofficial Proton Drive client for Linux

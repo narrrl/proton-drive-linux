@@ -39,6 +39,7 @@ BuildRequires:  glib2-devel
 BuildRequires:  webkitgtk6.0-devel
 BuildRequires:  gettext
 
+Requires:       polkit
 Requires:       fuse3
 Requires:       gtk4
 Requires:       libadwaita
@@ -114,6 +115,8 @@ install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux-tray.desktop \
   %{buildroot}%{_sysconfdir}/xdg/autostart/io.narl.proton-drive-linux-tray.desktop
 install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux.svg \
   %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
+install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux.policy \
+  %{buildroot}/usr/share/polkit-1/actions/io.narl.proton-drive-linux.policy
 install -D -m0644 %{src}/packaging/proton-drive.service \
   %{buildroot}/usr/lib/systemd/user/proton-drive.service
 %{src}/po/build.sh %{buildroot}%{_datadir}/locale
@@ -152,6 +155,7 @@ fi
 %{_sysconfdir}/xdg/autostart/io.narl.proton-drive-linux-tray.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
 /usr/lib/systemd/user/proton-drive.service
+%{_datadir}/polkit-1/actions/io.narl.proton-drive-linux.policy
 %{_datadir}/locale/*/LC_MESSAGES/pdfs.mo
 %{_datadir}/bash-completion/completions/pdfs
 %{_datadir}/zsh/site-functions/_pdfs

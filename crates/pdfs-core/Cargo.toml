@@ -10,7 +10,6 @@ homepage.workspace = true
 description = "Core auth/session/config for the Proton Drive Linux client"
 
 [dependencies]
-argon2 = "0.5"
 proton-sdk.workspace = true
 proton-drive-rs.workspace = true
 chrono.workspace = true

@@ -9,10 +9,19 @@ gallery by choosing a folder from **My files**. Opening it or any subfolder
 keeps you in Photos. Back or Escape returns to the parent and its scroll
 position.
 
-**Hidden albums** opens with the Gallery passphrase stored for this account in
-your Linux keyring. It includes hidden Proton albums and hidden Drive gallery
-folders, including folders inside public galleries. Leaving Hidden albums or
-switching away from the window locks it and closes its previews.
+**Hidden albums** opens with your Linux sign-in. The app uses the desktop
+polkit prompt, so it needs a running authentication agent and the installed
+polkit policy. Existing hidden albums remain hidden after upgrading. This view
+includes hidden Proton albums and hidden Drive folders, including folders
+inside public galleries. Leaving Hidden albums or switching away from the
+window locks it and closes its previews.
+
+For a system package, the policy is installed with the app. For a source build
+or a per-user tarball install, have your system administrator install
+`packaging/io.narl.proton-drive-linux.policy` (or the corresponding file under the
+tarball's `share/polkit-1/actions/`) into the system polkit actions directory.
+On NixOS, enable `security.polkit` and install the package system-wide to
+register its policy.
 
 GTK pages Timeline, Proton albums, and Places through the Drive daemon's Photos
 control requests backed by its SQLite database. Saved Drive galleries come from

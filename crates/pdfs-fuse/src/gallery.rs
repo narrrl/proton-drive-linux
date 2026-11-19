@@ -431,20 +431,40 @@ impl Core {
             .ok_or_else(|| CoreError::remote("The Gallery session is unavailable"))
     }
 
+    pub(super) fn authenticate_hidden_gallery(
+        &self,
+        stream: &std::os::unix::net::UnixStream,
+    ) -> CoreResult<Response> {
+        let gallery = self.gallery_host()?;
+        let access = gallery.access.load(Ordering::SeqCst);
+        let peer = rustix::net::sockopt::socket_peercred(stream)
+            .map_err(|_| CoreError::invalid("Couldn’t identify the authentication requester."))?;
+        if peer.uid != rustix::process::geteuid() {
+            return Err(CoreError::invalid(
+                "Use your Linux sign-in to unlock Hidden albums.",
+            ));
+        }
+        let subject = pg_app::desktop_auth::Subject::new(
+            peer.pid.as_raw_nonzero().get() as u32,
+            peer.uid.as_raw(),
+        )
+        .map_err(gallery_error)?;
+        self.rt
+            .block_on(subject.authenticate("io.narl.proton-drive-linux.unlock-hidden-albums"))
+            .map_err(gallery_error)?;
+        if gallery.cancel.is_cancelled() {
+            return Err(CoreError::invalid("The Gallery session has ended."));
+        }
+        gallery
+            .access
+            .compare_exchange(access, access | 1, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| CoreError::invalid("Hidden albums were locked"))?;
+        Ok(done())
+    }
+
     pub(super) fn drive_gallery(&self, action: GalleryAction) -> CoreResult<Response> {
         let gallery = self.gallery_host()?;
         let action = match action {
-            GalleryAction::Unlock { passphrase } => {
-                let passphrase = zeroize::Zeroizing::new(passphrase);
-                let access = gallery.access.load(Ordering::SeqCst);
-                pdfs_core::auth::unlock_gallery(gallery.session.username(), &passphrase)
-                    .map_err(gallery_error)?;
-                gallery
-                    .access
-                    .compare_exchange(access, access | 1, Ordering::SeqCst, Ordering::SeqCst)
-                    .map_err(|_| CoreError::invalid("Hidden albums were locked"))?;
-                return Ok(done());
-            }
             GalleryAction::Lock => {
                 gallery.lock();
                 return Ok(done());
@@ -457,7 +477,7 @@ impl Core {
                 .ensure_visibility(self, app, matches!(action, GalleryAction::Refresh))
                 .await?;
             match action {
-                GalleryAction::Unlock { .. } | GalleryAction::Lock => unreachable!(),
+                GalleryAction::AuthenticateHidden | GalleryAction::Lock => unreachable!(),
                 GalleryAction::List {
                     album,
                     offset,

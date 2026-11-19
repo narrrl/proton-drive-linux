@@ -396,8 +396,8 @@ fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
     use CtlRequest as R;
     match request {
         R::Pin { .. } | R::Unpin { .. } => &[Topic::Files],
-        // Unlock affects private requests only. Publishing the lock notification
-        // here for Unlock as well could close the view that just opened.
+        // Only locking invalidates a hidden view. Authentication does not
+        // change the public catalog and must not emit this notification.
         R::DriveGallery {
             action: pdfs_core::control::GalleryAction::Lock,
         } => &[Topic::GalleryVisibility],
@@ -952,6 +952,11 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             None => CtlResponse::error(CoreError::invalid(format!("bad uid: {uid}"))),
         },
+        Ok(CtlRequest::DriveGallery {
+            action: pdfs_core::control::GalleryAction::AuthenticateHidden,
+        }) => core
+            .authenticate_hidden_gallery(&stream)
+            .unwrap_or_else(CtlResponse::error),
         Ok(CtlRequest::DriveGallery { action }) => core
             .drive_gallery(action)
             .unwrap_or_else(CtlResponse::error),

@@ -3611,7 +3611,6 @@ dependencies = [
 name = "pdfs-core"
 version = "3.9.0"
 dependencies = [
- "argon2",
  "async-trait",
  "base64 0.23.1",
  "chrono",
@@ -3659,6 +3658,7 @@ dependencies = [
  "pg-app",
  "pg-core",
  "proton-drive-rs",
+ "rustix",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -3710,8 +3710,8 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pg-app"
-version = "0.2.0"
-source = "git+https://github.com/narrrl/proton-gallery.git?rev=b841c37ad57694470f499f575f7a956425c28ade#b841c37ad57694470f499f575f7a956425c28ade"
+version = "0.3.0"
+source = "git+https://github.com/narrrl/proton-gallery.git?rev=858d2446f71214ec5357eb8b543d6b82abf47386#858d2446f71214ec5357eb8b543d6b82abf47386"
 dependencies = [
  "async-trait",
  "hex",
@@ -3730,8 +3730,8 @@ dependencies = [
 
 [[package]]
 name = "pg-core"
-version = "0.2.0"
-source = "git+https://github.com/narrrl/proton-gallery.git?rev=b841c37ad57694470f499f575f7a956425c28ade#b841c37ad57694470f499f575f7a956425c28ade"
+version = "0.3.0"
+source = "git+https://github.com/narrrl/proton-gallery.git?rev=858d2446f71214ec5357eb8b543d6b82abf47386#858d2446f71214ec5357eb8b543d6b82abf47386"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-trait",
@@ -3750,8 +3750,8 @@ dependencies = [
 
 [[package]]
 name = "pg-drive"
-version = "0.2.0"
-source = "git+https://github.com/narrrl/proton-gallery.git?rev=b841c37ad57694470f499f575f7a956425c28ade#b841c37ad57694470f499f575f7a956425c28ade"
+version = "0.3.0"
+source = "git+https://github.com/narrrl/proton-gallery.git?rev=858d2446f71214ec5357eb8b543d6b82abf47386#858d2446f71214ec5357eb8b543d6b82abf47386"
 dependencies = [
  "async-trait",
  "hex",

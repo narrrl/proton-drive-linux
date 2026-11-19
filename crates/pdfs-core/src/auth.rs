@@ -128,48 +128,6 @@ fn with_keyring<T>(op: impl Fn(&Entry) -> keyring_core::Result<T>) -> Result<T> 
     with_keyring_entry(KEYRING_SERVICE, KEYRING_USER, op)
 }
 
-/// Verify the machine-local Gallery passphrase, setting it on first use.
-pub fn unlock_gallery(username: &str, passphrase: &str) -> std::result::Result<(), String> {
-    use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-    use std::io::Read;
-
-    if passphrase.is_empty() || passphrase.len() > 1024 {
-        return Err("Enter your Gallery passphrase.".into());
-    }
-    static VERIFY: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    let _verify = VERIFY.lock();
-    let service = "io.narl.protongallery";
-    let user = format!("hidden-albums:{username}");
-    let argon = argon2::Argon2::default();
-    match with_keyring_entry(service, &user, Entry::get_password) {
-        Ok(stored) => {
-            let hash = PasswordHash::new(&stored)
-                .map_err(|_| "The saved Gallery passphrase is unreadable.")?;
-            argon
-                .verify_password(passphrase.as_bytes(), &hash)
-                .map_err(|_| "The Gallery passphrase is incorrect.".into())
-        }
-        Err(Error::Keyring(keyring_core::Error::NoEntry)) => {
-            if passphrase.chars().count() < 12 {
-                return Err("Choose a Gallery passphrase with at least 12 characters.".into());
-            }
-            let mut bytes = [0; 16];
-            std::fs::File::open("/dev/urandom")
-                .and_then(|mut file| file.read_exact(&mut bytes))
-                .map_err(|_| "Couldn’t generate the passphrase salt.")?;
-            let salt = SaltString::encode_b64(&bytes)
-                .map_err(|_| "Couldn’t generate the passphrase salt.")?;
-            let hash = argon
-                .hash_password(passphrase.as_bytes(), &salt)
-                .map_err(|_| "Couldn’t protect the Gallery passphrase.")?
-                .to_string();
-            with_keyring_entry(service, &user, |entry| entry.set_password(&hash))
-                .map_err(|_| "Couldn’t save the Gallery passphrase in the system keyring.".into())
-        }
-        Err(_) => Err("The system keyring is locked or unavailable.".into()),
-    }
-}
-
 /// Run `op` on the entry `service`/`user`, reconnecting once if the Secret
 /// Service fails the call.
 ///

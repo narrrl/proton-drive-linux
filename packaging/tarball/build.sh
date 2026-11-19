@@ -32,6 +32,8 @@ install -Dm644 "$repo/packaging/io.narl.proton-drive-linux-tray.desktop" \
   "$root/etc/xdg/autostart/io.narl.proton-drive-linux-tray.desktop"
 install -Dm644 "$repo/packaging/io.narl.proton-drive-linux.svg" \
   "$root/share/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg"
+install -Dm644 "$repo/packaging/io.narl.proton-drive-linux.policy" \
+  "$root/share/polkit-1/actions/io.narl.proton-drive-linux.policy"
 install -Dm644 "$repo/packaging/proton-drive.service" \
   "$root/lib/systemd/user/proton-drive.service"
 install -Dm644 "$repo/LICENSE" "$root/share/licenses/proton-drive-linux/LICENSE"

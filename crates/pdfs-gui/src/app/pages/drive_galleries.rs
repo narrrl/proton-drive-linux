@@ -31,6 +31,7 @@ pub(crate) struct Browser {
     root_reload: Cell<bool>,
     preview: glib::WeakRef<adw::Dialog>,
     unlock_pending: Cell<bool>,
+    unlock_verified: Cell<bool>,
     rows: gio::ListStore,
     scroll: gtk4::ScrolledWindow,
     title: adw::WindowTitle,
@@ -75,7 +76,9 @@ impl Browser {
         self.next_request();
         self.loading.set(false);
         self.total.set(0);
-        if self.unlocked.replace(false) || self.unlock_pending.get() {
+        let was_unlocked = self.unlocked.replace(false);
+        let was_verified = self.unlock_verified.replace(false);
+        if was_unlocked || was_verified || self.unlock_pending.get() {
             self.lock();
         }
         if let Some(preview) = self.preview.upgrade() {
@@ -118,6 +121,15 @@ impl Browser {
         self.root.remove_all();
         self.load_root();
         if !self.active() || self.chooser.borrow().is_some() || self.unlock_pending.get() {
+            return;
+        }
+        if self.unlock_verified.get() {
+            if locked {
+                self.close();
+            }
+            return;
+        }
+        if !self.unlocked.get() && self.current().is_none() {
             return;
         }
         if let Some(preview) = self.preview.upgrade() {
@@ -393,7 +405,6 @@ impl Browser {
     }
 
     fn change(self: &Rc<Self>, action: GalleryAction) {
-        let unlock = matches!(action, GalleryAction::Unlock { .. });
         let update_root = matches!(
             action,
             GalleryAction::Add { .. }
@@ -401,9 +412,6 @@ impl Browser {
                 | GalleryAction::Refresh
                 | GalleryAction::Cover { .. }
         );
-        if unlock && self.unlock_pending.replace(true) {
-            return;
-        }
         self.unlock.set_visible(false);
         let generation = self.next_request();
         self.status.set_label(&gettext("Updating gallery…"));
@@ -414,25 +422,11 @@ impl Browser {
         let browser = self.clone();
         glib::spawn_future_local(async move {
             let result = rx.recv().await;
-            if unlock {
-                browser.unlock_pending.set(false);
-                browser.unlock.set_visible(
-                    browser.active()
-                        && browser.generation.get() == generation
-                        && !matches!(result, Ok(Ok(Response::Ok { .. }))),
-                );
-            }
             if browser.generation.get() != generation {
-                if unlock && matches!(result, Ok(Ok(Response::Ok { .. }))) {
-                    browser.lock();
-                }
                 return;
             }
             match result {
                 Ok(Ok(Response::Ok { .. })) => {
-                    if unlock {
-                        browser.unlocked.set(true);
-                    }
                     let added = browser.chooser.borrow().is_some();
                     if update_root {
                         browser.load_root();
@@ -467,36 +461,58 @@ impl Browser {
     }
 
     fn prompt_unlock(self: &Rc<Self>) {
-        if self.unlock_pending.get() {
+        if self.unlock_pending.replace(true) {
             return;
         }
-        let Some(parent) = ui_window(&self.ui) else {
-            return;
-        };
-        let dialog = adw::AlertDialog::builder()
-            .heading(gettext("Unlock Hidden Albums"))
-            .body(gettext("Enter your Gallery passphrase. On first use, choose one with at least 12 characters."))
-            .build();
-        let password = gtk4::PasswordEntry::builder().show_peek_icon(true).build();
-        dialog.set_extra_child(Some(&password));
-        dialog.add_response("cancel", &gettext("Cancel"));
-        dialog.add_response("unlock", &gettext("Unlock"));
-        dialog.set_response_appearance("unlock", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("unlock"));
-        let browser = Rc::downgrade(self);
-        dialog.connect_response(None, move |_, response| {
-            let passphrase = password.text().to_string();
-            password.set_text("");
-            if response == "unlock"
-                && let Some(browser) = browser.upgrade()
-            {
-                browser.enter();
-                browser.more.set_visible(false);
-                browser.title.set_title(&gettext("Hidden albums"));
-                browser.change(GalleryAction::Unlock { passphrase });
+        self.enter();
+        self.more.set_visible(false);
+        self.unlock.set_visible(false);
+        self.title.set_title(&gettext("Hidden albums"));
+        self.status
+            .set_label(&gettext("Use your Linux sign-in to unlock Hidden albums."));
+        let generation = self.next_request();
+        let rx = spawn_request(
+            self.ui.dirs.control_socket(),
+            Request::DriveGallery {
+                action: GalleryAction::AuthenticateHidden,
+            },
+        );
+        let browser = self.clone();
+        glib::spawn_future_local(async move {
+            let result = rx.recv().await;
+            browser.unlock_pending.set(false);
+            if browser.generation.get() != generation {
+                if matches!(result, Ok(Ok(Response::Ok { .. }))) {
+                    browser.lock();
+                }
+                return;
+            }
+            match result {
+                Ok(Ok(Response::Ok { .. })) => {
+                    browser.unlock_verified.set(true);
+                    browser.reveal_verified();
+                }
+                Ok(Ok(Response::Error { message, .. })) => {
+                    browser.status.set_label(&message);
+                    browser.unlock.set_visible(true);
+                }
+                _ => {
+                    browser
+                        .status
+                        .set_label(&gettext("Couldn't reach Proton Drive."));
+                    browser.unlock.set_visible(true);
+                }
             }
         });
-        dialog.present(Some(&parent));
+    }
+
+    fn reveal_verified(self: &Rc<Self>) {
+        if ui_window(&self.ui).is_some_and(|window| window.is_active())
+            && self.unlock_verified.replace(false)
+        {
+            self.unlocked.set(true);
+            self.load(0, 0.0);
+        }
     }
 
     pub(crate) fn back(self: &Rc<Self>) {
@@ -713,6 +729,7 @@ pub(crate) fn wire(
         root_loading: Cell::new(false),
         preview: glib::WeakRef::new(),
         unlock_pending: Cell::new(false),
+        unlock_verified: Cell::new(false),
         rows,
         scroll: scroll.clone(),
         title,
@@ -737,10 +754,12 @@ pub(crate) fn wire(
     *ui.drive_galleries.borrow_mut() = Rc::downgrade(&browser);
     let weak = Rc::downgrade(&browser);
     window.connect_is_active_notify(move |window| {
-        if !window.is_active()
-            && let Some(browser) = weak.upgrade()
-            && (browser.unlocked.get() || browser.unlock_pending.get())
-        {
+        let Some(browser) = weak.upgrade() else {
+            return;
+        };
+        if window.is_active() {
+            browser.reveal_verified();
+        } else if browser.unlocked.get() {
             browser.close();
         }
     });

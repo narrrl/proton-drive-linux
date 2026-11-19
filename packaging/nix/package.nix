@@ -15,6 +15,7 @@
   webkitgtk_6_0,
   libsecret,
   dbus,
+  polkit,
   exiftool,
   ffmpeg-headless,
   withFfmpeg ? true,
@@ -36,6 +37,7 @@ rustPlatform.buildRustPackage {
       ../../crates
       ../../po
       ../../LICENSE
+      ../io.narl.proton-drive-linux.policy
       ../proton-drive.service
       ../io.narl.proton-drive-linux.desktop
       ../io.narl.proton-drive-linux-tray.desktop
@@ -103,6 +105,8 @@ rustPlatform.buildRustPackage {
     substituteInPlace $out/etc/xdg/autostart/io.narl.proton-drive-linux-tray.desktop \
       --replace-fail "Exec=pdfs-tray" "Exec=$out/bin/pdfs-tray"
 
+    install -Dm644 packaging/io.narl.proton-drive-linux.policy \
+      $out/share/polkit-1/actions/io.narl.proton-drive-linux.policy
     install -Dm644 packaging/proton-drive.service \
       $out/lib/systemd/user/proton-drive.service
     substituteInPlace $out/lib/systemd/user/proton-drive.service \
@@ -123,7 +127,7 @@ rustPlatform.buildRustPackage {
   # it is the setuid wrapper in /run/wrappers/bin.
   preFixup = ''
     gappsWrapperArgs+=(--suffix PATH : ${
-      lib.makeBinPath ([ exiftool ] ++ lib.optional withFfmpeg ffmpeg-headless)
+      lib.makeBinPath ([ exiftool polkit ] ++ lib.optional withFfmpeg ffmpeg-headless)
     })
   '';
 
