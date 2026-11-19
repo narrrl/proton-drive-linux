@@ -160,6 +160,17 @@ impl Server {
             .is_some_and(|remote| remote.file.is_none() && !remote.trashed)
     }
 
+    fn in_trash(&self, uid: &NodeUid) -> bool {
+        let mut node = self.current(uid);
+        while let Some(remote) = node {
+            if remote.trashed {
+                return true;
+            }
+            node = remote.parent.as_ref().and_then(|uid| self.current(uid));
+        }
+        false
+    }
+
     fn is_below(&self, uid: &NodeUid, ancestor: &NodeUid) -> bool {
         let mut cursor = Some(uid.clone());
         while let Some(at) = cursor {
@@ -1037,6 +1048,12 @@ impl FakeClient {
         }
         let parent = new_parent.cloned().or(remote.parent.clone());
         let name = new_name.unwrap_or(&remote.name).to_owned();
+        if server.in_trash(uid) || parent.as_ref().is_some_and(|uid| server.in_trash(uid)) {
+            return Err(api(
+                ResponseCode::NotEnoughPermissions,
+                "an item involved in the move is in Trash",
+            ));
+        }
         if let Some(parent) = &parent {
             if !server.is_folder(parent) {
                 return Err(api(

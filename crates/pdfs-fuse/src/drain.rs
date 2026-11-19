@@ -20,7 +20,7 @@
 //! are kept as a conflict copy rather than discarded — see
 //! [`Core::revision_conflict`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +52,21 @@ use super::{
 };
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
+
+#[derive(Debug)]
+struct TrashedMove(String);
+
+impl std::fmt::Display for TrashedMove {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "‘{}’ is in Proton Drive Trash. Restore it before retrying this move.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for TrashedMove {}
 
 const DRAIN_ACCESS_RECHECK: Duration = Duration::from_secs(5);
 
@@ -795,13 +810,13 @@ impl Core {
         let parent = parse_node_uid(parent_str).ok_or("rename op has an unparseable parent")?;
         let name = op.name.clone().ok_or("rename op has no name")?;
 
-        // The node we were asked to rename may be gone or trashed by now. Either
-        // way there is nothing to rename and nothing to lose — a rename holds no
-        // bytes — so the op is satisfied rather than retried forever.
+        // A trashed node can be restored. Only retire the operation if the node
+        // is gone entirely.
         let node = match self.fetch_node_remote(&uid)? {
-            Some(n) if !n.trashed => n,
-            _ => {
-                warn!(%uid, name, "renamed node is gone or trashed remotely; dropping the rename");
+            Some(n) if n.trashed => return Err(TrashedMove(n.name).into()),
+            Some(n) => n,
+            None => {
+                warn!(%uid, name, "renamed node is gone remotely; dropping the rename");
                 self.db.delete_op(op.id)?;
                 return Ok(());
             }
@@ -827,23 +842,38 @@ impl Core {
             // no window for the requirements to go stale between two calls —
             // the race B46 queued this op to get away from.
             let target = (node.name != name).then_some(name.as_str());
-            match self.move_rename_remote(&uid, &parent, target) {
+            let try_move = |target| {
+                self.move_rename_remote(&uid, &parent, target).map_err(
+                    |error| -> Box<dyn std::error::Error> {
+                        if (is_gone(&error) || refusal(&error) == Some(Some(SyncIssue::Access)))
+                            && let Some(name) = trashed_move_folder(
+                                node.parent_uid.iter().chain(std::iter::once(&parent)),
+                                |uid| self.fetch_node_remote(uid).ok().flatten(),
+                            )
+                        {
+                            return TrashedMove(name).into();
+                        }
+                        error.into()
+                    },
+                )
+            };
+            match try_move(target) {
                 Ok(()) => name.clone(),
                 // The destination holds that name already. Landing under a
                 // *different* name is the non-destructive resolution: it neither
                 // clobbers their file nor drops ours, and it is visible.
-                Err(e) if is_already_exists(&e) => {
+                Err(e) if is_already_exists(e.as_ref()) => {
                     if self.name_is_held(op, Some(&parent), &name)? {
                         return Err(held_by_queued_change(&name));
                     }
                     // What held it may have let go since Drive answered
                     // (docs/BUGS.md B144).
-                    match self.move_rename_remote(&uid, &parent, target) {
+                    match try_move(target) {
                         Ok(()) => name.clone(),
-                        Err(e) if is_already_exists(&e) => {
+                        Err(e) if is_already_exists(e.as_ref()) => {
                             let alt = conflict_name(&name, now_secs());
                             warn!(%uid, name, alt, "destination already holds that name; using a conflict name");
-                            self.move_rename_remote(&uid, &parent, Some(&alt))?;
+                            try_move(Some(&alt))?;
                             self.adopt_drained_name(&uid, &alt);
                             self.log_activity(
                                 ActivityKind::Rename,
@@ -853,7 +883,7 @@ impl Core {
                             );
                             alt
                         }
-                        Err(e) => return Err(e.into()),
+                        Err(e) => return Err(e),
                     }
                 }
                 // The destination folder is gone. Leaving the node in its current
@@ -862,7 +892,7 @@ impl Core {
                 // the user chose still applies there. Retrying the move could
                 // only fail again — the folder is not coming back — and would
                 // wedge the queue.
-                Err(e) if is_gone(&e) => {
+                Err(e) if is_gone(e.as_ref()) => {
                     warn!(%uid, name, %parent, "move destination is gone; leaving the node where it is");
                     let landed = match self.drain_rename_in_place(
                         op,
@@ -885,7 +915,7 @@ impl Core {
                     );
                     landed
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         };
         self.db.delete_op(op.id)?;
@@ -2699,6 +2729,29 @@ fn moved_elsewhere(meta: &RenameMeta, node: &Node, parent: &NodeUid, name: &str)
     !at(&meta.original_parent_uid, original_name) && !at(&parent.to_string(), name)
 }
 
+/// A child can have a normal metadata record even when an ancestor is trashed.
+/// Check both live parent chains before interpreting a refused move as an
+/// access problem. Shared ancestors only need to be fetched once.
+fn trashed_move_folder<'a>(
+    parents: impl IntoIterator<Item = &'a NodeUid>,
+    mut fetch: impl FnMut(&NodeUid) -> Option<Node>,
+) -> Option<String> {
+    let mut seen = HashSet::new();
+    for parent in parents {
+        let mut next = Some(parent.clone());
+        while let Some(uid) = next.take()
+            && seen.insert(uid.clone())
+            && let Some(node) = fetch(&uid)
+        {
+            if node.trashed {
+                return Some(node.name);
+            }
+            next = node.parent_uid;
+        }
+    }
+    None
+}
+
 /// The answer from Drive somewhere in `e`'s chain, if it got that far.
 fn proton_error<'e>(e: &'e (dyn std::error::Error + 'static)) -> Option<&'e ProtonError> {
     std::iter::successors(Some(e), |e| e.source()).find_map(|e| e.downcast_ref::<ProtonError>())
@@ -2708,6 +2761,9 @@ fn proton_error<'e>(e: &'e (dyn std::error::Error + 'static)) -> Option<&'e Prot
 /// could not be reached, which says nothing; otherwise the issue Drive's answer
 /// is, or `Some(None)` for a failure that is not a refusal.
 fn refusal(e: &(dyn std::error::Error + 'static)) -> Option<Option<SyncIssue>> {
+    if e.is::<TrashedMove>() {
+        return Some(Some(SyncIssue::Trashed));
+    }
     let proton = proton_error(e)?;
     // A refused session refuses everything, so it says nothing about this
     // op either; the mount is offline for it (`Core::lost_link`).
@@ -3113,6 +3169,31 @@ mod tests {
             direct_role: None,
             share_id: None,
         }
+    }
+
+    #[test]
+    fn a_refused_move_identifies_a_trashed_ancestor_on_either_side() {
+        let source = folder_node("source", Some("old"));
+        let destination = folder_node("destination", Some("new"));
+        let mut old = folder_node("old", None);
+        let mut new = folder_node("new", None);
+        let find = |old: &Node, new: &Node| {
+            trashed_move_folder([&source.uid, &destination.uid], |uid| {
+                [&source, &destination, old, new]
+                    .into_iter()
+                    .find(|node| node.uid == *uid)
+                    .cloned()
+            })
+        };
+        old.trashed = true;
+        assert_eq!(find(&old, &new).as_deref(), Some("old"));
+        old.trashed = false;
+        new.trashed = true;
+        let error = TrashedMove(find(&old, &new).unwrap());
+        assert_eq!(refusal(&error), Some(Some(SyncIssue::Trashed)));
+        assert!(error.to_string().contains("‘new’"));
+        new.trashed = false;
+        assert_eq!(find(&old, &new), None);
     }
 
     #[test]

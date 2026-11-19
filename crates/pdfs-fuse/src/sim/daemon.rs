@@ -1919,6 +1919,68 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_move_blocked_by_trash_can_be_retried_after_restore() {
+        use pdfs_core::control::SyncIssue;
+
+        let drive = FakeDrive::new();
+        let dir = scratch("move-out-of-trash");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::none())).unwrap();
+        let mount = &daemon.mountpoint;
+        std::fs::create_dir_all(mount.join("source/nested")).unwrap();
+        std::fs::create_dir(mount.join("destination")).unwrap();
+        std::fs::write(mount.join("source/nested/wallpaper.jpg"), b"image").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || daemon.drained()
+            && drive.lookup("source/nested/wallpaper.jpg").is_some()));
+        let source = drive.lookup("source").unwrap();
+
+        let pause = |paused| Request::SetSyncPaused {
+            paused,
+            until: None,
+        };
+        daemon.request(&pause(true)).unwrap();
+        std::fs::rename(
+            mount.join("source/nested/wallpaper.jpg"),
+            mount.join("destination/wallpaper.jpg"),
+        )
+        .unwrap();
+        drive.device().trash("source");
+        daemon.request(&pause(false)).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || daemon
+            .pending()
+            .is_ok_and(|ops| ops.iter().any(|op| op.issue
+                == Some(SyncIssue::Trashed)
+                && op
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("‘source’"))))));
+
+        daemon
+            .request(&Request::RetryPendingOp { id: None })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || daemon
+            .pending()
+            .is_ok_and(|ops| ops.iter().any(|op| op.attempts >= 2))));
+        daemon
+            .request(&Request::Restore {
+                uids: vec![source.to_string()],
+            })
+            .unwrap();
+        daemon
+            .request(&Request::RetryPendingOp { id: None })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || daemon.drained()
+            && drive.lookup("destination/wallpaper.jpg").is_some()));
+        assert_eq!(
+            std::fs::read(mount.join("destination/wallpaper.jpg")).unwrap(),
+            b"image"
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_write_over_a_create_whose_read_back_failed_is_not_a_conflict() {
         // The create landed and the link went down before it was read back.
         // The next write was based on the file as it was made locally, and

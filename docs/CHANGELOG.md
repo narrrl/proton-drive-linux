@@ -13,13 +13,22 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [3.8.1] — 2026-11-19
 
-### Added
+Schema: **45**. No database migration in this release.
 
-- **Branding** icons updated, screenshots updated
+### Changed
+
+- Refreshed the application icon and project artwork, and updated the documentation screenshots.
 
 ### Fixed
 
-- **Cache Eviction** fixed an issue where it didn't scan past pinned files and now also reapplies the limit at startup.
+- The cache skips pinned files when looking for space to reclaim and reapplies the configured
+  limit when the service starts. Pinned files and recovery data are preserved.
+- Trashing a folder waits for queued moves out of it, including moves from nested subfolders.
+  If a move is blocked by an item or folder already in Trash, Sync and `pdfs sync issues`
+  identify what to restore before retrying.
+- The system tray displays a warning icon when sync needs attention or the session has expired.
+- Updated the Proton SDK to 0.12.1 so a fast local clock no longer causes Proton to reject
+  uploads of new files and photos.
 
 ## [3.8.0] — 2026-11-14
 
@@ -2363,6 +2372,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[3.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.8.1
 [3.5.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.5.0
 [3.4.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.1
 [3.4.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.0

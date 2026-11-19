@@ -1511,6 +1511,7 @@ fn issue_text(issue: SyncIssue) -> &'static str {
             "you can no longer change this on Proton Drive, for example because a share was \
              revoked. Save a copy to keep the content."
         }
+        SyncIssue::Trashed => "restore the item or folder from Trash, then retry the move.",
         SyncIssue::Missing => {
             "the file or its folder is gone from Proton Drive. Save a copy to keep the content."
         }

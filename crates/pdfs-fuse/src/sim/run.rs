@@ -112,6 +112,8 @@ struct Run {
 /// Run `profile` on `seed`. It answers a report of what went wrong, if
 /// anything did.
 pub(crate) fn run(seed: u64, profile: &'static Profile) -> Result<(), String> {
+    // The simulation suite runs serially. Discard logs left by earlier tests.
+    take_logged();
     let dir = scratch(&format!("{}-{seed}", profile.name));
     let mut rng = Rng::new(seed);
     let drive = FakeDrive::new();
@@ -137,6 +139,7 @@ pub(crate) fn run(seed: u64, profile: &'static Profile) -> Result<(), String> {
             let _ = daemon.stop();
         }
     }
+    run.logged.extend(take_logged());
     match outcome {
         Ok(()) => {
             let _ = std::fs::remove_dir_all(&dir);
@@ -432,6 +435,7 @@ impl Run {
 
     fn report(&self, failure: &str, dir: &Path) -> String {
         let _ = std::fs::write(dir.join("steps.log"), self.log.join("\n") + "\n");
+        let _ = std::fs::write(dir.join("daemon.log"), self.logged.join("\n") + "\n");
         let tail = &self.log[self.log.len().saturating_sub(LOG_TAIL)..];
         format!(
             "{} seed {} failed: {failure}\nreplay with PDFS_SIM_SEED={}; state kept in {}\nlast steps:\n{}",

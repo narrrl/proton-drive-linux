@@ -964,6 +964,8 @@ pub enum SyncIssue {
     /// The account may no longer change the file or its folder, for example
     /// because a share was revoked.
     Access,
+    /// The item or a folder involved in a move can be restored from Trash.
+    Trashed,
     /// The file or the folder it goes into is gone from Drive.
     Missing,
     /// The folder holds too many items, or is nested too deep.
@@ -981,6 +983,7 @@ impl SyncIssue {
         match self {
             SyncIssue::Quota => "quota",
             SyncIssue::Access => "access",
+            SyncIssue::Trashed => "trashed",
             SyncIssue::Missing => "missing",
             SyncIssue::Limit => "limit",
             SyncIssue::Rejected => "rejected",
@@ -993,6 +996,7 @@ impl SyncIssue {
         match name {
             "quota" => SyncIssue::Quota,
             "access" => SyncIssue::Access,
+            "trashed" => SyncIssue::Trashed,
             "missing" => SyncIssue::Missing,
             "limit" => SyncIssue::Limit,
             "rejected" => SyncIssue::Rejected,

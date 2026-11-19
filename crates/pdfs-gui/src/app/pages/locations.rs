@@ -788,6 +788,9 @@ pub(crate) fn issue_text(issue: SyncIssue) -> String {
         SyncIssue::Access => gettext(
             "You can no longer change this on Proton Drive. Ask the owner for edit access, or export the file to keep your version.",
         ),
+        SyncIssue::Trashed => {
+            gettext("Restore the item or folder from Trash, then retry the move.")
+        }
         SyncIssue::Missing => gettext(
             "The folder this change belongs in is gone from Proton Drive. Export the file to keep your version.",
         ),

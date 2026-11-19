@@ -75,7 +75,8 @@ PDFS_SIM_SEED=7 RUST_LOG=pdfs_fuse=debug cargo test -p pdfs-fuse --lib \
 | `PDFS_SIM_MEASURE` | Run `a_thousand_files_drain_as_fast_on_wifi_as_on_lan`, which times 1,000 files in 100 folders on a LAN and a Wi-Fi profile and prints the times |
 
 A failure is a seed that can be replayed, but the daemon uses real threads, so a race may need
-several replays. In CI, the `simulation` job uploads the stacks of a hung run as an artifact.
+several replays. In CI, the `simulation` job uploads the failed seed's steps and daemon logs,
+along with thread stacks when the watchdog catches a hang.
 
 ## Acceptance suite
 

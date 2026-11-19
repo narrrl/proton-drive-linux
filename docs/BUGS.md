@@ -988,10 +988,15 @@ timing.
 **Where:** not located; the drain's conflict check in `crates/pdfs-fuse/src/drain.rs` is the
 first suspect
 
-**Repro:** Only the CI run above. The last steps created `x/z/y/a.txt` (37 bytes), wrote 42
+**Repro:** The first CI failure created `x/z/y/a.txt` (37 bytes), wrote 42
 bytes into it at offset 20, and brought every link up. Drive then held the file at its first
 37 bytes, and the full content was in `x/z/y/a (sync-conflict …).txt`. No other client wrote
 to it.
+
+On 2026-11-19, seed 1 of `one-client-echoes` showed the same symptom with delayed,
+duplicated, and reordered events. A two-byte overwrite of `x/d` appeared only in a
+conflict copy. Local replays passed. The simulation now retains its operation trace
+and daemon logs on failure. [CI run](https://github.com/narrrl/proton-drive-linux/actions/runs/44427290348)
 
 **Cause.** Not known. Nothing was lost, since the conflict copy holds the bytes, but the file
 conflicted with its own create. B183 and B184 found the same symptom after a lost create
