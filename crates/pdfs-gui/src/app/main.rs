@@ -160,6 +160,7 @@ struct Ui {
     pub(crate) details: DetailsState,
     pub(crate) trash: TrashState,
     pub(crate) gallery: GalleryState,
+    drive_galleries: RefCell<std::rc::Weak<pages::drive_galleries::Browser>>,
     pub(crate) shared: SharedState,
     pub(crate) shared_by_me: SharedByMeState,
     pub(crate) devices: DevicesState,
@@ -459,6 +460,7 @@ fn build_window(app: &adw::Application) {
         nav: split.clone(),
         narrow: Cell::new(false),
         file_thumbs: FileThumbnailState::new(),
+        drive_galleries: RefCell::default(),
         login: login_widgets,
         status: StatusState {
             status_inflight: Cell::new(false),
@@ -760,6 +762,10 @@ fn build_window(app: &adw::Application) {
         &gallery_widgets.scroll,
         &gallery_widgets.square_action,
     );
+    gallery_widgets.drive_galleries.connect_clicked({
+        let ui = ui.clone();
+        move |_| pages::drive_galleries::open(&ui)
+    });
     wire_gallery_empty(
         &ui,
         &gallery_widgets.empty_upload,

@@ -164,32 +164,46 @@ impl Db {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<StoredPhoto>> {
+        self.album_photos_page_visible(album_uid, offset, limit, "[]")
+    }
+
+    pub fn album_photos_page_visible(
+        &self,
+        album_uid: &str,
+        offset: usize,
+        limit: usize,
+        excluded: &str,
+    ) -> Result<Vec<StoredPhoto>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT uid, capture_time, name, ratio, thumb_state, kind FROM album_photos
-             WHERE album_uid = ?1 ORDER BY seq LIMIT ?2 OFFSET ?3",
+             WHERE album_uid = ?1 AND uid NOT IN (SELECT value FROM json_each(?4))
+             ORDER BY seq LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![album_uid, limit as i64, offset as i64], |r| {
-                Ok(StoredPhoto {
-                    uid: r.get(0)?,
-                    capture_time: r.get(1)?,
-                    name: r.get(2)?,
-                    ratio: r.get(3)?,
-                    thumb_state: r.get(4)?,
-                    kind: crate::control::PhotoKind::from_i64(r.get(5)?),
-                    // Album rows have no favorite state of their own: an album
-                    // photo on someone else's volume is not in our timeline, and
-                    // favouriting one is not supported yet anyway.
-                    favorite: false,
-                    // Nor are album rows grouped: an album is a list the user
-                    // made, and it shows exactly what they put in it.
-                    group_size: 1,
-                    has_raw: false,
-                    // Album rows carry no location.
-                    place_id: None,
-                })
-            })?
+            .query_map(
+                params![album_uid, limit as i64, offset as i64, excluded],
+                |r| {
+                    Ok(StoredPhoto {
+                        uid: r.get(0)?,
+                        capture_time: r.get(1)?,
+                        name: r.get(2)?,
+                        ratio: r.get(3)?,
+                        thumb_state: r.get(4)?,
+                        kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+                        // Album rows have no favorite state of their own: an album
+                        // photo on someone else's volume is not in our timeline, and
+                        // favouriting one is not supported yet anyway.
+                        favorite: false,
+                        // Nor are album rows grouped: an album is a list the user
+                        // made, and it shows exactly what they put in it.
+                        group_size: 1,
+                        has_raw: false,
+                        // Album rows carry no location.
+                        place_id: None,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }

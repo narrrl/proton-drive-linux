@@ -49,6 +49,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpubits",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -77,6 +78,7 @@ dependencies = [
  "ctr 0.10.1",
  "ctutils",
  "ghash 0.6.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -1878,6 +1880,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
 dependencies = [
  "polyval 0.7.3",
+ "zeroize",
 ]
 
 [[package]]
@@ -2238,6 +2241,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2260,6 +2269,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -3601,6 +3611,7 @@ dependencies = [
 name = "pdfs-core"
 version = "3.8.1"
 dependencies = [
+ "argon2",
  "async-trait",
  "base64 0.23.1",
  "chrono",
@@ -3635,12 +3646,18 @@ dependencies = [
  "base64 0.23.1",
  "fuser",
  "futures",
+ "getrandom 0.4.3",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "image",
  "libc",
  "lofty",
  "notify",
  "parking_lot 0.13.0",
  "pdfs-core",
+ "pg-app",
+ "pg-core",
  "proton-drive-rs",
  "serde",
  "serde_json",
@@ -3648,6 +3665,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
  "zip",
 ]
 
@@ -3657,6 +3675,7 @@ version = "3.8.1"
 dependencies = [
  "anyhow",
  "async-channel",
+ "base64 0.23.1",
  "gettext-rs",
  "gtk4",
  "kamadak-exif",
@@ -3664,6 +3683,7 @@ dependencies = [
  "libadwaita",
  "pangocairo",
  "pdfs-core",
+ "pg-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -3687,6 +3707,65 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "pg-app"
+version = "0.2.0"
+source = "git+https://github.com/narrrl/proton-gallery.git?rev=72d83a29ad2836c698b18e2f5189a423c60c2399#72d83a29ad2836c698b18e2f5189a423c60c2399"
+dependencies = [
+ "async-trait",
+ "hex",
+ "pg-core",
+ "pg-drive",
+ "proton-drive-rs",
+ "proton-sdk",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "pg-core"
+version = "0.2.0"
+source = "git+https://github.com/narrrl/proton-gallery.git?rev=72d83a29ad2836c698b18e2f5189a423c60c2399#72d83a29ad2836c698b18e2f5189a423c60c2399"
+dependencies = [
+ "aes-gcm 0.11.1",
+ "async-trait",
+ "getrandom 0.4.3",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "zeroize",
+]
+
+[[package]]
+name = "pg-drive"
+version = "0.2.0"
+source = "git+https://github.com/narrrl/proton-gallery.git?rev=72d83a29ad2836c698b18e2f5189a423c60c2399#72d83a29ad2836c698b18e2f5189a423c60c2399"
+dependencies = [
+ "async-trait",
+ "hex",
+ "pg-core",
+ "proton-drive-rs",
+ "proton-sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
 
 [[package]]
 name = "pgp"
@@ -3825,6 +3904,7 @@ dependencies = [
  "cpubits",
  "cpufeatures 0.3.1",
  "universal-hash 0.6.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -5191,6 +5271,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

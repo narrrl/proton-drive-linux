@@ -123,6 +123,7 @@ scale.browser-status-meter trough { min-width: 140px; min-height: 6px; }
 .album-cover { border-radius: 16px; background: alpha(currentColor, 0.06); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32); transition: box-shadow 180ms ease; }
 .album-card:hover .album-cover { box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5); }
 .album-card:hover .photo-thumb { transform: scale(1.05); }
+listview.drive-gallery-rows > row { padding: 0; }
 .view-switch button, .view-switch toggle { padding-left: 12px; padding-right: 12px; }
 
 /* Shared with Me: what a share lets me do, as a tinted pill beside the name. */

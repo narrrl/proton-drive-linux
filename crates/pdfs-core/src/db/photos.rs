@@ -514,23 +514,41 @@ impl Db {
         favorites: bool,
         not_in_album: bool,
     ) -> Result<Vec<StoredPhoto>> {
+        self.photos_page_visible(offset, limit, kind, range, favorites, not_in_album, "[]")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn photos_page_visible(
+        &self,
+        offset: usize,
+        limit: usize,
+        kind: Option<crate::control::PhotoKind>,
+        range: Option<(i64, i64)>,
+        favorites: bool,
+        not_in_album: bool,
+        excluded: &str,
+    ) -> Result<Vec<StoredPhoto>> {
         let conn = self.read();
         // Built up so any combination of the optional filters is one indexed
         // query rather than a statement per case.
         let mut sql = String::from(PHOTO_SELECT);
-        let mut binds: Vec<i64> = Vec::new();
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
         let mut conds: Vec<String> = Vec::new();
+        if excluded != "[]" {
+            binds.push(excluded.to_owned().into());
+            conds.push("p.uid NOT IN (SELECT value FROM json_each(?1))".to_owned());
+        }
         if kind != Some(crate::control::PhotoKind::Raw) {
             conds.push("p.uid = COALESCE(p.group_key, p.uid)".to_string());
         }
         if let Some(k) = kind {
-            binds.push(k.as_i64());
+            binds.push((k.as_i64()).into());
             conds.push(format!("p.kind = ?{}", binds.len()));
         }
         if let Some((from, to)) = range {
-            binds.push(from);
+            binds.push((from).into());
             conds.push(format!("p.capture_time >= ?{}", binds.len()));
-            binds.push(to);
+            binds.push((to).into());
             conds.push(format!("p.capture_time < ?{}", binds.len()));
         }
         if favorites {
@@ -549,9 +567,9 @@ impl Db {
             sql.push_str(" WHERE ");
             sql.push_str(&conds.join(" AND "));
         }
-        binds.push(limit as i64);
+        binds.push((limit as i64).into());
         let limit_pos = binds.len();
-        binds.push(offset as i64);
+        binds.push((offset as i64).into());
         let offset_pos = binds.len();
         sql.push_str(&format!(
             " ORDER BY p.seq LIMIT ?{limit_pos} OFFSET ?{offset_pos}"
@@ -580,6 +598,25 @@ impl Db {
         Ok(rows)
     }
 
+    /// Include associated files so a public preview cannot reveal a hidden
+    /// RAW, JPEG or Live Photo through another part of the same shot.
+    pub fn photo_group_members_for(&self, uids: &HashSet<String>) -> Result<HashSet<String>> {
+        if uids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let ids = serde_json::to_string(uids).expect("file identifiers serialize");
+        let conn = self.read();
+        let mut query = conn.prepare(
+            "SELECT uid FROM photos WHERE COALESCE(group_key, uid) IN (
+               SELECT COALESCE(group_key, uid) FROM photos
+               WHERE uid IN (SELECT value FROM json_each(?1))
+             )",
+        )?;
+        Ok(query
+            .query_map([ids], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The whole persisted timeline, in stored order — every file, not one row
     /// per group. Only for whole-library passes (the photo re-date); the gallery
     /// pages with [`Db::photos_page`].
@@ -602,26 +639,32 @@ impl Db {
         &self,
         kind: Option<crate::control::PhotoKind>,
     ) -> Result<Vec<(i32, i32, usize)>> {
+        self.photos_months_visible(kind, "[]")
+    }
+
+    pub fn photos_months_visible(
+        &self,
+        kind: Option<crate::control::PhotoKind>,
+        excluded: &str,
+    ) -> Result<Vec<(i32, i32, usize)>> {
         let conn = self.read();
         // The scrubber has to agree with the page it scrubs, so it counts what
         // the page shows: groups everywhere except on the Raw tab.
-        let (filter, binds): (&str, Vec<i64>) = match kind {
-            Some(crate::control::PhotoKind::Raw) => (" WHERE kind = 2", Vec::new()),
-            Some(k) => (
-                " WHERE uid = COALESCE(group_key, uid) AND kind = ?1",
-                vec![k.as_i64()],
-            ),
-            None => (" WHERE uid = COALESCE(group_key, uid)", Vec::new()),
+        let filter = match kind {
+            Some(crate::control::PhotoKind::Raw) => "kind = ?2",
+            Some(_) => "uid = COALESCE(group_key, uid) AND kind = ?2",
+            None => "uid = COALESCE(group_key, uid) AND ?2 IS NULL",
         };
         let sql = format!(
             "SELECT CAST(strftime('%Y', capture_time, 'unixepoch', 'localtime') AS INTEGER) AS y, \
                     CAST(strftime('%m', capture_time, 'unixepoch', 'localtime') AS INTEGER) AS m, \
                     COUNT(*) \
-             FROM photos{filter} GROUP BY y, m ORDER BY y DESC, m DESC"
+             FROM photos WHERE {filter} AND uid NOT IN (SELECT value FROM json_each(?1))
+             GROUP BY y, m ORDER BY y DESC, m DESC"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(binds), |r| {
+            .query_map(params![excluded, kind.map(|kind| kind.as_i64())], |r| {
                 Ok((
                     r.get::<_, i32>(0)?,
                     r.get::<_, i32>(1)?,
@@ -637,6 +680,15 @@ impl Db {
     /// pick the date, and its own year is left out, because today's photos are
     /// what the timeline already opens on. One row per group, like the timeline.
     pub fn photos_on_this_day(&self, today: i64, limit: usize) -> Result<Vec<StoredPhoto>> {
+        self.photos_on_this_day_visible(today, limit, "[]")
+    }
+
+    pub fn photos_on_this_day_visible(
+        &self,
+        today: i64,
+        limit: usize,
+        excluded: &str,
+    ) -> Result<Vec<StoredPhoto>> {
         let conn = self.read();
         let sql = format!(
             "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) \
@@ -644,11 +696,12 @@ impl Db {
                  = strftime('%m-%d', ?1, 'unixepoch', 'localtime') \
              AND strftime('%Y', p.capture_time, 'unixepoch', 'localtime') \
                  < strftime('%Y', ?1, 'unixepoch', 'localtime') \
+             AND p.uid NOT IN (SELECT value FROM json_each(?3))
              ORDER BY p.seq LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![today, limit as i64], stored_photo)?
+            .query_map(params![today, limit as i64, excluded], stored_photo)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -657,6 +710,10 @@ impl Db {
     /// cover, most photographed first. Counted per group, like the timeline;
     /// photos without a location, or taken far from any town, are in none.
     pub fn photo_places(&self) -> Result<Vec<StoredPlace>> {
+        self.photo_places_visible("[]")
+    }
+
+    pub fn photo_places_visible(&self, excluded: &str) -> Result<Vec<StoredPlace>> {
         let rows: Vec<(u32, usize, String)> = {
             let conn = self.read();
             // SQLite fills the bare `uid` from the row `MIN(seq)` picked, which
@@ -664,9 +721,10 @@ impl Db {
             let mut stmt = conn.prepare(
                 "SELECT place_id, COUNT(*), uid, MIN(seq) FROM photos \
                  WHERE uid = COALESCE(group_key, uid) AND place_id IS NOT NULL \
+                 AND uid NOT IN (SELECT value FROM json_each(?1))
                  GROUP BY place_id ORDER BY COUNT(*) DESC, MIN(seq)",
             )?;
-            stmt.query_map([], |r| {
+            stmt.query_map([excluded], |r| {
                 Ok((r.get(0)?, r.get::<_, i64>(1)? as usize, r.get(2)?))
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -696,14 +754,28 @@ impl Db {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<StoredPhoto>> {
+        self.photos_at_place_visible(id, offset, limit, "[]")
+    }
+
+    pub fn photos_at_place_visible(
+        &self,
+        id: u32,
+        offset: usize,
+        limit: usize,
+        excluded: &str,
+    ) -> Result<Vec<StoredPhoto>> {
         let conn = self.read();
         let sql = format!(
-            "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) AND p.place_id = ?1 \
+            "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) AND p.place_id = ?1
+             AND p.uid NOT IN (SELECT value FROM json_each(?4))
              ORDER BY p.seq LIMIT ?2 OFFSET ?3"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![id, limit as i64, offset as i64], stored_photo)?
+            .query_map(
+                params![id, limit as i64, offset as i64, excluded],
+                stored_photo,
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -884,6 +956,10 @@ impl Db {
 
     /// Per-tab counts for the Photos page subtitle: `(photos, videos, raw)`.
     pub fn photos_counts(&self) -> Result<(usize, usize, usize)> {
+        self.photos_counts_visible("[]")
+    }
+
+    pub fn photos_counts_visible(&self, excluded: &str) -> Result<(usize, usize, usize)> {
         use crate::control::PhotoKind;
         let conn = self.read();
         // Photos and Videos count groups — one shot is one entry, however many
@@ -891,9 +967,12 @@ impl Db {
         // them individually.
         let mut stmt = conn.prepare(
             "SELECT kind, COUNT(*) FROM photos \
-             WHERE uid = COALESCE(group_key, uid) OR kind = 2 GROUP BY kind",
+             WHERE (uid = COALESCE(group_key, uid) OR kind = 2)
+             AND uid NOT IN (SELECT value FROM json_each(?1)) GROUP BY kind",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map([excluded], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
         let (mut photos, mut videos, mut raw) = (0usize, 0usize, 0usize);
         for row in rows {
             let (kind, n) = row?;

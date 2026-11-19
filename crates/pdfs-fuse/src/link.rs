@@ -232,6 +232,9 @@ impl Core {
     /// Unless the keyring holds a newer session than the refused one: then
     /// the mount ends, for the daemon to mount again on that one.
     pub(crate) fn mark_session_expired(&self, what: &str, error: &dyn std::fmt::Display) {
+        if let Some(gallery) = &self.gallery {
+            gallery.cancel();
+        }
         if self.link.resume_stored.load(Ordering::Relaxed) {
             return self.mark_offline(what, error);
         }

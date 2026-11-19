@@ -129,8 +129,12 @@ jobs:
       # Every crate the build needs, so COPR can build the spec without network.
       - name: Package vendored crates (.tar.xz)
         run: |
-          cargo vendor --locked dist/vendor > /dev/null
-          tar -cJf proton-drive-linux-vendor-${{ env.VERSION }}.tar.xz -C dist vendor
+          mkdir -p dist/.cargo
+          (
+            cd dist
+            cargo vendor --locked --manifest-path ../Cargo.toml vendor > .cargo/config.toml
+          )
+          tar -cJf proton-drive-linux-vendor-${{ env.VERSION }}.tar.xz -C dist vendor .cargo/config.toml
 
       - name: Package Debian package (.deb)
         run: |

@@ -2,7 +2,7 @@
 #
 # - From a checkout (local builds and the release workflow). From the repository root:
 #     rpmbuild -bb packaging/proton-drive-linux.spec --define "git_dir $PWD" ...
-#   %build needs network so cargo can fetch crates.io (same trade-off as the Arch PKGBUILD).
+#   %build needs network so Cargo can fetch crates.io and Git dependencies.
 # - From the release tarballs (COPR, .github/workflows/copr.yml), when git_dir is not
 #   defined. Source1 holds every crate, so the build runs offline.
 
@@ -72,16 +72,19 @@ system tray and search launcher. Unofficial and not affiliated with Proton AG.
 test -f %{git_dir}/Cargo.toml
 cp -a %{git_dir}/LICENSE .
 %else
-# -a 1 unpacks the vendored crates into vendor/ inside the source tree.
+# -a 1 unpacks the vendored crates and their source mappings.
 %autosetup -n %{name}-%{version} -a 1
-mkdir -p .cargo
-cat > .cargo/config.toml <<'EOF'
+# Older vendor tarballs contained only crates.io dependencies.
+if [ ! -f .cargo/config.toml ]; then
+  mkdir -p .cargo
+  cat > .cargo/config.toml <<'EOF'
 [source.crates-io]
 replace-with = "vendored-sources"
 
 [source.vendored-sources]
 directory = "vendor"
 EOF
+fi
 %endif
 
 %build

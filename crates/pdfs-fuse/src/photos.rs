@@ -1175,6 +1175,7 @@ impl Core {
             .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn photos_timeline(
         &self,
         offset: usize,
@@ -1183,6 +1184,7 @@ impl Core {
         range: Option<(i64, i64)>,
         favorites: bool,
         not_in_album: bool,
+        excluded: &str,
     ) -> CoreResult<Option<Vec<PhotoItem>>> {
         let count = self.db.photos_count().map_err(CoreError::from)?;
         if count == 0 {
@@ -1208,7 +1210,15 @@ impl Core {
 
         let page = self
             .db
-            .photos_page(offset, limit, kind, range, favorites, not_in_album)
+            .photos_page_visible(
+                offset,
+                limit,
+                kind,
+                range,
+                favorites,
+                not_in_album,
+                excluded,
+            )
             .map_err(CoreError::from)?;
         Ok(Some(page.into_iter().map(|p| self.photo_item(p)).collect()))
     }
@@ -1365,8 +1375,11 @@ impl Core {
     /// The towns the photos were taken in, as wire items. A town the bundled
     /// table no longer knows (the stored id came from an older table) is left
     /// out rather than shown without a name.
-    pub(crate) fn photo_places(&self) -> CoreResult<Vec<PlaceInfo>> {
-        let places = self.db.photo_places().map_err(CoreError::from)?;
+    pub(crate) fn photo_places(&self, excluded: &str) -> CoreResult<Vec<PlaceInfo>> {
+        let places = self
+            .db
+            .photo_places_visible(excluded)
+            .map_err(CoreError::from)?;
         Ok(places
             .into_iter()
             .filter_map(|place| {
@@ -1390,10 +1403,11 @@ impl Core {
         id: u32,
         offset: usize,
         limit: usize,
+        excluded: &str,
     ) -> CoreResult<Vec<PhotoItem>> {
         let photos = self
             .db
-            .photos_at_place(id, offset, limit)
+            .photos_at_place_visible(id, offset, limit, excluded)
             .map_err(CoreError::from)?;
         Ok(photos.into_iter().map(|p| self.photo_item(p)).collect())
     }
@@ -1417,13 +1431,17 @@ impl Core {
     /// Photos taken on today's date in earlier years, as wire items. Served
     /// from the stored timeline only: the strip is a nicety, not worth a wait
     /// on the network, and the timeline's own load keeps that store fresh.
-    pub(crate) fn photos_on_this_day(&self, limit: usize) -> CoreResult<Vec<PhotoItem>> {
+    pub(crate) fn photos_on_this_day(
+        &self,
+        limit: usize,
+        excluded: &str,
+    ) -> CoreResult<Vec<PhotoItem>> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
         let photos = self
             .db
-            .photos_on_this_day(now, limit)
+            .photos_on_this_day_visible(now, limit, excluded)
             .map_err(CoreError::from)?;
         Ok(photos.into_iter().map(|p| self.photo_item(p)).collect())
     }

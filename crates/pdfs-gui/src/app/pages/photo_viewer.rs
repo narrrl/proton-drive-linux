@@ -31,6 +31,8 @@ pub(crate) struct Viewer {
     pub(crate) scroller: gtk4::ScrolledWindow,
     pub(crate) picture: gtk4::Picture,
     pub(crate) video: gtk4::Video,
+    video_token: RefCell<Option<String>>,
+    load_generation: Cell<u64>,
     pub(crate) spinner: Spinner,
     pub(crate) status: gtk4::Label,
     pub(crate) title: gtk4::Label,
@@ -272,12 +274,14 @@ fn viewer_item(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: &str) -> Option<PhotoItem>
 /// full-size file, and swap it in — plus its EXIF — when it lands. A video
 /// plays in place once its file is down.
 pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
+    let generation = viewer.load_generation.get().wrapping_add(1);
+    viewer.load_generation.set(generation);
     viewer.spinner.set_visible(true);
     viewer.status.set_visible(false);
     viewer.loading.set(true);
     *viewer.path.borrow_mut() = None;
     clear_info(viewer);
-    stop_video(viewer);
+    stop_video(ui, viewer);
     viewer.media.set_visible_child_name("photo");
     sync_strip(viewer);
     reset_zoom(viewer);
@@ -302,17 +306,22 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
         None => viewer.picture.set_paintable(gtk4::gdk::Paintable::NONE),
     }
 
-    let rx = spawn_request(
-        ui.dirs.control_socket(),
-        Request::OpenPhoto { uid: uid.clone() },
-    );
+    let request = if is_video {
+        Request::OpenGalleryVideo { uid: uid.clone() }
+    } else {
+        Request::OpenPhoto { uid: uid.clone() }
+    };
+    let rx = spawn_request(ui.dirs.control_socket(), request);
     let viewer = viewer.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         // The user may have moved on while this was in flight; that photo's own
         // request owns the viewer now.
-        if *viewer.uid.borrow() != uid {
+        if viewer.load_generation.get() != generation {
+            if let Ok(Ok(Response::GalleryVideo { token, .. })) = result {
+                close_video(&ui, token);
+            }
             return;
         }
         viewer.spinner.set_visible(false);
@@ -326,6 +335,14 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
             viewer.status.set_visible(true);
         };
         let path = match result {
+            Ok(Ok(Response::GalleryVideo { url, token, size })) => {
+                *viewer.video_token.borrow_mut() = Some(token);
+                viewer.video.set_file(Some(&gio::File::for_uri(&url)));
+                viewer.media.set_visible_child_name("video");
+                sync_strip(&viewer);
+                show_info(&viewer, Some(size), ExifInfo::default());
+                return;
+            }
             Ok(Ok(Response::FilePath { path })) => path,
             Ok(Ok(Response::Error { message, .. })) => return fail(&message),
             Ok(Ok(_)) => return fail(&gettext("Unexpected reply from the Proton Drive service.")),
@@ -481,8 +498,18 @@ fn next_slide(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
 
 /// Stop whatever the player was playing, so stepping off a video (or closing
 /// the lightbox) doesn't leave its sound running.
-fn stop_video(viewer: &Rc<Viewer>) {
+fn close_video(ui: &Ui, token: String) {
+    let _reply = spawn_request(
+        ui.dirs.control_socket(),
+        Request::CloseGalleryVideo { token },
+    );
+}
+
+fn stop_video(ui: &Ui, viewer: &Rc<Viewer>) {
     viewer.video.set_media_stream(gtk4::MediaStream::NONE);
+    if let Some(token) = viewer.video_token.borrow_mut().take() {
+        close_video(ui, token);
+    }
 }
 
 /// Warm the cache with the photo `delta` steps away, so stepping there is
@@ -1473,6 +1500,8 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         scroller: scroller.clone(),
         picture: picture.clone(),
         video,
+        video_token: RefCell::new(None),
+        load_generation: Cell::new(0),
         spinner,
         status: status_label,
         title: title_label,
@@ -1700,7 +1729,10 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         }
         if let Some(viewer) = keep.borrow_mut().take() {
             reveal_photo(&ui_close, &viewer.uid.borrow());
-            stop_video(&viewer);
+            viewer
+                .load_generation
+                .set(viewer.load_generation.get().wrapping_add(1));
+            stop_video(&ui_close, &viewer);
             disarm_slide(&viewer);
             if let Some(source) = viewer.chrome_source.borrow_mut().take() {
                 source.remove();
@@ -1952,7 +1984,7 @@ fn open_viewer_menu(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
     }
     menu.section();
     // These need the full-size file, which may still be downloading.
-    if viewer.path.borrow().is_some() {
+    if viewer.path.borrow().is_some() || viewer.video_token.borrow().is_some() {
         let still = viewer.media.visible_child_name().as_deref() == Some("photo");
         if still {
             // Translators: menu item that puts the photo on the clipboard as an image.
@@ -1999,17 +2031,45 @@ fn open_viewer_menu(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
     });
 }
 
-fn save_shown_photo(_ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
-    if let Some(path) = viewer.path.borrow().as_deref() {
-        let name = viewer.name.borrow();
-        save_photo_to_disk(viewer, path, name.as_deref().unwrap_or("photo"));
-    }
+fn save_shown_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
+    with_viewer_file(ui, viewer, |viewer, path, name| {
+        save_photo_to_disk(viewer, path, name.unwrap_or("photo"))
+    });
 }
 
-fn open_shown_photo(_ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
+fn open_shown_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
+    with_viewer_file(ui, viewer, |viewer, path, name| {
+        open_with(&viewer.window, path, name)
+    });
+}
+
+fn with_viewer_file(
+    ui: &Rc<Ui>,
+    viewer: &Rc<Viewer>,
+    use_file: impl FnOnce(&Rc<Viewer>, &str, Option<&str>) + 'static,
+) {
+    let name = viewer.name.borrow().clone();
     if let Some(path) = viewer.path.borrow().as_deref() {
-        open_with(&viewer.window, path, viewer.name.borrow().as_deref());
+        use_file(viewer, path, name.as_deref());
+        return;
     }
+    if viewer.video_token.borrow().is_none() {
+        return;
+    }
+    let uid = viewer.uid.borrow().clone();
+    let viewer = viewer.clone();
+    let rx = spawn_request(ui.dirs.control_socket(), Request::OpenPhoto { uid });
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::FilePath { path })) => use_file(&viewer, &path, name.as_deref()),
+            Ok(Ok(Response::Error { message, .. })) => {
+                viewer.toasts.add_toast(adw::Toast::new(&message))
+            }
+            _ => viewer
+                .toasts
+                .add_toast(adw::Toast::new(&gettext("Couldn't open the file."))),
+        }
+    });
 }
 
 fn add_shown_photo_to_album(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {

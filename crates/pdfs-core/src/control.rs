@@ -44,14 +44,20 @@ pub enum Request {
     /// Report mount status (account, mountpoint, pin count).
     Status,
     /// Pin a file (path relative to the mountpoint, or absolute under it).
-    Pin { path: String },
+    Pin {
+        path: String,
+    },
     /// Unpin a file, evicting its cached content.
-    Unpin { path: String },
+    Unpin {
+        path: String,
+    },
     /// List pinned files.
     ListPins,
     /// List a directory for the in-app file browser. `path` is
     /// mountpoint-relative (empty or "." = the mount root).
-    ListDir { path: String },
+    ListDir {
+        path: String,
+    },
     /// Fetch a page of the photos timeline, newest first. Returns metadata only:
     /// a thumbnail path comes back only for photos already in the cache, so the
     /// reply never waits on the network. Front-ends ask for the thumbnails they
@@ -83,7 +89,9 @@ pub enum Request {
     /// live photo and its clip. Replies with [`Response::Photos`], holding one
     /// item per file in server order; a photo that stands alone comes back as a
     /// single item. The lightbox uses it to switch between a shot's files.
-    PhotoGroup { uid: String },
+    PhotoGroup {
+        uid: String,
+    },
     /// The months the timeline spans (newest first, with per-month counts) so a
     /// front-end can build a date scrubber without paging the whole library.
     /// `kind` scopes the counts to one tab when set.
@@ -94,7 +102,9 @@ pub enum Request {
     /// Photos taken on today's date in earlier years, newest first, at most
     /// `limit` of them — the "On this day" strip above the timeline. Replies
     /// with [`Response::Photos`]; a front-end groups them by year itself.
-    PhotosOnThisDay { limit: usize },
+    PhotosOnThisDay {
+        limit: usize,
+    },
     /// Sets of photos that are byte-identical copies of each other, going by
     /// the server's content hash. Replies with [`Response::PhotoDuplicates`].
     PhotoDuplicates,
@@ -118,7 +128,9 @@ pub enum Request {
     },
     /// Every photo taken in one town with where exactly it was taken, for the
     /// map's close-up. Replies with [`Response::PhotoLocations`].
-    PlaceLocations { id: u32 },
+    PlaceLocations {
+        id: u32,
+    },
     /// List the account's photo albums, newest activity first, including the
     /// albums other people share with us. Metadata only — an album's cover
     /// thumbnail is fetched with [`Request::PhotoThumbs`] like any other photo.
@@ -134,9 +146,14 @@ pub enum Request {
         limit: usize,
     },
     /// Create an album named `name`. Replies with [`Response::AlbumCreated`].
-    CreateAlbum { name: String },
+    CreateAlbum {
+        name: String,
+    },
     /// Rename the album `uid`. Replies with [`Response::Ok`].
-    RenameAlbum { uid: String, name: String },
+    RenameAlbum {
+        uid: String,
+        name: String,
+    },
     /// Delete the album `uid`. Its photos stay in the timeline; with
     /// `delete_photos` set, photos that exist only in the album (saved from a
     /// shared album) are deleted with it, which the server otherwise refuses.
@@ -148,14 +165,22 @@ pub enum Request {
     },
     /// Add timeline photos to the album `uid`. Replies with
     /// [`Response::AlbumChanged`].
-    AddToAlbum { uid: String, photos: Vec<String> },
+    AddToAlbum {
+        uid: String,
+        photos: Vec<String>,
+    },
     /// Take photos out of the album `uid`. They stay in the timeline: this is
     /// not a trash. Replies with [`Response::AlbumChanged`].
-    RemoveFromAlbum { uid: String, photos: Vec<String> },
+    RemoveFromAlbum {
+        uid: String,
+        photos: Vec<String>,
+    },
     /// Fetch thumbnails for the given photo uids, downloading the ones not
     /// already cached (one batched round-trip) and replying with their on-disk
     /// paths. Keep the batch small — it is served on demand, as tiles scroll in.
-    PhotoThumbs { uids: Vec<String> },
+    PhotoThumbs {
+        uids: Vec<String>,
+    },
     /// Trash photos by node uid, answered with [`Response::Trashed`].
     ///
     /// Uid-addressed rather than path-addressed because the photos volume is not
@@ -190,11 +215,15 @@ pub enum Request {
     ReserveFileThumbGeneration,
     /// Stop ordinary-file thumbnail work belonging to older listings. Photos
     /// timeline work and an explicit recursive build are deliberately separate.
-    CancelFileThumbs { generation: u64 },
+    CancelFileThumbs {
+        generation: u64,
+    },
     /// Start building local thumbnails for every supported image below `path`.
     /// The request returns immediately; progress is read with
     /// [`Request::ThumbnailBuildStatus`].
-    StartThumbnailBuild { path: String },
+    StartThumbnailBuild {
+        path: String,
+    },
     /// Stop the current recursive ordinary-file thumbnail build, if any.
     CancelThumbnailBuild,
     /// Read progress for the recursive ordinary-file thumbnail build.
@@ -206,7 +235,25 @@ pub enum Request {
     /// is how a front-end knows when the refreshed timeline is worth re-reading.
     PhotosRefreshStatus,
     /// Download a photo's full content into the cache; replies with its path.
-    OpenPhoto { uid: String },
+    OpenPhoto {
+        uid: String,
+    },
+    /// Open a revision for playback in the local viewer.
+    OpenGalleryVideo {
+        uid: String,
+    },
+    OpenGalleryImage {
+        uid: String,
+    },
+    CloseGalleryVideo {
+        token: String,
+    },
+    GalleryThumbnail {
+        uid: String,
+    },
+    DriveGallery {
+        action: GalleryAction,
+    },
     /// Add or remove Proton's `Favorite` tag on a photo. Replies with
     /// [`Response::Ok`].
     ///
@@ -214,7 +261,10 @@ pub enum Request {
     /// one shared with us, or one that lives only in an album — needs it
     /// re-encrypted for our timeline, which the SDK does not implement yet; the
     /// daemon reports that as an error rather than silently doing nothing.
-    SetPhotoFavorite { uid: String, favorite: bool },
+    SetPhotoFavorite {
+        uid: String,
+        favorite: bool,
+    },
     /// Import Google Photos **Takeout** archives into Proton Photos.
     ///
     /// `archives` are absolute paths to the export's `.zip` parts on the
@@ -326,7 +376,10 @@ pub enum Request {
     /// Search the daemon's index of *local* (non-Drive) files on this machine.
     /// Independent of [`Request::Search`] so a front-end can fire both at once and
     /// render whichever lands first. Replies with [`Response::LocalResults`].
-    SearchLocal { query: String, limit: usize },
+    SearchLocal {
+        query: String,
+        limit: usize,
+    },
     /// Search both the Drive metadata index and the local-file index in one
     /// round-trip. This is the preferred prompt API; the two legacy search
     /// requests remain available for older clients. `limit` applies to each
@@ -342,30 +395,48 @@ pub enum Request {
     },
     /// Rename a file or folder. `path` is mountpoint-relative; `new_name` is a
     /// single path component (no separators). Replies with [`Response::Ok`].
-    Rename { path: String, new_name: String },
+    Rename {
+        path: String,
+        new_name: String,
+    },
     /// Move a file or folder into a new parent folder. Both `path` and
     /// `new_parent` are mountpoint-relative, or both absolute local paths; two
     /// absolute paths may lie in different locations (My files, an on-demand
     /// or a mirror synced folder), and the move is still made on Proton Drive
     /// without transferring content. Replies with [`Response::Ok`].
-    Move { path: String, new_parent: String },
+    Move {
+        path: String,
+        new_parent: String,
+    },
     /// Copy a file or folder into a folder on Proton Drive, without
     /// downloading or uploading it. Both `path` and `new_parent` are
     /// mountpoint-relative, or absolute paths inside My files. A name already
     /// taken in `new_parent` gets the next free ` (n)` suffix. Replies with
     /// [`Response::Ok`].
-    Copy { path: String, new_parent: String },
+    Copy {
+        path: String,
+        new_parent: String,
+    },
     /// Ask Proton Drive how much the folder at mountpoint-relative `path`
     /// holds. Replies with [`Response::FolderSize`].
-    FolderSize { path: String },
+    FolderSize {
+        path: String,
+    },
     /// The by-uid twin of [`Request::FolderSize`].
-    FolderSizeByUid { uid: String },
+    FolderSizeByUid {
+        uid: String,
+    },
     /// Trash a file or folder. `path` is mountpoint-relative. Replies with
     /// [`Response::Ok`].
-    Delete { path: String },
+    Delete {
+        path: String,
+    },
     /// Create a new folder named `name` under the mountpoint-relative `parent`.
     /// Replies with [`Response::Ok`].
-    CreateFolder { parent: String, name: String },
+    CreateFolder {
+        parent: String,
+        name: String,
+    },
     // There is deliberately no bytes-carrying single-file upload: it was
     // `UploadFile { parent, name, bytes }`, and it OOMed on anything large for
     // the reason described on `UploadPhoto`. `UploadPaths` covers the same case
@@ -388,11 +459,16 @@ pub enum Request {
     /// Retune the on-disk cache's soft byte cap at runtime (`0` = unlimited) and
     /// persist it to config so the next mount keeps it. Replies with
     /// [`Response::Ok`].
-    SetCacheBudget { bytes: u64 },
+    SetCacheBudget {
+        bytes: u64,
+    },
     /// Cap uploads and downloads at these bytes per second (`0` = no cap),
     /// live for running transfers, and persist both to config so the next
     /// mount keeps them. Replies with [`Response::Ok`].
-    SetBandwidthLimits { upload: u64, download: u64 },
+    SetBandwidthLimits {
+        upload: u64,
+        download: u64,
+    },
     /// Report on the health of the metadata database and content cache: sizes,
     /// row counts, and — when `deep` — SQLite's own integrity check. Replies
     /// with [`Response::CacheReport`].
@@ -429,10 +505,14 @@ pub enum Request {
     ListTrash,
     /// Restore trashed nodes, by uid, to the folders they were trashed from.
     /// Replies with [`Response::Ok`].
-    Restore { uids: Vec<String> },
+    Restore {
+        uids: Vec<String>,
+    },
     /// Permanently delete trashed nodes by uid. Irreversible: the content is
     /// gone from Proton Drive, not moved. Replies with [`Response::Ok`].
-    DeleteForever { uids: Vec<String> },
+    DeleteForever {
+        uids: Vec<String>,
+    },
     /// Permanently delete everything in the trash. Irreversible.
     /// Replies with [`Response::Ok`].
     EmptyTrash,
@@ -443,7 +523,9 @@ pub enum Request {
     /// only notices another client's changes when its TTL lapses, so a user who
     /// knows the cache is stale needs a way to say so. Cheap and idempotent —
     /// it invalidates, it does not fetch.
-    Refresh { scope: RefreshScope },
+    Refresh {
+        scope: RefreshScope,
+    },
 
     // ---- locations --------------------------------------------------------
     /// List every local Proton Drive location. Replies with
@@ -454,26 +536,37 @@ pub enum Request {
     /// List the account's registered devices. Replies with [`Response::Devices`].
     ListDevices,
     /// Rename a device by its uid. Replies with [`Response::Ok`].
-    RenameDevice { uid: String, name: String },
+    RenameDevice {
+        uid: String,
+        name: String,
+    },
     /// Delete (deregister) a device by its uid. Replies with [`Response::Ok`].
-    DeleteDevice { uid: String },
+    DeleteDevice {
+        uid: String,
+    },
     /// Adopt an existing device as this machine's, pinning its uid in
     /// `config.json` so a hostname change or reinstall re-attaches to it instead
     /// of registering a duplicate. `uid: None` clears the pin.
     /// Replies with [`Response::Ok`].
-    AdoptDevice { uid: Option<String> },
+    AdoptDevice {
+        uid: Option<String>,
+    },
     /// Move every folder another device backs up into this machine's own
     /// device, as server-side moves on the main volume. The other device stays
     /// registered, without those folders. Sync folders here that already track
     /// one of them follow it to its new share. Nothing is downloaded: the moved
     /// folders are then offered by [`Request::ListRestorableFolders`].
     /// Replies with [`Response::Ok`].
-    MigrateDevice { uid: String },
+    MigrateDevice {
+        uid: String,
+    },
 
     // ---- device folder sync ----------------------------------
     /// Add a local folder to this machine's device, uploading its tree and
     /// registering the device on first use. Replies with [`Response::Ok`].
-    AddSyncFolder { local_path: String },
+    AddSyncFolder {
+        local_path: String,
+    },
     /// Keep a real local directory in step with an existing folder in My files.
     /// First sync unions one-sided files and preserves differing versions.
     /// Replies with [`Response::Ok`]; no device backup is created.
@@ -485,42 +578,65 @@ pub enum Request {
     ListSyncFolders,
     /// Remove a synced folder by id; `delete_remote` also trashes its cloud copy.
     /// Replies with [`Response::Ok`].
-    RemoveSyncFolder { id: i64, delete_remote: bool },
+    RemoveSyncFolder {
+        id: i64,
+        delete_remote: bool,
+    },
     /// Switch a synced folder between `mirror` and `ondemand` (Phase 3). Replies
     /// with [`Response::Ok`].
-    SetSyncFolderMode { id: i64, mode: String },
+    SetSyncFolderMode {
+        id: i64,
+        mode: String,
+    },
     /// Pause or resume one mirror folder's reconcile, independent of the
     /// global pause. Persisted until resumed. Replies with [`Response::Ok`].
-    SetSyncFolderPaused { id: i64, paused: bool },
+    SetSyncFolderPaused {
+        id: i64,
+        paused: bool,
+    },
     /// Forget what a mirror folder synced before, so its next pass compares
     /// both sides afresh: what is on one side only is copied to the other, and
     /// a file that differs keeps both versions. Nothing is deleted. Replies
     /// with [`Response::Ok`].
-    ResetSyncFolder { id: i64 },
+    ResetSyncFolder {
+        id: i64,
+    },
     /// Force a reconcile pass: one folder by id, or all when `id` is `None`.
     /// Replies with [`Response::Ok`].
-    SyncNow { id: Option<i64> },
+    SyncNow {
+        id: Option<i64>,
+    },
     /// Pause or resume syncing: queued uploads and changes stop draining and
     /// mirror folders stop reconciling, while reads through the mount keep
     /// working. `until` is the Unix second a pause ends by itself; `None`
     /// pauses until resumed. Ignored when resuming. Replies with
     /// [`Response::Ok`].
-    SetSyncPaused { paused: bool, until: Option<i64> },
+    SetSyncPaused {
+        paused: bool,
+        until: Option<i64>,
+    },
     /// List the queue of uploads and changes not yet on the remote. Replies
     /// with [`Response::PendingOps`].
     ListPendingOps,
     /// Retry a backed-off queued op now instead of waiting out its backoff;
     /// every failed op when `id` is `None`. Replies with [`Response::Ok`].
-    RetryPendingOp { id: Option<i64> },
+    RetryPendingOp {
+        id: Option<i64>,
+    },
     /// Copy the content of a queued upload (`id` from
     /// [`Request::ListPendingOps`]) to `dest`, an absolute path that must not
     /// exist yet. The op stays queued. Replies with [`Response::Ok`].
-    ExportPendingOp { id: i64, dest: String },
+    ExportPendingOp {
+        id: i64,
+        dest: String,
+    },
     /// Drop a queued change (`id` from [`Request::ListPendingOps`]) and undo
     /// it locally: a node made here goes, a node Drive has goes back to what
     /// Drive has, along with every other change queued on it. Its content is
     /// lost unless it was exported first. Replies with [`Response::Ok`].
-    DiscardPendingOp { id: i64 },
+    DiscardPendingOp {
+        id: i64,
+    },
     /// List the `(sync-conflict …)` copies under My Files and in synced
     /// folders. Replies with
     /// [`Response::Conflicts`].
@@ -529,18 +645,25 @@ pub enum Request {
     /// copy in a synced folder).
     /// Everything removed goes to the Proton trash. Replies with
     /// [`Response::Ok`].
-    ResolveConflict { path: String, keep: ConflictKeep },
+    ResolveConflict {
+        path: String,
+        keep: ConflictKeep,
+    },
     /// List the folders under this machine's device that can be synced here,
     /// each with a proposed local path. Replies with
     /// [`Response::RestorableFolders`].
     ListRestorableFolders,
     /// Attach the given remote device folders to local paths and sync them down.
     /// Replies with [`Response::Ok`].
-    RestoreSyncFolders { items: Vec<RestoreItem> },
+    RestoreSyncFolders {
+        items: Vec<RestoreItem>,
+    },
     /// [`Request::ListRestorableFolders`] for another registered device, by
     /// uid, so its folders can be synced down to this machine. Replies with
     /// [`Response::RestorableFolders`].
-    ListDeviceRestorableFolders { device: String },
+    ListDeviceRestorableFolders {
+        device: String,
+    },
     /// [`Request::RestoreSyncFolders`] for folders under another device. A
     /// separate variant rather than an optional field: an older daemon that
     /// ignored the field would attach the folders under this machine's device
@@ -571,9 +694,13 @@ pub enum Request {
     },
     /// List the members, pending invitations and public link of the node at
     /// mountpoint-relative `path`. Replies with [`Response::Share`].
-    ListShare { path: String },
+    ListShare {
+        path: String,
+    },
     /// The by-uid twin of [`Request::ListShare`].
-    ListShareByUid { uid: String },
+    ListShareByUid {
+        uid: String,
+    },
     /// Change the role of a share entry (member or pending invitation) on the node
     /// at `path`. `id` and `kind` identify the entry (from [`Response::Share`]).
     /// Replies with [`Response::Ok`].
@@ -621,9 +748,15 @@ pub enum Request {
     },
     /// Remove the public link `id` from the node at `path`. Replies with
     /// [`Response::Ok`].
-    RemovePublicLink { path: String, id: String },
+    RemovePublicLink {
+        path: String,
+        id: String,
+    },
     /// The by-uid twin of [`Request::RemovePublicLink`].
-    RemovePublicLinkByUid { uid: String, id: String },
+    RemovePublicLinkByUid {
+        uid: String,
+        id: String,
+    },
     /// Change the public link `id` on the node at `path`, keeping its URL.
     /// `role` is "viewer" or "editor", or `None` to keep the current one.
     /// Replies with [`Response::PublicLink`].
@@ -646,28 +779,48 @@ pub enum Request {
     /// invitation and every member. Each removal is attempted even if an
     /// earlier one fails. Replies with [`Response::Ok`], or an error naming
     /// what is still shared.
-    StopSharing { path: String },
+    StopSharing {
+        path: String,
+    },
     /// The by-uid twin of [`Request::StopSharing`].
-    StopSharingByUid { uid: String },
+    StopSharingByUid {
+        uid: String,
+    },
 
     // ---- revisions --------------------------------------------------------
     /// List the version history of the file at mountpoint-relative `path`,
     /// newest first. Replies with [`Response::Revisions`].
-    ListRevisions { path: String },
+    ListRevisions {
+        path: String,
+    },
     /// The by-uid twin of [`Request::ListRevisions`].
-    ListRevisionsByUid { uid: String },
+    ListRevisionsByUid {
+        uid: String,
+    },
     /// Make revision `revision_id` of the file at `path` current again. The
     /// server applies this asynchronously, so the restored content may take a
     /// moment to appear. Replies with [`Response::Ok`].
-    RestoreRevision { path: String, revision_id: String },
+    RestoreRevision {
+        path: String,
+        revision_id: String,
+    },
     /// The by-uid twin of [`Request::RestoreRevision`].
-    RestoreRevisionByUid { uid: String, revision_id: String },
+    RestoreRevisionByUid {
+        uid: String,
+        revision_id: String,
+    },
     /// Permanently delete revision `revision_id` of the file at `path`. The
     /// content is unrecoverable, and the server refuses to delete the revision
     /// that is currently active. Replies with [`Response::Ok`].
-    DeleteRevision { path: String, revision_id: String },
+    DeleteRevision {
+        path: String,
+        revision_id: String,
+    },
     /// The by-uid twin of [`Request::DeleteRevision`].
-    DeleteRevisionByUid { uid: String, revision_id: String },
+    DeleteRevisionByUid {
+        uid: String,
+        revision_id: String,
+    },
     /// Write revision `revision_id` of the file at `path` to the absolute local
     /// path `dest`, leaving the file's current content untouched. Replies with
     /// [`Response::Ok`].
@@ -699,15 +852,21 @@ pub enum Request {
     /// with [`Response::Entries`]; like [`Request::ListSharedWithMe`] the entries
     /// carry a `uid` and an empty `path`, since the subtree lives outside the
     /// mount. Lets a front-end browse into a shared folder.
-    ListSharedFolder { uid: String },
+    ListSharedFolder {
+        uid: String,
+    },
     /// Download a file shared with me into the content cache, addressed by `uid`.
     /// Replies with [`Response::FilePath`] so the front-end can open it with the
     /// default app. The by-uid twin of [`Request::OpenFile`], which can only
     /// address nodes inside the mount.
-    OpenSharedFile { uid: String },
+    OpenSharedFile {
+        uid: String,
+    },
     /// Leave a shared node by its `uid`, giving up my access. Replies with
     /// [`Response::Ok`].
-    LeaveShared { uid: String },
+    LeaveShared {
+        uid: String,
+    },
 
     // ---- incoming invitations ---------------------------------------------
     /// List invitations addressed to me, pending accept or reject. Replies with
@@ -715,9 +874,13 @@ pub enum Request {
     ListInvitations,
     /// Accept the invitation `id`, gaining access to the shared node. Replies with
     /// [`Response::Ok`].
-    AcceptInvitation { id: String },
+    AcceptInvitation {
+        id: String,
+    },
     /// Reject the invitation `id`, declining access. Replies with [`Response::Ok`].
-    RejectInvitation { id: String },
+    RejectInvitation {
+        id: String,
+    },
 
     // ---- bookmarks --------------------------------------------------------
     /// List public links saved to my account. Replies with [`Response::Bookmarks`].
@@ -729,7 +892,9 @@ pub enum Request {
         password: Option<String>,
     },
     /// Remove a saved bookmark by its `token`. Replies with [`Response::Ok`].
-    DeleteBookmark { token: String },
+    DeleteBookmark {
+        token: String,
+    },
 
     // ---- account ----------------------------------------------------------
     /// Total account storage usage (used/total, all Proton products, not just
@@ -743,7 +908,9 @@ pub enum Request {
     /// daemon performs (uploads, downloads, deletes, renames, shares, sync
     /// passes, …), so a front-end can show a running "what happened" feed
     /// without re-deriving it from anywhere.
-    ListActivity { limit: usize },
+    ListActivity {
+        limit: usize,
+    },
 
     // ---- push -------------------------------------------------------------
     /// Keep the connection open and stream [`Event`] lines instead of one
@@ -761,6 +928,10 @@ pub enum Topic {
     Files,
     /// The photos timeline or albums.
     Photos,
+    /// The visible set of gallery media changed.
+    GalleryVisibility,
+    /// A remote Gallery visibility update arrived or its state became unavailable.
+    GalleryVisibilitySynced,
     Trash,
     /// Shares, links, invitations and saved links, in either direction.
     Shares,
@@ -785,9 +956,11 @@ impl Topic {
     /// Every topic a front-end can act on. A new subscription is told all of
     /// them have changed, so it catches up on whatever happened while it was
     /// not connected.
-    pub const ALL: [Topic; 10] = [
+    pub const ALL: [Topic; 12] = [
         Topic::Files,
         Topic::Photos,
+        Topic::GalleryVisibility,
+        Topic::GalleryVisibilitySynced,
         Topic::Trash,
         Topic::Shares,
         Topic::Devices,
@@ -1831,6 +2004,56 @@ pub struct MappingProgress {
     pub total: usize,
 }
 
+/// Actions on saved Drive folder galleries.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum GalleryAction {
+    Unlock {
+        passphrase: String,
+    },
+    Lock,
+    List {
+        album: Option<GalleryPlace>,
+        offset: usize,
+        limit: usize,
+    },
+    Folders {
+        parent: Option<String>,
+    },
+    Add {
+        uid: String,
+    },
+    Remove {
+        gallery: String,
+    },
+    Refresh,
+    Cover {
+        album: GalleryPlace,
+        uid: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GalleryPlace {
+    pub gallery: String,
+    pub album: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GalleryFolder {
+    pub uid: String,
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GalleryAlbum {
+    pub place: GalleryPlace,
+    pub folder: GalleryFolder,
+    pub cover: Option<String>,
+    pub items: u64,
+    pub folders: u64,
+    pub hidden: bool,
+}
+
 /// One photo in a [`Request::PhotosTimeline`] page.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PhotoItem {
@@ -2222,7 +2445,9 @@ pub enum Response {
         version: String,
     },
     /// A human-readable success message.
-    Ok { message: String },
+    Ok {
+        message: String,
+    },
     /// Health report for the metadata database and content cache (reply to
     /// [`Request::CacheInspect`]).
     CacheReport {
@@ -2252,10 +2477,14 @@ pub enum Response {
         integrity_running: bool,
     },
     /// The pin registry.
-    Pins { pins: Vec<Pin> },
+    Pins {
+        pins: Vec<Pin>,
+    },
     /// A directory listing (reply to [`Request::ListDir`]) or a trash listing
     /// (reply to [`Request::ListTrash`]).
-    Entries { entries: Vec<DirEntry> },
+    Entries {
+        entries: Vec<DirEntry>,
+    },
     /// A page of the photos timeline. `available` is false when the account
     /// has no photos volume.
     Photos {
@@ -2268,6 +2497,22 @@ pub enum Response {
         #[serde(default)]
         counts: Option<(usize, usize, usize)>,
     },
+    GalleryFolders {
+        folders: Vec<GalleryFolder>,
+    },
+    GalleryPage {
+        albums: Vec<GalleryAlbum>,
+        items: Vec<PhotoItem>,
+        total: usize,
+    },
+    GalleryVideo {
+        url: String,
+        token: String,
+        size: u64,
+    },
+    GalleryThumbnail {
+        data: Option<String>,
+    },
     /// The account's photo albums (reply to [`Request::PhotoAlbums`]).
     /// `available` is false when the account has no photos volume, matching
     /// [`Response::Photos`].
@@ -2276,7 +2521,9 @@ pub enum Response {
         items: Vec<AlbumInfo>,
     },
     /// What the daemon is doing right now (reply to [`Request::Diagnostics`]).
-    Diagnostics { diagnostics: Diagnostics },
+    Diagnostics {
+        diagnostics: Diagnostics,
+    },
     /// How the Takeout import is doing (reply to [`Request::ImportStatus`]).
     /// `running` is false once it has finished, when `summary` is the final
     /// report; `summary` is `None` when no import has run this session.
@@ -2304,10 +2551,14 @@ pub enum Response {
     },
     /// The months the timeline spans (reply to [`Request::PhotoMonths`]),
     /// newest first.
-    PhotoMonths { months: Vec<PhotoMonth> },
+    PhotoMonths {
+        months: Vec<PhotoMonth>,
+    },
     /// The duplicate sets (reply to [`Request::PhotoDuplicates`]), newest
     /// first. Each set lists the copy worth keeping first.
-    PhotoDuplicates { sets: Vec<Vec<PhotoItem>> },
+    PhotoDuplicates {
+        sets: Vec<Vec<PhotoItem>>,
+    },
     /// The sets of alike shots (reply to [`Request::PhotoSimilar`]), newest
     /// first, each in capture order; and how far hashing has got, `None`
     /// once no pass is running. `uncompared` counts the shots left out
@@ -2329,9 +2580,13 @@ pub enum Response {
     },
     /// The photos of one town, each with its location (reply to
     /// [`Request::PlaceLocations`]).
-    PhotoLocations { items: Vec<PhotoLocation> },
+    PhotoLocations {
+        items: Vec<PhotoLocation>,
+    },
     /// Thumbnails for a [`Request::PhotoThumbs`] batch.
-    Thumbs { items: Vec<PhotoThumb> },
+    Thumbs {
+        items: Vec<PhotoThumb>,
+    },
     /// Per-node outcome of a [`Request::TrashNodes`] batch. Reported per uid
     /// rather than as one verdict: the server answers each node separately, and
     /// a front-end that removed all of them on a partial success would show a
@@ -2341,7 +2596,9 @@ pub enum Response {
         failed: Vec<TrashFailure>,
     },
     /// The album a [`Request::CreateAlbum`] made.
-    AlbumCreated { uid: String },
+    AlbumCreated {
+        uid: String,
+    },
     /// Outcome of a [`Request::AddToAlbum`] or [`Request::RemoveFromAlbum`],
     /// per photo like [`Response::Trashed`]: `changed` photos were added or
     /// removed, `failed` ones were not.
@@ -2355,20 +2612,33 @@ pub enum Response {
     FileThumbsStale,
     /// Daemon-issued generation reserved by
     /// [`Request::ReserveFileThumbGeneration`].
-    FileThumbGeneration { generation: u64 },
+    FileThumbGeneration {
+        generation: u64,
+    },
     /// Current recursive thumbnail-build progress.
-    ThumbnailBuild { status: ThumbnailBuildStatus },
+    ThumbnailBuild {
+        status: ThumbnailBuildStatus,
+    },
     /// Whether a photos-timeline refresh is still running (reply to
     /// [`Request::PhotosRefreshStatus`]).
-    PhotosRefresh { running: bool },
+    PhotosRefresh {
+        running: bool,
+    },
     /// An on-disk path the front-end can open (e.g. a downloaded photo).
-    FilePath { path: String },
+    FilePath {
+        path: String,
+    },
     /// Full-text search results (reply to [`Request::Search`]).
-    SearchResults { hits: Vec<SearchHit> },
+    SearchResults {
+        hits: Vec<SearchHit>,
+    },
     /// Local-file search results (reply to [`Request::SearchLocal`]). `indexing`
     /// is true while a scan of the machine is still running, so a front-end can
     /// say "still indexing" instead of "no matches" on a cold first launch.
-    LocalResults { hits: Vec<LocalHit>, indexing: bool },
+    LocalResults {
+        hits: Vec<LocalHit>,
+        indexing: bool,
+    },
     /// Drive and local-file search results returned together (reply to
     /// [`Request::SearchV2`]). `local_indexing` distinguishes a genuinely empty
     /// local result set from one observed while the initial scan is running.
@@ -2387,17 +2657,29 @@ pub enum Response {
         jobs: Vec<JobItem>,
     },
     /// The account's devices (reply to [`Request::ListDevices`]).
-    Devices { items: Vec<DeviceInfo> },
+    Devices {
+        items: Vec<DeviceInfo>,
+    },
     /// Every local Proton Drive location (reply to [`Request::ListLocations`]).
-    Locations { items: Vec<MountSpec> },
+    Locations {
+        items: Vec<MountSpec>,
+    },
     /// This device's synced folders (reply to [`Request::ListSyncFolders`]).
-    SyncFolders { items: Vec<SyncFolderInfo> },
+    SyncFolders {
+        items: Vec<SyncFolderInfo>,
+    },
     /// The upload/change queue (reply to [`Request::ListPendingOps`]).
-    PendingOps { items: Vec<PendingOpInfo> },
+    PendingOps {
+        items: Vec<PendingOpInfo>,
+    },
     /// Conflict copies (reply to [`Request::ListConflicts`]).
-    Conflicts { items: Vec<ConflictInfo> },
+    Conflicts {
+        items: Vec<ConflictInfo>,
+    },
     /// Folders offered for restore (reply to [`Request::ListRestorableFolders`]).
-    RestorableFolders { items: Vec<RestorableFolder> },
+    RestorableFolders {
+        items: Vec<RestorableFolder>,
+    },
     /// A node's share: members + pending invitations, and its public link if any
     /// (reply to [`Request::ListShare`]).
     Share {
@@ -2407,28 +2689,46 @@ pub enum Response {
     /// A freshly created or changed public link, carrying the shareable URL
     /// (reply to [`Request::CreatePublicLink`] and
     /// [`Request::UpdatePublicLink`]).
-    PublicLink { link: PublicLinkInfo },
+    PublicLink {
+        link: PublicLinkInfo,
+    },
     /// What a folder holds on Proton Drive (reply to [`Request::FolderSize`]):
     /// the bytes on storage and the number of items below it, folders and
     /// trashed items included.
-    FolderSize { size: u64, items: u64 },
+    FolderSize {
+        size: u64,
+        items: u64,
+    },
     /// Invitations addressed to me (reply to [`Request::ListInvitations`]).
-    Invitations { items: Vec<InvitationInfo> },
+    Invitations {
+        items: Vec<InvitationInfo>,
+    },
     /// Saved public links (reply to [`Request::ListBookmarks`]).
-    Bookmarks { items: Vec<BookmarkInfo> },
+    Bookmarks {
+        items: Vec<BookmarkInfo>,
+    },
     /// Account storage usage in bytes (reply to [`Request::AccountQuota`]).
     /// `max_space` is the total; `used_space` what is consumed. `max_space == 0`
     /// means the total is unknown, which a front-end shows as a plain used figure
     /// rather than a full bar.
-    AccountQuota { max_space: i64, used_space: i64 },
+    AccountQuota {
+        max_space: i64,
+        used_space: i64,
+    },
     /// Nodes I have shared with others (reply to [`Request::ListSharedByMe`]).
-    SharedByMe { items: Vec<SharedItem> },
+    SharedByMe {
+        items: Vec<SharedItem>,
+    },
     /// A file's version history, newest first (reply to
     /// [`Request::ListRevisions`]).
-    Revisions { items: Vec<RevisionInfo> },
+    Revisions {
+        items: Vec<RevisionInfo>,
+    },
     /// The daemon's recent activity, newest first (reply to
     /// [`Request::ListActivity`]).
-    Activity { items: Vec<ActivityEntry> },
+    Activity {
+        items: Vec<ActivityEntry>,
+    },
     /// The request failed. `message` is for the user; `kind` is for the code —
     /// a front-end decides its copy and whether to offer a retry from `kind`,
     /// never by matching on the text.
@@ -2527,6 +2827,8 @@ impl Request {
     pub fn read_timeout(&self) -> Duration {
         if self.is_poll() {
             POLL_READ_TIMEOUT
+        } else if matches!(self, Request::DriveGallery { .. }) {
+            Duration::from_secs(300)
         } else {
             READ_TIMEOUT
         }

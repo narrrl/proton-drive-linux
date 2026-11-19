@@ -91,6 +91,7 @@ mod drive;
 use drive::{DriveApi, RevisionRead};
 mod events;
 mod filesystem;
+mod gallery;
 mod keeper;
 mod link;
 pub use filesystem::ProtonFs;
@@ -499,6 +500,7 @@ struct Core {
     /// The concrete client, for what [`DriveApi`] does not cover: sharing,
     /// Photos, devices, invitations and public links.
     client: ProtonDriveClient,
+    gallery: Option<Arc<gallery::Gallery>>,
     rt: tokio::runtime::Handle,
     /// The daemon's My Files root. Forked on-demand sessions retain this value
     /// so ownership checks never mistake their own mount root for account scope.

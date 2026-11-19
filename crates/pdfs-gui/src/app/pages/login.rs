@@ -683,6 +683,10 @@ pub(crate) fn sign_out(ui: &Rc<Ui>) {
         ),
         &gettext("Sign Out"),
         move || {
+            let galleries = ui.drive_galleries.borrow().upgrade();
+            if let Some(galleries) = galleries {
+                galleries.close();
+            }
             // systemctl and the keyring both block, so run them on a worker.
             let ui = ui.clone();
             glib::spawn_future_local(async move {

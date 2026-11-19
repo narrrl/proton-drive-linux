@@ -154,6 +154,7 @@ impl Core {
         album: &NodeUid,
         offset: usize,
         limit: usize,
+        excluded: &str,
     ) -> CoreResult<Vec<PhotoItem>> {
         let key = album.to_string();
         let stamp = format!("{ALBUM_SYNCED_PREFIX}{key}");
@@ -172,7 +173,7 @@ impl Core {
 
         let page = self
             .db
-            .album_photos_page(&key, offset, limit)
+            .album_photos_page_visible(&key, offset, limit, excluded)
             .map_err(CoreError::from)?;
         Ok(page.into_iter().map(|p| self.photo_item(p)).collect())
     }

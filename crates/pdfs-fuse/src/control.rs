@@ -396,6 +396,11 @@ fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
     use CtlRequest as R;
     match request {
         R::Pin { .. } | R::Unpin { .. } => &[Topic::Files],
+        R::DriveGallery {
+            action:
+                pdfs_core::control::GalleryAction::Lock
+                | pdfs_core::control::GalleryAction::Unlock { .. },
+        } => &[Topic::GalleryVisibility],
         R::CreateAlbum { .. }
         | R::RenameAlbum { .. }
         | R::DeleteAlbum { .. }
@@ -552,6 +557,33 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
     // Registered before the request is even parsed, so a handler that wedges
     // inside the daemon shows up by name in `pdfs diagnostics`.
     let _inflight = super::diagnostics::InflightGuard::new(super::diagnostics::request_kind(&line));
+    let visibility = if matches!(
+        &request,
+        Ok(CtlRequest::PhotosTimeline { .. }
+            | CtlRequest::PhotoDuplicates
+            | CtlRequest::PhotoSimilar
+            | CtlRequest::PhotoPlaces
+            | CtlRequest::PlacePhotos { .. }
+            | CtlRequest::PlaceLocations { .. }
+            | CtlRequest::PhotosOnThisDay { .. }
+            | CtlRequest::PhotoGroup { .. }
+            | CtlRequest::PhotoAlbums
+            | CtlRequest::AlbumPhotos { .. }
+            | CtlRequest::PhotoMonths { .. }
+            | CtlRequest::PhotoThumbs { .. }
+            | CtlRequest::OpenGalleryImage { .. }
+            | CtlRequest::OpenPhoto { .. })
+    ) {
+        core.gallery_visibility()
+    } else {
+        Ok(std::sync::Arc::default())
+    };
+    let visibility = match visibility {
+        Ok(visibility) => visibility,
+        Err(error) => return write_response(stream, CtlResponse::error(error)),
+    };
+    let excluded =
+        serde_json::to_string(&visibility.media).expect("a set of file identifiers serializes");
     let response = match request {
         Ok(CtlRequest::Status) => status_response(core, username, mountpoint),
         Ok(CtlRequest::Subscribe) => {
@@ -668,11 +700,12 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             range,
             favorites,
             not_in_album,
+            &excluded,
         ) {
             Ok(Some(items)) => CtlResponse::Photos {
                 available: true,
                 items,
-                counts: core.db.photos_counts().ok(),
+                counts: core.db.photos_counts_visible(&excluded).ok(),
             },
             Ok(None) => CtlResponse::Photos {
                 available: false,
@@ -693,7 +726,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::PhotoPlaces) => match core.photo_places() {
+        Ok(CtlRequest::PhotoPlaces) => match core.photo_places(&excluded) {
             Ok(items) => CtlResponse::Places {
                 items,
                 mapping: core.timeline_progress(),
@@ -701,7 +734,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::PlacePhotos { id, offset, limit }) => {
-            match core.place_photos(id, offset, clamp_limit(limit)) {
+            match core.place_photos(id, offset, clamp_limit(limit), &excluded) {
                 Ok(items) => CtlResponse::Photos {
                     available: true,
                     items,
@@ -715,7 +748,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::PhotosOnThisDay { limit }) => {
-            match core.photos_on_this_day(clamp_limit(limit)) {
+            match core.photos_on_this_day(clamp_limit(limit), &excluded) {
                 Ok(items) => CtlResponse::Photos {
                     available: true,
                     items,
@@ -760,7 +793,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             // An album page is a timeline page as far as the front-end is
             // concerned, so it comes back in the same reply — with `counts`
             // unset, which describe the whole timeline rather than this album.
-            Some(album) => match core.album_photos(&album, offset, clamp_limit(limit)) {
+            Some(album) => match visibility
+                .permits(&uid)
+                .and_then(|()| core.album_photos(&album, offset, clamp_limit(limit), &excluded))
+            {
                 Ok(items) => CtlResponse::Photos {
                     available: true,
                     items,
@@ -802,17 +838,23 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 core.remove_from_album(album, photos)
             })
         }
-        Ok(CtlRequest::PhotoMonths { kind }) => match core.db.photos_months(kind) {
-            Ok(months) => CtlResponse::PhotoMonths {
-                months: months
-                    .into_iter()
-                    .map(|(year, month, count)| PhotoMonth { year, month, count })
-                    .collect(),
-            },
-            Err(e) => CtlResponse::error(e.into()),
-        },
+        Ok(CtlRequest::PhotoMonths { kind }) => {
+            match core.db.photos_months_visible(kind, &excluded) {
+                Ok(months) => CtlResponse::PhotoMonths {
+                    months: months
+                        .into_iter()
+                        .map(|(year, month, count)| PhotoMonth { year, month, count })
+                        .collect(),
+                },
+                Err(e) => CtlResponse::error(e.into()),
+            }
+        }
         Ok(CtlRequest::PhotoThumbs { uids }) => {
-            let parsed: Vec<NodeUid> = uids.iter().filter_map(|u| parse_uid(u)).collect();
+            let parsed: Vec<NodeUid> = uids
+                .iter()
+                .filter(|uid| !visibility.media.contains(*uid))
+                .filter_map(|u| parse_uid(u))
+                .collect();
             CtlResponse::Thumbs {
                 items: core.photo_thumbs(&parsed),
             }
@@ -862,7 +904,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             running: core.timeline_refreshing(),
         },
         Ok(CtlRequest::OpenPhoto { uid }) => match parse_uid(&uid) {
-            Some(u) => match core.open_photo(&u) {
+            Some(u) => match visibility.permits(&uid).and_then(|()| core.open_photo(&u)) {
                 Ok(p) => CtlResponse::FilePath {
                     path: p.display().to_string(),
                 },
@@ -870,6 +912,27 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             None => CtlResponse::error(CoreError::invalid(format!("bad uid: {uid}"))),
         },
+        Ok(CtlRequest::DriveGallery { action }) => core
+            .drive_gallery(action)
+            .unwrap_or_else(CtlResponse::error),
+        Ok(CtlRequest::OpenGalleryVideo { uid }) => core
+            .open_gallery_video(&uid)
+            .unwrap_or_else(CtlResponse::error),
+        Ok(CtlRequest::OpenGalleryImage { uid }) => match visibility
+            .permits(&uid)
+            .and_then(|()| core.open_shared_file(&uid))
+        {
+            Ok(path) => CtlResponse::FilePath {
+                path: path.display().to_string(),
+            },
+            Err(error) => CtlResponse::error(error),
+        },
+        Ok(CtlRequest::CloseGalleryVideo { token }) => core
+            .close_gallery_video(&token)
+            .unwrap_or_else(CtlResponse::error),
+        Ok(CtlRequest::GalleryThumbnail { uid }) => core
+            .gallery_thumbnail(&uid)
+            .unwrap_or_else(CtlResponse::error),
         // The scan alone walks every archive's central directory, so even the
         // dry run goes to a background thread and is read back through
         // `ImportStatus` rather than answered inline.
@@ -1929,9 +1992,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         // The request did not parse: the caller sent something malformed.
         Err(e) => CtlResponse::error(CoreError::invalid(format!("bad request: {e}"))),
     };
+    let response = filter_gallery_response(response, &visibility);
     if !touched.is_empty() && !matches!(response, CtlResponse::Error { .. }) {
         core.events.publish(touched);
     }
+    write_response(stream, response);
+}
+
+fn write_response(mut stream: UnixStream, response: CtlResponse) {
     let mut out = match serde_json::to_vec(&response) {
         Ok(v) => v,
         Err(e) => {
@@ -1940,8 +2008,38 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         }
     };
     out.push(b'\n');
-    let mut stream = stream;
     let _ = stream.write_all(&out);
+}
+
+fn filter_gallery_response(
+    mut response: CtlResponse,
+    visibility: &super::gallery::Visibility,
+) -> CtlResponse {
+    let visible = |item: &pdfs_core::control::PhotoItem| !visibility.media.contains(&item.uid);
+    match &mut response {
+        CtlResponse::Photos { items, .. } => items.retain(visible),
+        CtlResponse::Albums { items, .. } => {
+            items.retain(|item| !visibility.albums.contains(&item.uid));
+            for album in items {
+                if album
+                    .cover_uid
+                    .as_ref()
+                    .is_some_and(|uid| visibility.media.contains(uid))
+                {
+                    album.cover_uid = None;
+                }
+            }
+        }
+        CtlResponse::PhotoDuplicates { sets } | CtlResponse::PhotoSimilar { sets, .. } => {
+            for set in sets.iter_mut() {
+                set.retain(visible);
+            }
+            sets.retain(|set| set.len() > 1);
+        }
+        CtlResponse::PhotoLocations { items } => items.retain(|located| visible(&located.photo)),
+        _ => {}
+    }
+    response
 }
 
 /// Listen on the control socket, serving one command per connection, each on its

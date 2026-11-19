@@ -133,6 +133,32 @@ fn follow_changes(ui: &Rc<Ui>, state: &FeedState, topics: &[Topic]) {
         refresh_file_thumbnails(ui);
     }
     let page = ui.stack.visible_child_name();
+    if changed(Topic::GalleryVisibilitySynced)
+        && let Some(browser) = ui.drive_galleries.borrow().upgrade()
+    {
+        browser.refresh_visibility();
+    }
+    if changed(Topic::GalleryVisibility) || changed(Topic::GalleryVisibilitySynced) {
+        for window in gtk4::Window::list_toplevels() {
+            if let Ok(window) = window.downcast::<gtk4::Window>()
+                && window.has_css_class("photo-viewer-window")
+            {
+                window.close();
+            }
+        }
+        ui.gallery.photo_tex.borrow_mut().clear();
+        ui.gallery.photo_tex_order.borrow_mut().clear();
+        ui.gallery.model.remove_all();
+        ui.gallery.groups.remove_all();
+        ui.gallery.timeline_stale.set(true);
+        if page.as_deref() == Some("gallery") {
+            match ui.gallery.content.visible_child_name().as_deref() {
+                Some("albums") => load_albums(ui),
+                Some("places") => load_places(ui),
+                _ => load_gallery(ui, false),
+            }
+        }
+    }
     // A timeline out of sight is read again when the user comes back to it;
     // one on screen is left alone (below).
     if changed(Topic::Photos) && (page.as_deref() != Some("gallery") || !photo_grid_shown(ui)) {

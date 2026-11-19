@@ -11,6 +11,19 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+
+- Open **Drive Galleries** from Photos to browse saved My files folders and their
+  subfolders, choose album covers, and manage public links. Saved galleries and
+  covers sync with Proton Gallery on desktop and Android.
+
+### Changed
+
+- Photos uses Proton Gallery's justified row planner. The Photos viewer starts
+  and seeks through supported videos without caching the whole original.
+- Gallery-hidden albums and their contents are filtered from Photos and Drive
+  Galleries. Unlock them with the local Gallery passphrase.
+
 ## [3.8.1] — 2026-11-19
 
 Schema: **45**. No database migration in this release.

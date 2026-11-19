@@ -337,6 +337,10 @@ fn places_group_photos_by_the_nearest_town() {
         .map(|p| p.uid)
         .collect();
     assert_eq!(berlin, ["b2", "b1-jpeg"]);
+    let visible = db.photo_places_visible(r#"["b2","p1"]"#).unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].count, 1);
+    assert_eq!(visible[0].cover.uid, "b1-jpeg");
 }
 
 /// A town's photos come with where each was taken, one per RAW+JPEG shot.
@@ -7165,6 +7169,29 @@ fn a_raw_and_its_jpeg_are_one_entry_in_the_grid() {
         ["jpeg", "raw"]
     );
     assert_eq!(db.photos_group("alone").unwrap().len(), 1);
+
+    let hidden = db
+        .photo_group_members_for(&["raw".to_owned()].into_iter().collect())
+        .unwrap();
+    assert_eq!(
+        hidden,
+        ["raw".to_owned(), "jpeg".to_owned()].into_iter().collect()
+    );
+    let excluded = serde_json::to_string(&hidden).unwrap();
+    assert_eq!(db.photos_counts_visible(&excluded).unwrap(), (1, 0, 0));
+    let months = db.photos_months_visible(None, &excluded).unwrap();
+    assert_eq!(months.len(), 1);
+    assert_eq!(months[0].2, 1);
+    let public = db
+        .photos_page_visible(0, 1, None, None, false, false, &excluded)
+        .unwrap();
+    assert_eq!(
+        public
+            .iter()
+            .map(|photo| photo.uid.as_str())
+            .collect::<Vec<_>>(),
+        ["alone"]
+    );
 }
 
 /// Pixel names the two files of one raw capture after the role each plays, so

@@ -467,6 +467,7 @@ impl GalleryRow {
 
 /// The widgets [`build_gallery_page`] hands back to [`build_window`].
 pub(crate) struct GalleryWidgets {
+    pub(crate) drive_galleries: gtk4::Button,
     /// Flat, newest-first list of every loaded photo. Backs the lightbox's
     /// prev/next navigation; the visible sections are derived from it.
     pub(crate) model: gio::ListStore,
@@ -940,10 +941,13 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     header.pack_end(&more);
     header.pack_end(&select_btn);
     header.pack_end(&selection.cancel);
+    let drive_galleries = gtk4::Button::with_label(&gettext("Drive Galleries"));
+    header.pack_end(&drive_galleries);
 
     (
         frame.upcast(),
         GalleryWidgets {
+            drive_galleries,
             model,
             groups,
             content,
@@ -2203,16 +2207,15 @@ pub(crate) fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec
 /// The narrowest and the widest shape a tile may take, as width over height.
 /// A panorama at its own shape would be a ribbon, and a screenshot of a phone
 /// a thread; past these the thumbnail is cropped to fit.
-pub(crate) const TILE_RATIO_MIN: f64 = 0.5;
-pub(crate) const TILE_RATIO_MAX: f64 = 2.5;
+#[cfg(test)]
+const TILE_RATIO_MIN: f64 = 0.5;
+#[cfg(test)]
+const TILE_RATIO_MAX: f64 = 2.5;
 
 /// The shape a photo's tile takes: its own, clamped, or square while the
 /// daemon has not seen a thumbnail of it yet.
 pub(crate) fn tile_ratio(ratio: Option<f64>) -> f64 {
-    ratio
-        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
-        .unwrap_or(1.0)
-        .clamp(TILE_RATIO_MIN, TILE_RATIO_MAX)
+    pg_core::grid::tile_ratio(ratio.unwrap_or(1.0))
 }
 
 /// The justified layout math: tiles of the given shapes, in order, broken into
@@ -2225,64 +2228,33 @@ pub(crate) fn tile_ratio(ratio: Option<f64>) -> f64 {
 /// two photos from one day stay two photos at the target height, not two
 /// photos as tall as the window.
 pub(crate) fn plan_justified(ratios: &[f64], width: i32, target: i32) -> Vec<Vec<(i32, i32)>> {
-    let width = width.max(1);
-    let target = f64::from(target.clamp(ROW_MIN, ROW_MAX));
-    let gap = f64::from(TILE_GAP);
-    // The height that makes `ratios` span the width exactly.
-    let fit = |ratios: &[f64]| {
-        let gaps = gap * (ratios.len() as f64 - 1.0);
-        (f64::from(width) - gaps).max(1.0) / ratios.iter().sum::<f64>()
+    let Ok(grid) = pg_core::grid::plan_sections(
+        ratios,
+        &[],
+        width.clamp(1, 32_768) as u32,
+        target.clamp(ROW_MIN, ROW_MAX) as u32,
+        TILE_GAP as u32,
+    ) else {
+        return Vec::new();
     };
-    let mut rows = Vec::new();
-    let mut start = 0;
-    while start < ratios.len() {
-        let mut end = start + 1;
-        while end < ratios.len() && fit(&ratios[start..end]) > target {
-            end += 1;
-        }
-        let full = fit(&ratios[start..end]) <= target;
-        // Giving the last photo back leaves the row taller than the target;
-        // keeping it, shorter. Whichever misses by less wins.
-        if full
-            && end - start > 1
-            && fit(&ratios[start..end - 1]) - target < target - fit(&ratios[start..end])
-        {
-            end -= 1;
-        }
-        let row = &ratios[start..end];
-        rows.push(if full {
-            size_row(row, fit(row), Some(width))
-        } else {
-            size_row(row, target, None)
-        });
-        start = end;
-    }
-    rows
-}
-
-/// Tile sizes for one row of shapes at `height`. With `span`, the widths are
-/// rounded so the row, gaps included, is exactly that wide: each tile ends
-/// where its share of the row ends, so no rounding error piles up at the end.
-fn size_row(ratios: &[f64], height: f64, span: Option<i32>) -> Vec<(i32, i32)> {
-    let tile_height = (height.round() as i32).max(1);
-    let Some(span) = span else {
-        return ratios
-            .iter()
-            .map(|ratio| (((ratio * height).round() as i32).max(1), tile_height))
-            .collect();
-    };
-    let content = f64::from(span - TILE_GAP * (ratios.len() as i32 - 1));
-    let total: f64 = ratios.iter().sum();
-    let mut sizes = Vec::with_capacity(ratios.len());
-    let mut done = 0.0;
-    let mut left = 0;
-    for ratio in ratios {
-        done += ratio;
-        let right = (content * done / total).round() as i32;
-        sizes.push(((right - left).max(1), tile_height));
-        left = right;
-    }
-    sizes
+    let ends = grid
+        .row_starts
+        .iter()
+        .copied()
+        .skip(1)
+        .chain(std::iter::once(grid.widths.len() as u32));
+    grid.row_starts
+        .iter()
+        .copied()
+        .zip(ends)
+        .zip(grid.row_heights)
+        .map(|((start, end), height)| {
+            grid.widths[start as usize..end as usize]
+                .iter()
+                .map(|width| (*width as i32, height as i32))
+                .collect()
+        })
+        .collect()
 }
 
 /// The layout math: how many square tiles of about `target` px fit across
