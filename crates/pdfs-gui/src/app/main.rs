@@ -652,6 +652,7 @@ fn build_window(app: &adw::Application) {
             select_btn: gallery_widgets.select_btn.clone(),
             selection: gallery_widgets.selection.clone(),
             more: gallery_widgets.more.clone(),
+            gallery_actions: gallery_widgets.gallery_actions.clone(),
             upload_face: gallery_widgets.upload_face.clone(),
             float_heading: gallery_widgets.float_heading.clone(),
             float_label: gallery_widgets.float_label.clone(),

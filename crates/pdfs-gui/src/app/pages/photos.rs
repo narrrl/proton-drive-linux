@@ -225,6 +225,9 @@ pub(crate) struct GalleryState {
     /// The header's page menu and the Upload button's face, which drops its
     /// label in a narrow window.
     pub(crate) more: gtk4::MenuButton,
+    /// The header's end slot for an open Drive gallery's own buttons (Add
+    /// This Folder, Unlock, options), filled by the Drive gallery browser.
+    pub(crate) gallery_actions: gtk4::Box,
     pub(crate) upload_face: adw::ButtonContent,
     /// The section the top of the timeline is in, floating over the grid
     /// once its own heading has scrolled away.
@@ -524,6 +527,7 @@ pub(crate) struct GalleryWidgets {
     pub(crate) select_btn: gtk4::Button,
     pub(crate) selection: SelectionBar,
     pub(crate) more: gtk4::MenuButton,
+    pub(crate) gallery_actions: gtk4::Box,
     pub(crate) upload_face: adw::ButtonContent,
     pub(crate) float_heading: gtk4::Revealer,
     pub(crate) float_label: gtk4::Label,
@@ -693,6 +697,12 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .menu_model(&page_menu)
         .build();
     more.add_css_class("flat");
+
+    // An open Drive gallery's own buttons live in the header too, not in a row
+    // of their own above its grid: that row took height from the photos and
+    // left its button touching the first row of tiles.
+    let gallery_actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    gallery_actions.set_visible(false);
 
     // Picking photos is a mode: the button enters it, and the header then
     // trades the page's own controls for Cancel and a count, as GNOME apps do.
@@ -1002,6 +1012,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     header.pack_start(&back);
     header.pack_start(&upload);
     header.pack_end(&more);
+    header.pack_end(&gallery_actions);
     header.pack_end(&select_btn);
     header.pack_end(&selection.cancel);
 
@@ -1031,6 +1042,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             select_btn,
             selection,
             more,
+            gallery_actions,
             upload_face,
             float_heading,
             float_label,
@@ -1141,6 +1153,7 @@ pub(crate) fn sync_header(ui: &Rc<Ui>) {
     gallery.back.set_visible(!selecting && collection);
     gallery.upload.set_visible(!selecting && !collection);
     gallery.more.set_visible(!selecting && !galleries);
+    gallery.gallery_actions.set_visible(!selecting && galleries);
     gallery.select_btn.set_visible(!selecting && timeline);
     gallery.selection.title.set_visible(selecting);
     gallery.selection.cancel.set_visible(selecting);
