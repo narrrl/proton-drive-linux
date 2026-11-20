@@ -3669,6 +3669,7 @@ dependencies = [
  "proton-drive-rs",
  "proton-gallery-app-rs",
  "proton-gallery-rs",
+ "proton-media-rs",
  "rustix",
  "serde",
  "serde_json",
@@ -4041,6 +4042,19 @@ dependencies = [
  "tracing",
  "zeroize",
  "zip",
+]
+
+[[package]]
+name = "proton-media-rs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f03aa6c403e4f2f7a8f9a444dff1e268d8bc9bcaf1d0d953cc3a1312d798f1ef"
+dependencies = [
+ "lru",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

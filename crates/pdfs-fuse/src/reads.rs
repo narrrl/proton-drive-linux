@@ -212,15 +212,12 @@ impl BlockRing {
 }
 
 /// The result of fetching one block, shared between everyone who wanted it.
-type BlockResult = Result<Arc<Vec<u8>>, Errno>;
+pub(super) type BlockResult = Result<Arc<Vec<u8>>, Errno>;
 
 /// Identifies a block *of a revision*: node, validity tag, and the plaintext
 /// range the block covers — see [`RingKey`] for why it is the range and not the
 /// index.
-type BlockKey = (NodeUid, i64, u64, BlockSpan);
-
-/// A claim on a block key: who owns the fetch, and where its result is published.
-type Claim = (u64, tokio::sync::watch::Receiver<Option<BlockResult>>);
+pub(super) type BlockKey = (NodeUid, i64, u64, BlockSpan);
 
 /// Block fetches in flight, so a block is downloaded and decrypted once however
 /// many readers want it at that moment (audit T1).
@@ -231,34 +228,7 @@ type Claim = (u64, tokio::sync::watch::Receiver<Option<BlockResult>>);
 /// for. Without this each of them pays the full round-trip and decrypt and all
 /// but one result is discarded — roughly double the bandwidth and CPU in steady
 /// state. Same shape as [`ReaderSlot::Pending`] one level up.
-#[derive(Default)]
-pub(super) struct BlockFlight {
-    inflight: Mutex<HashMap<BlockKey, Claim>>,
-}
-
-/// Distinguishes attempts at the same key, so a leader only retires its own.
-static NEXT_FLIGHT_ID: AtomicU64 = AtomicU64::new(0);
-
-/// The leader's claim on a key. Retires it on drop — including when the task is
-/// cancelled mid-fetch, which is what keeps a dropped `JoinSet` from leaving a
-/// key nobody will ever publish.
-struct Flight {
-    flight: Arc<BlockFlight>,
-    key: BlockKey,
-    id: u64,
-}
-
-impl Drop for Flight {
-    fn drop(&mut self) {
-        let mut inflight = self.flight.inflight.lock();
-        if inflight
-            .get(&self.key)
-            .is_some_and(|(id, _)| *id == self.id)
-        {
-            inflight.remove(&self.key);
-        }
-    }
-}
+pub(super) type BlockFlight = proton_media_rs::SingleFlight<BlockKey, BlockResult>;
 
 /// Where each file's reader is expected to read next, so sequential reads can be
 /// told from random ones and only the former prefetched (audit T2).
@@ -581,49 +551,11 @@ impl Core {
         cache_blocks: bool,
     ) -> BlockResult {
         let key: BlockKey = (uid.clone(), mtime, fsize, span);
-        let claim = {
-            let mut inflight = self.block_flight.inflight.lock();
-            match inflight.get(&key) {
-                Some((_, rx)) => Err(rx.clone()),
-                None => {
-                    let id = NEXT_FLIGHT_ID.fetch_add(1, Ordering::Relaxed);
-                    let (tx, rx) = tokio::sync::watch::channel(None);
-                    inflight.insert(key.clone(), (id, rx));
-                    Ok((
-                        tx,
-                        Flight {
-                            flight: self.block_flight.clone(),
-                            key: key.clone(),
-                            id,
-                        },
-                    ))
-                }
-            }
-        };
-        let (tx, flight) = match claim {
-            Ok(lead) => lead,
-            Err(mut rx) => {
-                loop {
-                    if let Some(result) = rx.borrow_and_update().clone() {
-                        return result;
-                    }
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-                return self
-                    .read_block(reader, uid, mtime, fsize, span, cache_blocks)
-                    .await;
-            }
-        };
-        let result = self
-            .read_block(reader, uid, mtime, fsize, span, cache_blocks)
-            .await;
-        // Retire the claim before publishing, so a racer that wakes and re-enters
-        // finds no stale entry to join.
-        drop(flight);
-        let _ = tx.send(Some(result.clone()));
-        result
+        self.block_flight
+            .join(key, || {
+                self.read_block(reader, uid, mtime, fsize, span, cache_blocks)
+            })
+            .await
     }
 
     /// Download and decrypt one block, then put it where the next reader will

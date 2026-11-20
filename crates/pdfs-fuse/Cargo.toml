@@ -16,6 +16,7 @@ sha1.workspace = true
 proton-drive-rs.workspace = true
 proton-gallery-app-rs.workspace = true
 proton-gallery-rs.workspace = true
+proton-media-rs.workspace = true
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
