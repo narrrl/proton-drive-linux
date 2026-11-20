@@ -154,7 +154,6 @@ fn follow_changes(ui: &Rc<Ui>, state: &FeedState, topics: &[Topic]) {
         ui.gallery.decode_queue.borrow_mut().clear();
         ui.gallery.thumb_wanted.borrow_mut().clear();
         ui.gallery.photo_tex.borrow_mut().clear();
-        ui.gallery.photo_tex_order.borrow_mut().clear();
         ui.gallery.model.remove_all();
         ui.gallery.groups.remove_all();
         ui.gallery.row_by_photo.borrow_mut().clear();

@@ -52,8 +52,9 @@ fn staged_path(ui: &Rc<Ui>) -> PathBuf {
 
 /// Read the remembered set, dropping any archive that has since been moved or
 /// deleted — a stale path would only fail at launch, and silently is worse.
-fn load_staged(ui: &Rc<Ui>) -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(staged_path(ui)) else {
+/// Blocking: run it off the GTK thread.
+fn load_staged(path: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     let paths: Vec<String> = serde_json::from_str(&text).unwrap_or_default();
@@ -64,9 +65,39 @@ fn load_staged(ui: &Rc<Ui>) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Restore whatever was staged when the window last closed, read on a worker.
+/// Anything the user staged meanwhile is kept alongside it.
+fn restore_staged(ui: &Rc<Ui>) {
+    let path = staged_path(ui);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let restored = gio::spawn_blocking(move || load_staged(&path))
+            .await
+            .unwrap_or_default();
+        {
+            let mut staged = ui.takeout.archives.borrow_mut();
+            for path in restored {
+                if !staged.contains(&path) {
+                    staged.push(path);
+                }
+            }
+            staged.sort();
+        }
+        ui.takeout.restored.set(true);
+        repaint_archives(&ui);
+    });
+}
+
 /// Remember the staged set. Best-effort: failing to write it costs the user a
 /// re-pick next time, which is not worth interrupting them over now.
+///
+/// Written on a worker. Nothing is written before the remembered set has been
+/// read back, so the empty list shown meanwhile can't overwrite it, and a
+/// write that lands after a newer one is skipped.
 fn save_staged(ui: &Rc<Ui>) {
+    if !ui.takeout.restored.get() {
+        return;
+    }
     let paths: Vec<String> = ui
         .takeout
         .archives
@@ -75,12 +106,24 @@ fn save_staged(ui: &Rc<Ui>) {
         .map(|p| p.display().to_string())
         .collect();
     let path = staged_path(ui);
-    let written = serde_json::to_string(&paths)
-        .map_err(|e| e.to_string())
-        .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
-    if let Err(e) = written {
-        tracing::warn!("cannot remember staged Takeout archives: {e}");
-    }
+    let seq = ui.takeout.save_seq.get() + 1;
+    ui.takeout.save_seq.set(seq);
+    let saved = ui.takeout.saved_seq.clone();
+    gio::spawn_blocking(move || {
+        let Ok(mut last) = saved.lock() else {
+            return;
+        };
+        if *last > seq {
+            return;
+        }
+        *last = seq;
+        let written = serde_json::to_string(&paths)
+            .map_err(|e| e.to_string())
+            .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+        if let Err(e) = written {
+            tracing::warn!("cannot remember staged Takeout archives: {e}");
+        }
+    });
 }
 
 fn empty_list_description() -> String {
@@ -121,6 +164,16 @@ pub(crate) struct TakeoutState {
     pub(crate) inflight: Cell<bool>,
     /// Whether the daemon reported an import running on the last poll.
     pub(crate) running: Cell<bool>,
+    /// Whether the remembered staged set has been read back yet; until then
+    /// nothing is saved over it.
+    pub(crate) restored: Cell<bool>,
+    /// The last save started, and the last one written by a worker, so an
+    /// older save that lands late doesn't overwrite a newer one.
+    pub(crate) save_seq: Cell<u64>,
+    pub(crate) saved_seq: std::sync::Arc<std::sync::Mutex<u64>>,
+    /// Bumped by every repaint of the archive list, so the sizes of an older
+    /// list that arrive late are not painted over a newer one.
+    pub(crate) repaint_seq: Cell<u64>,
 }
 
 /// Widgets the Import page hands back for wiring.
@@ -490,10 +543,10 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
         .back_button
         .connect_clicked(move |_| ui_back.stack.set_visible_child_name("gallery"));
 
-    // Restore whatever was staged when the window last closed, before the first
-    // paint, so the page comes up as the user left it.
-    *ui.takeout.archives.borrow_mut() = load_staged(ui);
+    // Restore whatever was staged when the window last closed, so the page
+    // comes up as the user left it.
     repaint_archives(ui);
+    restore_staged(ui);
 }
 
 /// Stage `paths`, keeping only `.zip` files and skipping ones already staged.
@@ -503,15 +556,36 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
 /// the scan reads the archives' central directories, and an extracted tree has
 /// none — silently importing half of it would be worse than saying no.
 pub(crate) fn add_archives(ui: &Rc<Ui>, paths: Vec<PathBuf>) {
+    // Whether each is a regular file is asked of the filesystem, which may be
+    // a slow network mount: on a worker.
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let checked = gio::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .map(|path| {
+                    let file = path.is_file();
+                    (path, file)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        stage_archives(&ui, checked);
+    });
+}
+
+/// Stage the archives [`add_archives`] checked, as `(path, is a file)`.
+fn stage_archives(ui: &Rc<Ui>, paths: Vec<(PathBuf, bool)>) {
     let mut added = 0usize;
     let mut rejected = 0usize;
     {
         let mut staged = ui.takeout.archives.borrow_mut();
-        for path in paths {
+        for (path, file) in paths {
             let is_zip = path
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
-            if !is_zip || !path.is_file() {
+            if !is_zip || !file {
                 rejected += 1;
                 continue;
             }
@@ -542,12 +616,44 @@ pub(crate) fn add_archives(ui: &Rc<Ui>, paths: Vec<PathBuf>) {
 }
 
 /// Rebuild the staged-archive list and re-derive which actions are available.
+///
+/// The archives' sizes are read on a worker, and the list is rebuilt once
+/// they are in.
 pub(crate) fn repaint_archives(ui: &Rc<Ui>) {
+    let seq = ui.takeout.repaint_seq.get().wrapping_add(1);
+    ui.takeout.repaint_seq.set(seq);
+    let staged = ui.takeout.archives.borrow().clone();
+    save_staged(ui);
+    sync_takeout_actions(ui);
+    if staged.is_empty() {
+        paint_archives(ui, Vec::new());
+        return;
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let sized = gio::spawn_blocking(move || {
+            staged
+                .into_iter()
+                .map(|path| {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    (path, size)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        if ui.takeout.repaint_seq.get() == seq {
+            paint_archives(&ui, sized);
+        }
+    });
+}
+
+/// Fill the staged-archive list with `staged`, as `(path, size)`.
+fn paint_archives(ui: &Rc<Ui>, staged: Vec<(PathBuf, u64)>) {
     for row in ui.takeout.rows.borrow_mut().drain(..) {
         ui.takeout.list_group.remove(&row);
     }
 
-    let staged = ui.takeout.archives.borrow().clone();
     let mut rows: Vec<adw::PreferencesRow> = Vec::new();
     if staged.is_empty() {
         ui.takeout
@@ -558,8 +664,8 @@ pub(crate) fn repaint_archives(ui: &Rc<Ui>) {
         rows.push(row.upcast());
     } else {
         let mut total = 0u64;
-        for path in &staged {
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        for (path, size) in &staged {
+            let size = *size;
             total += size;
             let row = adw::ActionRow::builder()
                 .title(
@@ -601,9 +707,6 @@ pub(crate) fn repaint_archives(ui: &Rc<Ui>) {
         )));
     }
     *ui.takeout.rows.borrow_mut() = rows;
-
-    save_staged(ui);
-    sync_takeout_actions(ui);
 }
 
 /// Enable exactly the actions that make sense right now: nothing to launch
