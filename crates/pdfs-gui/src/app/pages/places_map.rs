@@ -67,6 +67,11 @@ const COVER_PX: i32 = 128;
 /// How many street-map tiles stay in memory.
 const TILE_CACHE: usize = 160;
 
+/// Photo marker covers kept, 64 KiB each. A town's own cover is never
+/// dropped (it only arrives with the town's card), but the photos zoomed past
+/// one by one would otherwise pile up for as long as the map is open.
+const COVER_CACHE: usize = 1024;
+
 /// How long a tile that couldn't be had is left alone before it is tried
 /// again.
 const TILE_RETRY: Duration = Duration::from_secs(60);
@@ -232,8 +237,11 @@ struct MapState {
     /// for from close up.
     locations: HashMap<u32, Vec<(PhotoItem, World)>>,
     asked_locations: HashSet<u32>,
-    /// Marker photos, scaled and cropped to a square, by photo uid.
-    covers: HashMap<String, cairo::ImageSurface>,
+    /// Marker photos, scaled and cropped to a square, by photo uid, with the
+    /// draw they were last shown in.
+    covers: HashMap<String, (cairo::ImageSurface, u64)>,
+    /// Counts draws, for dropping the covers shown longest ago.
+    draws: u64,
     asked_thumbs: HashSet<String>,
     view: View,
     /// False until the view has been fitted to the places at a real size, and
@@ -349,6 +357,7 @@ impl PlacesMap {
                 locations: HashMap::new(),
                 asked_locations: HashSet::new(),
                 covers: HashMap::new(),
+                draws: 0,
                 asked_thumbs: HashSet::new(),
                 view: View {
                     center: World { x: 0.5, y: 0.5 },
@@ -486,7 +495,18 @@ impl PlacesMap {
         let Some(cover) = square_cover(texture) else {
             return;
         };
-        self.state.borrow_mut().covers.insert(uid.to_owned(), cover);
+        let mut state = self.state.borrow_mut();
+        let state = &mut *state;
+        state.covers.insert(uid.to_owned(), (cover, state.draws));
+        let towns: HashSet<&str> = state
+            .places
+            .iter()
+            .map(|(place, _)| place.cover.uid.as_str())
+            .collect();
+        for dropped in evict_covers(&mut state.covers, &towns, state.draws) {
+            // Asked for again once it is back on screen.
+            state.asked_thumbs.remove(&dropped);
+        }
         self.area.queue_draw();
     }
 
@@ -840,6 +860,7 @@ impl PlacesMap {
             let mut state = self.state.borrow_mut();
             let state = &mut *state;
             let view = state.view;
+            state.draws += 1;
             paint_outline(cr, view, size, colors);
             let labels = match state.online.as_mut() {
                 Some(online) => paint_tiles(cr, online, view, size, dark, area.scale_factor()),
@@ -863,7 +884,10 @@ impl PlacesMap {
             }
             for bubble in &state.bubbles {
                 let marker = &state.markers[bubble.members[0]];
-                let cover = state.covers.get(&marker.cover);
+                let cover = state.covers.get_mut(&marker.cover).map(|(cover, drawn)| {
+                    *drawn = state.draws;
+                    &*cover
+                });
                 if cover.is_none()
                     && let Target::Photo { place, index } = marker.target
                     && state.asked_thumbs.insert(marker.cover.clone())
@@ -1119,6 +1143,35 @@ fn evict(cache: &mut HashMap<TileKey, CachedTile>, frame: u64) {
     for (_, key) in ages.into_iter().take(excess) {
         cache.remove(&key);
     }
+}
+
+/// Drop the photo covers drawn longest ago, down to [`COVER_CACHE`]. Never
+/// one drawn in the current draw, and never a town's cover. Returns the uids
+/// dropped.
+fn evict_covers<T>(
+    covers: &mut HashMap<String, (T, u64)>,
+    towns: &HashSet<&str>,
+    draw: u64,
+) -> Vec<String> {
+    if covers.len() <= COVER_CACHE {
+        return Vec::new();
+    }
+    let mut ages: Vec<(u64, &String)> = covers
+        .iter()
+        .filter(|(uid, (_, drawn))| *drawn < draw && !towns.contains(uid.as_str()))
+        .map(|(uid, (_, drawn))| (*drawn, uid))
+        .collect();
+    ages.sort_unstable_by_key(|(drawn, _)| *drawn);
+    let excess = covers.len() - COVER_CACHE;
+    let dropped: Vec<String> = ages
+        .into_iter()
+        .take(excess)
+        .map(|(_, uid)| uid.clone())
+        .collect();
+    for uid in &dropped {
+        covers.remove(uid);
+    }
+    dropped
 }
 
 /// Set the names of the tiles on screen, the most important first, leaving
@@ -1653,6 +1706,28 @@ fn set_color(cr: &cairo::Context, color: &gtk4::gdk::RGBA, alpha: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn covers_past_the_cap_drop_the_stalest_photos_but_no_town() {
+        let mut covers: HashMap<String, ((), u64)> = (0..COVER_CACHE as u64 + 3)
+            .map(|n| (format!("p{n}"), ((), n)))
+            .collect();
+        let towns: HashSet<&str> = ["p0"].into_iter().collect();
+        let mut dropped = evict_covers(&mut covers, &towns, COVER_CACHE as u64);
+        dropped.sort();
+        assert_eq!(dropped, ["p1", "p2", "p3"]);
+        assert_eq!(covers.len(), COVER_CACHE);
+        assert!(covers.contains_key("p0"));
+    }
+
+    #[test]
+    fn covers_drawn_this_frame_are_kept_even_past_the_cap() {
+        let mut covers: HashMap<String, ((), u64)> = (0..COVER_CACHE + 2)
+            .map(|n| (format!("p{n}"), ((), 7)))
+            .collect();
+        assert!(evict_covers(&mut covers, &HashSet::new(), 7).is_empty());
+        assert_eq!(covers.len(), COVER_CACHE + 2);
+    }
 
     #[test]
     fn projection_puts_the_equator_and_meridian_in_the_middle() {

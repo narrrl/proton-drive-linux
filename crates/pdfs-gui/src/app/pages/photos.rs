@@ -160,11 +160,10 @@ pub(crate) struct GalleryState {
     /// Content width the grid is currently laid out to. Updated when the
     /// ListView is resized, which re-flows the visible sections.
     pub(crate) width: Cell<i32>,
-    /// Decoded thumbnails by photo uid, with the insertion order that evicts the
-    /// oldest past [`TEXTURE_CACHE_MAX`]. Scrolling back over a day therefore
-    /// repaints from memory instead of re-decoding from disk.
-    pub(crate) photo_tex: RefCell<HashMap<String, gtk4::gdk::Texture>>,
-    pub(crate) photo_tex_order: RefCell<VecDeque<String>>,
+    /// Decoded thumbnails by photo uid, the least recently used evicted once
+    /// their pixels pass [`TEXTURE_CACHE_BYTES`]. Scrolling back over a day
+    /// therefore repaints from memory instead of re-decoding from disk.
+    pub(crate) photo_tex: RefCell<Lru<String, gtk4::gdk::Texture>>,
     /// Photos the daemon reported as having no thumbnail at all, so a tile that
     /// can never be filled isn't requested again on every scroll past it.
     pub(crate) photo_nothumb: RefCell<HashSet<String>>,
@@ -186,12 +185,14 @@ pub(crate) struct GalleryState {
     pub(crate) thumb_inflight: RefCell<HashSet<String>>,
     pub(crate) thumb_generation: Cell<u64>,
     /// Thumbnails on disk waiting to be turned into textures, as `(uid, path)`.
-    /// Decoding happens on the GTK thread (textures are not `Send`), so it is fed
-    /// a few at a time from an idle callback rather than in one blocking burst
-    /// that would stutter the scroll. [`Self::decode_idle`] is the "callback
-    /// already scheduled" guard.
+    /// [`schedule_decode`] decodes them on worker threads a few at a time, so
+    /// the scroll never waits on a JPEG decoder. [`Self::decode_idle`] is the
+    /// "decoder already running" guard, and [`Self::decode_inflight`] the uids
+    /// being decoded right now, so a tile rebound meanwhile doesn't queue its
+    /// photo a second time.
     pub(crate) decode_queue: RefCell<VecDeque<(String, String)>>,
     pub(crate) decode_idle: Cell<bool>,
+    pub(crate) decode_inflight: RefCell<HashSet<String>>,
     /// Pending debounce timers for the thumbnail queue flush and the section
     /// re-flow, replaced on each new trigger so only the last one fires.
     pub(crate) thumb_source: RefCell<Option<glib::SourceId>>,
@@ -351,11 +352,23 @@ pub(crate) const THUMB_DEBOUNCE: Duration = Duration::from_millis(60);
 /// in seconds, not milliseconds.
 pub(crate) const THUMB_RETRY: Duration = Duration::from_secs(4);
 
-/// Decoded thumbnails held in memory, evicted least-recently-*used* first. Each
-/// is a few hundred KiB of GPU texture, and at the justified row density 600 was
-/// under two screens' worth — a scroll down and back up then had to re-fetch and
-/// re-decode everything it had just shown.
-pub(crate) const TEXTURE_CACHE_MAX: usize = 1500;
+/// Decoded thumbnail pixels held in memory, evicted least-recently-*used*
+/// first. Budgeted by bytes rather than by count, because one oversized
+/// thumbnail costs as much as dozens of ordinary ones. A 512 px thumbnail is
+/// about 600 KiB decoded, so this holds roughly 900 of them: at the justified
+/// row density 600 was under two screens' worth, and a scroll down and back up
+/// then had to re-fetch and re-decode everything it had just shown.
+pub(crate) const TEXTURE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+/// What a decoded texture costs [`TEXTURE_CACHE_BYTES`]: four bytes a pixel.
+pub(crate) fn texture_bytes(width: i32, height: i32) -> usize {
+    let width = usize::try_from(width).unwrap_or(0);
+    let height = usize::try_from(height).unwrap_or(0);
+    width.saturating_mul(height).saturating_mul(4).max(1)
+}
+
+/// How many thumbnails [`schedule_decode`] decodes at once.
+const DECODE_BATCH: usize = 4;
 
 /// How many tiles beyond the realised rows [`prefetch_thumbs`] warms, so a tile
 /// is decoded before it is scrolled onto rather than after.
@@ -3260,6 +3273,7 @@ pub(crate) fn want_thumb(ui: &Rc<Ui>, photo: &PhotoItem, picture: &gtk4::Picture
 
     let mut decode = ui.gallery.decode_queue.borrow_mut();
     if decode.iter().any(|(uid, _)| uid == &photo.uid)
+        || ui.gallery.decode_inflight.borrow().contains(&photo.uid)
         || ui.gallery.thumb_inflight.borrow().contains(&photo.uid)
     {
         return;
@@ -3451,9 +3465,16 @@ fn prefetch_thumbs(ui: &Rc<Ui>, mut batch: Vec<String>) -> Vec<String> {
     batch
 }
 
-/// Decode queued thumbnails into textures on an idle callback, a few per pass, so
-/// a big batch fills in progressively instead of freezing the scroll for the
-/// length of the whole decode.
+/// Decode queued thumbnails into textures on worker threads, a few at a time,
+/// and hand each finished texture to the tiles still waiting for it.
+///
+/// Decoding a JPEG takes milliseconds; four of them per idle pass on the GTK
+/// thread were enough to stutter a scroll. The main thread now only picks the
+/// next batch (visible tiles first) and paints what comes back. A batch that
+/// lands after the timeline was reset is dropped, and a tile that was rebound
+/// or unbound meanwhile is no longer in [`GalleryState::thumb_wanted`], so it
+/// is not painted. [`GalleryState::decode_idle`] is the "decoder running"
+/// guard.
 pub(crate) fn schedule_decode(ui: &Rc<Ui>) {
     if ui.gallery.decode_idle.get() || ui.gallery.decode_queue.borrow().is_empty() {
         return;
@@ -3461,61 +3482,93 @@ pub(crate) fn schedule_decode(ui: &Rc<Ui>) {
     ui.gallery.decode_idle.set(true);
 
     let ui = ui.clone();
-    glib::idle_add_local(move || {
-        let batch: Vec<(String, String)> = {
-            let mut queue = ui.gallery.decode_queue.borrow_mut();
-            let wanted = ui.gallery.thumb_wanted.borrow();
-            let list = &ui.gallery.list;
-            let visible = |uid: &str| {
-                wanted.get(uid).is_some_and(|pictures| {
-                    pictures.iter().any(|picture| {
-                        if !picture.is_mapped() {
-                            return false;
-                        }
-                        !picture.is_ancestor(list)
-                            || picture.compute_bounds(list).is_some_and(|bounds| {
-                                bounds.y() + bounds.height() > 0.0
-                                    && bounds.y() < list.height() as f32
-                            })
-                    })
-                })
-            };
-            queue.retain(|(uid, _)| wanted.contains_key(uid));
-            (0..4)
-                .filter_map(|_| {
-                    queue
-                        .iter()
-                        .position(|(uid, _)| visible(uid))
-                        .and_then(|index| queue.remove(index))
-                        .or_else(|| queue.pop_front())
-                })
-                .collect()
-        };
-        for (uid, path) in batch {
-            if ui.gallery.photo_tex.borrow().contains_key(&uid) {
-                continue;
+    glib::spawn_future_local(async move {
+        loop {
+            let batch = next_decode_batch(&ui);
+            if batch.is_empty() {
+                break;
             }
-            let texture = match gtk4::gdk::Texture::from_filename(&path) {
-                Ok(texture) => texture,
-                Err(e) => {
-                    tracing::debug!("cannot decode thumbnail {path}: {e}");
-                    ui.gallery.photo_nothumb.borrow_mut().insert(uid);
+            let generation = ui.gallery.thumb_generation.get();
+            ui.gallery
+                .decode_inflight
+                .borrow_mut()
+                .extend(batch.iter().map(|(uid, _)| uid.clone()));
+            // All of the batch decodes at once, on the worker pool; the results
+            // are collected in the order they were picked.
+            let jobs: Vec<_> = batch
+                .into_iter()
+                .map(|(uid, path)| {
+                    let job = gio::spawn_blocking({
+                        let path = path.clone();
+                        move || gtk4::gdk::Texture::from_filename(&path)
+                    });
+                    (uid, path, job)
+                })
+                .collect();
+            for (uid, path, job) in jobs {
+                let decoded = job.await;
+                ui.gallery.decode_inflight.borrow_mut().remove(&uid);
+                if generation != ui.gallery.thumb_generation.get() {
                     continue;
                 }
-            };
-            ui.store_texture(&uid, texture.clone());
-            let waiting = ui.gallery.thumb_wanted.borrow_mut().remove(&uid);
-            for picture in waiting.into_iter().flatten() {
-                picture.set_paintable(Some(&texture));
+                let texture = match decoded {
+                    Ok(Ok(texture)) => texture,
+                    Ok(Err(e)) => {
+                        tracing::debug!("cannot decode thumbnail {path}: {e}");
+                        ui.gallery.photo_nothumb.borrow_mut().insert(uid);
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::debug!("thumbnail decoder for {path} panicked");
+                        ui.gallery.photo_nothumb.borrow_mut().insert(uid);
+                        continue;
+                    }
+                };
+                if ui.gallery.photo_tex.borrow().contains_key(&uid) {
+                    continue;
+                }
+                ui.store_texture(&uid, texture.clone());
+                let waiting = ui.gallery.thumb_wanted.borrow_mut().remove(&uid);
+                for picture in waiting.into_iter().flatten() {
+                    picture.set_paintable(Some(&texture));
+                }
             }
         }
-
-        if ui.gallery.decode_queue.borrow().is_empty() {
-            ui.gallery.decode_idle.set(false);
-            return glib::ControlFlow::Break;
-        }
-        glib::ControlFlow::Continue
+        ui.gallery.decode_idle.set(false);
     });
+}
+
+/// Take the next few thumbnails to decode off the queue: the ones on screen
+/// first, then in queue order, skipping tiles nobody waits for any more and
+/// photos already decoded.
+fn next_decode_batch(ui: &Rc<Ui>) -> Vec<(String, String)> {
+    let mut queue = ui.gallery.decode_queue.borrow_mut();
+    let wanted = ui.gallery.thumb_wanted.borrow();
+    let cached = ui.gallery.photo_tex.borrow();
+    let list = &ui.gallery.list;
+    let visible = |uid: &str| {
+        wanted.get(uid).is_some_and(|pictures| {
+            pictures.iter().any(|picture| {
+                if !picture.is_mapped() {
+                    return false;
+                }
+                !picture.is_ancestor(list)
+                    || picture.compute_bounds(list).is_some_and(|bounds| {
+                        bounds.y() + bounds.height() > 0.0 && bounds.y() < list.height() as f32
+                    })
+            })
+        })
+    };
+    queue.retain(|(uid, _)| wanted.contains_key(uid) && !cached.contains_key(uid));
+    (0..DECODE_BATCH)
+        .filter_map(|_| {
+            queue
+                .iter()
+                .position(|(uid, _)| visible(uid))
+                .and_then(|index| queue.remove(index))
+                .or_else(|| queue.pop_front())
+        })
+        .collect()
 }
 
 /// Re-flow the sections on screen shortly. Debounced, because the triggers (a
@@ -4787,12 +4840,22 @@ pub(crate) fn gallery_unreachable(ui: &Rc<Ui>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Grouping, PHOTOS_PAGE, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, TILE_RATIO_MAX,
-        TILE_RATIO_MIN, active_filters, copy_without_overwrite, empty_timeline_text, grouping_for,
-        memory_years, month_index, month_range, plan_grid, plan_justified, section_heading,
-        tile_ratio, viewport_unfilled,
+        Grouping, PHOTOS_PAGE, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TEXTURE_CACHE_BYTES,
+        TILE_GAP, TILE_RATIO_MAX, TILE_RATIO_MIN, active_filters, copy_without_overwrite,
+        empty_timeline_text, grouping_for, memory_years, month_index, month_range, plan_grid,
+        plan_justified, section_heading, texture_bytes, tile_ratio, viewport_unfilled,
     };
     use pdfs_core::control::{PhotoItem, PhotoKind, PhotoMonth};
+
+    #[test]
+    fn the_texture_cache_is_budgeted_by_decoded_pixels() {
+        assert_eq!(texture_bytes(512, 384), 512 * 384 * 4);
+        // A broken size still costs something, so it can't pile up for free.
+        assert_eq!(texture_bytes(0, 512), 1);
+        assert_eq!(texture_bytes(-1, -1), 1);
+        // Ordinary thumbnails: well over two dense screens' worth fit.
+        assert!(TEXTURE_CACHE_BYTES / texture_bytes(512, 384) >= 600);
+    }
 
     #[test]
     fn the_scrubber_finds_the_month_a_photo_was_taken_in() {

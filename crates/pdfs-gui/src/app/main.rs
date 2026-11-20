@@ -6,6 +6,7 @@ pub(crate) mod dates;
 pub(crate) mod events;
 #[path = "../i18n.rs"]
 pub(crate) mod i18n;
+pub(crate) mod lru;
 pub(crate) mod pages;
 pub(crate) mod reload;
 #[path = "../theme.rs"]
@@ -15,6 +16,7 @@ pub(crate) mod widgets;
 
 use compat::*;
 use events::*;
+use lru::Lru;
 use pages::activity::*;
 use pages::albums::*;
 use pages::browser::*;
@@ -190,16 +192,11 @@ impl Ui {
     /// Scrolling back over a day then repaints from memory rather than decoding
     /// the same JPEGs off disk again.
     fn store_texture(&self, uid: &str, texture: gtk4::gdk::Texture) {
-        let mut cache = self.gallery.photo_tex.borrow_mut();
-        let mut order = self.gallery.photo_tex_order.borrow_mut();
-        if cache.insert(uid.to_string(), texture).is_none() {
-            order.push_back(uid.to_string());
-        }
-        while order.len() > TEXTURE_CACHE_MAX {
-            if let Some(old) = order.pop_front() {
-                cache.remove(&old);
-            }
-        }
+        let bytes = texture_bytes(texture.width(), texture.height());
+        self.gallery
+            .photo_tex
+            .borrow_mut()
+            .insert(uid.to_string(), texture, bytes);
     }
 
     /// Mark a cached thumbnail as freshly used, so eviction takes the tiles
@@ -208,14 +205,7 @@ impl Ui {
     /// Insertion order alone evicts the top of the timeline first — exactly what
     /// a scroll back up then asks for again.
     fn touch_texture(&self, uid: &str) {
-        let mut order = self.gallery.photo_tex_order.borrow_mut();
-        if order.back().is_some_and(|back| back == uid) {
-            return;
-        }
-        if let Some(at) = order.iter().position(|held| held == uid) {
-            order.remove(at);
-            order.push_back(uid.to_string());
-        }
+        self.gallery.photo_tex.borrow_mut().touch(uid);
     }
 }
 
@@ -631,8 +621,7 @@ fn build_window(app: &adw::Application) {
             library: Cell::new(true),
             page_waiters: RefCell::new(Vec::new()),
             width: Cell::new(0),
-            photo_tex: RefCell::new(HashMap::new()),
-            photo_tex_order: RefCell::new(VecDeque::new()),
+            photo_tex: RefCell::new(Lru::new(TEXTURE_CACHE_BYTES)),
             photo_nothumb: RefCell::new(HashSet::new()),
             thumb_wanted: RefCell::new(HashMap::new()),
             thumb_queue: RefCell::new(VecDeque::new()),
@@ -640,6 +629,7 @@ fn build_window(app: &adw::Application) {
             thumb_generation: Cell::new(0),
             decode_queue: RefCell::new(VecDeque::new()),
             decode_idle: Cell::new(false),
+            decode_inflight: RefCell::default(),
             thumb_source: RefCell::new(None),
             relayout_source: RefCell::new(None),
             bound: RefCell::new(BTreeMap::new()),
@@ -738,6 +728,10 @@ fn build_window(app: &adw::Application) {
             resume_button: takeout_widgets.resume_button.clone(),
             inflight: Cell::new(false),
             running: Cell::new(false),
+            restored: Cell::new(false),
+            save_seq: Cell::new(0),
+            saved_seq: Default::default(),
+            repaint_seq: Cell::new(0),
         },
         update,
     });

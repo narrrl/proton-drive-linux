@@ -1,10 +1,32 @@
 use crate::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use pdfs_core::control::{GalleryAction, GalleryAlbum, GalleryFolder, GalleryPlace};
-use std::collections::VecDeque;
 
 const PAGE: usize = 150;
+/// Decoded thumbnails kept, the least recently shown dropped first.
 const THUMB_CACHE: usize = 256;
+/// What a new content width asks of the rows.
+#[derive(Debug, PartialEq, Eq)]
+enum Reflow {
+    /// Nothing changed, or there is no width yet.
+    None,
+    /// The first real width: lay the rows out now, nothing is on screen yet.
+    Now,
+    /// A resize: wait for it to settle, since the rows are rebuilt from
+    /// scratch and a drag resizes on every frame.
+    Debounced,
+}
+
+fn reflow_for(previous: i32, width: i32) -> Reflow {
+    if width <= 0 || width == previous {
+        Reflow::None
+    } else if previous <= 0 {
+        Reflow::Now
+    } else {
+        Reflow::Debounced
+    }
+}
+
 type ThumbnailKey = (u64, bool, String);
 type ThumbnailTarget = (glib::WeakRef<gtk4::Picture>, glib::WeakRef<gtk4::Image>);
 
@@ -45,12 +67,15 @@ pub(crate) struct Browser {
     albums: RefCell<Vec<GalleryAlbum>>,
     items: RefCell<Vec<PhotoItem>>,
     width: Cell<i32>,
+    /// The pending re-flow after a resize, replaced by each new width.
+    reflow: RefCell<Option<glib::SourceId>>,
     generation: Cell<u64>,
     total: Cell<usize>,
     loading: Cell<bool>,
     unlocked: Cell<bool>,
     thumbnail_slots: tokio::sync::Semaphore,
-    thumbnails: RefCell<VecDeque<(bool, String, gtk4::gdk::Texture)>>,
+    /// Decoded thumbnails by whether they are hidden-album ones and uid.
+    thumbnails: RefCell<Lru<(bool, String), gtk4::gdk::Texture>>,
     thumb_pending: RefCell<HashMap<ThumbnailKey, Vec<ThumbnailTarget>>>,
 }
 
@@ -86,7 +111,7 @@ impl Browser {
         }
         self.thumbnails
             .borrow_mut()
-            .retain(|(private, _, _)| !private);
+            .retain(|(private, _), _| !private);
         self.thumb_pending.borrow_mut().clear();
         self.trail.borrow_mut().clear();
         self.chooser.borrow_mut().take();
@@ -602,6 +627,13 @@ impl Browser {
         let generation = self.generation.get();
         glib::spawn_future_local(async move {
             let result = reply.recv().await;
+            // Decoded before the checks below, so they see the state after it.
+            let decoded = match &result {
+                Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) if private => {
+                    decode_thumbnail_off_thread(data.clone()).await
+                }
+                _ => None,
+            };
             let close = |token| {
                 let _ = spawn_request(
                     browser.ui.dirs.control_socket(),
@@ -646,8 +678,8 @@ impl Browser {
                     picture.set_vexpand(true);
                     content.append(&picture);
                 }
-                Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) if private => {
-                    let Some(texture) = decode_thumbnail(&data) else {
+                Ok(Ok(Response::GalleryThumbnail { data: Some(_) })) if private => {
+                    let Some(texture) = decoded else {
                         browser
                             .status
                             .set_label(&gettext("Couldn't open the photo."));
@@ -744,12 +776,13 @@ pub(crate) fn wire(
         albums: RefCell::new(Vec::new()),
         items: RefCell::new(Vec::new()),
         width: Cell::new(0),
+        reflow: RefCell::new(None),
         generation: Cell::new(0),
         total: Cell::new(0),
         loading: Cell::new(false),
         unlocked: Cell::new(false),
         thumbnail_slots: tokio::sync::Semaphore::new(8),
-        thumbnails: RefCell::default(),
+        thumbnails: RefCell::new(Lru::new(THUMB_CACHE)),
         thumb_pending: RefCell::default(),
     });
     *ui.drive_galleries.borrow_mut() = Rc::downgrade(&browser);
@@ -999,8 +1032,27 @@ pub(crate) fn wire(
                 return glib::ControlFlow::Break;
             };
             let width = scroll.width();
-            if width > 0 && browser.width.replace(width) != width {
-                browser.rebuild();
+            match reflow_for(browser.width.get(), width) {
+                Reflow::None => {}
+                Reflow::Now => {
+                    browser.width.set(width);
+                    browser.rebuild();
+                }
+                Reflow::Debounced => {
+                    browser.width.set(width);
+                    if let Some(source) = browser.reflow.borrow_mut().take() {
+                        source.remove();
+                    }
+                    let weak = Rc::downgrade(&browser);
+                    let source =
+                        glib::timeout_add_local_once(super::photos::RELAYOUT_DEBOUNCE, move || {
+                            if let Some(browser) = weak.upgrade() {
+                                browser.reflow.borrow_mut().take();
+                                browser.rebuild();
+                            }
+                        });
+                    *browser.reflow.borrow_mut() = Some(source);
+                }
             }
             glib::ControlFlow::Continue
         }
@@ -1088,6 +1140,15 @@ fn decode_thumbnail(data: &str) -> Option<gtk4::gdk::Texture> {
     gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
 }
 
+/// [`decode_thumbnail`] on gio's blocking pool, so neither the base64 nor the
+/// image decoder runs on the GTK thread.
+async fn decode_thumbnail_off_thread(data: String) -> Option<gtk4::gdk::Texture> {
+    gio::spawn_blocking(move || decode_thumbnail(&data))
+        .await
+        .ok()
+        .flatten()
+}
+
 impl Browser {
     fn want_thumbnail(
         self: &Rc<Self>,
@@ -1099,20 +1160,17 @@ impl Browser {
         if private && !self.unlocked.get() {
             return;
         }
-        {
-            let mut cache = self.thumbnails.borrow_mut();
-            if let Some(index) = cache
-                .iter()
-                .position(|(p, id, _)| *p == private && id == uid)
-            {
-                let cached = cache.remove(index).unwrap();
-                picture.set_paintable(Some(&cached.2));
-                if let Some(icon) = icon.upgrade() {
-                    icon.set_visible(false);
-                }
-                cache.push_back(cached);
-                return;
+        let cached = self
+            .thumbnails
+            .borrow_mut()
+            .fetch(&(private, uid.to_owned()))
+            .cloned();
+        if let Some(texture) = cached {
+            picture.set_paintable(Some(&texture));
+            if let Some(icon) = icon.upgrade() {
+                icon.set_visible(false);
             }
+            return;
         }
         let key = (self.generation.get(), private, uid.to_owned());
         {
@@ -1151,6 +1209,12 @@ impl Browser {
                 },
             );
             let response = request.recv().await;
+            let texture = match response {
+                Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) => {
+                    decode_thumbnail_off_thread(data).await
+                }
+                _ => None,
+            };
             let targets = browser
                 .thumb_pending
                 .borrow_mut()
@@ -1159,9 +1223,7 @@ impl Browser {
             if key.0 != browser.generation.get() || private && !browser.unlocked.get() {
                 return;
             }
-            if let Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) = response
-                && let Some(texture) = decode_thumbnail(&data)
-            {
+            if let Some(texture) = texture {
                 for (picture, icon) in targets {
                     if let Some(picture) = picture.upgrade() {
                         picture.set_paintable(Some(&texture));
@@ -1170,12 +1232,27 @@ impl Browser {
                         icon.set_visible(false);
                     }
                 }
-                let mut cache = browser.thumbnails.borrow_mut();
-                if cache.len() >= THUMB_CACHE {
-                    cache.pop_front();
-                }
-                cache.push_back((private, key.2, texture));
+                // Capped by count, like before: every entry costs one.
+                browser
+                    .thumbnails
+                    .borrow_mut()
+                    .insert((private, key.2), texture, 1);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Reflow, reflow_for};
+
+    #[test]
+    fn the_first_width_lays_out_at_once_and_a_resize_waits() {
+        assert_eq!(reflow_for(0, 0), Reflow::None);
+        assert_eq!(reflow_for(0, 800), Reflow::Now);
+        assert_eq!(reflow_for(800, 800), Reflow::None);
+        assert_eq!(reflow_for(800, 760), Reflow::Debounced);
+        // A collapsed widget reports no width; keep the last layout.
+        assert_eq!(reflow_for(800, 0), Reflow::None);
     }
 }
