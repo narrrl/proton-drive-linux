@@ -3655,9 +3655,9 @@ dependencies = [
  "notify",
  "parking_lot 0.13.0",
  "pdfs-core",
- "pg-app",
- "pg-core",
  "proton-drive-rs",
+ "proton-gallery-app-rs",
+ "proton-gallery-rs",
  "rustix",
  "serde",
  "serde_json",
@@ -3683,7 +3683,7 @@ dependencies = [
  "libadwaita",
  "pangocairo",
  "pdfs-core",
- "pg-core",
+ "proton-gallery-rs",
  "reqwest",
  "serde",
  "serde_json",
@@ -3707,65 +3707,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "pg-app"
-version = "0.3.0"
-source = "git+https://github.com/narrrl/proton-gallery.git?rev=858d2446f71214ec5357eb8b543d6b82abf47386#858d2446f71214ec5357eb8b543d6b82abf47386"
-dependencies = [
- "async-trait",
- "hex",
- "pg-core",
- "pg-drive",
- "proton-drive-rs",
- "proton-sdk",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "pg-core"
-version = "0.3.0"
-source = "git+https://github.com/narrrl/proton-gallery.git?rev=858d2446f71214ec5357eb8b543d6b82abf47386#858d2446f71214ec5357eb8b543d6b82abf47386"
-dependencies = [
- "aes-gcm 0.11.1",
- "async-trait",
- "getrandom 0.4.3",
- "hex",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "zeroize",
-]
-
-[[package]]
-name = "pg-drive"
-version = "0.3.0"
-source = "git+https://github.com/narrrl/proton-gallery.git?rev=858d2446f71214ec5357eb8b543d6b82abf47386#858d2446f71214ec5357eb8b543d6b82abf47386"
-dependencies = [
- "async-trait",
- "hex",
- "pg-core",
- "proton-drive-rs",
- "proton-sdk",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "zeroize",
-]
 
 [[package]]
 name = "pgp"
@@ -3997,6 +3938,70 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "proton-gallery-app-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6d18d11266ab2be5ab2f4b4040941caf2736c257e13909af7be8ea331892d59"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "hex",
+ "proton-drive-rs",
+ "proton-gallery-drive-rs",
+ "proton-gallery-rs",
+ "proton-sdk",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "proton-gallery-drive-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "535a14f63fd542701d2606acb971d4a7e8f235ca7b9439fea8c80a3f26110186"
+dependencies = [
+ "async-trait",
+ "hex",
+ "proton-drive-rs",
+ "proton-gallery-rs",
+ "proton-sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "proton-gallery-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a1159db137629675b0c91a75fa4b2b416a4ef306127e70bad8039c372855cd3"
+dependencies = [
+ "aes-gcm 0.11.1",
+ "async-trait",
+ "getrandom 0.4.3",
+ "hex",
+ "kamadak-exif",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "zeroize",
 ]
 
 [[package]]
@@ -5139,7 +5144,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

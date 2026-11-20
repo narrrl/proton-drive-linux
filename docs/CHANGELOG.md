@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Changed
+
+- The shared Gallery engine now comes from the `proton-gallery-rs` and
+  `proton-gallery-app-rs` crates on crates.io instead of a pinned Git revision of
+  Proton Gallery. Builds, vendoring and the Nix package no longer fetch from Git.
+
 ## [3.9.0] — 2026-11-19
 
 Schema: **46**. Photos adds a local database migration for incremental metadata sync.
