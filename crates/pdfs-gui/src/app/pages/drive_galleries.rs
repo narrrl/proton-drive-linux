@@ -603,6 +603,13 @@ impl Browser {
         let generation = self.generation.get();
         glib::spawn_future_local(async move {
             let result = reply.recv().await;
+            // Decoded before the checks below, so they see the state after it.
+            let decoded = match &result {
+                Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) if private => {
+                    decode_thumbnail_off_thread(data.clone()).await
+                }
+                _ => None,
+            };
             let close = |token| {
                 let _ = spawn_request(
                     browser.ui.dirs.control_socket(),
@@ -647,8 +654,8 @@ impl Browser {
                     picture.set_vexpand(true);
                     content.append(&picture);
                 }
-                Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) if private => {
-                    let Some(texture) = decode_thumbnail(&data) else {
+                Ok(Ok(Response::GalleryThumbnail { data: Some(_) })) if private => {
+                    let Some(texture) = decoded else {
                         browser
                             .status
                             .set_label(&gettext("Couldn't open the photo."));
@@ -1089,6 +1096,15 @@ fn decode_thumbnail(data: &str) -> Option<gtk4::gdk::Texture> {
     gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
 }
 
+/// [`decode_thumbnail`] on gio's blocking pool, so neither the base64 nor the
+/// image decoder runs on the GTK thread.
+async fn decode_thumbnail_off_thread(data: String) -> Option<gtk4::gdk::Texture> {
+    gio::spawn_blocking(move || decode_thumbnail(&data))
+        .await
+        .ok()
+        .flatten()
+}
+
 impl Browser {
     fn want_thumbnail(
         self: &Rc<Self>,
@@ -1149,6 +1165,12 @@ impl Browser {
                 },
             );
             let response = request.recv().await;
+            let texture = match response {
+                Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) => {
+                    decode_thumbnail_off_thread(data).await
+                }
+                _ => None,
+            };
             let targets = browser
                 .thumb_pending
                 .borrow_mut()
@@ -1157,9 +1179,7 @@ impl Browser {
             if key.0 != browser.generation.get() || private && !browser.unlocked.get() {
                 return;
             }
-            if let Ok(Ok(Response::GalleryThumbnail { data: Some(data) })) = response
-                && let Some(texture) = decode_thumbnail(&data)
-            {
+            if let Some(texture) = texture {
                 for (picture, icon) in targets {
                     if let Some(picture) = picture.upgrade() {
                         picture.set_paintable(Some(&texture));
