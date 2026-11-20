@@ -347,6 +347,15 @@ pub fn sign_in_blocked(e: &proton_sdk::ProtonError) -> bool {
 /// The result every request-serving method in the daemon returns.
 pub type CoreResult<T> = std::result::Result<T, CoreError>;
 
+impl From<proton_auth_rs::Error> for Error {
+    fn from(error: proton_auth_rs::Error) -> Self {
+        match error {
+            proton_auth_rs::Error::Keyring(error) => Self::Keyring(error),
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

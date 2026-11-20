@@ -28,6 +28,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use keyring_core::Entry;
+use proton_auth_rs::{KeyringStore, SecretStore};
 use proton_drive_rs::{KeySalt, ProtonDriveClient};
 use proton_sdk::account::KeyPassphrases;
 use proton_sdk::api::{HumanVerification, HumanVerificationCredential};
@@ -125,82 +126,28 @@ fn client_config() -> ProtonClientConfiguration {
 
 /// Run `op` on the session's keyring entry.
 fn with_keyring<T>(op: impl Fn(&Entry) -> keyring_core::Result<T>) -> Result<T> {
-    with_keyring_entry(KEYRING_SERVICE, KEYRING_USER, op)
+    Ok(keyring().with_entry(KEYRING_USER, op)?)
 }
 
-/// Run `op` on the entry `service`/`user`, reconnecting once if the Secret
-/// Service fails the call.
+/// The process's keyring, connected on first use.
 ///
-/// The store holds one D-Bus connection and one Secret Service session for the
-/// whole process. The session lives in the provider's memory: once the provider
-/// restarts (oo7's unit restarts it on failure, and both oo7 and gnome-keyring
-/// can be `--replace`d), every read and write on the old session fails with
-/// `NoSession`, for as long as this process runs. A daemon then keeps refreshed
-/// tokens only in memory, and a cold boot loses them (`docs/BUGS.md` B285). A
-/// platform failure therefore drops the store, and the call is made once more
-/// on a new one. A locked keyring, a dismissed prompt or a missing entry is
-/// not the connection's fault and comes back as it is.
-fn with_keyring_entry<T>(
-    service: &str,
-    user: &str,
-    op: impl Fn(&Entry) -> keyring_core::Result<T>,
-) -> Result<T> {
-    let store = keyring_store()?;
-    match op(&Entry::new(service, user)?) {
-        Err(keyring_core::Error::PlatformFailure(e)) => {
-            tracing::warn!(
-                error = %e,
-                "the Secret Service failed this process's connection; reconnecting"
-            );
-            drop_keyring_store(&store);
-            keyring_store()?;
-            Ok(op(&Entry::new(service, user)?)?)
+/// One connection for the whole process; when the Secret Service fails it
+/// (a restarted provider forgets the session, `docs/BUGS.md` B285), the call
+/// reconnects and is made once more. A changed session replaces its item
+/// instead of editing it (B291). Both live in `proton-auth-rs`.
+fn keyring() -> &'static KeyringStore {
+    static STORE: std::sync::OnceLock<KeyringStore> = std::sync::OnceLock::new();
+    STORE.get_or_init(|| {
+        #[cfg(not(test))]
+        {
+            KeyringStore::new(KEYRING_SERVICE)
         }
-        result => Ok(result?),
-    }
-}
-
-/// Held while the default store is looked at and replaced, so that threads
-/// failing at the same time drop the broken store once and share its
-/// replacement.
-static KEYRING_STORE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-/// The process's Secret Service store, connected now if there is none.
-///
-/// Connected lazily rather than once at startup so a session bus that was not
-/// up yet on the first attempt is tried again on the next one.
-fn keyring_store() -> Result<Arc<keyring_core::CredentialStore>> {
-    let _swap = KEYRING_STORE.lock();
-    if let Some(store) = keyring_core::get_default_store() {
-        return Ok(store);
-    }
-    let store = connect_keyring_store()?;
-    keyring_core::set_default_store(Arc::clone(&store));
-    Ok(store)
-}
-
-/// Forget `failed`, unless another thread has already replaced it.
-fn drop_keyring_store(failed: &Arc<keyring_core::CredentialStore>) {
-    let _swap = KEYRING_STORE.lock();
-    if keyring_core::get_default_store().is_some_and(|store| Arc::ptr_eq(&store, failed)) {
-        keyring_core::unset_default_store();
-    }
-}
-
-#[cfg(not(test))]
-fn connect_keyring_store() -> Result<Arc<keyring_core::CredentialStore>> {
-    Ok(dbus_secret_service_keyring_store::Store::new()?)
-}
-
-/// The tests' in-memory store when they set one, so a reconnect finds the
-/// same entries; the real Secret Service otherwise.
-#[cfg(test)]
-fn connect_keyring_store() -> Result<Arc<keyring_core::CredentialStore>> {
-    tests::KEYRING_CONNECTS.fetch_add(1, Ordering::SeqCst);
-    match tests::MOCK_STORE.lock().clone() {
-        Some(store) => Ok(store),
-        None => Ok(dbus_secret_service_keyring_store::Store::new()?),
-    }
+        #[cfg(test)]
+        {
+            KeyringStore::with_connector(KEYRING_SERVICE, Arc::new(tests::connect_keyring_store))
+                .replace_items(|| tests::MOCK_STORE.lock().is_none())
+        }
+    })
 }
 
 /// What the user answered when asked for the mailbox password.
@@ -492,33 +439,12 @@ fn classify_verification_gate(e: ProtonError) -> Error {
 
 /// Save `stored` to the keyring.
 ///
-/// An existing entry is replaced by a new item rather than edited, because
-/// oo7 before 0.7.0 keeps an edit only in memory and a reboot brings the
-/// spent refresh token back (`docs/BUGS.md` B291). The usual write is the
-/// fallback: for the first save, and whenever replacing is not possible.
+/// Save the session. An existing entry is replaced by a new item rather than
+/// edited, because oo7 before 0.7.0 keeps an edit only in memory and a reboot
+/// brings the spent refresh token back (`docs/BUGS.md` B291).
 fn write_stored(stored: &StoredSession) -> Result<()> {
     let json = Zeroizing::new(serde_json::to_string(stored)?);
-    if replace_items() {
-        match crate::secretservice::replace(KEYRING_SERVICE, KEYRING_USER, json.as_bytes()) {
-            crate::secretservice::Replaced::Saved => return Ok(()),
-            crate::secretservice::Replaced::Skipped(why) => {
-                tracing::debug!(%why, "not replacing the keyring item; writing it in place");
-            }
-        }
-    }
-    with_keyring(|entry| entry.set_password(&json))
-}
-
-/// Whether [`write_stored`] talks to the Secret Service directly: always,
-/// except in tests that use the in-memory store.
-#[cfg(not(test))]
-fn replace_items() -> bool {
-    true
-}
-
-#[cfg(test)]
-fn replace_items() -> bool {
-    tests::MOCK_STORE.lock().is_none()
+    Ok(keyring().set(KEYRING_USER, &json)?)
 }
 
 /// A short, one-way tag for a refresh token, for the log: enough to tell
@@ -1324,7 +1250,28 @@ mod tests {
         let store: Arc<keyring_core::CredentialStore> = keyring_core::mock::Store::new().unwrap();
         *MOCK_STORE.lock() = Some(Arc::clone(&store));
         keyring_core::set_default_store(store);
+        keyring().disconnect();
         turn
+    }
+
+    /// The tests' in-memory store when they set one, so a reconnect finds the
+    /// same entries; the real Secret Service otherwise.
+    pub(super) fn connect_keyring_store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>>
+    {
+        KEYRING_CONNECTS.fetch_add(1, Ordering::SeqCst);
+        match MOCK_STORE.lock().clone() {
+            Some(store) => Ok(store),
+            None => Ok(dbus_secret_service_keyring_store::Store::new()?),
+        }
+    }
+
+    /// Run `op` on the entry `service`/`user` of the real Secret Service.
+    fn with_keyring_entry<T>(
+        store: &KeyringStore,
+        user: &str,
+        op: impl Fn(&Entry) -> keyring_core::Result<T>,
+    ) -> Result<T> {
+        Ok(store.with_entry(user, op)?)
     }
 
     static KEYRING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -1427,7 +1374,8 @@ mod tests {
         let _turn = KEYRING.lock();
         *MOCK_STORE.lock() = None;
         keyring_core::unset_default_store();
-        let (service, user) = ("pdfs-test", "restart");
+        let user = "restart";
+        let service = &KeyringStore::with_connector("pdfs-test", Arc::new(connect_keyring_store));
 
         with_keyring_entry(service, user, |e| e.set_password("before")).unwrap();
         let status = std::process::Command::new("sh")
@@ -1468,6 +1416,7 @@ mod tests {
         let _turn = KEYRING.lock();
         *MOCK_STORE.lock() = None;
         keyring_core::unset_default_store();
+        keyring().disconnect();
 
         for refresh in ["r1", "r2", "r3"] {
             write_stored(&stored_with(refresh)).unwrap();
