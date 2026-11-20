@@ -457,26 +457,7 @@ fn load_config_at(path: &Path) -> AppConfig {
 /// [`AppDirs::save_config`] for the file at `path`.
 fn save_config_at(path: &Path, config: &AppConfig) -> Result<()> {
     refuse_to_replace_unreadable(path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::Other("configuration path has no parent".into()))?;
-    std::fs::create_dir_all(parent)?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let tmp = path.with_extension(format!("json.tmp-{}-{nonce}", std::process::id()));
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    use std::io::Write as _;
-    file.write_all(&serde_json::to_vec_pretty(config)?)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    std::fs::File::open(parent)?.sync_all()?;
+    proton_base_rs::atomic::write(path, &serde_json::to_vec_pretty(config)?)?;
     Ok(())
 }
 
@@ -621,15 +602,8 @@ impl AppDirs {
         use std::io::Read as _;
         std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let parent = path
-            .parent()
-            .ok_or_else(|| Error::Other("machine id path has no parent".into()))?;
-        std::fs::create_dir_all(parent)?;
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&tmp, format!("{id}\n"))?;
-        std::fs::File::open(&tmp)?.sync_all()?;
-        std::fs::rename(&tmp, &path)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        // Not secret, and other tools may read it; keep it world-readable.
+        proton_base_rs::atomic::write_with_mode(&path, format!("{id}\n").as_bytes(), 0o644)?;
         Ok(id)
     }
 

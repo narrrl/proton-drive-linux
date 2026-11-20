@@ -66,6 +66,7 @@ keyring-core = "1"
 # The keyring store all three apps share: reconnects after a Secret Service
 # restart (B285) and replaces items instead of editing them (B291).
 proton-auth-rs = "0.1"
+proton-base-rs = "0.1"
 dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 # The same Secret Service client the store wraps, used directly to replace an
 # item instead of editing it, which oo7 before 0.7.0 kept only in memory (B291).

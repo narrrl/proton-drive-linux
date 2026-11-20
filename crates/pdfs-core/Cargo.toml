@@ -26,6 +26,7 @@ sha2.workspace = true
 rusqlite.workspace = true
 keyring-core.workspace = true
 proton-auth-rs = { workspace = true, features = ["keyring"] }
+proton-base-rs.workspace = true
 dbus-secret-service-keyring-store.workspace = true
 dbus-secret-service.workspace = true
 parking_lot.workspace = true
