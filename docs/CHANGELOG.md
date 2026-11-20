@@ -13,6 +13,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ### Changed
 
+- Block fetches shared by concurrent readers now use `SingleFlight` from
+  `proton-media-rs`, the same code Proton Stream uses. Same behaviour: one
+  download per block, every reader gets its result, and a reader whose fetch was
+  cancelled downloads the block itself.
 - The shared Gallery engine now comes from the `proton-gallery-rs` and
   `proton-gallery-app-rs` crates on crates.io instead of a pinned Git revision of
   Proton Gallery. Builds, vendoring and the Nix package no longer fetch from Git.
