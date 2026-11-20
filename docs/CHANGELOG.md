@@ -19,6 +19,9 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - RAW+JPEG grouping, Google Takeout reading, EXIF capture times, look-alike
   detection and the offline town lookup now come from `proton-gallery-rs`,
   shared with Proton Gallery. No behaviour change.
+- The keyring code (one Secret Service connection that reconnects after the provider
+  restarts, B285, and replacing the session item instead of editing it, B291) now comes
+  from `proton-auth-rs`, shared with Proton Gallery and Proton Stream. No behaviour change.
 
 ## [3.9.0] — 2026-11-19
 

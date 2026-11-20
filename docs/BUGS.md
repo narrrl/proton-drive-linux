@@ -432,7 +432,7 @@ the build Fedora 45 and 46 ship as stable, from before oo7's
 [7fb11dd](https://github.com/linux-credentials/oo7/commit/7fb11dd111c4be8fec01996e3caa31c44fa962b3)
 ("server: Write item changes to the keyring file"). See
 [the investigation](ISSUE-78.md#setsecret-is-kept-only-in-memory-in-fedoras-oo7).
-**Where:** `crates/pdfs-core/src/auth.rs`, `write_stored`; `crates/pdfs-core/src/secretservice.rs`
+**Where:** `crates/pdfs-core/src/auth.rs`, `write_stored`; `proton-auth-rs` (`secret_service.rs`, moved from `crates/pdfs-core/src/secretservice.rs`)
 
 **Repro:** With oo7-daemon at e91b98a, save the session blob, save it again with a new refresh
 token, and restart oo7-daemon. The read after the restart returns the first blob. The keyring
