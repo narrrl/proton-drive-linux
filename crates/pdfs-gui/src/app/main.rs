@@ -629,6 +629,7 @@ fn build_window(app: &adw::Application) {
             thumb_generation: Cell::new(0),
             decode_queue: RefCell::new(VecDeque::new()),
             decode_idle: Cell::new(false),
+            decode_inflight: RefCell::default(),
             thumb_source: RefCell::new(None),
             relayout_source: RefCell::new(None),
             bound: RefCell::new(BTreeMap::new()),
