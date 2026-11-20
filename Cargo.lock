@@ -4022,15 +4022,16 @@ dependencies = [
 
 [[package]]
 name = "proton-gallery-rs"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc9c9bbb76a5fba4071ee90de4aada71c292c0e408024ddfb04a12869291404a"
+checksum = "5a978cc4dc990ae1941209fece17c952a11dbaee392b358ca64c0c836cb2ec21"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-trait",
  "getrandom 0.4.3",
  "hex",
  "kamadak-exif",
+ "proton-base-rs",
  "rusqlite",
  "serde",
  "serde_json",
