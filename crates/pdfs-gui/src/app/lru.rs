@@ -71,6 +71,18 @@ impl<K: Eq + Hash + Clone, V> Lru<K, V> {
         true
     }
 
+    /// Look an entry up and mark it used.
+    pub(crate) fn fetch<Q>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        if !self.touch(key) {
+            return None;
+        }
+        self.get(key)
+    }
+
     /// Store `value` as the most recently used entry, then evict the least
     /// recently used ones until the total cost fits the budget again. The new
     /// entry itself is never evicted, even when it alone is over budget.
@@ -100,6 +112,20 @@ impl<K: Eq + Hash + Clone, V> Lru<K, V> {
         self.order.remove(&entry.stamp);
         self.used -= entry.cost;
         Some(entry.value)
+    }
+
+    /// Keep only the entries `keep` accepts.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        let order = &mut self.order;
+        let used = &mut self.used;
+        self.entries.retain(|key, entry| {
+            let kept = keep(key, &entry.value);
+            if !kept {
+                order.remove(&entry.stamp);
+                *used -= entry.cost;
+            }
+            kept
+        });
     }
 
     pub(crate) fn clear(&mut self) {
@@ -186,5 +212,37 @@ mod tests {
         // "b" was used longest ago now.
         assert!(!cache.contains_key("b"));
         assert!(cache.contains_key("a"));
+    }
+
+    #[test]
+    fn fetch_touches_and_get_does_not() {
+        let mut cache = Lru::new(2);
+        cache.insert("a", 1, 1);
+        cache.insert("b", 2, 1);
+        assert_eq!(cache.get("a"), Some(&1));
+        cache.insert("c", 3, 1);
+        assert!(!cache.contains_key("a"));
+        assert_eq!(cache.fetch("b"), Some(&2));
+        cache.insert("d", 4, 1);
+        assert!(cache.contains_key("b"));
+        assert!(!cache.contains_key("c"));
+        assert_eq!(cache.fetch("missing"), None);
+    }
+
+    #[test]
+    fn retain_drops_rejected_entries_and_their_cost() {
+        let mut cache = Lru::new(100);
+        cache.insert((true, "a".to_string()), (), 10);
+        cache.insert((false, "b".to_string()), (), 20);
+        cache.insert((true, "c".to_string()), (), 30);
+        cache.retain(|(private, _), _| !private);
+        assert_eq!(cache.used(), 20);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.remove(&(false, "b".to_string())).is_some());
+        assert_eq!(cache.used(), 0);
+        cache.insert((true, "d".to_string()), (), 10);
+        cache.clear();
+        assert_eq!(cache.used(), 0);
+        assert_eq!(cache.len(), 0);
     }
 }

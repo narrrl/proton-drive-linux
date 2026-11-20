@@ -1,9 +1,9 @@
 use crate::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use pdfs_core::control::{GalleryAction, GalleryAlbum, GalleryFolder, GalleryPlace};
-use std::collections::VecDeque;
 
 const PAGE: usize = 150;
+/// Decoded thumbnails kept, the least recently shown dropped first.
 const THUMB_CACHE: usize = 256;
 type ThumbnailKey = (u64, bool, String);
 type ThumbnailTarget = (glib::WeakRef<gtk4::Picture>, glib::WeakRef<gtk4::Image>);
@@ -50,7 +50,8 @@ pub(crate) struct Browser {
     loading: Cell<bool>,
     unlocked: Cell<bool>,
     thumbnail_slots: tokio::sync::Semaphore,
-    thumbnails: RefCell<VecDeque<(bool, String, gtk4::gdk::Texture)>>,
+    /// Decoded thumbnails by whether they are hidden-album ones and uid.
+    thumbnails: RefCell<Lru<(bool, String), gtk4::gdk::Texture>>,
     thumb_pending: RefCell<HashMap<ThumbnailKey, Vec<ThumbnailTarget>>>,
 }
 
@@ -86,7 +87,7 @@ impl Browser {
         }
         self.thumbnails
             .borrow_mut()
-            .retain(|(private, _, _)| !private);
+            .retain(|(private, _), _| !private);
         self.thumb_pending.borrow_mut().clear();
         self.trail.borrow_mut().clear();
         self.chooser.borrow_mut().take();
@@ -749,7 +750,7 @@ pub(crate) fn wire(
         loading: Cell::new(false),
         unlocked: Cell::new(false),
         thumbnail_slots: tokio::sync::Semaphore::new(8),
-        thumbnails: RefCell::default(),
+        thumbnails: RefCell::new(Lru::new(THUMB_CACHE)),
         thumb_pending: RefCell::default(),
     });
     *ui.drive_galleries.borrow_mut() = Rc::downgrade(&browser);
@@ -1099,20 +1100,17 @@ impl Browser {
         if private && !self.unlocked.get() {
             return;
         }
-        {
-            let mut cache = self.thumbnails.borrow_mut();
-            if let Some(index) = cache
-                .iter()
-                .position(|(p, id, _)| *p == private && id == uid)
-            {
-                let cached = cache.remove(index).unwrap();
-                picture.set_paintable(Some(&cached.2));
-                if let Some(icon) = icon.upgrade() {
-                    icon.set_visible(false);
-                }
-                cache.push_back(cached);
-                return;
+        let cached = self
+            .thumbnails
+            .borrow_mut()
+            .fetch(&(private, uid.to_owned()))
+            .cloned();
+        if let Some(texture) = cached {
+            picture.set_paintable(Some(&texture));
+            if let Some(icon) = icon.upgrade() {
+                icon.set_visible(false);
             }
+            return;
         }
         let key = (self.generation.get(), private, uid.to_owned());
         {
@@ -1170,11 +1168,11 @@ impl Browser {
                         icon.set_visible(false);
                     }
                 }
-                let mut cache = browser.thumbnails.borrow_mut();
-                if cache.len() >= THUMB_CACHE {
-                    cache.pop_front();
-                }
-                cache.push_back((private, key.2, texture));
+                // Capped by count, like before: every entry costs one.
+                browser
+                    .thumbnails
+                    .borrow_mut()
+                    .insert((private, key.2), texture, 1);
             }
         });
     }
