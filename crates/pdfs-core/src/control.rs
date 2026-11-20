@@ -1740,27 +1740,6 @@ pub enum PhotoKind {
     Raw,
 }
 
-/// File-name extensions that denote a video, matched case-insensitively.
-const VIDEO_EXTS: &[&str] = &[
-    "mkv", "mp4", "mov", "avi", "webm", "m4v", "flv", "wmv", "mpg", "mpeg", "ts", "3gp", "m2ts",
-    "mts", "ogv",
-];
-
-/// File-name extensions that denote a camera raw. The server media type for
-/// these is frequently a generic `application/octet-stream`, so the extension is
-/// the authoritative signal.
-const RAW_EXTS: &[&str] = &[
-    "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "srw", "pef",
-    "raw", "rwl", "iiq", "3fr", "dcr", "kdc", "mrw", "x3f",
-];
-
-/// File-name extensions that denote a ready-to-view still photo. Listed so a
-/// known image name classifies as a photo outright, without deferring to a media
-/// type that might disagree.
-const PHOTO_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "avif", "bmp", "tif", "tiff",
-];
-
 impl PhotoKind {
     /// Classify a photo from what the daemon knows about it. A recognised
     /// file-name extension is authoritative — it is reliable even before the
@@ -1768,26 +1747,11 @@ impl PhotoKind {
     /// useless generic — so the media type is only consulted for names that carry
     /// no extension we know. Anything still unresolved is a still photo.
     pub fn classify(name: Option<&str>, media_type: Option<&str>) -> PhotoKind {
-        if let Some(ext) = name
-            .and_then(|n| n.rsplit_once('.'))
-            .map(|(_, e)| e.to_ascii_lowercase())
-        {
-            if RAW_EXTS.contains(&ext.as_str()) {
-                return PhotoKind::Raw;
-            }
-            if VIDEO_EXTS.contains(&ext.as_str()) {
-                return PhotoKind::Video;
-            }
-            if PHOTO_EXTS.contains(&ext.as_str()) {
-                return PhotoKind::Photo;
-            }
+        match proton_gallery_rs::grouping::MediaClass::classify(name, media_type) {
+            proton_gallery_rs::grouping::MediaClass::Photo => PhotoKind::Photo,
+            proton_gallery_rs::grouping::MediaClass::Video => PhotoKind::Video,
+            proton_gallery_rs::grouping::MediaClass::Raw => PhotoKind::Raw,
         }
-        if let Some(mt) = media_type
-            && mt.starts_with("video/")
-        {
-            return PhotoKind::Video;
-        }
-        PhotoKind::Photo
     }
 
     /// The stable integer this kind is persisted as (see the `kind` column of the
@@ -3196,7 +3160,7 @@ mod tests {
     /// videos back to the expensive whole-file path.
     #[test]
     fn photo_kind_recognises_every_supported_video_extension() {
-        for ext in VIDEO_EXTS {
+        for ext in proton_gallery_rs::grouping::VIDEO_EXTENSIONS {
             let lower = format!("movie.{ext}");
             let upper = format!("MOVIE.{}", ext.to_ascii_uppercase());
             assert_eq!(

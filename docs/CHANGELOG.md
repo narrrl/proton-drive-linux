@@ -16,6 +16,9 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - The shared Gallery engine now comes from the `proton-gallery-rs` and
   `proton-gallery-app-rs` crates on crates.io instead of a pinned Git revision of
   Proton Gallery. Builds, vendoring and the Nix package no longer fetch from Git.
+- RAW+JPEG grouping, Google Takeout reading, EXIF capture times, look-alike
+  detection and the offline town lookup now come from `proton-gallery-rs`,
+  shared with Proton Gallery. No behaviour change.
 
 ## [3.9.0] — 2026-11-19
 

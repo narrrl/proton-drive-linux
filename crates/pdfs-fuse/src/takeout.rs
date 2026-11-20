@@ -527,7 +527,7 @@ impl Core {
         let scan = match scan_archives_until(archives, || self.import_should_stop(cancel)) {
             Ok(scan) => scan,
             Err(_) if self.import_should_stop(cancel) => return Ok(true),
-            Err(e) => return Err(e),
+            Err(e) => return Err(CoreError::conflict(e.to_string())),
         };
         *planned = plan(&scan);
         *albums = scan.albums.clone();
