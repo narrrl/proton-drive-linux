@@ -552,7 +552,7 @@ impl Browser {
         if self.chooser.borrow().is_some() {
             return;
         }
-        let width = (self.width.get() - 24).max(240);
+        let width = self.width.get().max(240);
         let columns = ((width + 8) / 216).max(1);
         let card = (width - 8 * (columns - 1)) / columns;
         let mut rows = Vec::new();
@@ -683,13 +683,15 @@ pub(crate) fn wire(
     hidden: &gtk4::Button,
 ) {
     let title = ui.gallery.title.clone();
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header.set_halign(gtk4::Align::End);
+    // The page's header bar holds these, beside Select (see `sync_header`).
+    let header = &ui.gallery.gallery_actions;
     let choose = gtk4::Button::with_label(&gettext("Add This Folder"));
     choose.set_visible(false);
+    choose.add_css_class("suggested-action");
     header.append(&choose);
     let more = gtk4::Button::from_icon_name("view-more-symbolic");
     more.set_tooltip_text(Some(&gettext("Gallery Options")));
+    more.add_css_class("flat");
     let unlock = gtk4::Button::with_label(&gettext("Unlock"));
     unlock.set_visible(false);
     header.append(&unlock);
@@ -709,7 +711,6 @@ pub(crate) fn wire(
     let status = gtk4::Label::new(None);
     status.set_wrap(true);
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    content.append(&header);
     content.append(&status);
     content.append(&scroll);
     ui.gallery
@@ -794,12 +795,13 @@ pub(crate) fn wire(
             return;
         };
         let row = data.borrow::<Row>();
+        // The page around the list already keeps its margins, so rows run edge
+        // to edge like the timeline's.
         let line = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        line.set_margin_start(12);
-        line.set_margin_end(12);
         line.set_margin_bottom(8);
         match &*row {
             Row::Heading(label) => {
+                line.set_margin_top(12);
                 let label = gtk4::Label::new(Some(label));
                 label.add_css_class("heading");
                 line.append(&label);
@@ -841,7 +843,9 @@ pub(crate) fn wire(
                 }
             }
             Row::Media(items) => {
+                // The same gap down as across, as in the timeline.
                 line.set_spacing(super::photos::TILE_GAP);
+                line.set_margin_bottom(super::photos::TILE_GAP);
                 for (item, (width, height)) in items {
                     let button = tile(
                         &browser,
@@ -917,11 +921,6 @@ pub(crate) fn wire(
                     menu.item(&gettext("Lock Hidden Albums"), {
                         let browser = browser.clone();
                         move || browser.close()
-                    });
-                } else {
-                    menu.item(&gettext("Refresh galleries"), {
-                        let browser = browser.clone();
-                        move || browser.change(GalleryAction::Refresh)
                     });
                 }
                 if let Some(album) = browser.current().filter(|album| !album.proton) {
