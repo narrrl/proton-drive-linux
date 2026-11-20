@@ -3739,6 +3739,10 @@ msgstr "Anmeldung abgebrochen: Es wurde kein Postfach-Passwort eingegeben."
 msgid "That mailbox password didn't unlock your account."
 msgstr "Das Postfach-Passwort hat Ihr Konto nicht entsperrt."
 
+#: crates/pdfs-gui/src/app/pages/login.rs
+msgid "This account's only second factor is a security key, which this app can't use yet. Add an authenticator app in your Proton account settings, then sign in with its code."
+msgstr "Der einzige zweite Faktor dieses Kontos ist ein Sicherheitsschlüssel, den diese App noch nicht nutzen kann. Fügen Sie in Ihren Proton-Kontoeinstellungen eine Authentifizierungs-App hinzu und melden Sie sich dann mit deren Code an."
+
 #: crates/pdfs-gui/src/app/pages/login.rs:340
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "

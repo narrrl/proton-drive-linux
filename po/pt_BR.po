@@ -3715,6 +3715,10 @@ msgstr "Entrada cancelada: nenhuma senha da caixa de correio foi digitada."
 msgid "That mailbox password didn't unlock your account."
 msgstr "Essa senha da caixa de correio não desbloqueou sua conta."
 
+#: crates/pdfs-gui/src/app/pages/login.rs
+msgid "This account's only second factor is a security key, which this app can't use yet. Add an authenticator app in your Proton account settings, then sign in with its code."
+msgstr "O único segundo fator desta conta é uma chave de segurança, que este app ainda não pode usar. Adicione um app autenticador nas configurações da sua conta Proton e depois entre com o código dele."
+
 #: crates/pdfs-gui/src/app/pages/login.rs:340
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "

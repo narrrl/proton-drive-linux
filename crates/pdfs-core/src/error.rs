@@ -42,6 +42,13 @@ pub enum Error {
     #[error("that mailbox password does not unlock your account")]
     WrongMailboxPassword,
 
+    /// The account's only second factor is a security key, which needs
+    /// WebAuthn. Asking for a code would only fail as a wrong one.
+    #[error(
+        "this account's only second factor is a security key, which pdfs cannot use yet — add an authenticator app in your Proton account settings"
+    )]
+    SecurityKeyOnly,
+
     /// The login was gated behind human verification. Not a failure the user can
     /// fix by retrying: the challenge has to be solved and the login restarted
     /// with the resulting token (see [`auth::login_verified`](crate::auth::login_verified)).
@@ -220,6 +227,7 @@ fn core_kind(e: &Error) -> ErrorKind {
         | Error::ReloginRequired
         | Error::Locked
         | Error::WrongMailboxPassword
+        | Error::SecurityKeyOnly
         | Error::HumanVerificationRequired(_) => ErrorKind::Denied,
         Error::Proton(proton) => proton_kind(proton),
         _ => ErrorKind::Internal,

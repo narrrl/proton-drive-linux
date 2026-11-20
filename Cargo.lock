@@ -3926,14 +3926,16 @@ dependencies = [
 
 [[package]]
 name = "proton-auth-rs"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e140db8b4444e50c818c9793c2078b57c16c5b6c285a8d4bbd74886f41b05c6f"
+checksum = "383119b502a1741f1ec4a248cb1e8d2f4835d5ea415803b041f76b6f89cf1ffc"
 dependencies = [
  "apple-native-keyring-store",
  "dbus-secret-service",
  "dbus-secret-service-keyring-store",
  "keyring-core",
+ "proton-sdk",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
  "windows-native-keyring-store",

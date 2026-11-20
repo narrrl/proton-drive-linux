@@ -3723,6 +3723,10 @@ msgstr "Aanmelden geannuleerd: er is geen mailboxwachtwoord ingevoerd."
 msgid "That mailbox password didn't unlock your account."
 msgstr "Dat mailboxwachtwoord heeft je account niet ontgrendeld."
 
+#: crates/pdfs-gui/src/app/pages/login.rs
+msgid "This account's only second factor is a security key, which this app can't use yet. Add an authenticator app in your Proton account settings, then sign in with its code."
+msgstr "De enige tweede factor van dit account is een beveiligingssleutel, die deze app nog niet kan gebruiken. Voeg een authenticator-app toe in je Proton-accountinstellingen en meld je daarna aan met de code daarvan."
+
 #: crates/pdfs-gui/src/app/pages/login.rs:340
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "
