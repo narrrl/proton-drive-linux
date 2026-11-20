@@ -160,11 +160,10 @@ pub(crate) struct GalleryState {
     /// Content width the grid is currently laid out to. Updated when the
     /// ListView is resized, which re-flows the visible sections.
     pub(crate) width: Cell<i32>,
-    /// Decoded thumbnails by photo uid, with the insertion order that evicts the
-    /// oldest past [`TEXTURE_CACHE_MAX`]. Scrolling back over a day therefore
-    /// repaints from memory instead of re-decoding from disk.
-    pub(crate) photo_tex: RefCell<HashMap<String, gtk4::gdk::Texture>>,
-    pub(crate) photo_tex_order: RefCell<VecDeque<String>>,
+    /// Decoded thumbnails by photo uid, the least recently used evicted once
+    /// their pixels pass [`TEXTURE_CACHE_BYTES`]. Scrolling back over a day
+    /// therefore repaints from memory instead of re-decoding from disk.
+    pub(crate) photo_tex: RefCell<Lru<String, gtk4::gdk::Texture>>,
     /// Photos the daemon reported as having no thumbnail at all, so a tile that
     /// can never be filled isn't requested again on every scroll past it.
     pub(crate) photo_nothumb: RefCell<HashSet<String>>,
@@ -351,11 +350,20 @@ pub(crate) const THUMB_DEBOUNCE: Duration = Duration::from_millis(60);
 /// in seconds, not milliseconds.
 pub(crate) const THUMB_RETRY: Duration = Duration::from_secs(4);
 
-/// Decoded thumbnails held in memory, evicted least-recently-*used* first. Each
-/// is a few hundred KiB of GPU texture, and at the justified row density 600 was
-/// under two screens' worth — a scroll down and back up then had to re-fetch and
-/// re-decode everything it had just shown.
-pub(crate) const TEXTURE_CACHE_MAX: usize = 1500;
+/// Decoded thumbnail pixels held in memory, evicted least-recently-*used*
+/// first. Budgeted by bytes rather than by count, because one oversized
+/// thumbnail costs as much as dozens of ordinary ones. A 512 px thumbnail is
+/// about 600 KiB decoded, so this holds roughly 900 of them: at the justified
+/// row density 600 was under two screens' worth, and a scroll down and back up
+/// then had to re-fetch and re-decode everything it had just shown.
+pub(crate) const TEXTURE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+/// What a decoded texture costs [`TEXTURE_CACHE_BYTES`]: four bytes a pixel.
+pub(crate) fn texture_bytes(width: i32, height: i32) -> usize {
+    let width = usize::try_from(width).unwrap_or(0);
+    let height = usize::try_from(height).unwrap_or(0);
+    width.saturating_mul(height).saturating_mul(4).max(1)
+}
 
 /// How many tiles beyond the realised rows [`prefetch_thumbs`] warms, so a tile
 /// is decoded before it is scrolled onto rather than after.
@@ -4787,12 +4795,22 @@ pub(crate) fn gallery_unreachable(ui: &Rc<Ui>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Grouping, PHOTOS_PAGE, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, TILE_RATIO_MAX,
-        TILE_RATIO_MIN, active_filters, copy_without_overwrite, empty_timeline_text, grouping_for,
-        memory_years, month_index, month_range, plan_grid, plan_justified, section_heading,
-        tile_ratio, viewport_unfilled,
+        Grouping, PHOTOS_PAGE, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TEXTURE_CACHE_BYTES,
+        TILE_GAP, TILE_RATIO_MAX, TILE_RATIO_MIN, active_filters, copy_without_overwrite,
+        empty_timeline_text, grouping_for, memory_years, month_index, month_range, plan_grid,
+        plan_justified, section_heading, texture_bytes, tile_ratio, viewport_unfilled,
     };
     use pdfs_core::control::{PhotoItem, PhotoKind, PhotoMonth};
+
+    #[test]
+    fn the_texture_cache_is_budgeted_by_decoded_pixels() {
+        assert_eq!(texture_bytes(512, 384), 512 * 384 * 4);
+        // A broken size still costs something, so it can't pile up for free.
+        assert_eq!(texture_bytes(0, 512), 1);
+        assert_eq!(texture_bytes(-1, -1), 1);
+        // Ordinary thumbnails: well over two dense screens' worth fit.
+        assert!(TEXTURE_CACHE_BYTES / texture_bytes(512, 384) >= 600);
+    }
 
     #[test]
     fn the_scrubber_finds_the_month_a_photo_was_taken_in() {
