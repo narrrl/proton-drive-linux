@@ -28,7 +28,6 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use keyring_core::Entry;
-use proton_auth_rs::session::{self, SignInError, Step};
 use proton_auth_rs::{KeyringStore, SecretStore};
 use proton_drive_rs::{KeySalt, ProtonDriveClient};
 use proton_sdk::account::KeyPassphrases;
@@ -37,6 +36,7 @@ use proton_sdk::cache::EncryptedCacheRepository;
 use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::error::ProtonError;
 use proton_sdk::http::Tokens;
+use proton_sdk::login::{self, LoginError, Step};
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
 use proton_sdk::telemetry::TracingTelemetry;
 use serde::{Deserialize, Serialize};
@@ -280,12 +280,12 @@ pub async fn login_verified(
     get_totp: impl Fn() -> Result<String>,
     get_mailbox: impl Fn(u32) -> Result<Mailbox>,
 ) -> Result<()> {
-    // The sequence is `proton_auth_rs::session`, shared with the other Proton
+    // The sequence is `proton_sdk::login`, shared with the other Proton
     // apps. It reads the key salts before unlocking, while this access token
     // still has the `locked` scope: after its first refresh it never will
     // again, and without them no later resume can unlock the key chain. See
     // `StoredSession::key_salts`.
-    let mut step = session::begin(client_config(), username, password, verification)
+    let mut step = login::begin(client_config(), username, password, verification)
         .await
         .map_err(sign_in_error)?;
     let (unlocked, remember) = loop {
@@ -305,9 +305,7 @@ pub async fn login_verified(
                     let mailbox = get_mailbox(attempt)?;
                     match pending.mailbox_password(&mailbox.password).await {
                         Ok(unlocked) => break (unlocked, mailbox.remember),
-                        Err(SignInError::WrongMailboxPassword)
-                            if attempt + 1 < MAILBOX_ATTEMPTS =>
-                        {
+                        Err(LoginError::WrongMailboxPassword) if attempt + 1 < MAILBOX_ATTEMPTS => {
                             attempt += 1;
                         }
                         Err(e) => return Err(sign_in_error(e)),
@@ -317,16 +315,16 @@ pub async fn login_verified(
         };
     };
 
-    let tokens = unlocked.tokens().await;
+    let tokens = unlocked.resume_parameters().await;
     register_refresh_handler(&unlocked.session, tokens.refresh_token.clone());
     let stored = StoredSession {
-        session_id: tokens.session_id,
+        session_id: tokens.session_id.as_str().to_owned(),
         username: tokens.username,
-        user_id: tokens.user_id,
+        user_id: tokens.user_id.as_str().to_owned(),
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         scopes: tokens.scopes,
-        password_mode: session::password_mode_to_wire(tokens.password_mode),
+        password_mode: tokens.password_mode.to_wire() as u8,
         mailbox_password: String::new(),
         key_salts: unlocked.key_salts,
         key_passphrases: None,
@@ -412,15 +410,15 @@ fn decode_secret(secret: &[u8]) -> Option<KeyPassphrases> {
 /// names a solvable method is a [`Error::HumanVerificationRequired`]: one that
 /// offers only `email`/`sms` stays a plain API error, because sending the UI to
 /// open a page it cannot complete reads as a hang rather than a refusal.
-fn sign_in_error(e: SignInError) -> Error {
+fn sign_in_error(e: LoginError) -> Error {
     match e {
-        SignInError::HumanVerification(hv) => Error::HumanVerificationRequired(hv),
-        SignInError::SecurityKeyOnly => Error::SecurityKeyOnly,
-        SignInError::Blocked(api) | SignInError::Rejected(api) | SignInError::WrongCode(api) => {
+        LoginError::HumanVerification(hv) => Error::HumanVerificationRequired(hv),
+        LoginError::SecurityKeyOnly => Error::SecurityKeyOnly,
+        LoginError::Blocked(api) | LoginError::Rejected(api) | LoginError::WrongCode(api) => {
             Error::Proton(ProtonError::Api(api))
         }
-        SignInError::WrongMailboxPassword => Error::WrongMailboxPassword,
-        SignInError::Proton(e) => e.into(),
+        LoginError::WrongMailboxPassword => Error::WrongMailboxPassword,
+        LoginError::Proton(e) => e.into(),
         other => Error::Other(other.to_string()),
     }
 }

@@ -13,8 +13,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ### Changed
 
-- Signing in runs through `proton_auth_rs::session`, the sequence Proton Gallery and
-  Proton Stream use too. The stored session, the lock/unlock choice for two-password
+- Signing in runs through `proton_sdk::login` (proton-sdk 0.12.2), the sequence Proton
+  Gallery and Proton Stream use too. The stored session, the lock/unlock choice for two-password
   accounts, the three mailbox-password tries and the messages stay as they were.
 - An account whose only second factor is a security key now gets a clear message at
   sign-in instead of a code prompt that could only fail.
