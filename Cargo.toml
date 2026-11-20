@@ -65,7 +65,7 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 keyring-core = "1"
 # The keyring store all three apps share: reconnects after a Secret Service
 # restart (B285) and replaces items instead of editing them (B291).
-proton-auth-rs = "0.1"
+proton-auth-rs = "0.1.1"
 proton-base-rs = "0.1"
 proton-media-rs = "0.1.1"
 dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }

@@ -3411,6 +3411,10 @@ msgstr ""
 msgid "That mailbox password didn't unlock your account."
 msgstr ""
 
+#: crates/pdfs-gui/src/app/pages/login.rs
+msgid "This account's only second factor is a security key, which this app can't use yet. Add an authenticator app in your Proton account settings, then sign in with its code."
+msgstr ""
+
 #: crates/pdfs-gui/src/app/pages/login.rs:340
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "

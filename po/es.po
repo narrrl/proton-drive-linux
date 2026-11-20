@@ -3575,6 +3575,10 @@ msgstr "Inicio de sesión cancelado: no se introdujo la contraseña del buzón."
 msgid "That mailbox password didn't unlock your account."
 msgstr "Esa contraseña del buzón no desbloqueó tu cuenta."
 
+#: crates/pdfs-gui/src/app/pages/login.rs
+msgid "This account's only second factor is a security key, which this app can't use yet. Add an authenticator app in your Proton account settings, then sign in with its code."
+msgstr "El único segundo factor de esta cuenta es una llave de seguridad, que esta aplicación aún no puede usar. Añade una aplicación de autenticación en los ajustes de tu cuenta de Proton y luego inicia sesión con su código."
+
 #: crates/pdfs-gui/src/app/pages/login.rs:340
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "

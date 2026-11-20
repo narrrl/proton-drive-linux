@@ -28,6 +28,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use keyring_core::Entry;
+use proton_auth_rs::session::{self, SignInError, Step};
 use proton_auth_rs::{KeyringStore, SecretStore};
 use proton_drive_rs::{KeySalt, ProtonDriveClient};
 use proton_sdk::account::KeyPassphrases;
@@ -279,74 +280,58 @@ pub async fn login_verified(
     get_totp: impl Fn() -> Result<String>,
     get_mailbox: impl Fn(u32) -> Result<Mailbox>,
 ) -> Result<()> {
-    let password = Zeroizing::new(password.to_owned());
-    let session = ProtonApiSession::begin_verified(
-        client_config(),
-        username,
-        password.as_bytes(),
-        verification,
-    )
-    .await
-    .map_err(classify_verification_gate);
-    let mut session = session?;
-
-    if session.is_waiting_for_second_factor() {
-        let code = get_totp()?;
-        session.apply_second_factor_code(code.trim()).await?;
-    }
-
-    // Grab the key salts while this access token still has the `locked` scope:
-    // after its first refresh it never will again, and without them no later
-    // resume can unlock the key chain. See `StoredSession::key_salts`.
-    let key_salts = ProtonDriveClient::new(&session, Vec::new())
-        .account()
-        .key_salts()
-        .await?;
-
-    // A single-password account's mailbox password is the login password. A
-    // two-password one has a second secret the user must type, and it is checked
-    // against the account now — a typo found at login is a retry, found later it
-    // is a daemon that never mounts.
-    let (passphrases, remember) = match session.password_mode() {
-        PasswordMode::Single => (
-            derive_verified(&session, password.as_bytes(), key_salts.clone()).await?,
-            true,
-        ),
-        PasswordMode::Dual => {
-            let mut attempt = 0;
-            loop {
-                let mailbox = get_mailbox(attempt)?;
-                match derive_verified(&session, mailbox.password.as_bytes(), key_salts.clone())
-                    .await
-                {
-                    Ok(passphrases) => break (passphrases, mailbox.remember),
-                    Err(Error::WrongMailboxPassword) if attempt + 1 < MAILBOX_ATTEMPTS => {
-                        attempt += 1;
-                    }
-                    Err(e) => return Err(e),
-                }
+    // The sequence is `proton_auth_rs::session`, shared with the other Proton
+    // apps. It reads the key salts before unlocking, while this access token
+    // still has the `locked` scope: after its first refresh it never will
+    // again, and without them no later resume can unlock the key chain. See
+    // `StoredSession::key_salts`.
+    let mut step = session::begin(client_config(), username, password, verification)
+        .await
+        .map_err(sign_in_error)?;
+    let (unlocked, remember) = loop {
+        step = match step {
+            Step::SecondFactor(pending) => {
+                let code = get_totp()?;
+                pending.second_factor(&code).await.map_err(sign_in_error)?
             }
-        }
+            // A single-password account's mailbox password is the login password.
+            Step::Unlock(pending) => break (pending.unlock().await.map_err(sign_in_error)?, true),
+            // A two-password one has a second secret the user must type, and it is
+            // checked against the account now — a typo found at login is a retry,
+            // found later it is a daemon that never mounts.
+            Step::MailboxPassword(pending) => {
+                let mut attempt = 0;
+                break loop {
+                    let mailbox = get_mailbox(attempt)?;
+                    match pending.mailbox_password(&mailbox.password).await {
+                        Ok(unlocked) => break (unlocked, mailbox.remember),
+                        Err(SignInError::WrongMailboxPassword)
+                            if attempt + 1 < MAILBOX_ATTEMPTS =>
+                        {
+                            attempt += 1;
+                        }
+                        Err(e) => return Err(sign_in_error(e)),
+                    }
+                };
+            }
+        };
     };
 
-    let tokens = session.current_tokens().await;
-    register_refresh_handler(&session, tokens.refresh_token.clone());
+    let tokens = unlocked.tokens().await;
+    register_refresh_handler(&unlocked.session, tokens.refresh_token.clone());
     let stored = StoredSession {
-        session_id: session.session_id().as_str().to_owned(),
-        username: session.username().to_owned(),
-        user_id: session.user_id().as_str().to_owned(),
+        session_id: tokens.session_id,
+        username: tokens.username,
+        user_id: tokens.user_id,
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
-        scopes: session.scopes().to_vec(),
-        password_mode: match session.password_mode() {
-            PasswordMode::Single => 1,
-            PasswordMode::Dual => 2,
-        },
+        scopes: tokens.scopes,
+        password_mode: session::password_mode_to_wire(tokens.password_mode),
         mailbox_password: String::new(),
-        key_salts,
+        key_salts: unlocked.key_salts,
         key_passphrases: None,
     };
-    keep_passphrases(stored, &passphrases, remember)
+    keep_passphrases(stored, &unlocked.key_passphrases, remember)
 }
 
 /// Derive the key passphrases from `mailbox` and prove they unlock the account.
@@ -420,20 +405,23 @@ fn decode_secret(secret: &[u8]) -> Option<KeyPassphrases> {
     decode(&serde_json::from_slice(secret).ok()?)
 }
 
-/// Lift a human-verification gate out of the generic API error into the typed
-/// variant a front-end can act on.
+/// A failed sign-in step as this crate's error.
 ///
-/// Only a gate that names a solvable method is converted. A `9001` with no
-/// `Details`, or one offering only `email`/`sms`, stays a plain API error:
-/// promoting it would send the UI to open a verification page it cannot
-/// complete, which reads to the user as a hang rather than a refusal.
-fn classify_verification_gate(e: ProtonError) -> Error {
-    let ProtonError::Api(api) = &e else {
-        return e.into();
-    };
-    match api.human_verification() {
-        Some(hv) if hv.supports_captcha() => Error::HumanVerificationRequired(Box::new(hv)),
-        _ => e.into(),
+/// A blocked, refused or wrong-code attempt goes back to the Proton error it
+/// came from, which is what the front-ends word themselves. Only a gate that
+/// names a solvable method is a [`Error::HumanVerificationRequired`]: one that
+/// offers only `email`/`sms` stays a plain API error, because sending the UI to
+/// open a page it cannot complete reads as a hang rather than a refusal.
+fn sign_in_error(e: SignInError) -> Error {
+    match e {
+        SignInError::HumanVerification(hv) => Error::HumanVerificationRequired(hv),
+        SignInError::SecurityKeyOnly => Error::SecurityKeyOnly,
+        SignInError::Blocked(api) | SignInError::Rejected(api) | SignInError::WrongCode(api) => {
+            Error::Proton(ProtonError::Api(api))
+        }
+        SignInError::WrongMailboxPassword => Error::WrongMailboxPassword,
+        SignInError::Proton(e) => e.into(),
+        other => Error::Other(other.to_string()),
     }
 }
 

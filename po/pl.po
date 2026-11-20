@@ -3652,6 +3652,10 @@ msgstr "Anulowano logowanie: nie wpisano hasła skrzynki pocztowej."
 msgid "That mailbox password didn't unlock your account."
 msgstr "To hasło skrzynki pocztowej nie odblokowało Twojego konta."
 
+#: crates/pdfs-gui/src/app/pages/login.rs
+msgid "This account's only second factor is a security key, which this app can't use yet. Add an authenticator app in your Proton account settings, then sign in with its code."
+msgstr "Jedynym drugim składnikiem tego konta jest klucz bezpieczeństwa, którego ta aplikacja nie może jeszcze używać. Dodaj aplikację uwierzytelniającą w ustawieniach konta Proton, a następnie zaloguj się jej kodem."
+
 #: crates/pdfs-gui/src/app/pages/login.rs:340
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "

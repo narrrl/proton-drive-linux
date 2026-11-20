@@ -336,6 +336,9 @@ pub(crate) fn login_error_message(error: &pdfs_core::Error) -> String {
         pdfs_core::Error::WrongMailboxPassword => {
             gettext("That mailbox password didn't unlock your account.")
         }
+        pdfs_core::Error::SecurityKeyOnly => gettext(
+            "This account's only second factor is a security key, which this app can't use yet. Add an authenticator app in your Proton account settings, then sign in with its code.",
+        ),
         pdfs_core::Error::Other(message) if message.contains("verification") => gettext(
             "Sign-in cancelled: the verification wasn't completed. Sign in again to get a new one.",
         ),
@@ -711,6 +714,9 @@ mod tests {
 
     #[test]
     fn a_cancelled_prompt_says_which_step_was_skipped() {
+        assert!(
+            login_error_message(&pdfs_core::Error::SecurityKeyOnly).contains("authenticator app")
+        );
         let totp = pdfs_core::Error::Other("two-factor entry cancelled".into());
         assert!(login_error_message(&totp).contains("two-factor code"));
         let hv = pdfs_core::Error::Other("verification cancelled".into());
