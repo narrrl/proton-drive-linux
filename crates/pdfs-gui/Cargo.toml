@@ -22,7 +22,7 @@ name = "pdfs-prompt"
 path = "src/prompt.rs"
 
 [dependencies]
-pg-core.workspace = true
+proton-gallery-rs.workspace = true
 base64.workspace = true
 pdfs-core.workspace = true
 tracing.workspace = true

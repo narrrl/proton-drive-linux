@@ -14,10 +14,10 @@ use pdfs_core::control::{
     GalleryAction, GalleryAlbum, GalleryFolder, GalleryPlace, PhotoItem, PhotoKind, Response,
 };
 use pdfs_core::{CoreError, CoreResult};
-use pg_app::{App, View};
-use pg_core::CancellationToken;
-use pg_core::model::{AssetKey, SourceId};
 use proton_drive_rs::proton_sdk::session::ProtonApiSession;
+use proton_gallery_app_rs::{App, View};
+use proton_gallery_rs::CancellationToken;
+use proton_gallery_rs::model::{AssetKey, SourceId};
 use tokio::sync::{Mutex, Notify, OnceCell};
 
 use super::{Core, NodeUid, parse_uid};
@@ -187,8 +187,9 @@ impl Gallery {
         Ok(Arc::new(visibility))
     }
 
-    fn account(&self) -> CoreResult<pg_core::model::AccountId> {
-        pg_core::model::AccountId::new(self.session.user_id().as_str()).map_err(gallery_error)
+    fn account(&self) -> CoreResult<proton_gallery_rs::model::AccountId> {
+        proton_gallery_rs::model::AccountId::new(self.session.user_id().as_str())
+            .map_err(gallery_error)
     }
 
     async fn page(
@@ -345,13 +346,15 @@ impl Gallery {
     fn asset(&self, uid: &NodeUid) -> CoreResult<AssetKey> {
         Ok(AssetKey {
             account: self.account()?,
-            volume: pg_core::model::VolumeId::new(uid.volume_id.as_str()).map_err(gallery_error)?,
-            node: pg_core::model::NodeId::new(uid.link_id.as_str()).map_err(gallery_error)?,
+            volume: proton_gallery_rs::model::VolumeId::new(uid.volume_id.as_str())
+                .map_err(gallery_error)?,
+            node: proton_gallery_rs::model::NodeId::new(uid.link_id.as_str())
+                .map_err(gallery_error)?,
         })
     }
 }
 
-fn gallery_album(entry: pg_core::library::Album, proton: bool) -> GalleryAlbum {
+fn gallery_album(entry: proton_gallery_rs::library::Album, proton: bool) -> GalleryAlbum {
     GalleryAlbum {
         place: GalleryPlace {
             gallery: entry.gallery.to_string(),
@@ -444,7 +447,7 @@ impl Core {
                 "Use your Linux sign-in to unlock Hidden albums.",
             ));
         }
-        let subject = pg_app::desktop_auth::Subject::new(
+        let subject = proton_gallery_app_rs::desktop_auth::Subject::new(
             peer.pid.as_raw_nonzero().get() as u32,
             peer.uid.as_raw(),
         )

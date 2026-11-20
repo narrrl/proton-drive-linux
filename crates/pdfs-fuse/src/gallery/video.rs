@@ -11,8 +11,8 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use pdfs_core::{CoreResult, control::Response as ControlResponse};
-use pg_app::video::VideoStream;
-use pg_core::CancellationToken;
+use proton_gallery_app_rs::video::VideoStream;
+use proton_gallery_rs::CancellationToken;
 use tokio::net::TcpListener;
 
 type Body = UnsyncBoxBody<Bytes, io::Error>;

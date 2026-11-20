@@ -2360,7 +2360,7 @@ const TILE_RATIO_MAX: f64 = 2.5;
 /// The shape a photo's tile takes: its own, clamped, or square while the
 /// daemon has not seen a thumbnail of it yet.
 pub(crate) fn tile_ratio(ratio: Option<f64>) -> f64 {
-    pg_core::grid::tile_ratio(ratio.unwrap_or(1.0))
+    proton_gallery_rs::grid::tile_ratio(ratio.unwrap_or(1.0))
 }
 
 /// The justified layout math: tiles of the given shapes, in order, broken into
@@ -2373,7 +2373,7 @@ pub(crate) fn tile_ratio(ratio: Option<f64>) -> f64 {
 /// two photos from one day stay two photos at the target height, not two
 /// photos as tall as the window.
 pub(crate) fn plan_justified(ratios: &[f64], width: i32, target: i32) -> Vec<Vec<(i32, i32)>> {
-    let Ok(grid) = pg_core::grid::plan_sections(
+    let Ok(grid) = proton_gallery_rs::grid::plan_sections(
         ratios,
         &[],
         width.clamp(1, 32_768) as u32,
