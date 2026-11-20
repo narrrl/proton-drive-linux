@@ -5,6 +5,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use std::collections::{HashMap, HashSet};
 
+use proton_gallery_rs::grouping::{Grouped, group_photos, name_stem};
+
 use super::Db;
 use crate::Result;
 
@@ -119,135 +121,6 @@ fn capture_day(conn: &rusqlite::Connection, capture_time: i64) -> Option<String>
     )
     .ok()
     .flatten()
-}
-
-/// The file name without its extension, lowercased — `IMG_1234.CR2` and
-/// `IMG_1234.JPG` share `img_1234` — with the camera's own part-of-a-shot
-/// marker removed, so the two files a raw capture writes share a stem too.
-fn name_stem(name: Option<&str>) -> Option<String> {
-    let name = name?;
-    let stem = match name.rsplit_once('.') {
-        Some((stem, _)) if !stem.is_empty() => stem,
-        _ => name,
-    };
-    let stem = stem.to_ascii_lowercase();
-    Some(strip_shot_marker(&stem).to_string())
-}
-
-/// Drop a `.RAW-NN.ROLE` marker from a stem.
-///
-/// Pixel stores one raw capture as `PXL_20260919_000625670.RAW-01.COVER.jpg`
-/// and `PXL_20260919_000625670.RAW-02.ORIGINAL.dng`: one shot, two files, two
-/// stems that differ in exactly the part naming which file of the shot this is.
-/// Cutting the marker off is what lets rule 2 see the pair. The check is narrow
-/// on purpose — digits, then a single role word — so an ordinary name that
-/// happens to contain `.raw-` keeps its stem.
-fn strip_shot_marker(stem: &str) -> &str {
-    let Some(at) = stem.rfind(".raw-") else {
-        return stem;
-    };
-    let rest = &stem[at + ".raw-".len()..];
-    let Some((index, role)) = rest.split_once('.') else {
-        return stem;
-    };
-    let marked = !index.is_empty()
-        && index.bytes().all(|b| b.is_ascii_digit())
-        && !role.is_empty()
-        && role.bytes().all(|b| b.is_ascii_alphabetic());
-    if marked { &stem[..at] } else { stem }
-}
-
-/// One entry of the grouping pass: what rule 2 needs, plus what choosing a
-/// representative needs.
-struct Grouped {
-    uid: String,
-    kind: crate::control::PhotoKind,
-    main_uid: Option<String>,
-    day: Option<String>,
-    stem: Option<String>,
-}
-
-/// Which group each photo belongs to, and which member of it the gallery shows.
-///
-/// Precedence, as agreed:
-///
-/// 1. The server's own relation — a photo with a `main_photo_uid` joins that
-///    photo's group. The server knows about live photos and bursts; we do not
-///    have to guess at them.
-/// 2. Otherwise, same capture day **and** same file-name stem **and** one of the
-///    two is a camera raw while the other is not. That is the RAW+JPEG pair a
-///    camera writes, and the differing-kind clause keeps two JPEGs that happen
-///    to share a name apart.
-/// 3. Otherwise the photo is its own group.
-///
-/// The representative is the non-raw member when the group has one — a JPEG
-/// decodes in milliseconds and is what the person expects to see — and the
-/// earliest member in server order otherwise.
-fn group_photos(entries: &[Grouped]) -> Vec<String> {
-    let mut parent: Vec<usize> = (0..entries.len()).collect();
-    fn find(parent: &mut [usize], mut i: usize) -> usize {
-        while parent[i] != i {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
-        }
-        i
-    }
-    let union = |parent: &mut [usize], a: usize, b: usize| {
-        let (a, b) = (find(parent, a), find(parent, b));
-        if a != b {
-            parent[b] = a;
-        }
-    };
-
-    let index: HashMap<&str, usize> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.uid.as_str(), i))
-        .collect();
-    for (i, entry) in entries.iter().enumerate() {
-        if let Some(main) = entry.main_uid.as_deref()
-            && let Some(&j) = index.get(main)
-        {
-            union(&mut parent, j, i);
-        }
-    }
-
-    // Rule 2 needs only one pass: everything sharing a day and a stem lands in
-    // the same bucket, and the raw / non-raw split is checked pairwise there.
-    let mut by_name: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
-    for (i, entry) in entries.iter().enumerate() {
-        if let (Some(day), Some(stem)) = (entry.day.as_deref(), entry.stem.as_deref()) {
-            by_name.entry((day, stem)).or_default().push(i);
-        }
-    }
-    let is_raw = |i: usize| entries[i].kind == crate::control::PhotoKind::Raw;
-    for bucket in by_name.values() {
-        for (n, &i) in bucket.iter().enumerate() {
-            for &j in &bucket[n + 1..] {
-                if is_raw(i) != is_raw(j) {
-                    union(&mut parent, i, j);
-                }
-            }
-        }
-    }
-
-    // Representative per root, then the key every member carries.
-    let mut representative: HashMap<usize, usize> = HashMap::new();
-    for i in 0..entries.len() {
-        let root = find(&mut parent, i);
-        match representative.get(&root).copied() {
-            Some(current) if !is_raw(current) || is_raw(i) => {}
-            _ => {
-                representative.insert(root, i);
-            }
-        }
-    }
-    (0..entries.len())
-        .map(|i| {
-            let root = find(&mut parent, i);
-            entries[representative[&root]].uid.clone()
-        })
-        .collect()
 }
 
 /// The columns every photo read selects, with the group aggregates joined in.
@@ -483,7 +356,8 @@ impl Db {
                     Ok((
                         Grouped {
                             uid: r.get(0)?,
-                            kind: crate::control::PhotoKind::from_i64(r.get(1)?),
+                            raw: crate::control::PhotoKind::from_i64(r.get(1)?)
+                                == crate::control::PhotoKind::Raw,
                             main_uid: r.get(2)?,
                             day: r.get(3)?,
                             stem: name_stem(name.as_deref()),
@@ -640,7 +514,7 @@ impl Db {
             .iter()
             .map(|(row, carried, kind)| Grouped {
                 uid: row.uid.clone(),
-                kind: *kind,
+                raw: *kind == crate::control::PhotoKind::Raw,
                 main_uid: carried.main_uid.clone(),
                 day: capture_day(&tx, row.capture_time),
                 stem: name_stem(carried.name.as_deref()),

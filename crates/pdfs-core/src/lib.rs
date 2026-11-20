@@ -10,7 +10,6 @@ pub mod config;
 pub mod control;
 pub mod db;
 pub mod error;
-pub mod exiftime;
 pub mod kernelkey;
 pub mod keycheck;
 pub mod localindex;
@@ -19,20 +18,19 @@ pub mod mountfail;
 pub mod mountpoint;
 pub mod mounts;
 pub mod opener;
-pub mod places;
 pub mod profile;
 pub mod sdkcache;
 pub mod search;
-mod secretservice;
 pub mod service;
 pub mod shell;
-pub mod similar;
 pub mod syncignore;
 pub mod syncroot;
-pub mod takeout;
 pub mod timestamp;
 pub mod tray;
 pub mod update;
+
+// Photo logic shared with Proton Gallery through the proton-rs crates.
+pub use proton_gallery_rs::{exiftime, places, similar, takeout};
 
 pub use access::{Access, access_for, perm_bits};
 pub use error::{CoreError, CoreResult, Error, Result};

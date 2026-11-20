@@ -16,6 +16,15 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - The shared Gallery engine now comes from the `proton-gallery-rs` and
   `proton-gallery-app-rs` crates on crates.io instead of a pinned Git revision of
   Proton Gallery. Builds, vendoring and the Nix package no longer fetch from Git.
+- RAW+JPEG grouping, Google Takeout reading, EXIF capture times, look-alike
+  detection and the offline town lookup now come from `proton-gallery-rs`,
+  shared with Proton Gallery. No behaviour change.
+- The keyring code (one Secret Service connection that reconnects after the provider
+  restarts, B285, and replacing the session item instead of editing it, B291) now comes
+  from `proton-auth-rs`, shared with Proton Gallery and Proton Stream. No behaviour change.
+- Config, machine-id and mount-failure files are written through `proton-base-rs`'s
+  atomic writer (temporary file, sync, rename, directory sync). The mount-failure file
+  is now synced before the rename too, so a crash cannot leave it empty.
 
 ## [3.9.0] — 2026-11-19
 

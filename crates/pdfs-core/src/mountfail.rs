@@ -40,9 +40,7 @@ pub fn path(state_dir: &Path) -> PathBuf {
 /// and renamed, so a reader never sees half of it.
 pub fn record(state_dir: &Path, failure: &MountFailure) -> std::io::Result<()> {
     let json = serde_json::to_vec(failure).map_err(std::io::Error::other)?;
-    let tmp = state_dir.join(format!("{FILE_NAME}.tmp"));
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path(state_dir))
+    proton_base_rs::atomic::write_with_mode(&path(state_dir), &json, 0o644)
 }
 
 /// Forget the failure: a mount is up, or a new daemon has started.
