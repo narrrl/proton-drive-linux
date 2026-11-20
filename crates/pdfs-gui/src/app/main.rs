@@ -728,6 +728,10 @@ fn build_window(app: &adw::Application) {
             resume_button: takeout_widgets.resume_button.clone(),
             inflight: Cell::new(false),
             running: Cell::new(false),
+            restored: Cell::new(false),
+            save_seq: Cell::new(0),
+            saved_seq: Default::default(),
+            repaint_seq: Cell::new(0),
         },
         update,
     });
