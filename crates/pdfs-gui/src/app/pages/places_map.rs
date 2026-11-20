@@ -17,6 +17,8 @@
 //! a single photo opens it in its town, and photos taken on one spot, which
 //! never part, are listed to pick from.
 
+// Markers merge the same way in every Proton gallery app.
+use proton_gallery_rs::places::{Bubble, bubble_radius, cluster, compact_count};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -137,13 +139,6 @@ fn parse_ring(line: &str) -> Option<Ring> {
     Some(Ring { points, min, max })
 }
 
-/// Radius in px of a marker holding `photos` photos: big enough to make the
-/// photo out, and growing with the count, but slowly, so a home town with
-/// thousands doesn't cover a continent.
-fn bubble_radius(photos: usize) -> f64 {
-    18.0 + 2.0 * (photos.max(1) as f64).ln()
-}
-
 /// What the map shows: which part of the world, at what size.
 #[derive(Clone, Copy, Debug)]
 struct View {
@@ -193,17 +188,6 @@ struct Marker {
     /// The photo it shows.
     cover: String,
     target: Target,
-}
-
-/// One marker as last drawn, standing for one or more [`Marker`]s: where, how
-/// big, and which (indices into [`MapState::markers`], the one with the most
-/// photos first).
-struct Bubble {
-    x: f64,
-    y: f64,
-    radius: f64,
-    photos: usize,
-    members: Vec<usize>,
 }
 
 /// A street-map tile ready to draw, and the names on it.
@@ -1646,52 +1630,6 @@ fn spread(points: &[World]) -> f64 {
         (hi - lo).max(0.0)
     };
     span(&mut xs.into_iter()).max(span(&mut ys.into_iter()))
-}
-
-/// Merge markers whose circles would overlap on screen, the one with the
-/// most photos claiming its neighbours (the first of equals, when counts
-/// tie). Markers off screen are left out.
-fn cluster(screen: &[(f64, f64)], counts: &[usize], width: f64, height: f64) -> Vec<Bubble> {
-    let mut order: Vec<usize> = (0..screen.len()).collect();
-    order.sort_by(|a, b| counts[*b].cmp(&counts[*a]));
-    let mut bubbles: Vec<Bubble> = Vec::new();
-    for index in order {
-        let (x, y) = screen[index];
-        let reach = bubble_radius(counts[index]);
-        if x < -reach || y < -reach || x > width + reach || y > height + reach {
-            continue;
-        }
-        match bubbles
-            .iter_mut()
-            .find(|b| (b.x - x).hypot(b.y - y) < b.radius + reach * 0.5)
-        {
-            Some(bubble) => {
-                bubble.photos += counts[index];
-                bubble.radius = bubble_radius(bubble.photos);
-                bubble.members.push(index);
-            }
-            None => bubbles.push(Bubble {
-                x,
-                y,
-                radius: reach,
-                photos: counts[index],
-                members: vec![index],
-            }),
-        }
-    }
-    // Smallest last, so a small marker next to a big one stays clickable.
-    bubbles.sort_by(|a, b| b.radius.total_cmp(&a.radius));
-    bubbles
-}
-
-/// "7", "840", "1.2k", "35k": short enough to fit a marker. Digits and the
-/// "k" read the same in every language the app ships.
-fn compact_count(n: usize) -> String {
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..10_000 => format!("{:.1}k", n as f64 / 1_000.0),
-        _ => format!("{}k", n / 1_000),
-    }
 }
 
 fn set_color(cr: &cairo::Context, color: &gtk4::gdk::RGBA, alpha: f32) {
