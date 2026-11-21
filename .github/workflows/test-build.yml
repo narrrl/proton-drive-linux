@@ -65,6 +65,7 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           SHORT=${GITHUB_SHA::7}
+          scripts/fetch-basemap.sh
           mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT,db}
           rpmbuild -bb \
             --nodeps \

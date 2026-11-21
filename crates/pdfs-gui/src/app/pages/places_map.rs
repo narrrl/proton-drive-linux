@@ -2,13 +2,13 @@
 //! their newest photo, and once the map is zoomed in close, each photo where
 //! it was taken.
 //!
-//! Underneath is one of two maps. The built-in one is drawn here from Natural
+//! Underneath are up to two maps. The outline is drawn here from Natural
 //! Earth's 1:50m land polygons and country borders (public domain), trimmed
 //! into `data/land.txt` and `data/borders.txt` by
-//! `scripts/natural-earth-land.py`; it needs no network and tells nobody
-//! anything. The street map from OpenFreeMap ([`super::map_tiles`]) is
-//! opt-in, in Preferences, and draws over the built-in one wherever its tiles
-//! have arrived.
+//! `scripts/natural-earth-land.py`, and is always there. Over it go tiles
+//! ([`super::map_tiles`]) wherever they have arrived: the offline basemap
+//! installed with the app, which needs no network and tells nobody anything,
+//! or, when turned on in Preferences, the street map from OpenFreeMap.
 //!
 //! The projection is Web Mercator, the one every other map uses, so the
 //! world looks the way people expect. Markers that would overlap on screen
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use gtk4::cairo;
 use pdfs_core::control::PhotoLocation;
 
-use super::map_tiles::{self, Done, Label, LabelClass, Palette, TILE_EDGE, TileKey, Tiles};
+use super::map_tiles::{self, Done, Label, LabelClass, Palette, Source, TILE_EDGE, TileKey, Tiles};
 use crate::*;
 
 const LAND: &str = include_str!("../../../data/land.txt");
@@ -37,8 +37,8 @@ const BORDERS: &str = include_str!("../../../data/borders.txt");
 const MAX_LATITUDE: f64 = 85.0;
 
 /// How far in the map zooms, as a multiple of the whole world fitting the
-/// widget: far enough for photos in one town to part on the built-in map,
-/// and down to single streets on the street map.
+/// widget: far enough for photos in one town to part on the outline and the
+/// basemap, and down to single streets on the street map.
 const MAX_ZOOM: f64 = 8192.0;
 const ONLINE_MAX_ZOOM: f64 = 65536.0;
 
@@ -66,7 +66,7 @@ const MIN_SEGMENT: f64 = 0.75;
 /// Edge in px of the square a marker's photo is scaled down to once.
 const COVER_PX: i32 = 128;
 
-/// How many street-map tiles stay in memory.
+/// How many map tiles stay in memory.
 const TILE_CACHE: usize = 160;
 
 /// Photo marker covers kept, 64 KiB each. A town's own cover is never
@@ -190,7 +190,7 @@ struct Marker {
     target: Target,
 }
 
-/// A street-map tile ready to draw, and the names on it.
+/// A map tile ready to draw, and the names on it.
 struct CachedTile {
     surface: cairo::ImageSurface,
     labels: Rc<Vec<Label>>,
@@ -198,9 +198,11 @@ struct CachedTile {
     used: u64,
 }
 
-/// The street map, while it is turned on.
-struct Online {
+/// The tiles drawn over the outline, from the basemap or the street map.
+struct TileLayer {
     tiles: Tiles,
+    /// Whether they come from the street map.
+    online: bool,
     cache: HashMap<TileKey, CachedTile>,
     pending: HashSet<TileKey>,
     failed: HashMap<TileKey, Instant>,
@@ -239,7 +241,11 @@ struct MapState {
     drag_origin: Option<View>,
     /// The scale a pinch started from.
     pinch_origin: Option<View>,
-    online: Option<Online>,
+    tiles: Option<TileLayer>,
+    /// Whether the street map is turned on in Preferences.
+    street_map: bool,
+    /// The installed basemap, if any.
+    basemap: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     /// The spot [`PlacesMap::show_spot`] went to, ringed until the map is
     /// fitted to all places again.
@@ -295,32 +301,11 @@ impl PlacesMap {
         buttons.append(&zoom);
         buttons.append(&fit);
 
-        let link = |url: &str, name: &str| format!("<a href=\"{url}\">{name}</a>");
         let credit = gtk4::Label::builder()
             .use_markup(true)
             .halign(gtk4::Align::End)
             .valign(gtk4::Align::End)
             .visible(false)
-            .label(gettext_f(
-                // Translators: the credit on the street map. {openfreemap},
-                // {openmaptiles} and {openstreetmap} are the linked names of
-                // the projects, which stay as they are.
-                "{openfreemap} © {openmaptiles} Data from {openstreetmap}",
-                &[
-                    (
-                        "openfreemap",
-                        &link("https://openfreemap.org", "OpenFreeMap"),
-                    ),
-                    (
-                        "openmaptiles",
-                        &link("https://www.openmaptiles.org/", "OpenMapTiles"),
-                    ),
-                    (
-                        "openstreetmap",
-                        &link("https://www.openstreetmap.org/copyright", "OpenStreetMap"),
-                    ),
-                ],
-            ))
             .build();
         credit.add_css_class("places-map-credit");
         credit.add_css_class("caption");
@@ -354,7 +339,9 @@ impl PlacesMap {
                 pointer: (0.0, 0.0),
                 drag_origin: None,
                 pinch_origin: None,
-                online: None,
+                tiles: None,
+                street_map: false,
+                basemap: map_tiles::find_basemap(),
                 cache_dir: None,
                 pin: None,
             }),
@@ -494,39 +481,53 @@ impl PlacesMap {
         self.area.queue_draw();
     }
 
-    /// Draw OpenFreeMap's street map under the markers, or stop, keeping its
-    /// tiles in `cache_dir`.
+    /// Draw OpenFreeMap's street map under the markers, keeping its tiles in
+    /// `cache_dir`, or else the installed basemap.
     pub(crate) fn set_online(self: &Rc<Self>, on: bool, cache_dir: PathBuf) {
         {
             let mut state = self.state.borrow_mut();
             state.cache_dir = Some(cache_dir);
-            if on == state.online.is_some() {
+            let started = state.tiles.is_some() || state.basemap.is_none();
+            if on == state.street_map && started {
                 return;
             }
-            state.online = None;
+            state.street_map = on;
+            state.tiles = None;
         }
-        self.credit.set_visible(on);
-        if on {
-            self.start_tiles();
-        }
+        self.start_tiles();
         self.clamp_zoom();
         self.area.queue_draw();
     }
 
-    /// Start a tile worker for the widget's current pixel density.
+    /// Start a tile worker for the widget's current pixel density, and show
+    /// the credit for what it draws.
     fn start_tiles(self: &Rc<Self>) {
-        let Some(dir) = self.state.borrow().cache_dir.clone() else {
+        let source = {
+            let state = self.state.borrow();
+            match (&state.cache_dir, &state.basemap) {
+                (Some(dir), _) if state.street_map => {
+                    let language = gtk4::pango::Language::default().to_string();
+                    let language = language.split(['-', '_']).next().unwrap_or("en").to_owned();
+                    Some(Source::Online {
+                        cache_dir: dir.join("map-tiles"),
+                        language,
+                    })
+                }
+                (_, Some(basemap)) => Some(Source::Offline(basemap.clone())),
+                _ => None,
+            }
+        };
+        let Some(source) = source else {
+            self.credit.set_visible(false);
             return;
         };
-        let language = gtk4::pango::Language::default().to_string();
-        let language = language.split(['-', '_']).next().unwrap_or("en").to_owned();
-        let (tiles, done) = Tiles::start(
-            dir.join("map-tiles"),
-            language,
-            self.area.scale_factor().max(1),
-        );
-        self.state.borrow_mut().online = Some(Online {
+        let online = matches!(source, Source::Online { .. });
+        self.credit.set_label(&credit_text(online));
+        self.credit.set_visible(true);
+        let (tiles, done) = Tiles::start(source, self.area.scale_factor().max(1));
+        self.state.borrow_mut().tiles = Some(TileLayer {
             tiles,
+            online,
             cache: HashMap::new(),
             pending: HashSet::new(),
             failed: HashMap::new(),
@@ -546,7 +547,7 @@ impl PlacesMap {
 
     fn tile_done(&self, done: Done) {
         let mut state = self.state.borrow_mut();
-        let Some(online) = state.online.as_mut() else {
+        let Some(online) = state.tiles.as_mut() else {
             return;
         };
         match done {
@@ -732,7 +733,7 @@ impl PlacesMap {
     }
 
     fn max_scale(&self) -> f64 {
-        let zoom = if self.state.borrow().online.is_some() {
+        let zoom = if self.state.borrow().tiles.as_ref().is_some_and(|t| t.online) {
             ONLINE_MAX_ZOOM
         } else {
             MAX_ZOOM
@@ -827,11 +828,11 @@ impl PlacesMap {
         let restart = self
             .state
             .borrow()
-            .online
+            .tiles
             .as_ref()
             .is_some_and(|o| o.tiles.scale != area.scale_factor().max(1));
         if restart {
-            self.state.borrow_mut().online = None;
+            self.state.borrow_mut().tiles = None;
             self.start_tiles();
         }
 
@@ -846,7 +847,7 @@ impl PlacesMap {
             let view = state.view;
             state.draws += 1;
             paint_outline(cr, view, size, colors);
-            let labels = match state.online.as_mut() {
+            let labels = match state.tiles.as_mut() {
                 Some(online) => paint_tiles(cr, online, view, size, dark, area.scale_factor()),
                 None => Vec::new(),
             };
@@ -999,16 +1000,16 @@ fn paint_outline(cr: &cairo::Context, view: View, size: (f64, f64), colors: &Pal
     let _ = cr.stroke();
 }
 
-/// The street-map zoom whose tiles come closest to their own size on screen.
+/// The tile zoom whose tiles come closest to their own size on screen.
 fn tile_zoom(scale: f64) -> u8 {
     (scale / TILE_EDGE).log2().round().clamp(0.0, 18.0) as u8
 }
 
-/// Draw the street-map tiles on screen, asking for the missing ones and
-/// standing in their nearest ancestor meanwhile. Returns the names on them.
+/// Draw the map tiles on screen, asking for the missing ones and standing in
+/// their nearest ancestor meanwhile. Returns the names on them.
 fn paint_tiles(
     cr: &cairo::Context,
-    online: &mut Online,
+    online: &mut TileLayer,
     view: View,
     size: (f64, f64),
     dark: bool,
@@ -1564,6 +1565,47 @@ impl PlacesMap {
 
 /// How many town names a merged marker's tooltip lists.
 const TOOLTIP_NAMES: usize = 5;
+
+/// The credit for the map's tiles, as Pango markup.
+fn credit_text(online: bool) -> String {
+    let link = |url: &str, name: &str| format!("<a href=\"{url}\">{name}</a>");
+    if online {
+        gettext_f(
+            // Translators: the credit on the street map. {openfreemap},
+            // {openmaptiles} and {openstreetmap} are the linked names of
+            // the projects, which stay as they are.
+            "{openfreemap} © {openmaptiles} Data from {openstreetmap}",
+            &[
+                (
+                    "openfreemap",
+                    &link("https://openfreemap.org", "OpenFreeMap"),
+                ),
+                (
+                    "openmaptiles",
+                    &link("https://www.openmaptiles.org/", "OpenMapTiles"),
+                ),
+                (
+                    "openstreetmap",
+                    &link("https://www.openstreetmap.org/copyright", "OpenStreetMap"),
+                ),
+            ],
+        )
+    } else {
+        gettext_f(
+            // Translators: the credit on the offline map. {naturalearth} and
+            // {geonames} are the linked names of the projects, which stay as
+            // they are.
+            "Map data © {naturalearth} (public domain) and {geonames} (CC BY 4.0)",
+            &[
+                (
+                    "naturalearth",
+                    &link("https://www.naturalearthdata.com/", "Natural Earth"),
+                ),
+                ("geonames", &link("https://www.geonames.org/", "GeoNames")),
+            ],
+        )
+    }
+}
 
 fn map_button(icon: &str, tooltip: &str) -> gtk4::Button {
     let button = gtk4::Button::from_icon_name(icon);

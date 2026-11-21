@@ -159,6 +159,9 @@ jobs:
           install -Dm644 packaging/io.narl.proton-drive-linux.policy deb/usr/share/polkit-1/actions/io.narl.proton-drive-linux.policy
           cp packaging/proton-drive.service deb/usr/lib/systemd/user/
           cp LICENSE deb/usr/share/licenses/proton-drive-linux/
+          # The offline Places basemap, already fetched for the tarball.
+          scripts/fetch-basemap.sh
+          install -Dm644 data/basemap-v1.pmtiles deb/usr/share/proton-drive-linux/basemap-v1.pmtiles
           po/build.sh deb/usr/share/locale
           packaging/completions.sh target/release/pdfs deb/usr/share
 
@@ -191,6 +194,8 @@ jobs:
 
       - name: Package Fedora package (.rpm)
         run: |
+          # The in-tree spec build installs the basemap from data/.
+          scripts/fetch-basemap.sh
           # Sanitize version (replace hyphens with dots for RPM compatibility)
           RPM_VERSION=$(echo "${{ env.VERSION }}" | tr '-' '.')
           

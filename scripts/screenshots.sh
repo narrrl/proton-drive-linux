@@ -233,6 +233,9 @@ printf '[Settings]\ngtk-decoration-layout=:close\n' >"$root/config/gtk-4.0/setti
 home=/home/alex
 [[ -e "$home" ]] && home="$root/home"
 
+# The offline Places basemap, as the packages install it.
+"$repo/scripts/fetch-basemap.sh"
+
 outer_bus=${DBUS_SESSION_BUS_ADDRESS:-unset}
 env -i \
     PATH="$PATH" LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 TZ="${TZ:-Europe/Berlin}" \
@@ -241,6 +244,7 @@ env -i \
     XDG_CACHE_HOME="$root/cache" XDG_DATA_HOME="$root/data" \
     XDG_RUNTIME_DIR="$root/run" \
     PDFS_DEMO_ROOT="$root" PDFS_DEMO_OUTER_BUS="$outer_bus" \
+    PDFS_BASEMAP="$repo/data/basemap-v1.pmtiles" \
     GSETTINGS_BACKEND=memory ADW_DEBUG_COLOR_SCHEME=prefer-dark GTK_A11Y=none GDK_DEBUG=no-portals \
     BIN="$bin" PHOTOS="$photos" OUT="$out" SHOTS="$shots" SETTLE="$settle" \
     dbus-run-session -- "$repo/scripts/screenshots.sh" --session 2>"$root/session.log"

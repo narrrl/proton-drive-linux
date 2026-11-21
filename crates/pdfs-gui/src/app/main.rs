@@ -1476,7 +1476,7 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             None,
             gtk4::License::Custom,
             Some(&gettext(
-                "The places map is drawn from <a href=\"https://www.naturalearthdata.com/\">Natural Earth</a> land outlines and country borders, which are in the public domain.",
+                "The places map is drawn from <a href=\"https://www.naturalearthdata.com/\">Natural Earth</a> land, water and borders, which are in the public domain.",
             )),
         );
         dialog.add_legal_section(

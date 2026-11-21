@@ -23,6 +23,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ### Changed
 
+- The Places map draws an offline basemap, the one Proton Gallery shows: seas by
+  depth, lakes, rivers, built-up areas, borders and town names, in light and dark,
+  rendered in the background through `proton-map-rs`. It ships with every package
+  (about 25 MB, fetched by `scripts/fetch-basemap.sh` against a pinned SHA-256) and
+  sends no request. The street map stays opt-in and replaces it when turned on.
+  Without the file the map falls back to the coarse outlines.
 - A Google Photos import uploads two photos at once instead of one, while the next
   photo is read out of its archive. Live-photo videos still go after their stills, and
   cancelling still lets the uploads in flight finish.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lay out the release tarball: built binaries, desktop files, icon, user
-# service, translations, shell completions and install.sh, under one top-level
+# service, the Places basemap, translations, shell completions and install.sh, under one top-level
 # directory with a /usr-like tree, then pack it.
 #
 # usage: packaging/tarball/build.sh <binary dir> <version> <output dir>
@@ -37,6 +37,11 @@ install -Dm644 "$repo/packaging/io.narl.proton-drive-linux.policy" \
 install -Dm644 "$repo/packaging/proton-drive.service" \
   "$root/lib/systemd/user/proton-drive.service"
 install -Dm644 "$repo/LICENSE" "$root/share/licenses/proton-drive-linux/LICENSE"
+# The offline Places basemap, fetched once into data/ and checked against
+# its pinned SHA-256.
+"$repo/scripts/fetch-basemap.sh"
+install -Dm644 "$repo/data/basemap-v1.pmtiles" \
+  "$root/share/proton-drive-linux/basemap-v1.pmtiles"
 "$repo/po/build.sh" "$root/share/locale"
 "$repo/packaging/completions.sh" "$root/bin/pdfs" "$root/share"
 install -Dm755 "$repo/packaging/tarball/install.sh" "$root/install.sh"

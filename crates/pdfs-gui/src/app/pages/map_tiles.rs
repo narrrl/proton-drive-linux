@@ -1,7 +1,12 @@
-//! The online street map under the Places map: vector tiles from OpenFreeMap,
-//! fetched and drawn on a worker thread, and handed to the map as finished
-//! images.
+//! The tiles under the Places map, made on worker threads and handed to the
+//! map as finished images. They come from one of two sources.
 //!
+//! The offline basemap is a PMTiles file installed with the app and drawn by
+//! `proton-map-rs`, the same map Proton Gallery shows: seas, lakes, rivers,
+//! built-up areas, borders and town names from Natural Earth and GeoNames.
+//! It sends nothing anywhere. Its names are drawn into the tiles.
+//!
+//! The online street map is vector tiles from OpenFreeMap.
 //! It is off unless turned on in Preferences, since every tile fetched tells
 //! OpenFreeMap which part of the world is being looked at. OpenFreeMap needs
 //! no account or key, and its tiles are OpenStreetMap data in the
@@ -20,8 +25,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gtk4::cairo;
+use proton_map::{Basemap, Style, TileId};
 
 use super::mvt::{self, Kind, Layer};
+
+/// The basemap's file name, wherever it is installed.
+pub(crate) const BASEMAP_FILE: &str = "basemap-v1.pmtiles";
+
+/// How many threads draw basemap tiles. Drawing is all CPU; two keep the map
+/// quick without taking the machine.
+const BASEMAP_THREADS: usize = 2;
 
 /// Where OpenFreeMap describes its current tile set.
 const TILEJSON_URL: &str = "https://tiles.openfreemap.org/planet";
@@ -254,8 +267,20 @@ struct Job {
     dark: bool,
 }
 
-/// The worker thread making tiles. Dropping it stops the thread once the
-/// fetches under way are done.
+/// Where a tile worker gets its tiles.
+pub(crate) enum Source {
+    /// OpenFreeMap's street map, cached under `cache_dir`, with names in
+    /// `language` where the map has them.
+    Online {
+        cache_dir: PathBuf,
+        language: String,
+    },
+    /// The basemap installed at this path.
+    Offline(PathBuf),
+}
+
+/// The worker threads making tiles. Dropping it stops them once the tiles
+/// under way are done.
 pub(crate) struct Tiles {
     jobs: async_channel::Sender<Job>,
     wanted: Arc<Mutex<HashSet<TileKey>>>,
@@ -264,27 +289,35 @@ pub(crate) struct Tiles {
 }
 
 impl Tiles {
-    /// Start the worker, caching under `cache_dir`, drawing names in
-    /// `language` where the map has them. Finished tiles arrive on the
-    /// returned channel.
-    pub(crate) fn start(
-        cache_dir: PathBuf,
-        language: String,
-        scale: i32,
-    ) -> (Self, async_channel::Receiver<Done>) {
+    /// Start the worker for `source`. Finished tiles arrive on the returned
+    /// channel.
+    pub(crate) fn start(source: Source, scale: i32) -> (Self, async_channel::Receiver<Done>) {
         let (jobs, job_rx) = async_channel::unbounded();
         let (done_tx, done_rx) = async_channel::unbounded();
         let wanted = Arc::new(Mutex::new(HashSet::new()));
-        let worker = Worker {
-            dir: cache_dir,
-            language,
-            scale,
-            wanted: wanted.clone(),
-            done: done_tx,
+        let spawned = match source {
+            Source::Online {
+                cache_dir,
+                language,
+            } => {
+                let worker = Worker {
+                    dir: cache_dir,
+                    language,
+                    scale,
+                    wanted: wanted.clone(),
+                    done: done_tx,
+                };
+                std::thread::Builder::new()
+                    .name("map-tiles".into())
+                    .spawn(move || worker.run(job_rx))
+            }
+            Source::Offline(path) => {
+                let wanted = wanted.clone();
+                std::thread::Builder::new()
+                    .name("map-basemap".into())
+                    .spawn(move || draw_basemap(&path, scale, &wanted, &job_rx, &done_tx))
+            }
         };
-        let spawned = std::thread::Builder::new()
-            .name("map-tiles".into())
-            .spawn(move || worker.run(job_rx));
         if let Err(e) = spawned {
             tracing::warn!("map tiles: cannot start the worker: {e}");
         }
@@ -461,6 +494,126 @@ impl Worker {
     fn build_dir(&self, template: &str) -> Option<PathBuf> {
         Some(self.dir.join(build_name(template)?))
     }
+}
+
+/// Where the basemap may be installed, most specific first.
+fn basemap_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = std::env::var_os("PDFS_BASEMAP") {
+        paths.push(PathBuf::from(path));
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        paths.push(dir.join("../share/proton-drive-linux").join(BASEMAP_FILE));
+    }
+    paths.push(Path::new("/usr/share/proton-drive-linux").join(BASEMAP_FILE));
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".local/share")))
+    {
+        paths.push(dir.join("proton-drive-linux").join(BASEMAP_FILE));
+    }
+    if cfg!(debug_assertions) {
+        // `scripts/fetch-basemap.sh` puts it here for development builds.
+        paths
+            .push(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data")).join(BASEMAP_FILE));
+    }
+    paths
+}
+
+/// The installed basemap's path, if there is one.
+pub(crate) fn find_basemap() -> Option<PathBuf> {
+    basemap_paths().into_iter().find(|path| path.is_file())
+}
+
+/// The basemap, read once per run: the map restarts its worker when the
+/// window moves to a screen of another density, and the file is 25 MB.
+fn open_basemap(path: &Path) -> Option<Arc<Basemap>> {
+    static OPENED: Mutex<Option<(PathBuf, Arc<Basemap>)>> = Mutex::new(None);
+    let mut opened = OPENED.lock().ok()?;
+    if let Some((at, basemap)) = opened.as_ref()
+        && at == path
+    {
+        return Some(basemap.clone());
+    }
+    match Basemap::open(path) {
+        Ok(basemap) => {
+            let basemap = Arc::new(basemap);
+            *opened = Some((path.to_path_buf(), basemap.clone()));
+            Some(basemap)
+        }
+        Err(e) => {
+            tracing::warn!("map tiles: cannot open the basemap: {e}");
+            None
+        }
+    }
+}
+
+/// Open the basemap at `path` and draw the tiles asked for on
+/// [`BASEMAP_THREADS`] threads until the map lets go of the worker. Without
+/// a readable basemap every tile fails, and the outline shows.
+fn draw_basemap(
+    path: &Path,
+    scale: i32,
+    wanted: &Mutex<HashSet<TileKey>>,
+    jobs: &async_channel::Receiver<Job>,
+    done: &async_channel::Sender<Done>,
+) {
+    let basemap = open_basemap(path);
+    std::thread::scope(|scope| {
+        for _ in 0..BASEMAP_THREADS {
+            let basemap = basemap.clone();
+            scope.spawn(move || {
+                while let Ok(job) = jobs.recv_blocking() {
+                    let key = job.key;
+                    let still_wanted = wanted.lock().map(|w| w.contains(&key)).unwrap_or(true);
+                    let result = match &basemap {
+                        _ if !still_wanted => Done::Dropped(key),
+                        Some(basemap) => Done::Tile(draw_basemap_tile(basemap, job, scale)),
+                        None => Done::Failed(key),
+                    };
+                    if done.send_blocking(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// One basemap tile at `scale` device px per logical px.
+fn draw_basemap_tile(basemap: &Basemap, job: Job, scale: i32) -> Raster {
+    let style = if job.dark {
+        Style::dark()
+    } else {
+        Style::light()
+    };
+    let key = job.key;
+    let tile = proton_map::render_tile(
+        basemap,
+        TileId::new(key.z, key.x, key.y),
+        scale.max(1) as f32,
+        &style,
+    );
+    Raster {
+        key,
+        dark: job.dark,
+        edge: tile.width as i32,
+        pixels: rgba_to_cairo(tile.rgba),
+        labels: Vec::new(),
+    }
+}
+
+/// Premultiplied RGBA bytes to cairo's premultiplied ARGB, one native-endian
+/// word per pixel.
+fn rgba_to_cairo(mut pixels: Vec<u8>) -> Vec<u8> {
+    for px in pixels.as_chunks_mut::<4>().0 {
+        let [r, g, b, a] = *px;
+        *px = u32::from_be_bytes([a, r, g, b]).to_ne_bytes();
+    }
+    pixels
 }
 
 /// The first tile URL template in a TileJSON document.
@@ -822,6 +975,42 @@ fn label_name(layer: &Layer, feature: &mvt::Feature, language: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_basemap() -> Basemap {
+        Basemap::from_bytes(proton_map::pmtiles::writer::Writer::new().finish(
+            "{}",
+            [-180.0, -85.0, 180.0, 85.0],
+            [0.0, 0.0],
+        ))
+        .expect("empty archive opens")
+    }
+
+    #[test]
+    fn rgba_pixels_become_cairo_words() {
+        let pixels = rgba_to_cairo(vec![0x11, 0x22, 0x33, 0xff]);
+        let word = u32::from_ne_bytes(pixels.try_into().expect("one pixel"));
+        assert_eq!(word, 0xff11_2233);
+    }
+
+    #[test]
+    fn basemap_tiles_come_at_the_screen_density_in_the_theme_asked() {
+        let basemap = empty_basemap();
+        let key = TileKey { z: 3, x: 4, y: 2 };
+        for dark in [false, true] {
+            let raster = draw_basemap_tile(&basemap, Job { key, dark }, 2);
+            assert_eq!((raster.key, raster.dark), (key, dark));
+            assert_eq!(raster.edge, 512);
+            assert_eq!(raster.pixels.len(), 512 * 512 * 4);
+            // An empty basemap is all open sea.
+            let sea = if dark { Style::dark() } else { Style::light() }.water[0];
+            let word = u32::from_ne_bytes(raster.pixels[..4].try_into().expect("a pixel"));
+            assert_eq!(
+                word & 0x00ff_ffff,
+                u32::from_be_bytes([0, sea.r, sea.g, sea.b])
+            );
+            assert!(raster.surface().is_some());
+        }
+    }
 
     #[test]
     fn deep_tiles_draw_from_their_ancestor_at_the_data_zoom() {

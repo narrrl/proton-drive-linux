@@ -68,11 +68,14 @@ albums, and add or remove photos. Deleting an album keeps its photos in the time
 
 **Places** groups photos by the town they were taken in, as cards or on a map. Town names come
 from [GeoNames](https://www.geonames.org/) data (CC BY 4.0) and the map from
-[Natural Earth](https://www.naturalearthdata.com/) (public domain). Both ship with the app, so
-nothing is fetched online.
+[Natural Earth](https://www.naturalearthdata.com/) (public domain): seas by depth, lakes, rivers,
+built-up areas, borders and town names, in light and dark. Both ship with the app as
+`/usr/share/proton-drive-linux/basemap-v1.pmtiles`, so nothing is fetched online. Without that file,
+for example in a build from source that skipped `scripts/fetch-basemap.sh`, the map shows coarse
+land outlines only. `PDFS_BASEMAP` points the app at another copy.
 
 A street map from [OpenFreeMap](https://openfreemap.org/) (© OpenStreetMap contributors) can be
-turned on under **Preferences → General → Appearance**. It is off by default, because the map
+turned on instead under **Preferences → General → Appearance**. It is off by default, because the map
 server learns which areas you look at.
 
 ## Viewer and duplicates
