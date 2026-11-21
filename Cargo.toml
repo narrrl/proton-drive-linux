@@ -15,10 +15,10 @@ keywords = ["proton", "drive", "fuse", "sync", "linux"]
 categories = ["filesystem", "command-line-utilities"]
 
 [workspace.dependencies]
-proton-sdk = { version = "0.12.2" }
-proton-drive-rs = { version = "0.12.2" }
+proton-sdk = { version = "0.12.3" }
+proton-drive-rs = { version = "0.12.3" }
 proton-gallery-app-rs = "0.1.0"
-proton-gallery-rs = "0.1.3"
+proton-gallery-rs = "0.1.5"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Internal crates.
