@@ -675,15 +675,45 @@ fn verify_in_browser(
 /// Sign out, after a confirmation: disable+stop the mount service (so the
 /// daemon isn't left running without credentials), forget the stored session,
 /// and drop back to the login page.
+///
+/// Changes still queued are named first: they stay staged here and are sent
+/// after the next sign-in, but until then they exist nowhere else.
 pub(crate) fn sign_out(ui: &Rc<Ui>) {
+    let rx = spawn_request(ui.dirs.control_socket(), Request::Status);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let queued = match rx.recv().await {
+            Ok(Ok(Response::Status {
+                pending_uploads,
+                pending_changes,
+                parked_uploads,
+                ..
+            })) => pending_uploads + pending_changes + parked_uploads,
+            _ => 0,
+        };
+        confirm_sign_out(&ui, queued);
+    });
+}
+
+fn confirm_sign_out(ui: &Rc<Ui>, queued: u64) {
     let Some(window) = ui_window(ui) else { return };
     let ui = ui.clone();
+    let mut body = gettext(
+        "Proton Drive will disconnect and stop syncing until you sign in again. Files already on this computer stay where they are.",
+    );
+    if queued > 0 {
+        let warning = ngettext_f(
+            "{n} change is not on Proton Drive yet. It stays on this computer and is sent after you sign in again.",
+            "{n} changes are not on Proton Drive yet. They stay on this computer and are sent after you sign in again.",
+            queued,
+            &[],
+        );
+        body = format!("{warning}\n\n{body}");
+    }
     confirm_destructive(
         &window,
         &gettext("Sign Out?"),
-        &gettext(
-            "Proton Drive will disconnect and stop syncing until you sign in again. Files already on this computer stay where they are.",
-        ),
+        &body,
         &gettext("Sign Out"),
         move || {
             let galleries = ui.drive_galleries.borrow().upgrade();

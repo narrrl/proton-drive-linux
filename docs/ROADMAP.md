@@ -43,7 +43,7 @@ them along.
 
 | Item | State | Notes |
 |---|---|---|
-| Protect queued changes at shutdown | Not started | A systemd inhibitor lock while `staging/` holds unsent data, a warning when signing out, and a `pdfs sync flush` that waits for the queue. Today the queue is visible in `pdfs sync queue`, the tray and **Sync → Overview**, but nothing stops a shutdown (B66) |
+| Protect queued changes at shutdown | Done, live check owed | The daemon holds a logind shutdown inhibitor while the queue holds changes it can send, signing out warns with the count, and `pdfs sync flush` waits for the queue (B66) |
 | Restore pins from the machine profile | Not started | `profile.json` records pins; `pdfs sync restore` does not apply them yet |
 | Profile backup health | Not started | A failed profile upload is a `WARN` in the log and nothing in the app (B68) |
 | Rotated credentials survive a keyring failure | Open | Report and retry keyring write failures, so a rotated single-use refresh token is not lost (B61) |

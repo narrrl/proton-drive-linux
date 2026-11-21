@@ -11,6 +11,16 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+
+- `pdfs sync flush` waits until every queued change is on Proton Drive, retrying
+  failed ones at once. It exits 3 when what is left needs you and 4 on `--timeout`.
+- While changes are queued that only this computer has, the daemon holds off a
+  shutdown through logind, and desktops show "Sending N changes to Proton Drive" in
+  their power-off dialog. Changes waiting on you never hold it up (B66).
+- Signing out, in the app or with `pdfs logout`, says how many changes are not on
+  Proton Drive yet. They stay on this computer and are sent after the next sign-in.
+
 ### Changed
 
 - A Google Photos import uploads two photos at once instead of one, while the next
