@@ -16,6 +16,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - A Google Photos import uploads two photos at once instead of one, while the next
   photo is read out of its archive. Live-photo videos still go after their stills, and
   cancelling still lets the uploads in flight finish.
+- proton-sdk 0.12.4: thumbnails need fewer requests to Proton (0.12.3), and the SDK
+  can list photos that have no thumbnail (0.12.4).
 - Signing in runs through `proton_sdk::login` (proton-sdk 0.12.2), the sequence Proton
   Gallery and Proton Stream use too. The stored session, the lock/unlock choice for two-password
   accounts, the three mailbox-password tries and the messages stay as they were.
