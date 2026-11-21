@@ -793,6 +793,17 @@ pub(crate) fn mount_with(
             warn!(%error, "start My Files share-id repair failed");
         }
     }
+    // Hold off a shutdown while changes exist only here (B66). Only the real
+    // daemon: a simulation's queue is not the user's data.
+    if matches!(host, Host::Daemon) {
+        let inhibit_core = core.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("pdfs-inhibit".into())
+            .spawn(move || crate::inhibit::run(inhibit_core))
+        {
+            warn!(%error, "start the shutdown inhibitor failed");
+        }
+    }
 
     // Stop signals (SIGTERM from `systemctl --user stop`, SIGINT from Ctrl-C)
     // are delivered onto the async runtime; bridge them onto a sync channel so

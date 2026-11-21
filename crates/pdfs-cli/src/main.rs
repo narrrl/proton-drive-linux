@@ -158,8 +158,12 @@ enum Command {
         #[arg(long)]
         forget: bool,
     },
-    /// Forget the stored session.
-    Logout,
+    /// Forget the stored session. Asks first while changes are still queued.
+    Logout {
+        /// Do not ask first.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show account login state, and mount status if a daemon is running.
     Status,
     /// List every local Proton Drive location.
@@ -857,6 +861,13 @@ enum SyncCmd {
     },
     /// List uploads and changes not yet on Proton Drive.
     Queue,
+    /// Wait until every queued change is on Proton Drive. Exits 0 once nothing
+    /// is left, 3 when what is left needs you (see `sync issues`), 4 on timeout.
+    Flush {
+        /// Give up after this many seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
     /// List queued changes Proton Drive refused or that keep failing, and what to do.
     Issues,
     /// Save the content of a queued upload (by id from `sync queue`) to a file.
@@ -1047,7 +1058,7 @@ fn main() -> Result<()> {
         cli.command,
         Command::Login { .. }
             | Command::Unlock { .. }
-            | Command::Logout
+            | Command::Logout { .. }
             | Command::Mount { .. }
             | Command::Daemon { .. }
     ) {
@@ -1057,7 +1068,7 @@ fn main() -> Result<()> {
         Command::Login { username, remember } => cmd_login(username, remember),
         Command::Unlock { remember } => cmd_unlock(remember),
         Command::Lock { forget } => cmd_lock(forget),
-        Command::Logout => cmd_logout(),
+        Command::Logout { yes } => cmd_logout(yes),
         Command::Status => cmd_status(),
         Command::Locations => cmd_locations(),
         Command::Mount { mountpoint } => cmd_mount(mountpoint),
@@ -1362,6 +1373,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
             })?)?
         }
         SyncCmd::Queue => return cmd_sync_queue(),
+        SyncCmd::Flush { timeout } => return cmd_sync_flush(timeout),
         SyncCmd::Issues => return cmd_sync_issues(),
         SyncCmd::Export { id, dest } => return cmd_sync_export(id, &dest),
         SyncCmd::Limit { up, down } => return cmd_sync_limit(up, down),
@@ -1463,6 +1475,71 @@ fn cmd_sync_queue() -> Result<()> {
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
+}
+
+/// `pdfs sync flush`: wait for the queue to drain.
+///
+/// Failed changes are retried at once rather than after their backoff. The
+/// wait ends early, with exit code 3, when everything left is waiting on the
+/// user: refused by Drive, failing again and again, or a temporary file
+/// waiting for its final name. Paused or offline, it keeps waiting and says
+/// why.
+fn cmd_sync_flush(timeout: Option<u64>) -> Result<()> {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(1);
+    let deadline =
+        timeout.map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
+    ok_or_bail(control_request(CtlRequest::RetryPendingOp { id: None })?)?;
+    let mut last_line = String::new();
+    loop {
+        let items = match control_request(CtlRequest::ListPendingOps)? {
+            CtlResponse::PendingOps { items } => items,
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        };
+        let waiting = items
+            .iter()
+            .filter(|op| !op.parked && !op.failing && op.issue.is_none())
+            .count();
+        if items.is_empty() {
+            finish_line(&last_line);
+            println!("Everything is on Proton Drive.");
+            return Ok(());
+        }
+        if waiting == 0 {
+            finish_line(&last_line);
+            eprintln!(
+                "{} queued change(s) need you before they can be sent. See `pdfs sync issues`.",
+                items.len()
+            );
+            std::process::exit(3);
+        }
+        let reason = match control_request(CtlRequest::Status)? {
+            CtlResponse::Status { paused: true, .. } => " (sync is paused; `pdfs sync resume`)",
+            CtlResponse::Status { online: false, .. } => " (offline; waiting for Proton Drive)",
+            _ => "",
+        };
+        let line = format!("{waiting} change(s) left to send{reason}");
+        if line != last_line {
+            if !last_line.is_empty() {
+                print!("\r\x1b[2K");
+            }
+            print!("{line}");
+            last_line = line;
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            finish_line(&last_line);
+            eprintln!("Timed out with {waiting} change(s) still queued.");
+            std::process::exit(4);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// End a progress line so the next message starts on its own.
+fn finish_line(last_line: &str) {
+    if !last_line.is_empty() {
+        println!();
+    }
 }
 
 /// `pdfs sync issues`: the queued changes that need the user, and what to do.
@@ -2298,7 +2375,27 @@ fn key_state_name() -> &'static str {
     }
 }
 
-fn cmd_logout() -> Result<()> {
+fn cmd_logout(yes: bool) -> Result<()> {
+    // Queued changes stay staged on this computer and are sent after the next
+    // sign-in, but until then they exist nowhere else. Without a running
+    // daemon there is no count to show.
+    if !yes
+        && let Ok(CtlResponse::Status {
+            pending_uploads,
+            pending_changes,
+            parked_uploads,
+            ..
+        }) = control_request(CtlRequest::Status)
+    {
+        let queued = pending_uploads + pending_changes + parked_uploads;
+        if queued > 0 {
+            println!(
+                "{queued} change(s) are not on Proton Drive yet. They stay on this computer and are \
+                 sent after you sign in again. Run `pdfs sync flush` first to send them now."
+            );
+            confirm("Sign out anyway?")?;
+        }
+    }
     if auth::logout()? {
         println!("Signed out: the session is ended on Proton and cleared here.");
     } else {

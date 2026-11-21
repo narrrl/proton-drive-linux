@@ -74,7 +74,6 @@ original wording.
 | [B134](#b134--a-file-deleted-online-while-the-drain-checks-its-write-is-kept-as-a-conflict-copy) | A file deleted online while the drain checks its write is kept as a conflict copy | Only with `local_first` off |
 | [B91](#b91--the-daemon-hung-overnight-and-nothing-could-say-what-it-was-waiting-on) | The daemon hung overnight, and nothing could say what it was waiting on | The cause is not diagnosed; the daemon now reports where it is stuck and is restarted |
 | [B67](#b67--fresh-state-restore-can-silently-select-a-new-device-high-22) | Fresh-state restore can silently select a new device (HIGH-22) | An ambiguous device after a loss of local state is not asked about |
-| [B66](#b66--local-only-pending-data-is-not-protected-at-shutdown-high-21) | Local-only pending data is not protected at shutdown (HIGH-21) | No shutdown protection and no `pdfs sync flush` |
 | [B65](#b65--release-artifacts-lack-supply-chain-verification-med-11) | Release artifacts lack supply-chain verification (MED-11) | No SBOM, provenance or checksums |
 | [B15](#b15--an-empty-but-listed-folder-and-duplicated-folder-uids) | An empty-but-`listed` folder, and duplicated folder uids | Cause not attributed |
 | [B10](#b10--glib-critical-when-the-launcher-closes-over-an-in-flight-open) | GLib critical when the launcher closes over an in-flight open |  |
@@ -109,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B66](#b66--local-only-pending-data-is-not-protected-at-shutdown-high-21) | Local-only pending data is not protected at shutdown (HIGH-21) |
 | [B291](#b291--on-fedora-45s-oo7-every-saved-sign-in-is-lost-at-the-next-reboot) | On Fedora 45's oo7, every saved sign-in is lost at the next reboot |
 | [B289](#b289--the-takeout-import-mixes-in-other-services-and-drops-location-and-live-photos) | The Takeout import mixes in other services and drops location and live photos |
 | [B288](#b288--an-interrupted-takeout-import-reads-as-finished-and-one-error-ends-it) | An interrupted Takeout import reads as finished, and one error ends it |
@@ -7475,7 +7475,7 @@ duplicates, renamed folders, multiple devices, and byte-identical restoration.
 
 ### B66 — Local-only pending data is not protected at shutdown (HIGH-21)
 
-**Status:** Open — 1.0 data-safety/UX blocker
+**Status:** Fixed, unverified live
 **Found:** 2026-07-22, 1.0 recovery audit
 **Where:** shutdown, CLI/GUI status, logout/unregister workflows
 
@@ -7487,6 +7487,19 @@ shutdown/logout warning/inhibition.
 and last errors, and protect destructive lifecycle actions. Test offline stop,
 logout, unregister, reboot, retry exhaustion, and drain. Credential removal must
 never delete staged bytes.
+
+**Fix:** `crates/pdfs-fuse/src/inhibit.rs` takes a logind shutdown inhibitor
+(`systemd-inhibit --what=shutdown --mode=block`) while the queue holds changes
+the drain can send, and lets it go once they land. Parked transient files and
+changes that need the user are left out, so they never hold a power-off up for
+good. `pdfs sync flush` retries failed changes and waits for the queue, with
+its own exit codes for "needs you" and timeout. `pdfs logout` and the app's
+Sign Out dialog say how many changes are still queued and that they stay
+staged. Credential removal never touched `staging/`.
+
+**Verified:** unit tests for which work holds the lock; `systemd-inhibit` in
+block mode taken by a user process on 2026-11-21. A power-off with a queued
+upload is still owed.
 
 ---
 

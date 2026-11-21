@@ -70,7 +70,7 @@ The script runs `pdfs` from `PATH` on every Tab, so it keeps working after an up
 | `pdfs login [-u EMAIL] [--remember]` | Sign in (password, then a 2FA code if the account has one) and store the session in the system keyring. Restarts the service if it is running. `--remember` keeps a two-password account unlocked across logins. |
 | `pdfs unlock [--remember]` | Enter the mailbox password of a two-password account, so the service can open your files. Needed once per login session, or once with `--remember`. |
 | `pdfs lock` | Forget the unlock held in memory; the account is locked again. |
-| `pdfs logout` | End the session on Proton and remove the stored session. |
+| `pdfs logout [--yes]` | End the session on Proton and remove the stored session. Asks first while changes are still queued; they stay on this computer and are sent after the next sign-in. |
 | `pdfs status` | Account, mount, queue and cache state. |
 | `pdfs quota` | Storage used across all Proton products. |
 | `pdfs locations` | Every local place the service occupies: the Proton Drive folder and each synced folder, with mode and state. |
@@ -125,6 +125,7 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs sync ignore check PATH` | Say whether a file in a synced folder is synced, and which pattern decides. |
 | `pdfs sync limit [--up RATE] [--down RATE]` | Cap bandwidth, for example `500K` or `2M` per second. `0` removes a cap. Without options, prints the current caps. |
 | `pdfs sync queue` | List changes that have not reached Proton Drive yet. |
+| `pdfs sync flush [--timeout SECS]` | Retry failed changes now and wait until the queue is empty. Exits 0 when everything is on Proton Drive, 3 when what is left needs you (see `sync issues`), 4 on timeout. Says so while sync is paused or offline. |
 | `pdfs sync issues` | List queued changes Proton Drive refused or that keep failing, and what to do. |
 | `pdfs sync export ID DEST` | Save a copy of a queued upload's content. `DEST` may be a folder; an existing file is never overwritten. The upload stays queued. |
 | `pdfs sync discard ID [--yes]` | Drop a queued change and undo it here: a new file or folder goes, anything else goes back to what Proton Drive has. Content not exported first is lost. |

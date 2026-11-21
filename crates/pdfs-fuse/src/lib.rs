@@ -92,6 +92,7 @@ use drive::{DriveApi, RevisionRead};
 mod events;
 mod filesystem;
 mod gallery;
+mod inhibit;
 mod keeper;
 mod link;
 pub use filesystem::ProtonFs;
