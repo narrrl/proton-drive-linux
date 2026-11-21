@@ -256,6 +256,62 @@ impl Reporter {
     }
 }
 
+/// Photos uploaded at once. Each upload waits on Proton between its blocks,
+/// so two keep the link busy where one leaves it idle; more would mostly
+/// stage more copies on disk.
+const IMPORT_UPLOADS: usize = 2;
+
+/// Where an upload reads the photo from.
+enum Source<'a> {
+    /// A copy staged on disk, which a thumbnail can be made from.
+    Staged(&'a Path),
+    /// Straight out of the open archive.
+    Archive(&'a mut zip::ZipArchive<std::io::BufReader<std::fs::File>>),
+}
+
+/// A staged photo handed to an upload worker.
+struct Upload {
+    index: usize,
+    path: PathBuf,
+    photo: TakeoutPhoto,
+    tags: Vec<PhotoTag>,
+    main_uid: Option<NodeUid>,
+}
+
+impl Upload {
+    fn landed(self, result: CoreResult<NodeUid>) -> Landed {
+        Landed {
+            index: self.index,
+            live: self.main_uid.is_some(),
+            photo: self.photo,
+            result,
+        }
+    }
+
+    fn streamed(
+        index: usize,
+        photo: TakeoutPhoto,
+        main_uid: Option<NodeUid>,
+        result: CoreResult<NodeUid>,
+    ) -> Landed {
+        Landed {
+            index,
+            live: main_uid.is_some(),
+            photo,
+            result,
+        }
+    }
+}
+
+/// A finished upload, to be counted on the import thread.
+struct Landed {
+    index: usize,
+    /// The video of a live pair, filed with its still.
+    live: bool,
+    photo: TakeoutPhoto,
+    result: CoreResult<NodeUid>,
+}
+
 /// How a planned photo relates to a live or motion photo pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveRole {
@@ -714,72 +770,133 @@ impl Core {
                 }
             }
 
-            for (archive_index, indices) in by_archive {
-                if self.import_should_stop(cancel) {
-                    stopped = true;
-                    break;
-                }
-                let mut archive = match open_archive(archives, archive_index) {
-                    Ok(archive) => archive,
-                    Err(e) => {
-                        // The archive was readable at scan time; whatever broke
-                        // it since costs its own photos, not the whole run.
-                        warn!(error = %e, photos = indices.len(), "cannot reopen a takeout archive");
-                        summary.failed += indices.len();
-                        for _ in &indices {
-                            job.step();
-                            report.step();
+            // Staged photos go to IMPORT_UPLOADS workers while this thread
+            // reads the next one out of its archive. A round ends only when
+            // every upload in it has landed, so a pair's video always finds
+            // its still's uid.
+            let (jobs, queue) = std::sync::mpsc::sync_channel::<Upload>(0);
+            let queue = std::sync::Mutex::new(queue);
+            std::thread::scope(|scope| {
+                let (landed_tx, landed) = std::sync::mpsc::channel::<Landed>();
+                for _ in 0..IMPORT_UPLOADS {
+                    let queue = &queue;
+                    let landed_tx = landed_tx.clone();
+                    scope.spawn(move || {
+                        loop {
+                            let next = queue.lock().map(|queue| queue.recv());
+                            let Ok(Ok(upload)) = next else { break };
+                            let result = self.upload_takeout_photo(
+                                Source::Staged(&upload.path),
+                                &upload.photo,
+                                upload.tags.clone(),
+                                upload.main_uid.clone(),
+                            );
+                            let _ = std::fs::remove_file(&upload.path);
+                            if landed_tx.send(upload.landed(result)).is_err() {
+                                break;
+                            }
                         }
-                        report.counts(summary);
-                        continue;
-                    }
-                };
+                    });
+                }
+                drop(landed_tx);
 
-                for index in indices {
+                'archives: for (archive_index, indices) in by_archive {
                     if self.import_should_stop(cancel) {
                         stopped = true;
                         break;
                     }
-                    let main_uid = match planned[index].live {
-                        Some(LiveRole::Video(still)) => planned[still].uid.clone(),
-                        _ => None,
-                    };
-                    let photo = planned[index].photo.clone();
-                    job.detail(photo.name.clone());
-                    report.current(&photo.name);
-
-                    let uploaded =
-                        self.upload_takeout_photo(&mut archive, &planned[index], main_uid.clone());
-                    job.step();
-                    report.step();
-
-                    match uploaded {
-                        Ok(uid) => {
-                            self.note_self_change(&uid);
-                            summary.uploaded += 1;
-                            summary.bytes += photo.size;
-                            if main_uid.is_some() {
-                                summary.live_photos += 1;
-                            }
-                            if photo.favorite {
-                                favorites.push(uid.clone());
-                            }
-                            planned[index].uid = Some(uid);
-                            if summary.uploaded.is_multiple_of(TIMELINE_REFRESH_EVERY) {
-                                self.spawn_timeline_refresh();
-                            }
-                            if summary.uploaded.is_multiple_of(CHECKPOINT_EVERY) {
-                                report.counts(summary);
-                                report.checkpoint();
-                            }
-                        }
+                    let mut archive = match open_archive(archives, archive_index) {
+                        Ok(archive) => archive,
                         Err(e) => {
-                            summary.failed += 1;
-                            warn!(name = photo.name, error = %e, "takeout photo upload failed");
+                            // The archive was readable at scan time; whatever
+                            // broke it since costs its own photos, not the run.
+                            warn!(error = %e, photos = indices.len(), "cannot reopen a takeout archive");
+                            summary.failed += indices.len();
+                            for _ in &indices {
+                                job.step();
+                                report.step();
+                            }
+                            report.counts(summary);
+                            continue;
+                        }
+                    };
+
+                    for index in indices {
+                        for done in landed.try_iter() {
+                            self.record_upload(planned, done, summary, &mut favorites, job, report);
+                        }
+                        if self.import_should_stop(cancel) {
+                            stopped = true;
+                            break 'archives;
+                        }
+                        let item = &planned[index];
+                        let main_uid = match item.live {
+                            Some(LiveRole::Video(still)) => planned[still].uid.clone(),
+                            _ => None,
+                        };
+                        let tags = match item.live {
+                            Some(LiveRole::Still(tag)) => vec![tag],
+                            _ => Vec::new(),
+                        };
+                        let photo = item.photo.clone();
+                        job.detail(photo.name.clone());
+                        report.current(&photo.name);
+
+                        // A thumbnail is made from a file, so a photo that can
+                        // have one is copied out of the archive and uploaded
+                        // from the copy by a worker. Without one, Proton's apps
+                        // show a blank tile until they make their own.
+                        let staged = can_make_thumbnail(&photo.name, photo.size)
+                            .then(|| self.stage_takeout_entry(&mut archive, &photo.entry))
+                            .and_then(|staged| {
+                                staged
+                                    .inspect_err(|e| {
+                                        warn!(error = %e,
+                                              "copying a takeout photo out failed; uploading it without a thumbnail")
+                                    })
+                                    .ok()
+                            });
+                        match staged {
+                            Some(path) => {
+                                let upload = Upload {
+                                    index,
+                                    path,
+                                    photo,
+                                    tags,
+                                    main_uid,
+                                };
+                                if let Err(std::sync::mpsc::SendError(upload)) = jobs.send(upload) {
+                                    let _ = std::fs::remove_file(&upload.path);
+                                }
+                            }
+                            None => {
+                                let result = self.upload_takeout_photo(
+                                    Source::Archive(&mut archive),
+                                    &photo,
+                                    tags,
+                                    main_uid.clone(),
+                                );
+                                let done = Upload::streamed(index, photo, main_uid, result);
+                                self.record_upload(
+                                    planned,
+                                    done,
+                                    summary,
+                                    &mut favorites,
+                                    job,
+                                    report,
+                                );
+                            }
                         }
                     }
-                    report.counts(summary);
                 }
+
+                drop(jobs);
+                for done in landed.iter() {
+                    self.record_upload(planned, done, summary, &mut favorites, job, report);
+                }
+            });
+            if stopped {
+                break;
             }
         }
 
@@ -787,14 +904,55 @@ impl Core {
         stopped
     }
 
-    /// Upload one planned photo out of its open archive.
+    /// Count one finished upload and file its uid in the plan.
+    fn record_upload(
+        &self,
+        planned: &mut [Planned],
+        done: Landed,
+        summary: &mut ImportSummary,
+        favorites: &mut Vec<NodeUid>,
+        job: &crate::transfers::JobGuard,
+        report: &Reporter,
+    ) {
+        job.step();
+        report.step();
+        match done.result {
+            Ok(uid) => {
+                self.note_self_change(&uid);
+                summary.uploaded += 1;
+                summary.bytes += done.photo.size;
+                if done.live {
+                    summary.live_photos += 1;
+                }
+                if done.photo.favorite {
+                    favorites.push(uid.clone());
+                }
+                planned[done.index].uid = Some(uid);
+                if summary.uploaded.is_multiple_of(TIMELINE_REFRESH_EVERY) {
+                    self.spawn_timeline_refresh();
+                }
+                if summary.uploaded.is_multiple_of(CHECKPOINT_EVERY) {
+                    report.counts(summary);
+                    report.checkpoint();
+                }
+            }
+            Err(e) => {
+                summary.failed += 1;
+                warn!(error = %e, "takeout photo upload failed");
+            }
+        }
+        report.counts(summary);
+    }
+
+    /// Upload one planned photo, from its staged copy or straight out of its
+    /// open archive.
     fn upload_takeout_photo(
         &self,
-        archive: &mut zip::ZipArchive<std::io::BufReader<std::fs::File>>,
-        item: &Planned,
+        source: Source<'_>,
+        photo: &TakeoutPhoto,
+        tags: Vec<PhotoTag>,
         main_uid: Option<NodeUid>,
     ) -> CoreResult<NodeUid> {
-        let photo = &item.photo;
         let photos = self.photos();
         let guard = self.transfers.begin(
             photo.name.clone(),
@@ -802,10 +960,6 @@ impl Core {
             TransferDirection::Upload,
             photo.size,
         );
-        let tags = match item.live {
-            Some(LiveRole::Still(tag)) => vec![tag],
-            _ => Vec::new(),
-        };
         let metadata = |capture_time: Option<i64>| PhotoUploadMetadata {
             capture_time,
             last_modification_time: capture_time.and_then(pdfs_core::timestamp::modification_time),
@@ -820,21 +974,8 @@ impl Core {
             replace_existing_draft: true,
         };
 
-        // A thumbnail is made from a file, so a photo that can have one is
-        // copied out of the archive first and uploaded from the copy. Without
-        // one, Proton's apps show a blank tile until they make their own.
-        let staged = can_make_thumbnail(&photo.name, photo.size)
-            .then(|| self.stage_takeout_entry(archive, &photo.entry))
-            .and_then(|staged| {
-                staged
-                    .inspect_err(|e| {
-                        warn!(name = photo.name, error = %e,
-                              "copying a takeout photo out failed; uploading it without a thumbnail")
-                    })
-                    .ok()
-            });
-        let uploaded = match &staged {
-            Some(path) => {
+        match source {
+            Source::Staged(path) => {
                 let thumbnails = self.upload_thumbnails(path, &photo.name);
                 // No sidecar date and none in the name: the photo's own EXIF,
                 // then when Google received it, before Drive files it under
@@ -860,7 +1001,7 @@ impl Core {
                             .map_err(|e| CoreError::from_api(&e, "upload"))
                     })
             }
-            None => read_entry(archive, &photo.entry, |reader| {
+            Source::Archive(archive) => read_entry(archive, &photo.entry, |reader| {
                 let counting = CountingReader::new(reader, &guard);
                 self.rt
                     .block_on(photos.upload_photo_from(
@@ -875,11 +1016,7 @@ impl Core {
                     .map_err(|e| CoreError::from_api(&e, "upload"))
             })
             .and_then(|result| result),
-        };
-        if let Some(path) = staged {
-            let _ = std::fs::remove_file(path);
         }
-        uploaded
     }
 
     /// Mark photos as favorites. A separate call: the upload seal takes
