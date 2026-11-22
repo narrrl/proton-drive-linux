@@ -103,7 +103,7 @@ That URL follows `main`. To stay on releases, pin the input to a release tag ins
 the tag to update:
 
 ```nix
-inputs.proton-drive-linux.url = "github:narrrl/proton-drive-linux/v3.8.0";
+inputs.proton-drive-linux.url = "github:narrrl/proton-drive-linux/v3.10.0";
 ```
 
 Each release tag is built with Nix before the release is published.
