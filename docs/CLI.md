@@ -154,7 +154,7 @@ commands are for scripts and for cases where the mount is not available.
 
 | Command | Description |
 |---|---|
-| `pdfs trash` | List the Trash with the UIDs the next commands take. |
+| `pdfs trash` | List the Trash with the UIDs the next commands take. `--by-folder` groups it by original folder; `--folder UID` lists a deleted folder. |
 | `pdfs restore UIDS...` | Put items back where they were. |
 | `pdfs delete-forever UIDS...` | Delete items permanently. |
 | `pdfs empty-trash` | Delete everything in the Trash permanently. |

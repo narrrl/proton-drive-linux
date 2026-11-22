@@ -515,6 +515,13 @@ pub enum Request {
     /// its `uid` — the handle for [`Request::Restore`] and
     /// [`Request::DeleteForever`] — and its `path` is empty.
     ListTrash,
+    /// List what a trashed folder holds, by the folder's `uid`. Replies with
+    /// [`Response::Entries`]; each entry's `trashed_parent` is that folder.
+    /// The contents went to the trash with the folder, so only the entries
+    /// [`Request::ListTrash`] also lists can be restored on their own.
+    ListTrashedFolder {
+        uid: String,
+    },
     /// Restore trashed nodes, by uid, to the folders they were trashed from.
     /// Replies with [`Response::Ok`].
     Restore {
@@ -1566,8 +1573,8 @@ pub struct DirEntry {
     #[serde(default)]
     pub shared_by_unverified: bool,
     /// When a [`Request::ListTrash`] entry went to the trash, epoch seconds; 0
-    /// when unknown, and for anything not in the trash. The API does not report
-    /// it to this client, so the daemon notes when it first saw the node there.
+    /// when unknown, and for anything not in the trash. Taken from the server;
+    /// when it gives none, the daemon notes when it first saw the node there.
     #[serde(default)]
     pub trashed_at: i64,
     /// The folder a [`Request::ListTrash`] entry goes back to on restore, as a
@@ -1575,6 +1582,11 @@ pub struct DirEntry {
     /// not known, and for anything not in the trash.
     #[serde(default)]
     pub trashed_from: Option<String>,
+    /// The trashed folder a [`Request::ListTrash`] entry was trashed inside, by
+    /// uid, when that folder is in the trash too; `None` otherwise. Lets a
+    /// front end show the trash as folders.
+    #[serde(default)]
+    pub trashed_parent: Option<String>,
     /// Why Drive refused a change queued on the node, for a [`Request::ListDir`]
     /// entry; `None` otherwise.
     #[serde(default)]
@@ -3625,6 +3637,9 @@ mod tests {
     fn trash_requests_roundtrip() {
         let reqs = [
             Request::ListTrash,
+            Request::ListTrashedFolder {
+                uid: "vol~folder".into(),
+            },
             Request::Restore {
                 uids: vec!["vol~link".into(), "vol~other".into()],
             },

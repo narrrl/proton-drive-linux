@@ -1746,6 +1746,11 @@ impl DriveApi for FakeClient {
         .await
     }
 
+    async fn empty_trash(&self) -> Result<()> {
+        let trashed = self.enumerate_trash_node_uids().await?;
+        self.batch(&trashed, delete_one).await.map(|_| ())
+    }
+
     async fn enumerate_trash_node_uids(&self) -> Result<Vec<NodeUid>> {
         self.request(false, |server| {
             Ok(server

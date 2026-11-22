@@ -1,6 +1,6 @@
 //! Trashed nodes, persisted so the trash view opens without a round-trip.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::params;
 
@@ -46,6 +46,60 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Add or update trashed nodes, keeping every other row.
+    pub fn trash_upsert(&self, items: &[StoredTrash]) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO trash (uid, name, is_dir, size, mtime, parent_uid, trashed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(uid) DO UPDATE SET
+                   name = excluded.name, is_dir = excluded.is_dir, size = excluded.size,
+                   mtime = excluded.mtime, parent_uid = excluded.parent_uid,
+                   trashed_at = excluded.trashed_at",
+            )?;
+            for item in items {
+                stmt.execute(params![
+                    item.uid,
+                    item.name,
+                    item.is_dir as i64,
+                    item.size,
+                    item.mtime,
+                    item.parent_uid,
+                    item.trashed_at
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop the trashed nodes with these uids. Returns how many rows went.
+    pub fn trash_remove(&self, uids: &[String]) -> Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut removed = 0;
+        {
+            let mut stmt = tx.prepare("DELETE FROM trash WHERE uid = ?1")?;
+            for uid in uids {
+                removed += stmt.execute(params![uid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Drop every trashed node not in `keep`. Returns how many rows went.
+    pub fn trash_retain(&self, keep: &HashSet<String>) -> Result<usize> {
+        let gone: Vec<String> = self
+            .trash_seen()?
+            .into_keys()
+            .filter(|uid| !keep.contains(uid))
+            .collect();
+        self.trash_remove(&gone)
     }
 
     /// The persisted trash listing, folders first then by name — the order the

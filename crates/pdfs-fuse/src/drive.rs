@@ -29,7 +29,7 @@ use proton_drive_rs::proton_sdk::error::Result;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid, ShareId};
 use proton_drive_rs::{
     AvailableNameTarget, Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeMoveItem,
-    ProtonDriveClient, RevisionReader, Thumbnail, ThumbnailType,
+    ProtonDriveClient, RevisionReader, Thumbnail, ThumbnailType, TrashedNode,
 };
 
 /// One outcome per node of a batch request; see [`ProtonDriveClient::trash_nodes`].
@@ -179,6 +179,23 @@ pub(crate) trait DriveApi: Send + Sync {
     fn delete_nodes_streaming<'a>(&'a self, uids: &[NodeUid]) -> OutcomeStream<'a>;
 
     async fn enumerate_trash_node_uids(&self) -> Result<Vec<NodeUid>>;
+
+    /// Permanently delete everything in the trash.
+    async fn empty_trash(&self) -> Result<()>;
+
+    /// As [`DriveApi::enumerate_nodes_light`], for nodes in the trash, each
+    /// with the time it was trashed when the server reports one.
+    async fn enumerate_trashed_nodes_light(&self, uids: &[NodeUid]) -> Result<Vec<TrashedNode>> {
+        Ok(self
+            .enumerate_nodes_light(uids)
+            .await?
+            .into_iter()
+            .map(|node| TrashedNode {
+                node,
+                trash_time: None,
+            })
+            .collect())
+    }
 
     /// The account's storage, across every Proton product.
     async fn quota(&self) -> Result<Quota>;
@@ -536,6 +553,14 @@ impl DriveApi for ProtonDriveClient {
 
     async fn enumerate_trash_node_uids(&self) -> Result<Vec<NodeUid>> {
         ProtonDriveClient::enumerate_trash_node_uids(self).await
+    }
+
+    async fn enumerate_trashed_nodes_light(&self, uids: &[NodeUid]) -> Result<Vec<TrashedNode>> {
+        ProtonDriveClient::enumerate_trashed_nodes_light(self, uids).await
+    }
+
+    async fn empty_trash(&self) -> Result<()> {
+        ProtonDriveClient::empty_trash(self).await
     }
 
     async fn quota(&self) -> Result<Quota> {

@@ -71,13 +71,20 @@ terminal: `pdfs copy PATH... NEW_PARENT`.
 ## Trash
 
 Deleted files go to the Trash, both from `~/ProtonDrive` and from the app. The **Trash** page
-lists them with the date they were deleted.
+shows the folders things were deleted from, with how many items each holds and when the last
+one went. Open a folder to see what was deleted from it, and open a deleted folder to see what
+it held. The folder button in the header switches to one list of everything, newest deletion
+first, and the search box finds an item anywhere in the Trash by name.
 
 - **Restore** puts an item back where it was, together with any trashed folders above it.
 - **Delete Forever** and **Empty Trash** are permanent.
 
+- Restore or delete a whole folder row to act on everything deleted from that folder.
+
 From a terminal: `pdfs trash` lists the Trash with an ID for each item, and `pdfs restore`,
-`pdfs delete-forever` and `pdfs empty-trash` take those IDs.
+`pdfs delete-forever` and `pdfs empty-trash` take those IDs. `pdfs trash --by-folder` groups the
+list by the folder each item was deleted from, and `pdfs trash --folder ID` shows what a deleted
+folder holds.
 
 ## Earlier versions of a file
 

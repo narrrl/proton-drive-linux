@@ -75,7 +75,7 @@ use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
 use proton_drive_rs::{
     AvailableNameTarget, DriveEvent, DriveEventScopeId, MemberRole, Node, NodeKind, NodeMoveItem,
-    ProtonDriveClient, ProtonPhotosClient, SharedWithMeItem, ThumbnailType,
+    ProtonDriveClient, ProtonPhotosClient, SharedWithMeItem, ThumbnailType, TrashedNode,
 };
 
 mod albums;
@@ -4611,6 +4611,7 @@ impl Core {
                 shared_by_unverified: false,
                 trashed_at: 0,
                 trashed_from: None,
+                trashed_parent: None,
                 issue: state::ino_lid(ino)
                     .and_then(|lid| issues.get(&lid))
                     .map(|issue| SyncIssue::parse(issue)),
@@ -5604,20 +5605,29 @@ impl Core {
             self.await_trash_refresh(TRASH_FIRST_WAIT);
         }
 
+        let items = self.db.trash_list().map_err(CoreError::from)?;
+        let trashed: HashSet<&str> = items.iter().map(|item| item.uid.as_str()).collect();
+        let trashed_parents: Vec<Option<String>> = items
+            .iter()
+            .map(|item| {
+                item.parent_uid
+                    .clone()
+                    .filter(|parent| trashed.contains(parent.as_str()))
+            })
+            .collect();
         // Most of a trash comes from a handful of folders.
         let mut origins: HashMap<String, Option<String>> = HashMap::new();
-        Ok(self
-            .db
-            .trash_list()
-            .map_err(CoreError::from)?
+        Ok(items
             .into_iter()
-            .map(|item| DirEntry {
+            .zip(trashed_parents)
+            .map(|(item, trashed_parent)| DirEntry {
                 trashed_from: item.parent_uid.as_ref().and_then(|parent| {
                     origins
                         .entry(parent.clone())
                         .or_insert_with(|| self.db.node_path(parent).ok().flatten())
                         .clone()
                 }),
+                trashed_parent,
                 trashed_at: item.trashed_at.unwrap_or(0),
                 name: item.name,
                 is_dir: item.is_dir,
@@ -5639,13 +5649,86 @@ impl Core {
             .collect())
     }
 
+    /// What a trashed folder holds: its children on the server, and the
+    /// stored trash entries trashed inside it before it went.
+    fn list_trashed_folder(&self, uid: &str) -> CoreResult<Vec<DirEntry>> {
+        let folder =
+            parse_uid(uid).ok_or_else(|| CoreError::invalid(format!("invalid uid: {uid}")))?;
+        let children = self
+            .rt
+            .block_on(within_trash_call(
+                "enumerate trashed folder",
+                self.drive.enumerate_folder_children_node_uids(&folder),
+            ))?
+            .map_err(|e| CoreError::from_api(&e, "enumerate trashed folder"))?;
+        let mut nodes = Vec::with_capacity(children.len());
+        for chunk in children.chunks(TRASH_MATERIALIZE_CHUNK) {
+            nodes.extend(
+                self.rt
+                    .block_on(within_trash_call(
+                        "enumerate nodes",
+                        self.drive.enumerate_trashed_nodes_light(chunk),
+                    ))?
+                    .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?,
+            );
+        }
+        let stored = self.db.trash_list().map_err(CoreError::from)?;
+        let stored_at: HashMap<&str, Option<i64>> = stored
+            .iter()
+            .map(|item| (item.uid.as_str(), item.trashed_at))
+            .collect();
+        let mut entries: Vec<DirEntry> = nodes
+            .iter()
+            .map(|TrashedNode { node, trash_time }| {
+                let uid = node.uid.to_string();
+                let trashed_at = trash_time
+                    .or_else(|| stored_at.get(uid.as_str()).copied().flatten())
+                    .unwrap_or(0);
+                trashed_entry(
+                    uid,
+                    node.name.clone(),
+                    node.is_folder(),
+                    node_size(node) as i64,
+                    node.modification_time,
+                    trashed_at,
+                    folder.to_string(),
+                )
+            })
+            .collect();
+        let listed: HashSet<String> = entries.iter().map(|e| e.uid.clone()).collect();
+        entries.extend(
+            stored
+                .into_iter()
+                .filter(|item| {
+                    item.parent_uid.as_deref() == Some(uid) && !listed.contains(&item.uid)
+                })
+                .map(|item| {
+                    trashed_entry(
+                        item.uid,
+                        item.name,
+                        item.is_dir,
+                        item.size,
+                        item.mtime,
+                        item.trashed_at.unwrap_or(0),
+                        folder.to_string(),
+                    )
+                }),
+        );
+        entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        Ok(entries)
+    }
+
     /// Re-fetch the trash listing from the server and persist it.
     ///
-    /// Materialized in chunks of [`TRASH_MATERIALIZE_CHUNK`], each persisted as
-    /// it lands: decrypting a trashed node costs an S2K unlock, so a trash of a
-    /// few thousand nodes takes minutes, and an all-or-nothing write would throw
-    /// that away on the first failure and show the user nothing until the very
-    /// end. Every batch is a usable listing.
+    /// Only nodes the stored listing does not hold yet are read, and light: a
+    /// trashed file needs no content key, so none is unlocked. Each chunk of
+    /// [`TRASH_MATERIALIZE_CHUNK`] is stored as it lands, so a large trash
+    /// fills the page while it loads. Rows the server no longer lists go once
+    /// the whole listing is in, never earlier.
     async fn refresh_trash(&self) -> CoreResult<()> {
         let started = Instant::now();
         let uids = within_trash_call("enumerate trash", self.drive.enumerate_trash_node_uids())
@@ -5657,8 +5740,6 @@ impl Core {
             "trash refresh: enumerated"
         );
 
-        // What the listing held before, and whether it was the whole trash: the
-        // chunks below overwrite it, so both are read up front.
         let seen = self.db.trash_seen().unwrap_or_default();
         let complete = self
             .db
@@ -5666,36 +5747,51 @@ impl Core {
             .ok()
             .flatten()
             .is_some();
-        let _ = self.db.clear_state(TRASH_COMPLETE_MS);
         let now = now_secs();
 
-        if uids.is_empty() {
-            self.db.trash_replace(&[]).map_err(CoreError::from)?;
-        }
-        let mut items: Vec<StoredTrash> = Vec::with_capacity(uids.len());
-        for chunk in uids.chunks(TRASH_MATERIALIZE_CHUNK) {
-            let chunk_started = Instant::now();
-            let nodes = within_trash_call("enumerate nodes", self.drive.enumerate_nodes(chunk))
-                .await?
-                .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
-            items.extend(nodes.into_iter().map(|node| StoredTrash {
-                uid: node.uid.to_string(),
-                name: node.name.clone(),
-                is_dir: node.is_folder(),
-                size: node_size(&node) as i64,
-                mtime: node.modification_time,
-                // The folder the node will go back to, which is also what tells
-                // a restore whether that folder is itself in the trash.
-                parent_uid: node.parent_uid.as_ref().map(|uid| uid.to_string()),
-                trashed_at: first_seen_in_trash(&seen, &node.uid.to_string(), complete, now),
-            }));
-            // Cumulative, so the table is always a prefix of the real trash
-            // rather than a mix of this refresh and the last one.
-            self.db.trash_replace(&items).map_err(CoreError::from)?;
+        let listed: HashSet<String> = uids.iter().map(ToString::to_string).collect();
+        let removed = self.db.trash_retain(&listed).map_err(CoreError::from)?;
+        if removed > 0 {
             self.trash_progress.notify_waiters();
+        }
+        let missing: Vec<NodeUid> = uids
+            .into_iter()
+            .filter(|uid| !seen.contains_key(&uid.to_string()))
+            .collect();
+        let mut materialized = 0usize;
+        for chunk in missing.chunks(TRASH_MATERIALIZE_CHUNK) {
+            let chunk_started = Instant::now();
+            let nodes = within_trash_call(
+                "enumerate nodes",
+                self.drive.enumerate_trashed_nodes_light(chunk),
+            )
+            .await?
+            .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
+            let items: Vec<StoredTrash> = nodes
+                .into_iter()
+                .map(|TrashedNode { node, trash_time }| {
+                    let uid = node.uid.to_string();
+                    StoredTrash {
+                        trashed_at: trash_time
+                            .or_else(|| first_seen_in_trash(&seen, &uid, complete, now)),
+                        uid,
+                        name: node.name.clone(),
+                        is_dir: node.is_folder(),
+                        size: node_size(&node) as i64,
+                        mtime: node.modification_time,
+                        // The folder the node will go back to, which is also what
+                        // tells a restore whether that folder is itself in the trash.
+                        parent_uid: node.parent_uid.as_ref().map(|uid| uid.to_string()),
+                    }
+                })
+                .collect();
+            materialized += items.len();
+            self.db.trash_upsert(&items).map_err(CoreError::from)?;
+            self.trash_progress.notify_waiters();
+            self.events.publish(&[Topic::Trash]);
             debug!(
-                materialized = items.len(),
-                total = uids.len(),
+                materialized,
+                total = missing.len(),
                 chunk_ms = chunk_started.elapsed().as_millis() as u64,
                 "trash refresh: batch"
             );
@@ -5704,7 +5800,9 @@ impl Core {
         let _ = self.db.set_state_i64(TRASH_SYNCED_MS, now_ms());
         let _ = self.db.set_state_i64(TRASH_COMPLETE_MS, now_ms());
         info!(
-            count = items.len(),
+            count = listed.len(),
+            new = materialized,
+            removed,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "trash refresh: done"
         );
@@ -5885,6 +5983,8 @@ impl Core {
                 }
             }
         });
+        let back: Vec<String> = restored.iter().map(ToString::to_string).collect();
+        let _ = self.db.trash_remove(&back);
         self.invalidate_trash();
         Ok(restored.len())
     }
@@ -5898,6 +5998,7 @@ impl Core {
         // daemon interrupted mid-batch has already forgotten exactly the nodes
         // the server destroyed — never more, never fewer.
         let mut deleted = 0usize;
+        let mut gone: Vec<String> = Vec::new();
         let mut first_error: Option<ProtonError> = None;
         self.rt
             .block_on(async {
@@ -5907,6 +6008,7 @@ impl Core {
                     match outcome {
                         Ok(()) => {
                             self.drop_local(std::slice::from_ref(&uid));
+                            gone.push(uid.to_string());
                             deleted += 1;
                         }
                         Err(e) => {
@@ -5923,23 +6025,34 @@ impl Core {
         {
             return Err(CoreError::from_api(&error, "delete"));
         }
+        let _ = self.db.trash_remove(&gone);
         self.invalidate_trash();
         Ok(deleted)
     }
 
-    /// Permanently delete everything in the trash. The uids are listed first so
-    /// the blobs of items trashed by *another* client — which this daemon may
-    /// still hold in its cache — are reclaimed too, not just the ones it trashed.
+    /// Permanently delete everything in the trash.
+    ///
+    /// The stored listing says what goes, so the blobs of items trashed by
+    /// another client, which this daemon may still hold, are reclaimed too. It
+    /// is not read from the server again first: on a large trash that listing
+    /// is what kept the delete from ever being sent (`docs/BUGS.md` B293).
+    /// The stored listing is cleared at once, and the server is asked again
+    /// after [`TRASH_TTL`], so anything it still holds then shows up again.
     fn empty_trash(&self) -> CoreResult<usize> {
-        let uids = self
-            .rt
-            .block_on(self.drive.enumerate_trash_node_uids())
-            .map_err(|e| CoreError::from_api(&e, "enumerate trash"))?;
+        let uids: Vec<String> = self
+            .db
+            .trash_seen()
+            .map_err(CoreError::from)?
+            .into_keys()
+            .collect();
         self.rt
-            .block_on(self.client.empty_trash())
+            .block_on(within_trash_call("empty trash", self.drive.empty_trash()))?
             .map_err(|e| CoreError::from_api(&e, "empty trash"))?;
-        self.drop_local(&uids);
-        self.invalidate_trash();
+        let parsed: Vec<NodeUid> = uids.iter().filter_map(|uid| parse_uid(uid)).collect();
+        self.drop_local(&parsed);
+        let _ = self.db.trash_replace(&[]);
+        let _ = self.db.set_state_i64(TRASH_SYNCED_MS, now_ms());
+        self.events.publish(&[Topic::Trash]);
         Ok(uids.len())
     }
 
@@ -6839,6 +6952,37 @@ async fn within_trash_call<T>(what: &str, call: impl Future<Output = T>) -> Core
                 format!("{what}: no answer within {}s", TRASH_CALL_TIMEOUT.as_secs()),
             )
         })
+}
+
+/// An entry inside a trashed folder, for [`Core::list_trashed_folder`].
+fn trashed_entry(
+    uid: String,
+    name: String,
+    is_dir: bool,
+    size: i64,
+    mtime: i64,
+    trashed_at: i64,
+    parent: String,
+) -> DirEntry {
+    DirEntry {
+        name,
+        is_dir,
+        size: size.max(0) as u64,
+        modified: mtime,
+        pinned: false,
+        pinned_by_folder: false,
+        cached: false,
+        uid,
+        path: String::new(),
+        role: String::new(),
+        shared_by: String::new(),
+        shared_at: 0,
+        shared_by_unverified: false,
+        trashed_at,
+        trashed_from: None,
+        trashed_parent: Some(parent),
+        issue: None,
+    }
 }
 
 /// When a node a trash refresh found went to the trash, as far as the daemon

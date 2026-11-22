@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 46;
+pub(super) const SCHEMA_VERSION: i64 = 47;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -499,6 +499,16 @@ impl Db {
             )?;
             if !has_resolved {
                 tx.execute_batch(MIGRATION_V46_ALBUM_PHOTOS)?;
+            }
+        }
+        if current < 47 {
+            let has_trash: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'trash'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )?;
+            if has_trash {
+                tx.execute_batch(MIGRATION_V47)?;
             }
         }
         tx.execute(
@@ -1479,4 +1489,13 @@ CREATE TABLE IF NOT EXISTS photo_tombstones(uid TEXT PRIMARY KEY);
 const MIGRATION_V46_ALBUM_PHOTOS: &str = "
 ALTER TABLE album_photos ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0;
 UPDATE album_photos SET resolved=1 WHERE name IS NOT NULL;
+";
+
+/// Index the trash by parent, for browsing it by folder. The rows are dropped
+/// so the next refresh reads them again with the time each was trashed, which
+/// earlier builds did not get from the server and made up instead.
+const MIGRATION_V47: &str = "
+CREATE INDEX IF NOT EXISTS trash_parent ON trash(parent_uid);
+DELETE FROM trash;
+DELETE FROM sync_state WHERE key IN ('trash_synced_ms', 'trash_complete_ms');
 ";

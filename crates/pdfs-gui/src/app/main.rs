@@ -547,6 +547,13 @@ fn build_window(app: &adw::Application) {
             selection_bar: trash_widgets.selection_bar.clone(),
             selection_label: trash_widgets.selection_label.clone(),
             loader: Loader::new(&trash_widgets.content),
+            back: trash_widgets.back.clone(),
+            crumb: trash_widgets.crumb.clone(),
+            search: trash_widgets.search.clone(),
+            grouped: trash_widgets.grouped.clone(),
+            all: RefCell::new(Vec::new()),
+            nav: RefCell::new(Vec::new()),
+            folder_rows: RefCell::new(None),
         },
         gallery: GalleryState {
             model: gallery_widgets.model.clone(),

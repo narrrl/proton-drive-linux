@@ -650,6 +650,54 @@ fn trash_replace_lists_folders_first() {
     assert!(db.trash_list().unwrap().is_empty());
 }
 
+fn stored_trash(uid: &str, name: &str, trashed_at: Option<i64>) -> StoredTrash {
+    StoredTrash {
+        uid: uid.into(),
+        name: name.into(),
+        is_dir: false,
+        size: 1,
+        mtime: 1,
+        parent_uid: None,
+        trashed_at,
+    }
+}
+
+#[test]
+fn trash_upsert_keeps_other_rows_and_retain_drops_unlisted_ones() {
+    let db = Db::open_in_memory().unwrap();
+    db.trash_upsert(&[
+        stored_trash("a", "a.txt", Some(1)),
+        stored_trash("b", "b.txt", None),
+    ])
+    .unwrap();
+    // A later refresh adds what is new without touching what it kept.
+    db.trash_upsert(&[
+        stored_trash("c", "c.txt", Some(3)),
+        stored_trash("b", "b2.txt", Some(2)),
+    ])
+    .unwrap();
+    let mut names: Vec<String> = db
+        .trash_list()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.txt", "b2.txt", "c.txt"]);
+
+    // Rows the server no longer lists go; the listed ones stay.
+    let keep: std::collections::HashSet<String> = ["a", "c"].map(String::from).into();
+    assert_eq!(db.trash_retain(&keep).unwrap(), 1);
+    assert_eq!(db.trash_remove(&["a".into(), "gone".into()]).unwrap(), 1);
+    let left: Vec<String> = db
+        .trash_list()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.uid)
+        .collect();
+    assert_eq!(left, ["c"]);
+}
+
 #[test]
 fn state_stamps_round_trip_and_clear() {
     let db = Db::open_in_memory().unwrap();

@@ -1920,6 +1920,81 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn the_trash_lists_by_folder_and_empties() {
+        let drive = FakeDrive::new();
+        let dir = scratch("trash-by-folder");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::none())).unwrap();
+        let mount = &daemon.mountpoint;
+        std::fs::create_dir_all(mount.join("album/inner")).unwrap();
+        std::fs::write(mount.join("album/inner/a.jpg"), b"a").unwrap();
+        std::fs::write(mount.join("album/b.jpg"), b"b").unwrap();
+        std::fs::write(mount.join("loose.txt"), b"c").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || daemon.drained()
+            && drive.lookup("album/inner/a.jpg").is_some()
+            && drive.lookup("loose.txt").is_some()));
+        let album = drive.lookup("album").unwrap();
+        let inner = drive.lookup("album/inner").unwrap();
+
+        // A file trashed on its own, then the folder that held it.
+        drive.device().trash("album/b.jpg");
+        drive.device().trash("album");
+        std::fs::remove_file(mount.join("loose.txt")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || daemon.drained()));
+
+        let list = |request: &Request| match daemon.request(request) {
+            Ok(Response::Entries { entries }) => entries,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        daemon
+            .request(&Request::Refresh {
+                scope: RefreshScope::Trash,
+            })
+            .unwrap();
+        let mut trash = Vec::new();
+        assert!(wait_until(Duration::from_secs(30), || {
+            trash = list(&Request::ListTrash);
+            trash.len() == 3
+        }));
+        let b = trash.iter().find(|e| e.name == "b.jpg").unwrap();
+        assert_eq!(
+            b.trashed_parent.as_deref(),
+            Some(album.to_string().as_str())
+        );
+        let top: Vec<&str> = trash
+            .iter()
+            .filter(|e| e.trashed_parent.is_none())
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(top.len(), 2);
+        assert!(top.contains(&"album") && top.contains(&"loose.txt"));
+
+        let inside = list(&Request::ListTrashedFolder {
+            uid: album.to_string(),
+        });
+        let names: Vec<&str> = inside.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"inner"), "{names:?}");
+        assert!(names.contains(&"b.jpg"), "{names:?}");
+        assert!(inside.iter().any(|e| e.uid == inner.to_string()));
+
+        assert!(matches!(
+            daemon.request(&Request::EmptyTrash),
+            Ok(Response::Ok { .. })
+        ));
+        assert!(list(&Request::ListTrash).is_empty());
+        daemon
+            .request(&Request::Refresh {
+                scope: RefreshScope::Trash,
+            })
+            .unwrap();
+        assert!(list(&Request::ListTrash).is_empty());
+        assert!(drive.lookup("album").is_none());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_move_blocked_by_trash_can_be_retried_after_restore() {
         use pdfs_core::control::SyncIssue;
 

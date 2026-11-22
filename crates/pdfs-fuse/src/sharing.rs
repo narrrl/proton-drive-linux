@@ -77,6 +77,7 @@ fn shared_entry_of(core: &Core, n: Node) -> DirEntry {
         shared_by_unverified,
         trashed_at: 0,
         trashed_from: None,
+        trashed_parent: None,
         issue: None,
     }
 }

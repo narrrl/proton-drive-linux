@@ -1,6 +1,6 @@
 //! `pdfs` — command-line front-end for the Proton Drive Linux client.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::FileTypeExt;
@@ -436,7 +436,14 @@ enum Command {
     Diagnostics,
     /// List what is in the account's trash, with the uids the restore and
     /// delete-forever commands take.
-    Trash,
+    Trash {
+        /// Group the trash by the folder each item was deleted from.
+        #[arg(long, conflicts_with = "folder")]
+        by_folder: bool,
+        /// List what a trashed folder holds, by its uid.
+        #[arg(long, value_name = "UID")]
+        folder: Option<String>,
+    },
     /// Restore trashed items, by uid, to the folders they were trashed from.
     Restore {
         /// Node uids (`volume~link`), as printed by `pdfs trash`.
@@ -1139,7 +1146,7 @@ fn main() -> Result<()> {
         Command::Upload { sources, parent } => cmd_upload(sources, parent),
         Command::Transfers => cmd_transfers(),
         Command::Diagnostics => cmd_diagnostics(),
-        Command::Trash => cmd_trash(),
+        Command::Trash { by_folder, folder } => cmd_trash(by_folder, folder),
         Command::Restore { uids } => cmd_restore(uids),
         Command::DeleteForever { uids } => cmd_delete_forever(uids),
         Command::EmptyTrash => cmd_empty_trash(),
@@ -3617,23 +3624,48 @@ fn cmd_diagnostics() -> Result<()> {
     Ok(())
 }
 
-fn cmd_trash() -> Result<()> {
-    let response = control_request(CtlRequest::ListTrash)?;
+fn cmd_trash(by_folder: bool, folder: Option<String>) -> Result<()> {
+    let request = match folder {
+        Some(uid) => CtlRequest::ListTrashedFolder { uid },
+        None => CtlRequest::ListTrash,
+    };
+    let response = control_request(request)?;
     if emit_json(&response)? {
         return Ok(());
     }
     match response {
-        CtlResponse::Entries { entries } if entries.is_empty() => println!("(trash is empty)"),
+        CtlResponse::Entries { entries } if entries.is_empty() => println!("(nothing here)"),
+        CtlResponse::Entries { entries } if by_folder => {
+            let mut groups: BTreeMap<String, Vec<&pdfs_core::control::DirEntry>> = BTreeMap::new();
+            for e in entries.iter().filter(|e| e.trashed_parent.is_none()) {
+                let folder = match e.trashed_from.as_deref() {
+                    None => "(unknown folder)".to_string(),
+                    Some("") => "/".to_string(),
+                    Some(path) => format!("/{path}"),
+                };
+                groups.entry(folder).or_default().push(e);
+            }
+            for (folder, items) in groups {
+                println!("{folder}  ({} item(s))", items.len());
+                for e in items {
+                    print_trashed(e, "  ");
+                }
+            }
+        }
         CtlResponse::Entries { entries } => {
-            for e in entries {
-                let kind = if e.is_dir { "d" } else { "-" };
-                println!("{kind} {:>12}  {}  [{}]", e.size, e.name, e.uid);
+            for e in &entries {
+                print_trashed(e, "");
             }
         }
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
+}
+
+fn print_trashed(e: &pdfs_core::control::DirEntry, indent: &str) {
+    let kind = if e.is_dir { "d" } else { "-" };
+    println!("{indent}{kind} {:>12}  {}  [{}]", e.size, e.name, e.uid);
 }
 
 fn cmd_restore(uids: Vec<String>) -> Result<()> {
@@ -5091,6 +5123,7 @@ mod login_wait_tests {
             shared_by_unverified: false,
             trashed_at: 0,
             trashed_from: None,
+            trashed_parent: None,
             issue: None,
         };
         assert_eq!(shared_by_line(&entry), None, "no invitation, no line");

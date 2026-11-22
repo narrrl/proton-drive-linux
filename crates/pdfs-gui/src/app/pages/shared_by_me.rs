@@ -635,6 +635,7 @@ pub(crate) fn shared_item_as_entry(item: &SharedItem) -> DirEntry {
         shared_by_unverified: false,
         trashed_at: 0,
         trashed_from: None,
+        trashed_parent: None,
         issue: None,
     }
 }
