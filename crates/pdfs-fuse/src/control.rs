@@ -1342,6 +1342,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Ok(entries) => CtlResponse::Entries { entries },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::ListTrashedFolder { uid }) => match core.list_trashed_folder(&uid) {
+            Ok(entries) => CtlResponse::Entries { entries },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::Restore { uids }) => match core.restore(&uids) {
             Ok(n) => {
                 core.log_activity(ActivityKind::Restore, format!("{n} item(s)"), "", true);

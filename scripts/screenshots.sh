@@ -17,7 +17,7 @@ Options:
   --only LIST      capture only these, comma-separated (default: all of
                    login,files,photos,photos_map,computers,sync,conflicts,
                    prompt_gtk,prompt_fzf). preferences_sync and
-                   preferences_apps exist too, for pull requests only
+                   preferences_apps and trash exist too, for pull requests only
   --website DIR    afterwards, copy them into the website checkout at DIR
                    with its scripts/sync-screenshots.sh
   --settle SECS    how long a page gets to load before its capture (default 3)
@@ -37,7 +37,7 @@ EOF
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 all=login,files,photos,photos_map,computers,sync,conflicts,prompt_gtk,prompt_fzf
 # Not in the README, so not taken by default.
-extra=preferences_sync,preferences_apps
+extra=preferences_sync,preferences_apps,trash
 
 # The capture itself, run by cage inside the throwaway session (see below).
 if [[ "${1:-}" == --capture ]]; then
@@ -82,7 +82,7 @@ if [[ "${1:-}" == --capture ]]; then
     sleep "$SETTLE"
     for shot in files:browser photos:gallery photos_map:places-map computers:devices \
         sync:sync-folders conflicts:activity \
-        preferences_sync:preferences-sync preferences_apps:preferences-apps; do
+        preferences_sync:preferences-sync preferences_apps:preferences-apps trash:trash; do
         name=${shot%%:*}
         wants "$name" || continue
         "$BIN/pdfs-app" --page "${shot#*:}"

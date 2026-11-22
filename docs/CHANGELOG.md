@@ -23,6 +23,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ### Changed
 
+- The Trash page shows the folders things were deleted from. Open one to see what
+  was deleted there, and open a deleted folder to see what it held. A switch in
+  the header goes back to one list, and a search box finds anything in the trash
+  by name. Restore and Delete Permanently work on a whole folder row. `pdfs trash`
+  takes `--by-folder`, and `--folder UID` for a deleted folder.
+- The trash loads faster: a refresh reads only what is new, without unlocking file
+  keys, and shows the time each item was deleted as Proton Drive reports it.
 - The Places map draws an offline basemap, the one Proton Gallery shows: seas by
   depth, lakes, rivers, built-up areas, borders and town names, in light and dark,
   rendered in the background through `proton-map-rs`. It ships with every package
@@ -55,6 +62,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - Config, machine-id and mount-failure files are written through `proton-base-rs`'s
   atomic writer (temporary file, sync, rename, directory sync). The mount-failure file
   is now synced before the rename too, so a crash cannot leave it empty.
+
+### Fixed
+
+- A large trash listed only its first items and never refreshed, and Empty Trash
+  never emptied it (B293). Needs proton-drive-rs 0.12.5.
 
 ## [3.9.0] — 2026-11-19
 

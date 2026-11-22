@@ -337,6 +337,12 @@ impl Demo {
             Request::ListDir { path } => Response::Entries {
                 entries: self.dir(path),
             },
+            Request::ListTrash => Response::Entries {
+                entries: self.trash(),
+            },
+            Request::ListTrashedFolder { uid } => Response::Entries {
+                entries: self.trashed_folder(uid),
+            },
             Request::ReserveFileThumbGeneration => Response::FileThumbGeneration { generation: 1 },
             Request::FileThumbs { items, .. } => Response::Thumbs {
                 items: items
@@ -589,6 +595,59 @@ impl Demo {
                 }
             })
             .collect()
+    }
+
+    /// The trash: things deleted from a few folders, and a deleted folder with
+    /// a file deleted from it before it went.
+    fn trash(&self) -> Vec<DirEntry> {
+        let item = |name: &str, size: u64, hours: i64, from: &str| DirEntry {
+            name: name.into(),
+            is_dir: size == 0,
+            size,
+            modified: self.now - 40 * DAY,
+            uid: format!("demo-trash~{from}/{name}"),
+            trashed_at: self.now - hours * 3600,
+            trashed_from: Some(from.into()),
+            ..Default::default()
+        };
+        let mut inside = item("Draft 3.odt", 48_120, 30, "");
+        inside.uid = "demo-trash~Old drafts/Draft 3.odt".into();
+        inside.trashed_from = None;
+        inside.trashed_parent = Some("demo-trash~Work/Old drafts".into());
+        vec![
+            item("Budget 2025.ods", 51_200, 2, "Documents"),
+            item("Scan 0042.pdf", 1_204_331, 5, "Documents"),
+            item("Scan 0043.pdf", 1_198_002, 5, "Documents"),
+            item("IMG_2041.jpg", 3_402_112, 20, "Pictures/Lisbon"),
+            item("IMG_2042.jpg", 3_311_870, 20, "Pictures/Lisbon"),
+            item("IMG_2043.jpg", 3_587_004, 20, "Pictures/Lisbon"),
+            item("Old drafts", 0, 26, "Work"),
+            item("Meeting notes (copy).md", 6_120, 50, ""),
+            item("Invoice 118.pdf", 88_341, 80, "Taxes/2025"),
+            inside,
+        ]
+    }
+
+    /// What the deleted folder in [`Self::trash`] holds.
+    fn trashed_folder(&self, uid: &str) -> Vec<DirEntry> {
+        if uid != "demo-trash~Work/Old drafts" {
+            return Vec::new();
+        }
+        let file = |name: &str, size: u64| DirEntry {
+            name: name.into(),
+            size,
+            modified: self.now - 50 * DAY,
+            uid: format!("demo-trash~Old drafts/{name}"),
+            trashed_parent: Some(uid.into()),
+            ..Default::default()
+        };
+        let mut gone = file("Draft 3.odt", 48_120);
+        gone.trashed_at = self.now - 30 * 3600;
+        vec![
+            file("Draft 1.odt", 41_002),
+            file("Draft 2.odt", 44_870),
+            gone,
+        ]
     }
 
     /// My files: folders first, then a few files, some of them pictures with

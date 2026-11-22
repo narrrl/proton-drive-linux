@@ -109,6 +109,7 @@ a live account since.
 | Entry | Title |
 |---|---|
 | [B66](#b66--local-only-pending-data-is-not-protected-at-shutdown-high-21) | Local-only pending data is not protected at shutdown (HIGH-21) |
+| [B293](#b293--a-large-trash-never-lists-and-empty-trash-never-empties-it) | A large trash never lists, and Empty Trash never empties it |
 | [B291](#b291--on-fedora-45s-oo7-every-saved-sign-in-is-lost-at-the-next-reboot) | On Fedora 45's oo7, every saved sign-in is lost at the next reboot |
 | [B289](#b289--the-takeout-import-mixes-in-other-services-and-drops-location-and-live-photos) | The Takeout import mixes in other services and drops location and live photos |
 | [B288](#b288--an-interrupted-takeout-import-reads-as-finished-and-one-error-ends-it) | An interrupted Takeout import reads as finished, and one error ends it |
@@ -394,6 +395,38 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B293 — A large trash never lists, and Empty Trash never empties it
+
+**Status:** Fixed in code, live check pending
+
+**Found:** 2026-11-22. The user reported that the Trash page always showed the same 64 items and
+that Empty Trash did nothing.
+
+**Where:** `proton-drive-rs` `enumerate_trash_node_uids`; `crates/pdfs-fuse/src/lib.rs`
+`Core::refresh_trash` and `Core::empty_trash`
+
+**Repro:** An account with a few thousand items in the trash. The log shows `background trash
+refresh failed error=enumerate trash: no answer within 120s` on every refresh, and Empty Trash
+shows `a control request has been running for a long time request=EmptyTrash age_secs=417`.
+
+**Cause:** The SDK sent the trash paging parameters in lower case, unlike every other paged
+request, and kept asking while pages came back full. On a large trash the listing never
+finished. The refresh therefore timed out every time, and the page kept the rows of the last
+refresh that had got anywhere. Empty Trash listed the trash first, with no time limit, so the
+`DELETE` was never sent. A refresh also decrypted every trashed file again, and rewrote the whole
+table after every chunk.
+
+**Fix:** SDK 0.12.5 sends `Page` and `PageSize` and stops on a page that brings nothing new.
+The refresh reads only nodes it has not stored yet, without unlocking file keys, and keeps the
+time the server says each was trashed. Rows go only once the whole listing is in. Empty Trash
+sends the `DELETE` at once, under the trash call time limit, and clears the stored listing.
+Restore and Delete Permanently drop their rows right away. Schema v47 indexes `trash.parent_uid`
+and drops the stored rows once, so they are read again with real deletion times.
+
+**Verified:** `cargo test -p pdfs-fuse the_trash_lists_by_folder_and_empties -- --ignored`, the
+new `trash_upsert_keeps_other_rows_and_retain_drops_unlisted_ones`, and the SDK paging tests on
+2026-11-22. Pending: a live listing and empty on the affected account.
 
 ### B292 — Two programs changing settings at once lose one of the changes
 

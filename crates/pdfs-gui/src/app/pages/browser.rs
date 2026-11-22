@@ -3185,6 +3185,7 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             shared_by_unverified: false,
             trashed_at: 0,
             trashed_from: None,
+            trashed_parent: None,
             issue: None,
         })
         .collect();
@@ -3249,6 +3250,7 @@ mod tests {
             shared_by_unverified: false,
             trashed_at: 0,
             trashed_from: None,
+            trashed_parent: None,
             issue: None,
         }
     }
