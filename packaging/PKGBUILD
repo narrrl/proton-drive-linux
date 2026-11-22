@@ -16,7 +16,7 @@ arch=('x86_64')
 url="https://proton-drive.narl.io"
 license=('MIT')
 depends=('fuse3' 'polkit' 'gtk4' 'libadwaita' 'webkitgtk-6.0' 'perl-image-exiftool')
-makedepends=('cargo' 'git' 'gettext')
+makedepends=('cargo' 'git' 'gettext' 'curl')
 provides=('pdfs')
 # Files-on-demand mount + keyring need these at runtime.
 optdepends=('gnome-keyring: credential storage via Secret Service'
@@ -79,6 +79,10 @@ package() {
 
   install -Dm644 "packaging/io.narl.proton-drive-linux.policy" \
     "$pkgdir/usr/share/polkit-1/actions/io.narl.proton-drive-linux.policy"
+
+  # The offline Places basemap, fetched and checked against its pinned
+  # SHA-256 by scripts/fetch-basemap.sh.
+  scripts/fetch-basemap.sh "$pkgdir/usr/share/proton-drive-linux/basemap-v1.pmtiles"
 
   # Translations: compiled from po/ into /usr/share/locale.
   po/build.sh "$pkgdir/usr/share/locale"

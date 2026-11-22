@@ -5,3 +5,4 @@
 /rpmbuild
 /result
 /result-*
+/data/*.pmtiles

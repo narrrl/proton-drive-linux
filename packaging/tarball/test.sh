@@ -40,6 +40,7 @@ grep -qx "ExecStart=\"$prefix/bin/pdfs\" daemon" "$unit" || fail "ExecStart= was
 [ -f "$prefix/share/locale/de/LC_MESSAGES/pdfs.mo" ] || fail "no translations"
 [ -f "$prefix/share/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg" ] || fail "no icon"
 [ -f "$prefix/share/bash-completion/completions/pdfs" ] || fail "no bash completion"
+[ -f "$prefix/share/proton-drive-linux/basemap-v1.pmtiles" ] || fail "no Places basemap"
 [ ! -e "$prefix/share/proton-drive-linux/managed-updates" ] || fail "the update check must stay on offer"
 uninstaller="$prefix/share/proton-drive-linux/install.sh"
 [ -x "$uninstaller" ] || fail "install.sh was not kept for --uninstall"

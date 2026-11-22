@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-21 23:13+0100\n"
+"POT-Creation-Date: 2026-11-22 00:24+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: French\n"
@@ -210,12 +210,11 @@ msgstr ""
 #: crates/pdfs-gui/src/app/main.rs:1479
 msgid ""
 "The places map is drawn from <a href=\"https://www.naturalearthdata.com/"
-"\">Natural Earth</a> land outlines and country borders, which are in the "
-"public domain."
+"\">Natural Earth</a> land, water and borders, which are in the public domain."
 msgstr ""
-"La carte des lieux est dessinée à partir des contours des terres et des "
-"frontières des pays de <a href=\"https://www.naturalearthdata.com/\">Natural "
-"Earth</a>, qui sont dans le domaine public."
+"La carte des lieux est dessinée à partir des terres, des eaux et des "
+"frontières de <a href=\"https://www.naturalearthdata.com/\">Natural Earth</"
+"a>, qui sont dans le domaine public."
 
 #: crates/pdfs-gui/src/app/main.rs:1487
 msgid ""
@@ -1577,7 +1576,7 @@ msgstr[1] "{n} photos · partagé avec moi"
 
 #: crates/pdfs-gui/src/app/pages/albums.rs:608
 #: crates/pdfs-gui/src/app/pages/places.rs:307
-#: crates/pdfs-gui/src/app/pages/places_map.rs:1554
+#: crates/pdfs-gui/src/app/pages/places_map.rs:1555
 #, rust-format
 msgid "{n} photo"
 msgid_plural "{n} photos"
@@ -3830,7 +3829,6 @@ msgstr "Code d’authentification"
 msgid "Confirm"
 msgstr "Confirmer"
 
-#
 #: crates/pdfs-gui/src/app/pages/login.rs:629
 msgid "Verify in Your Browser"
 msgstr "Vérifier dans le navigateur"
@@ -3844,12 +3842,10 @@ msgstr ""
 "système. Ouvrez-la dans votre navigateur, terminez-la, puis revenez et "
 "choisissez « Continuer »."
 
-#
 #: crates/pdfs-gui/src/app/pages/login.rs:637
 msgid "Open Verification Page"
 msgstr "Ouvrir la page de vérification"
 
-#
 #: crates/pdfs-gui/src/app/pages/login.rs:644
 msgid "Continue"
 msgstr "Continuer"
@@ -3871,8 +3867,12 @@ msgid ""
 msgid_plural ""
 "{n} changes are not on Proton Drive yet. They stay on this computer and are "
 "sent after you sign in again."
-msgstr[0] "{n} modification n’est pas encore sur Proton Drive. Elle reste sur cet ordinateur et sera envoyée lorsque vous vous reconnecterez."
-msgstr[1] "{n} modifications ne sont pas encore sur Proton Drive. Elles restent sur cet ordinateur et seront envoyées lorsque vous vous reconnecterez."
+msgstr[0] ""
+"{n} modification n’est pas encore sur Proton Drive. Elle reste sur cet "
+"ordinateur et sera envoyée lorsque vous vous reconnecterez."
+msgstr[1] ""
+"{n} modifications ne sont pas encore sur Proton Drive. Elles restent sur cet "
+"ordinateur et seront envoyées lorsque vous vous reconnecterez."
 
 #: crates/pdfs-gui/src/app/pages/login.rs:715
 msgid "Sign Out?"
@@ -4636,25 +4636,35 @@ msgid_plural "{country} · {n} photos"
 msgstr[0] "{country} · {n} photo"
 msgstr[1] "{country} · {n} photos"
 
-#: crates/pdfs-gui/src/app/pages/places_map.rs:283
+#: crates/pdfs-gui/src/app/pages/places_map.rs:289
 msgid "Zoom In"
 msgstr "Zoom avant"
 
-#: crates/pdfs-gui/src/app/pages/places_map.rs:284
+#: crates/pdfs-gui/src/app/pages/places_map.rs:290
 msgid "Zoom Out"
 msgstr "Zoom arrière"
 
-#: crates/pdfs-gui/src/app/pages/places_map.rs:285
+#: crates/pdfs-gui/src/app/pages/places_map.rs:291
 msgid "Show All Places"
 msgstr "Afficher tous les lieux"
 
 #. Translators: the credit on the street map. {openfreemap},
 #. {openmaptiles} and {openstreetmap} are the linked names of
 #. the projects, which stay as they are.
-#: crates/pdfs-gui/src/app/pages/places_map.rs:308
+#: crates/pdfs-gui/src/app/pages/places_map.rs:1577
 #, rust-format
 msgid "{openfreemap} © {openmaptiles} Data from {openstreetmap}"
 msgstr "{openfreemap} © {openmaptiles} Données d’{openstreetmap}"
+
+#. Translators: the credit on the offline map. {naturalearth} and
+#. {geonames} are the linked names of the projects, which stay as
+#. they are.
+#: crates/pdfs-gui/src/app/pages/places_map.rs:1598
+#, rust-format
+msgid "Map data © {naturalearth} (public domain) and {geonames} (CC BY 4.0)"
+msgstr ""
+"Données cartographiques © {naturalearth} (domaine public) et {geonames} (CC "
+"BY 4.0)"
 
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:35
 msgid "Text"
@@ -5461,10 +5471,10 @@ msgstr "Carte des rues dans Lieux"
 
 #: crates/pdfs-gui/src/app/pages/status.rs:248
 msgid ""
-"Show streets and town names from OpenFreeMap. It learns which parts of the "
-"world you look at."
+"Show streets from OpenFreeMap instead of the offline map. It learns which "
+"parts of the world you look at."
 msgstr ""
-"Afficher les rues et les noms de localités d’OpenFreeMap. OpenFreeMap "
+"Afficher les rues d’OpenFreeMap au lieu de la carte hors ligne. OpenFreeMap "
 "apprend ainsi quelles parties du monde sont consultées."
 
 #: crates/pdfs-gui/src/app/pages/status.rs:253
@@ -7544,8 +7554,6 @@ msgstr "impossible de joindre le démon Proton Drive : {error}"
 #~ msgstr "Actualiser les galeries"
 
 #, fuzzy
-#~| msgctxt "verb"
-#~| msgid "Resume"
 #~ msgid "Resume"
 #~ msgstr "Reprendre"
 
@@ -7867,7 +7875,5 @@ msgstr "impossible de joindre le démon Proton Drive : {error}"
 #~ msgstr "Impossible d’enregistrer la couleur d’accentuation"
 
 #, fuzzy
-#~| msgctxt "layout"
-#~| msgid "Grid"
 #~ msgid "Grid"
 #~ msgstr "Grille"

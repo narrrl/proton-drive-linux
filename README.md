@@ -193,7 +193,8 @@ Proton Drive Linux is free and built in spare time. If it saves you a few headac
 Released under the [MIT License](LICENSE).
 
 The Places map uses [GeoNames](https://www.geonames.org/) data (CC BY 4.0) and
-[Natural Earth](https://www.naturalearthdata.com/) outlines (public domain). The optional street
+[Natural Earth](https://www.naturalearthdata.com/) land, water and borders (public domain), drawn
+through [proton-map-rs](https://github.com/narrrl/proton-rs). The optional street
 map comes from [OpenFreeMap](https://openfreemap.org/), © [OpenStreetMap](https://www.openstreetmap.org/copyright)
 contributors.
 

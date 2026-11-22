@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 3.9.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-21 23:13+0100\n"
+"POT-Creation-Date: 2026-11-22 00:24+0100\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -195,8 +195,7 @@ msgstr ""
 #: crates/pdfs-gui/src/app/main.rs:1479
 msgid ""
 "The places map is drawn from <a href=\"https://www.naturalearthdata.com/"
-"\">Natural Earth</a> land outlines and country borders, which are in the "
-"public domain."
+"\">Natural Earth</a> land, water and borders, which are in the public domain."
 msgstr ""
 
 #: crates/pdfs-gui/src/app/main.rs:1487
@@ -1514,7 +1513,7 @@ msgstr[1] ""
 
 #: crates/pdfs-gui/src/app/pages/albums.rs:608
 #: crates/pdfs-gui/src/app/pages/places.rs:307
-#: crates/pdfs-gui/src/app/pages/places_map.rs:1554
+#: crates/pdfs-gui/src/app/pages/places_map.rs:1555
 #, rust-format
 msgid "{n} photo"
 msgid_plural "{n} photos"
@@ -4407,24 +4406,32 @@ msgid_plural "{country} · {n} photos"
 msgstr[0] ""
 msgstr[1] ""
 
-#: crates/pdfs-gui/src/app/pages/places_map.rs:283
+#: crates/pdfs-gui/src/app/pages/places_map.rs:289
 msgid "Zoom In"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/places_map.rs:284
+#: crates/pdfs-gui/src/app/pages/places_map.rs:290
 msgid "Zoom Out"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/places_map.rs:285
+#: crates/pdfs-gui/src/app/pages/places_map.rs:291
 msgid "Show All Places"
 msgstr ""
 
 #. Translators: the credit on the street map. {openfreemap},
 #. {openmaptiles} and {openstreetmap} are the linked names of
 #. the projects, which stay as they are.
-#: crates/pdfs-gui/src/app/pages/places_map.rs:308
+#: crates/pdfs-gui/src/app/pages/places_map.rs:1577
 #, rust-format
 msgid "{openfreemap} © {openmaptiles} Data from {openstreetmap}"
+msgstr ""
+
+#. Translators: the credit on the offline map. {naturalearth} and
+#. {geonames} are the linked names of the projects, which stay as
+#. they are.
+#: crates/pdfs-gui/src/app/pages/places_map.rs:1598
+#, rust-format
+msgid "Map data © {naturalearth} (public domain) and {geonames} (CC BY 4.0)"
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:35
@@ -5188,8 +5195,8 @@ msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/status.rs:248
 msgid ""
-"Show streets and town names from OpenFreeMap. It learns which parts of the "
-"world you look at."
+"Show streets from OpenFreeMap instead of the offline map. It learns which "
+"parts of the world you look at."
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/status.rs:253

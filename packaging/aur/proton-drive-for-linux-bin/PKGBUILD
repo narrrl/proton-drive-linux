@@ -49,6 +49,10 @@ package() {
   install -Dm644 lib/systemd/user/proton-drive.service \
     "$pkgdir/usr/lib/systemd/user/proton-drive.service"
 
+  # The offline Places basemap.
+  install -Dm644 share/proton-drive-linux/basemap-v1.pmtiles \
+    "$pkgdir/usr/share/proton-drive-linux/basemap-v1.pmtiles"
+
   # Translations and shell completion for bash, zsh and fish.
   install -dm755 "$pkgdir/usr/share"
   cp -r --no-preserve=ownership share/locale share/bash-completion share/zsh share/fish \

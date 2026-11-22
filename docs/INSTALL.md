@@ -360,7 +360,11 @@ git clone https://github.com/narrrl/proton-drive-linux.git
 cd proton-drive-linux
 cargo build --release --locked
 po/build.sh target/locale        # optional: compile the translations
+scripts/fetch-basemap.sh         # optional: the offline Places map, into data/
 ```
+
+Install `data/basemap-v1.pmtiles` as `~/.local/share/proton-drive-linux/basemap-v1.pmtiles`, or
+point `PDFS_BASEMAP` at it. Without it Places shows coarse outlines only.
 
 The four programs are in `target/release/`: `pdfs`, `pdfs-app`, `pdfs-tray` and `pdfs-prompt`.
 
@@ -376,6 +380,7 @@ cd packaging && makepkg -fi
 
 ```bash
 sudo dnf install -y rpm-build
+scripts/fetch-basemap.sh
 rpmbuild -bb packaging/proton-drive-linux.spec \
   --define "git_dir $PWD" \
   --define "_rpmdir $PWD/packaging/out" \

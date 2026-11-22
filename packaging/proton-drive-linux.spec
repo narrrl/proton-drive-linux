@@ -25,7 +25,10 @@ ExclusiveArch:  x86_64
 %if 0%{!?git_dir:1}
 Source0:        %{forge}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 Source1:        %{forge}/releases/download/v%{version}/%{name}-vendor-%{version}.tar.xz
+# The offline Places basemap, checked against its pinned SHA-256 in %%prep.
+Source2:        https://github.com/narrrl/proton-rs/releases/download/basemap-v1/basemap-v1.pmtiles
 %endif
+%global basemap_sha256 ce9acab1b7ed7f15b23e2365b1b6a580db79f4bc4421851ee673eff4c920d280
 
 BuildRequires:  cargo
 BuildRequires:  rust >= 1.96
@@ -75,6 +78,7 @@ cp -a %{git_dir}/LICENSE .
 %else
 # -a 1 unpacks the vendored crates and their source mappings.
 %autosetup -n %{name}-%{version} -a 1
+echo "%{basemap_sha256}  %{SOURCE2}" | sha256sum --check --quiet
 # Older vendor tarballs contained only crates.io dependencies.
 if [ ! -f .cargo/config.toml ]; then
   mkdir -p .cargo
@@ -119,6 +123,14 @@ install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux.policy \
   %{buildroot}/usr/share/polkit-1/actions/io.narl.proton-drive-linux.policy
 install -D -m0644 %{src}/packaging/proton-drive.service \
   %{buildroot}/usr/lib/systemd/user/proton-drive.service
+%if 0%{?git_dir:1}
+# scripts/fetch-basemap.sh puts it here for in-tree builds.
+basemap=%{git_dir}/data/basemap-v1.pmtiles
+%else
+basemap=%{SOURCE2}
+%endif
+echo "%{basemap_sha256}  $basemap" | sha256sum --check --quiet
+install -D -m0644 "$basemap" %{buildroot}%{_datadir}/proton-drive-linux/basemap-v1.pmtiles
 %{src}/po/build.sh %{buildroot}%{_datadir}/locale
 %{src}/packaging/completions.sh "$rel/pdfs" %{buildroot}%{_datadir}
 %if 0%{!?git_dir:1}
@@ -160,6 +172,8 @@ fi
 %{_datadir}/bash-completion/completions/pdfs
 %{_datadir}/zsh/site-functions/_pdfs
 %{_datadir}/fish/vendor_completions.d/pdfs.fish
+%dir %{_datadir}/proton-drive-linux
+%{_datadir}/proton-drive-linux/basemap-v1.pmtiles
 %if 0%{!?git_dir:1}
 %{_datadir}/proton-drive-linux/managed-updates
 %endif

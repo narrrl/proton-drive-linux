@@ -23,6 +23,8 @@ path = "src/prompt.rs"
 
 [dependencies]
 proton-gallery-rs.workspace = true
+# The offline basemap under the Places map.
+proton-map-rs.workspace = true
 base64.workspace = true
 pdfs-core.workspace = true
 tracing.workspace = true
@@ -43,3 +45,7 @@ pangocairo = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots"] }
 # The system libintl (glibc) rather than a bundled gettext build.
 gettext-rs = { version = "0.8", features = ["gettext-system"] }
+
+[dev-dependencies]
+# Builds small basemaps for the map tests.
+proton-map-rs = { workspace = true, features = ["writer"] }

@@ -3,6 +3,7 @@
 {
   lib,
   rustPlatform,
+  fetchurl,
   adwaita-icon-theme,
   pkg-config,
   gettext,
@@ -23,6 +24,11 @@
 
 let
   cargoToml = lib.importTOML ../../Cargo.toml;
+  # The offline Places basemap, as scripts/fetch-basemap.sh pins it.
+  basemap = fetchurl {
+    url = "https://github.com/narrrl/proton-rs/releases/download/basemap-v1/basemap-v1.pmtiles";
+    sha256 = "ce9acab1b7ed7f15b23e2365b1b6a580db79f4bc4421851ee673eff4c920d280";
+  };
 in
 rustPlatform.buildRustPackage {
   pname = "proton-drive-linux";
@@ -116,6 +122,7 @@ rustPlatform.buildRustPackage {
     packaging/completions.sh $out/bin/pdfs $out/share
 
     # Nix brings new releases, so the app never checks for them itself.
+    install -Dm644 ${basemap} $out/share/proton-drive-linux/basemap-v1.pmtiles
     install -Dm644 /dev/null $out/share/proton-drive-linux/managed-updates
   '';
 

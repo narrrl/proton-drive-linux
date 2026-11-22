@@ -245,7 +245,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
     let online_map_row = adw::SwitchRow::builder()
         .title(gettext("Street map for Places"))
         .subtitle(gettext(
-            "Show streets and town names from OpenFreeMap. It learns which parts of the world you look at.",
+            "Show streets from OpenFreeMap instead of the offline map. It learns which parts of the world you look at.",
         ))
         .build();
     appearance_group.add(&online_map_row);

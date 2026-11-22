@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-21 23:13+0100\n"
+"POT-Creation-Date: 2026-11-22 00:24+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Polish\n"
@@ -212,10 +212,9 @@ msgstr ""
 #: crates/pdfs-gui/src/app/main.rs:1479
 msgid ""
 "The places map is drawn from <a href=\"https://www.naturalearthdata.com/"
-"\">Natural Earth</a> land outlines and country borders, which are in the "
-"public domain."
+"\">Natural Earth</a> land, water and borders, which are in the public domain."
 msgstr ""
-"Mapa miejsc jest rysowana z konturów lądów i granic państw <a href=\"https://"
+"Mapa miejsc jest rysowana z lądów, wód i granic <a href=\"https://"
 "www.naturalearthdata.com/\">Natural Earth</a>, które należą do domeny "
 "publicznej."
 
@@ -1606,7 +1605,7 @@ msgstr[2] "{n} zdjęć · udostępnione mi"
 
 #: crates/pdfs-gui/src/app/pages/albums.rs:608
 #: crates/pdfs-gui/src/app/pages/places.rs:307
-#: crates/pdfs-gui/src/app/pages/places_map.rs:1554
+#: crates/pdfs-gui/src/app/pages/places_map.rs:1555
 #, rust-format
 msgid "{n} photo"
 msgid_plural "{n} photos"
@@ -3879,7 +3878,6 @@ msgstr "Kod uwierzytelniania"
 msgid "Confirm"
 msgstr "Potwierdź"
 
-#
 #: crates/pdfs-gui/src/app/pages/login.rs:629
 msgid "Verify in Your Browser"
 msgstr "Weryfikacja w przeglądarce"
@@ -3893,12 +3891,10 @@ msgstr ""
 "otworzyć ją w przeglądarce, ukończyć tam weryfikację, a następnie wrócić i "
 "wybrać „Kontynuuj”."
 
-#
 #: crates/pdfs-gui/src/app/pages/login.rs:637
 msgid "Open Verification Page"
 msgstr "Otwórz stronę weryfikacji"
 
-#
 #: crates/pdfs-gui/src/app/pages/login.rs:644
 msgid "Continue"
 msgstr "Kontynuuj"
@@ -3919,9 +3915,15 @@ msgid ""
 msgid_plural ""
 "{n} changes are not on Proton Drive yet. They stay on this computer and are "
 "sent after you sign in again."
-msgstr[0] "{n} zmiana nie jest jeszcze w Proton Drive. Zostaje na tym komputerze i zostanie wysłana po ponownym zalogowaniu."
-msgstr[1] "{n} zmiany nie są jeszcze w Proton Drive. Zostają na tym komputerze i zostaną wysłane po ponownym zalogowaniu."
-msgstr[2] "{n} zmian nie jest jeszcze w Proton Drive. Zostają na tym komputerze i zostaną wysłane po ponownym zalogowaniu."
+msgstr[0] ""
+"{n} zmiana nie jest jeszcze w Proton Drive. Zostaje na tym komputerze i "
+"zostanie wysłana po ponownym zalogowaniu."
+msgstr[1] ""
+"{n} zmiany nie są jeszcze w Proton Drive. Zostają na tym komputerze i "
+"zostaną wysłane po ponownym zalogowaniu."
+msgstr[2] ""
+"{n} zmian nie jest jeszcze w Proton Drive. Zostają na tym komputerze i "
+"zostaną wysłane po ponownym zalogowaniu."
 
 #: crates/pdfs-gui/src/app/pages/login.rs:715
 msgid "Sign Out?"
@@ -4694,25 +4696,33 @@ msgstr[0] "{country} · {n} zdjęcie"
 msgstr[1] "{country} · {n} zdjęcia"
 msgstr[2] "{country} · {n} zdjęć"
 
-#: crates/pdfs-gui/src/app/pages/places_map.rs:283
+#: crates/pdfs-gui/src/app/pages/places_map.rs:289
 msgid "Zoom In"
 msgstr "Powiększ"
 
-#: crates/pdfs-gui/src/app/pages/places_map.rs:284
+#: crates/pdfs-gui/src/app/pages/places_map.rs:290
 msgid "Zoom Out"
 msgstr "Pomniejsz"
 
-#: crates/pdfs-gui/src/app/pages/places_map.rs:285
+#: crates/pdfs-gui/src/app/pages/places_map.rs:291
 msgid "Show All Places"
 msgstr "Pokaż wszystkie miejsca"
 
 #. Translators: the credit on the street map. {openfreemap},
 #. {openmaptiles} and {openstreetmap} are the linked names of
 #. the projects, which stay as they are.
-#: crates/pdfs-gui/src/app/pages/places_map.rs:308
+#: crates/pdfs-gui/src/app/pages/places_map.rs:1577
 #, rust-format
 msgid "{openfreemap} © {openmaptiles} Data from {openstreetmap}"
 msgstr "{openfreemap} © {openmaptiles} Dane z {openstreetmap}"
+
+#. Translators: the credit on the offline map. {naturalearth} and
+#. {geonames} are the linked names of the projects, which stay as
+#. they are.
+#: crates/pdfs-gui/src/app/pages/places_map.rs:1598
+#, rust-format
+msgid "Map data © {naturalearth} (public domain) and {geonames} (CC BY 4.0)"
+msgstr "Dane mapy © {naturalearth} (domena publiczna) i {geonames} (CC BY 4.0)"
 
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:35
 msgid "Text"
@@ -5521,10 +5531,10 @@ msgstr "Mapa ulic w widoku Miejsca"
 
 #: crates/pdfs-gui/src/app/pages/status.rs:248
 msgid ""
-"Show streets and town names from OpenFreeMap. It learns which parts of the "
-"world you look at."
+"Show streets from OpenFreeMap instead of the offline map. It learns which "
+"parts of the world you look at."
 msgstr ""
-"Wyświetlanie ulic i nazw miejscowości z OpenFreeMap. OpenFreeMap dowiaduje "
+"Wyświetlanie ulic z OpenFreeMap zamiast mapy offline. OpenFreeMap dowiaduje "
 "się przy tym, które części świata są oglądane."
 
 #: crates/pdfs-gui/src/app/pages/status.rs:253
@@ -7626,8 +7636,6 @@ msgstr "nie można połączyć się z usługą Proton Drive: {error}"
 #~ msgstr "Odśwież galerie"
 
 #, fuzzy
-#~| msgctxt "verb"
-#~| msgid "Resume"
 #~ msgid "Resume"
 #~ msgstr "Wznów"
 
@@ -7947,7 +7955,5 @@ msgstr "nie można połączyć się z usługą Proton Drive: {error}"
 #~ msgstr "Nie można zapisać koloru akcentu"
 
 #, fuzzy
-#~| msgctxt "layout"
-#~| msgid "Grid"
 #~ msgid "Grid"
 #~ msgstr "Siatka"
