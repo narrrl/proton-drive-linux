@@ -109,7 +109,6 @@ a live account since.
 | Entry | Title |
 |---|---|
 | [B66](#b66--local-only-pending-data-is-not-protected-at-shutdown-high-21) | Local-only pending data is not protected at shutdown (HIGH-21) |
-| [B293](#b293--a-large-trash-never-lists-and-empty-trash-never-empties-it) | A large trash never lists, and Empty Trash never empties it |
 | [B291](#b291--on-fedora-45s-oo7-every-saved-sign-in-is-lost-at-the-next-reboot) | On Fedora 45's oo7, every saved sign-in is lost at the next reboot |
 | [B289](#b289--the-takeout-import-mixes-in-other-services-and-drops-location-and-live-photos) | The Takeout import mixes in other services and drops location and live photos |
 | [B288](#b288--an-interrupted-takeout-import-reads-as-finished-and-one-error-ends-it) | An interrupted Takeout import reads as finished, and one error ends it |
@@ -307,6 +306,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B293](#b293--a-large-trash-never-lists-and-empty-trash-never-empties-it) | A large trash never lists, and Empty Trash never empties it |
 | [B292](#b292--two-programs-changing-settings-at-once-lose-one-of-the-changes) | Two programs changing settings at once lose one of the changes |
 | [B290](#b290--reopening-the-database-right-after-closing-it-can-be-refused-as-another-daemon) | Reopening the database right after closing it can be refused as another daemon |
 | [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
@@ -398,7 +398,7 @@ Newest first.
 
 ### B293 — A large trash never lists, and Empty Trash never empties it
 
-**Status:** Fixed in code, live check pending
+**Status:** Fixed (verified 2026-11-22)
 
 **Found:** 2026-11-22. The user reported that the Trash page always showed the same 64 items and
 that Empty Trash did nothing.
@@ -423,10 +423,14 @@ time the server says each was trashed. Rows go only once the whole listing is in
 sends the `DELETE` at once, under the trash call time limit, and clears the stored listing.
 Restore and Delete Permanently drop their rows right away. Schema v47 indexes `trash.parent_uid`
 and drops the stored rows once, so they are read again with real deletion times.
+SDK 0.12.6 accepts the `202 Accepted` the server answers to the `DELETE`; it empties the trash
+in the background, and Empty Trash had reported that answer as an error.
 
 **Verified:** `cargo test -p pdfs-fuse the_trash_lists_by_folder_and_empties -- --ignored`, the
 new `trash_upsert_keeps_other_rows_and_retain_drops_unlisted_ones`, and the SDK paging tests on
-2026-11-22. Pending: a live listing and empty on the affected account.
+2026-11-22. Live on the affected account the same day: the listing read all 3379 items in
+2.8 s and stored them in 23 s, and Empty Trash emptied it on the server (the next refresh
+removed all 3379 rows).
 
 ### B292 — Two programs changing settings at once lose one of the changes
 

@@ -11,6 +11,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.10.0] — 2026-11-22
+
+Schema: **47**. The trash table gets an index on the original folder, and its stored rows are
+dropped once so they are read again with real deletion times.
+
 ### Added
 
 - `pdfs sync flush` waits until every queued change is on Proton Drive, retrying
@@ -66,7 +71,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 ### Fixed
 
 - A large trash listed only its first items and never refreshed, and Empty Trash
-  never emptied it (B293). Needs proton-drive-rs 0.12.5.
+  never emptied it (B293). Empty Trash no longer reports the server's "Accepted"
+  answer as an error. Needs proton-sdk and proton-drive-rs 0.12.6.
 
 ## [3.9.0] — 2026-11-19
 
@@ -2454,6 +2460,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[3.10.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.10.0
 [3.9.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.9.0
 [3.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.8.1
 [3.5.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.5.0
