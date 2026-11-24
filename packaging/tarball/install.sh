@@ -8,6 +8,7 @@ set -Eeuo pipefail
 usage() {
     cat >&2 <<'EOF'
 usage: ./install.sh [--prefix DIR] [--no-service] [--force]
+       ./install.sh --check
        ./install.sh --uninstall [--prefix DIR] [--no-service]
 
 Installs the app, the tray, the search launcher and the `pdfs` command into
@@ -15,6 +16,7 @@ Installs the app, the tray, the search launcher and the `pdfs` command into
 the tray's login entry into ~/.config/autostart. Run it again from a newer
 tarball to update; the running service restarts on the new version.
 
+  --check        check the binary and host requirements without installing files
   --prefix DIR   install under DIR instead of ~/.local
   --uninstall    remove what an earlier run installed; your settings, cache
                  and the files in Proton Drive stay
@@ -26,6 +28,7 @@ EOF
 }
 
 prefix=""
+check=0
 uninstall=0
 service=1
 force=0
@@ -33,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix) [[ $# -ge 2 ]] || usage; prefix="$2"; shift ;;
         --prefix=*) prefix="${1#*=}" ;;
+        --check) check=1 ;;
         --uninstall) uninstall=1 ;;
         --no-service) service=0 ;;
         --force) force=1 ;;
@@ -41,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+(( !check || (!uninstall && !force) )) || usage
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The copy kept for --uninstall knows where it was installed.
 if [[ -z "$prefix" && -f "$here/installed-files" ]]; then
@@ -97,15 +102,17 @@ fi
 
 [[ -x "$here/bin/pdfs" ]] || die "run install.sh from the unpacked tarball (no bin/pdfs next to it)"
 
-# A package and this install would each bring a service unit, and the one in
-# ~/.config wins: the two would run different versions against one database.
-if [[ $force -eq 0 && ( -e /usr/bin/pdfs || -e /usr/lib/systemd/user/$unit ) ]]; then
-    die "a package already installs Proton Drive for Linux (/usr/bin/pdfs). Remove it first, or keep using it."
-fi
-
 # Missing libraries would only show when the app does not start.
+if [[ "$(uname -m)" != x86_64 ]]; then
+    die "this binary tarball requires an x86-64 Linux host"
+fi
+command -v ldd >/dev/null || die "ldd is required to check the tarball's shared libraries"
 missing="$(for exe in pdfs pdfs-app pdfs-tray pdfs-prompt; do
-    ldd "$here/bin/$exe" 2>&1 | grep -E 'not found' || true
+    if output="$(LC_ALL=C ldd "$here/bin/$exe" 2>&1)"; then
+        grep -F 'not found' <<<"$output" || true
+    else
+        printf '%s: %s\n' "$exe" "$output"
+    fi
 done | sort -u)"
 if [[ -n "$missing" ]]; then
     printf '%s\n' "$missing" | sed 's/^[[:space:]]*/  /' >&2
@@ -129,6 +136,21 @@ if [[ -z "$fusermount" ]]; then
     warn "fusermount3 is missing; install fuse3, or My files cannot be mounted"
 elif [[ ! -u "$fusermount" ]]; then
     warn "$fusermount is not setuid root; My files may not mount"
+fi
+
+if [[ $check -eq 1 ]]; then
+    [[ -n "$fusermount" && -u "$fusermount" && "$(stat -Lc %u "$fusermount")" == 0 ]] ||
+        die "the mount requires a setuid-root fusermount3"
+    [[ -c /dev/fuse && -r /dev/fuse && -w /dev/fuse ]] || die "the current user needs access to /dev/fuse"
+    "$here/bin/pdfs" --version
+    say "The binaries load and the FUSE helper is available. Sign-in and mounting require a desktop session."
+    exit 0
+fi
+
+# A package and this install would each bring a service unit, and the one in
+# ~/.config wins: the two would run different versions against one database.
+if [[ $force -eq 0 && ( -e /usr/bin/pdfs || -e /usr/lib/systemd/user/$unit ) ]]; then
+    die "a package already installs Proton Drive for Linux (/usr/bin/pdfs). Remove it first, or keep using it."
 fi
 
 # Where each file of the tarball goes, as "source<TAB>target" lines.

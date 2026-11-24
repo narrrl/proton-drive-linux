@@ -24,6 +24,19 @@ src="$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'proton-drive-linux-*'
 export HOME="$work/home" XDG_CONFIG_HOME="$work/home/.config"
 mkdir -p "$HOME"
 prefix="$HOME/.local"
+# Exercise the failure path independently of this host's own packages.
+mkdir "$work/tools"
+cat >"$work/tools/ldd" <<'EOF'
+#!/bin/sh
+echo 'libmissing.so => not found'
+EOF
+chmod +x "$work/tools/ldd"
+if PATH="$work/tools:$PATH" "$src/install.sh" --check >"$work/check.log" 2>&1; then
+  fail "compatibility check accepted a missing library"
+fi
+grep -q 'libmissing.so' "$work/check.log" || fail "check did not name the missing library"
+[ -z "$(find "$HOME" -mindepth 1 -print -quit)" ] || fail "compatibility check wrote into HOME"
+
 "$src/install.sh" --no-service --force >"$work/install.log" 2>&1 ||
   { cat "$work/install.log" >&2; fail "install.sh failed"; }
 
