@@ -182,6 +182,7 @@ impl FileList {
                 bind_file_thumbnail(&ui, &thumbnail, &entry, false);
                 label.set_label(&entry.name);
                 label.set_tooltip_text(Some(&entry.name));
+                mark_pending_upload(&tile, &entry);
                 if behavior.badges {
                     apply_badge(&badge, &entry);
                 }
@@ -350,6 +351,9 @@ impl FileList {
                     .ellipsize(gtk4::pango::EllipsizeMode::End)
                     .build();
                 let cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+                // The whole Name column, not just the icon and the name, is
+                // where a row is dragged from and dropped onto.
+                cell.set_hexpand(true);
                 cell.append(&thumbnail);
                 cell.append(&label);
                 list.attach_context_menu(&ui, item, &cell, behavior);
@@ -379,6 +383,7 @@ impl FileList {
                 bind_file_thumbnail(&ui, &thumbnail, &entry, true);
                 label.set_label(&entry.name);
                 label.set_tooltip_text(Some(&entry.name));
+                mark_pending_upload(&cell, &entry);
                 if behavior.badges {
                     apply_badge(&badge, &entry);
                 }
@@ -408,6 +413,10 @@ impl FileList {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() {
                 let entry = obj.borrow::<DirEntry>().clone();
+                if is_pending_upload(&entry) {
+                    // No action applies to a file Proton Drive does not have yet.
+                    return;
+                }
                 // Right-clicking a row that is part of a multi-selection acts on
                 // the batch; right-clicking outside one acts on the row.
                 let selected = list.selected();
@@ -515,8 +524,21 @@ pub(crate) fn text_column(
         let text = render(&entry);
         label.set_tooltip_text(Some(&text));
         label.set_label(&text);
+        mark_pending_upload(&label, &entry);
     });
     gtk4::ColumnViewColumn::new(Some(title), Some(factory))
+}
+
+/// Fade a cell bound to a placeholder for an upload, and say why; clear both
+/// otherwise, since list factories recycle cells.
+fn mark_pending_upload(cell: &impl IsA<gtk4::Widget>, entry: &DirEntry) {
+    if is_pending_upload(entry) {
+        cell.add_css_class("file-pending");
+        cell.set_tooltip_text(Some(&gettext("Uploading…")));
+    } else if cell.has_css_class("file-pending") {
+        cell.remove_css_class("file-pending");
+        cell.set_tooltip_text(None);
+    }
 }
 
 fn resize_grid_tile(thumbnail: &gtk4::Overlay, label: &gtk4::Label, size: i32) {

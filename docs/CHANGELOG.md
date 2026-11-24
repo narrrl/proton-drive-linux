@@ -11,6 +11,26 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+
+- Files and folders drag out of My files into a file manager, the desktop or any app
+  that takes files, as the real files under `~/ProtonDrive`. Dragging a selected row
+  drags the whole selection.
+- Files and folders uploaded in My files, dropped in or picked with Upload Files or
+  Upload Folder, show in their folder at once, faded, until Proton Drive lists
+  them. One that never arrives (a failed upload) goes once nothing is transferring
+  any more.
+
+### Fixed
+
+- Files dragged in from a file manager on Wayland upload. The compositor offers
+  such a drag as a move at first, and My files, answering only to a copy, refused
+  it without a word. It now asks for a copy, which the compositor then picks.
+- Files dropped from a file manager onto a row of My files no longer fail: dropped
+  onto a folder they upload into that folder, and dropped onto a file they upload
+  into the folder on screen, as a drop onto empty space always did. Moving rows
+  onto a folder inside the app works as before, and now takes the whole selection.
+
 ## [3.10.0] — 2026-11-22
 
 Schema: **47**. The trash table gets an index on the original folder, and its stored rows are

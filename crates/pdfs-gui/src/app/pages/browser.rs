@@ -94,6 +94,12 @@ pub(crate) struct BrowserState {
     pub(crate) zoom: gtk4::Scale,
     /// Saves the zoom once the slider rests, not on every step.
     pub(crate) zoom_save: RefCell<Option<glib::SourceId>>,
+    /// Files handed to the daemon for upload that its listings do not show
+    /// yet, drawn faded in their folder until they do (see
+    /// [`with_pending_uploads`]).
+    pub(crate) pending_uploads: RefCell<Vec<PendingUpload>>,
+    /// Whether the timer that retires [`BrowserState::pending_uploads`] runs.
+    pub(crate) pending_watch: Cell<bool>,
 }
 
 /// Idle pause after the last keystroke before a search query is sent, so typing
@@ -532,7 +538,13 @@ pub(crate) fn browser_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
 
 /// Every entry highlighted in My files, in model order.
 pub(crate) fn selected_entries(ui: &Rc<Ui>) -> Vec<DirEntry> {
-    ui.browser.files.selected()
+    // A placeholder for an upload is not a node: no bulk action applies to it.
+    ui.browser
+        .files
+        .selected()
+        .into_iter()
+        .filter(|entry| !is_pending_upload(entry))
+        .collect()
 }
 
 /// Drop the selection, which also retracts the bulk bar.
@@ -1098,6 +1110,10 @@ pub(crate) fn entry_at(model: Option<&impl IsA<gio::ListModel>>, pos: u32) -> Op
 /// Open an entry the Nautilus way: folders descend, media plays in the app,
 /// streamed from the mount, other files download-and-open.
 pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
+    if is_pending_upload(entry) {
+        // Nothing to open until Proton Drive has it.
+        return;
+    }
     let rel = entry_rel(ui, entry);
     if entry.is_dir {
         // Descending into a search hit: clear the query so the folder listing
@@ -1375,16 +1391,19 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
     });
     ui.browser.content.add_controller(buttons);
 
-    // Files dropped in from a file manager upload into the folder on screen.
+    // Files dropped in from a file manager upload into the folder on screen;
+    // rows dragged from this page (dropped anywhere but onto a folder) move
+    // into it. See [`drop_files`].
     let drop = gtk4::DropTarget::new(
         gtk4::gdk::FileList::static_type(),
-        gtk4::gdk::DragAction::COPY,
+        gtk4::gdk::DragAction::COPY | gtk4::gdk::DragAction::MOVE,
     );
     let ui_enter = ui.clone();
-    drop.connect_enter(move |_, _, _| {
+    drop.connect_enter(move |target, _, _| {
         ui_enter.browser.content.add_css_class("files-drop-active");
-        gtk4::gdk::DragAction::COPY
+        browser_drop_action(target.current_drop())
     });
+    drop.connect_motion(|target, _, _| browser_drop_action(target.current_drop()));
     let ui_leave = ui.clone();
     drop.connect_leave(move |_| {
         ui_leave
@@ -1401,18 +1420,12 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
         let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
             return false;
         };
-        let sources: Vec<String> = files
-            .files()
-            .iter()
-            .filter_map(|f| f.path())
-            .filter_map(|p| p.to_str().map(str::to_string))
-            .collect();
-        if sources.is_empty() || !ui_drop.browser.search.text().trim().is_empty() {
+        if !ui_drop.browser.search.text().trim().is_empty() {
             // Search results have no one folder to upload into.
             return false;
         }
-        start_upload(&ui_drop, sources);
-        true
+        let dest = ui_drop.browser.path.borrow().clone();
+        drop_files(&ui_drop, &dest, &files)
     });
     ui.browser.content.add_controller(drop);
 }
@@ -2682,6 +2695,151 @@ pub(crate) fn prompt_upload_folder(ui: &Rc<Ui>) {
 /// hand-off with a toast; the Activity group then shows live progress and the
 /// listing refreshes itself when the transfers finish (see [`repaint_transfers`]).
 pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
+    let parent = ui.browser.path.borrow().clone();
+    start_upload_into(ui, parent, sources);
+}
+
+/// [`start_upload`] into `parent`, a mountpoint-relative folder that need not be
+/// the one on screen (a folder that files were dropped onto).
+pub(crate) fn start_upload_into(ui: &Rc<Ui>, parent: String, sources: Vec<String>) {
+    let placeholders: Vec<DirEntry> = sources
+        .iter()
+        .filter_map(|source| pending_entry(Path::new(source)))
+        .collect();
+    start_upload_request(ui, parent.clone(), sources, move |ui| {
+        add_pending_uploads(ui, &parent, placeholders)
+    });
+}
+
+/// The `uid` of a placeholder row for a file on its way up. No node has it, so
+/// nothing that acts on nodes mistakes the row for one.
+pub(crate) const PENDING_UPLOAD_UID: &str = "pending-upload";
+
+/// How long a placeholder stays once no transfer is running, so the daemon can
+/// scan what it was handed and start on it.
+const PENDING_UPLOAD_GRACE: Duration = Duration::from_secs(10);
+
+/// Whether `entry` is a placeholder for an upload rather than a node.
+pub(crate) fn is_pending_upload(entry: &DirEntry) -> bool {
+    entry.uid == PENDING_UPLOAD_UID
+}
+
+/// A file or folder handed to the daemon for upload into `parent`
+/// (mountpoint-relative), shown there before Proton Drive lists it.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingUpload {
+    pub(crate) parent: String,
+    pub(crate) entry: DirEntry,
+    pub(crate) since: Instant,
+}
+
+/// The placeholder row for uploading the local `source`: its name, size and
+/// modification time, and [`PENDING_UPLOAD_UID`].
+fn pending_entry(source: &Path) -> Option<DirEntry> {
+    let name = source.file_name()?.to_str()?.to_string();
+    let meta = std::fs::metadata(source).ok();
+    let is_dir = meta.as_ref().is_some_and(|meta| meta.is_dir());
+    let size = meta
+        .as_ref()
+        .filter(|_| !is_dir)
+        .map_or(0, |meta| meta.len());
+    let modified = meta
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs() as i64);
+    Some(DirEntry {
+        name,
+        is_dir,
+        size,
+        modified,
+        uid: PENDING_UPLOAD_UID.to_string(),
+        ..DirEntry::default()
+    })
+}
+
+/// `entries` of the folder `parent`, plus a placeholder for each upload into it
+/// that they do not list yet. A placeholder whose name the listing now has is
+/// done, and is forgotten.
+pub(crate) fn with_pending_uploads(
+    pending: &mut Vec<PendingUpload>,
+    parent: &str,
+    entries: &[DirEntry],
+) -> Vec<DirEntry> {
+    pending.retain(|upload| {
+        upload.parent != parent || !entries.iter().any(|entry| entry.name == upload.entry.name)
+    });
+    let mut shown = entries.to_vec();
+    shown.extend(
+        pending
+            .iter()
+            .filter(|upload| upload.parent == parent)
+            .map(|upload| upload.entry.clone()),
+    );
+    shown
+}
+
+/// Show `placeholders` in `parent` until the daemon lists them, and repaint
+/// that folder now if it is on screen.
+fn add_pending_uploads(ui: &Rc<Ui>, parent: &str, placeholders: Vec<DirEntry>) {
+    if placeholders.is_empty() {
+        return;
+    }
+    let since = Instant::now();
+    ui.browser
+        .pending_uploads
+        .borrow_mut()
+        .extend(placeholders.into_iter().map(|entry| PendingUpload {
+            parent: parent.to_string(),
+            entry,
+            since,
+        }));
+    let showing = ui.browser.listed.borrow().as_deref() == Some(parent)
+        && ui.browser.search.text().trim().is_empty();
+    if showing {
+        let listing = ui.browser.listing.borrow().clone();
+        repaint_browser(ui, &listing);
+    }
+    watch_pending_uploads(ui);
+}
+
+/// Retire placeholders the daemon never lists: an upload that failed, or one
+/// that finished without the listing on screen being reloaded. Once nothing
+/// is transferring and a placeholder is past [`PENDING_UPLOAD_GRACE`], the
+/// listing is reloaded, which shows the real file if it arrived.
+fn watch_pending_uploads(ui: &Rc<Ui>) {
+    if ui.browser.pending_watch.replace(true) {
+        return;
+    }
+    let ui = ui.clone();
+    glib::timeout_add_local(Duration::from_secs(2), move || {
+        if ui.status.active_transfers.get() == 0 {
+            let expired = {
+                let mut pending = ui.browser.pending_uploads.borrow_mut();
+                let before = pending.len();
+                pending.retain(|upload| upload.since.elapsed() < PENDING_UPLOAD_GRACE);
+                pending.len() != before
+            };
+            if expired {
+                reload_listing(&ui);
+            }
+        }
+        if ui.browser.pending_uploads.borrow().is_empty() {
+            ui.browser.pending_watch.set(false);
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// Send the daemon an upload of `sources` into `parent`, then confirm the
+/// hand-off and run `accepted` once the daemon has taken it.
+fn start_upload_request(
+    ui: &Rc<Ui>,
+    parent: String,
+    sources: Vec<String>,
+    accepted: impl FnOnce(&Rc<Ui>) + 'static,
+) {
     if sources.is_empty() {
         return;
     }
@@ -2693,7 +2851,6 @@ pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
         );
         return;
     }
-    let parent = ui.browser.path.borrow().clone();
     let n = sources.len();
     let rx = spawn_request(
         ui.dirs.control_socket(),
@@ -2712,6 +2869,7 @@ pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
                 toast_action(&ui, &what, &pgettext("verb", "View"), |ui| {
                     ui.stack.set_visible_child_name("locations")
                 });
+                accepted(&ui);
             }
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, &gettext("Couldn't upload"), &message, kind)
@@ -2766,60 +2924,166 @@ pub(crate) fn apply_badge(badge: &gtk4::Image, entry: &DirEntry) {
     }
 }
 
-/// Make a browser cell draggable, carrying the bound entry's mountpoint-relative
-/// path as the drag payload. Reads the entry live at drag time (via the captured
-/// [`gtk4::ListItem`]) so a recycled cell drags whatever it currently shows.
+/// Make a browser cell draggable. The drag carries the bound entry, or the
+/// whole selection when the entry is part of it, as files under the mountpoint:
+/// a file manager or any other app that takes files gets the real thing (read on
+/// demand through the mount), and a drop back onto this page moves it inside
+/// Proton Drive (see [`drop_files`]). Reads the entry live at drag time (via the
+/// captured [`gtk4::ListItem`]) so a recycled cell drags whatever it currently
+/// shows.
 pub(crate) fn attach_drag(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box) {
     let source = gtk4::DragSource::new();
-    source.set_actions(gtk4::gdk::DragAction::MOVE);
+    source.set_actions(gtk4::gdk::DragAction::COPY | gtk4::gdk::DragAction::MOVE);
     let ui = ui.clone();
     let item = item.clone();
-    source.connect_prepare(move |_, _, _| {
+    source.connect_prepare(move |source, x, y| {
+        if !*ui.mounted.borrow() {
+            // No mount, nothing another app could read.
+            return None;
+        }
         let obj = item.item().and_downcast::<BoxedAnyObject>()?;
-        let rel = entry_rel(&ui, &obj.borrow::<DirEntry>());
-        Some(gtk4::gdk::ContentProvider::for_value(&glib::Value::from(
-            rel.as_str(),
-        )))
+        if is_pending_upload(&obj.borrow::<DirEntry>()) {
+            // Not in the mount yet, so nothing to hand over.
+            return None;
+        }
+        let rels: Vec<String> = if item.is_selected() {
+            selected_entries(&ui)
+                .iter()
+                .map(|entry| entry_rel(&ui, entry))
+                .collect()
+        } else {
+            vec![entry_rel(&ui, &obj.borrow::<DirEntry>())]
+        };
+        let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
+        let files: Vec<gtk4::gio::File> = rels
+            .iter()
+            .map(|rel| gtk4::gio::File::for_path(mounted_path(&mountpoint, rel)))
+            .collect();
+        if let Some(cell) = source.widget() {
+            let icon = gtk4::WidgetPaintable::new(Some(&cell));
+            source.set_icon(Some(&icon), x as i32, y as i32);
+        }
+        let files = gtk4::gdk::FileList::from_array(&files);
+        Some(gtk4::gdk::ContentProvider::for_value(&files.to_value()))
     });
     anchor.add_controller(source);
 }
 
-/// Make a browser cell a drop target: dropping a dragged path onto a *folder* cell
-/// moves the source into it through the daemon. Drops onto files, onto the item
-/// itself, or that would move a folder into its own subtree are rejected.
+/// Make a browser cell a drop target for its *folder*: files dropped onto it
+/// upload into that folder, and rows of this page move into it (see
+/// [`drop_files`]). A file cell does not accept a drop at all, so the drop falls
+/// through to the page, which takes it for the folder on screen.
 pub(crate) fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box) {
-    let target = gtk4::DropTarget::new(glib::types::Type::STRING, gtk4::gdk::DragAction::MOVE);
+    let target = gtk4::DropTarget::new(
+        gtk4::gdk::FileList::static_type(),
+        gtk4::gdk::DragAction::COPY | gtk4::gdk::DragAction::MOVE,
+    );
+    let item_accept = item.clone();
+    target.connect_accept(move |_, drop| {
+        let is_dir = item_accept
+            .item()
+            .and_downcast::<BoxedAnyObject>()
+            .is_some_and(|obj| {
+                let entry = obj.borrow::<DirEntry>();
+                entry.is_dir && !is_pending_upload(&entry)
+            });
+        is_dir
+            && drop
+                .formats()
+                .contains_type(gtk4::gdk::FileList::static_type())
+    });
+    let anchor_enter = anchor.clone();
+    target.connect_enter(move |target, _, _| {
+        anchor_enter.add_css_class("files-drop-folder");
+        browser_drop_action(target.current_drop())
+    });
+    target.connect_motion(|target, _, _| browser_drop_action(target.current_drop()));
+    let anchor_leave = anchor.clone();
+    target.connect_leave(move |_| anchor_leave.remove_css_class("files-drop-folder"));
     let ui = ui.clone();
     let item = item.clone();
+    let anchor_drop = anchor.clone();
     target.connect_drop(move |_, value, _, _| {
+        anchor_drop.remove_css_class("files-drop-folder");
         let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() else {
             return false;
         };
-        let dest = obj.borrow::<DirEntry>();
-        if !dest.is_dir {
-            return false;
-        }
-        let Ok(src) = value.get::<String>() else {
+        let dest = {
+            let entry = obj.borrow::<DirEntry>();
+            if !entry.is_dir {
+                return false;
+            }
+            entry_rel(&ui, &entry)
+        };
+        let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
             return false;
         };
-        let dest_path = entry_rel(&ui, &dest);
-        // No-op onto self, and never move a folder into itself or a descendant.
-        if src == dest_path || dest_path.starts_with(&format!("{src}/")) {
-            return false;
-        }
-        let done = gettext_f("Moved into “{name}”", &[("name", &dest.name)]);
-        run_mutation(
-            &ui,
-            Request::Move {
-                path: src,
-                new_parent: dest_path,
-            },
-            done,
-            gettext_noop("Couldn't move"),
-        );
-        true
+        drop_files(&ui, &dest, &files)
     });
     anchor.add_controller(target);
+}
+
+/// The action to answer a drag over the browser with: a move for rows dragged
+/// from this app (so the cursor says what happens), a copy for anything from
+/// elsewhere. An outside drag is never answered with a move: the upload copies,
+/// and a move would have the source delete what it handed over.
+///
+/// The answer is not checked against [`gtk4::gdk::Drop::actions`]: on Wayland
+/// that is the one action the compositor has picked so far (a file manager's
+/// drag shows up as MOVE alone), not every action the source supports. The
+/// answer is what makes the compositor pick again, so a copy has to be asked
+/// for even while the drop says move, or the drop is refused.
+fn browser_drop_action(drop: Option<gtk4::gdk::Drop>) -> gtk4::gdk::DragAction {
+    use gtk4::gdk::DragAction;
+    if drop.is_some_and(|drop| drop.drag().is_some()) {
+        DragAction::MOVE
+    } else {
+        DragAction::COPY
+    }
+}
+
+/// Act on `files` dropped into `dest`, a mountpoint-relative folder: the ones
+/// already in Proton Drive move there, the ones from elsewhere upload into it.
+/// Returns whether anything was done, which is what the drop reports back.
+fn drop_files(ui: &Rc<Ui>, dest: &str, files: &gtk4::gdk::FileList) -> bool {
+    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
+    let (moves, uploads) =
+        split_dropped(&mountpoint, files.files().iter().filter_map(|f| f.path()));
+    let movable = !moves.is_empty() && move_target_allowed(&moves, dest);
+    if !movable && uploads.is_empty() {
+        return false;
+    }
+    if movable {
+        run_bulk_move(ui, moves, dest.to_string());
+    }
+    start_upload_into(ui, dest.to_string(), uploads);
+    true
+}
+
+/// Split dropped local paths into those inside the mount at `mountpoint`, as
+/// mountpoint-relative paths to move, and those from anywhere else, as absolute
+/// paths to upload. The mountpoint itself is neither: it cannot be moved.
+pub(crate) fn split_dropped(
+    mountpoint: &Path,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> (Vec<String>, Vec<String>) {
+    let mut moves = Vec::new();
+    let mut uploads = Vec::new();
+    for path in paths {
+        match path.strip_prefix(mountpoint) {
+            Ok(rel) => {
+                if let Some(rel) = rel.to_str().filter(|rel| !rel.is_empty()) {
+                    moves.push(rel.to_string());
+                }
+            }
+            Err(_) => {
+                if let Some(path) = path.to_str() {
+                    uploads.push(path.to_string());
+                }
+            }
+        }
+    }
+    (moves, uploads)
 }
 
 /// The full-colour icon for an entry: [`icon_base_for`], except that folders
@@ -2974,6 +3238,8 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     // any other load forgot it (see `load_browser`).
     let path = ui.browser.path.borrow().clone();
     let another_folder = ui.browser.listed.replace(Some(path.clone())).as_ref() != Some(&path);
+    // The rows on screen: the listing, and what is on its way up into it.
+    let shown = with_pending_uploads(&mut ui.browser.pending_uploads.borrow_mut(), &path, entries);
     ui.browser.summary.set_label(&listing_summary(
         entries.iter().filter(|entry| !entry.is_dir).count(),
         entries.iter().filter(|entry| entry.is_dir).count(),
@@ -2983,7 +3249,7 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
             .map(|entry| entry.size)
             .sum(),
     ));
-    if entries.is_empty() {
+    if shown.is_empty() {
         browser_status(
             ui,
             "folder-open-symbolic",
@@ -2997,7 +3263,7 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     }
     browser_views(ui);
 
-    let mut sorted = entries.to_vec();
+    let mut sorted = shown;
     sort_entries(&mut sorted, ui.browser.view.get());
     // Only the rows that changed are swapped, so a refresh keeps the
     // selection, the scroll position and the thumbnails already drawn.
@@ -3228,8 +3494,65 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 mod tests {
     use super::{
         MoveTarget, badge_for, copy_target_allowed, hit_location, icon_base_for, listing_summary,
-        move_target_allowed, show_thumbnail_build_progress, sort_entries,
+        move_target_allowed, show_thumbnail_build_progress, sort_entries, split_dropped,
     };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn pending_uploads_show_until_listed() {
+        use super::{PENDING_UPLOAD_UID, PendingUpload, is_pending_upload, with_pending_uploads};
+        let placeholder = |parent: &str, name: &str| PendingUpload {
+            parent: parent.to_string(),
+            entry: DirEntry {
+                name: name.to_string(),
+                uid: PENDING_UPLOAD_UID.to_string(),
+                ..DirEntry::default()
+            },
+            since: std::time::Instant::now(),
+        };
+        let mut pending = vec![
+            placeholder("Docs", "a.pdf"),
+            placeholder("Docs", "b.pdf"),
+            placeholder("", "c.txt"),
+        ];
+        let listed = DirEntry {
+            name: "a.pdf".to_string(),
+            uid: "vol~a".to_string(),
+            ..DirEntry::default()
+        };
+
+        // a.pdf has arrived; b.pdf is still on its way; c.txt is elsewhere.
+        let shown = with_pending_uploads(&mut pending, "Docs", std::slice::from_ref(&listed));
+        let names: Vec<(&str, bool)> = shown
+            .iter()
+            .map(|entry| (entry.name.as_str(), is_pending_upload(entry)))
+            .collect();
+        assert_eq!(names, [("a.pdf", false), ("b.pdf", true)]);
+        let left: Vec<&str> = pending.iter().map(|p| p.entry.name.as_str()).collect();
+        assert_eq!(left, ["b.pdf", "c.txt"]);
+    }
+
+    #[test]
+    fn dropped_paths_split_into_moves_and_uploads() {
+        let (moves, uploads) = split_dropped(
+            Path::new("/home/me/ProtonDrive"),
+            [
+                PathBuf::from("/home/me/ProtonDrive/Docs/a.pdf"),
+                PathBuf::from("/home/me/Documents/b.txt"),
+                PathBuf::from("/home/me/ProtonDrive"),
+                PathBuf::from("/home/me/ProtonDriveOther/c.txt"),
+                PathBuf::from("/home/me/ProtonDrive/Photos"),
+            ],
+        );
+        assert_eq!(moves, ["Docs/a.pdf", "Photos"]);
+        assert_eq!(
+            uploads,
+            [
+                "/home/me/Documents/b.txt",
+                "/home/me/ProtonDriveOther/c.txt"
+            ]
+        );
+    }
     use pdfs_core::config::{FileSort, FilesView};
     use pdfs_core::control::{DirEntry, SyncIssue, ThumbnailBuildStatus};
 
