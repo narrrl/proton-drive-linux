@@ -11,6 +11,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+- A cold mount whose account keys cannot open My Files waits for Retry or a fresh sign-in (#40).
+
 ## [3.10.0] — 2026-11-22
 
 Schema: **47**. The trash table gets an index on the original folder, and its stored rows are

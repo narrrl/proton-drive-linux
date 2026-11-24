@@ -13,6 +13,22 @@ use serde::{Deserialize, Serialize};
 /// The file's name inside the state directory.
 const FILE_NAME: &str = "mount-failure.json";
 
+/// Failure to fetch My Files on a cold start with no cached root.
+#[derive(Debug, thiserror::Error)]
+#[error("fetch My Files root: {0}")]
+pub struct RootLookup(pub proton_sdk::ProtonError);
+
+impl RootLookup {
+    pub fn needs_account_keys(&self) -> bool {
+        use proton_sdk::{ProtonError, crypto::CryptoError};
+
+        // SDK 0.12 exposes the underlying PGP missing-key reason as the
+        // payload of Decrypt. Never park for an unrelated decryption error.
+        matches!(self.0, ProtonError::KeysLocked)
+            || matches!(&self.0, ProtonError::Crypto(CryptoError::Decrypt(reason)) if reason == "missing key")
+    }
+}
+
 /// The last failed mount attempt.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MountFailure {
@@ -22,8 +38,8 @@ pub struct MountFailure {
     pub since: i64,
     /// Failed attempts in a row.
     pub attempts: u32,
-    /// Unix seconds of the next attempt.
-    pub next_attempt: i64,
+    /// Unix seconds of the next attempt, or None while waiting for key recovery.
+    pub next_attempt: Option<i64>,
     /// Set when the mount was refused because the folder already has files in
     /// it, so the app can explain that in the user's language. Absent in a
     /// file an older daemon wrote.
@@ -67,7 +83,7 @@ mod tests {
             error: "fetch My Files root: missing key".into(),
             since: 1_700_000_000,
             attempts: 3,
-            next_attempt: 1_700_000_040,
+            next_attempt: Some(1_700_000_040),
             not_empty: None,
         };
         record(&dir, &failure).unwrap();
@@ -81,6 +97,7 @@ mod tests {
     fn a_failure_an_older_daemon_wrote_still_reads() {
         let old = r#"{"error":"missing key","since":1,"attempts":2,"next_attempt":3}"#;
         let failure: MountFailure = serde_json::from_str(old).unwrap();
+        assert_eq!(failure.next_attempt, Some(3));
         assert_eq!(failure.not_empty, None);
         assert_eq!(failure.attempts, 2);
     }

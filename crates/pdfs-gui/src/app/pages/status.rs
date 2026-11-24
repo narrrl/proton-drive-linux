@@ -1430,6 +1430,7 @@ pub(crate) fn paint_disconnected(ui: &Rc<Ui>) {
             match failure {
                 Some(failure) => SyncState::CannotOpen {
                     not_empty: failure.not_empty.is_some(),
+                    waiting_for_keys: failure.next_attempt.is_none(),
                 },
                 None => SyncState::Disconnected,
             },
@@ -1482,6 +1483,7 @@ pub(crate) enum SyncState {
     /// it refuses a folder that already has files in it.
     CannotOpen {
         not_empty: bool,
+        waiting_for_keys: bool,
     },
     /// The daemon is running but didn't answer in time.
     NotResponding,
@@ -1586,11 +1588,18 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
             gettext("Not connected"),
             Some(gettext("Proton Drive isn't running")),
         ),
-        SyncState::CannotOpen { not_empty } => (
+        SyncState::CannotOpen {
+            not_empty,
+            waiting_for_keys,
+        } => (
             "dialog-warning-symbolic",
             Some("warning"),
             gettext("Can't open your Drive"),
-            Some(if not_empty {
+            Some(if waiting_for_keys {
+                gettext(
+                    "Your account keys could not open My Files. After recovering your keys, choose Retry.",
+                )
+            } else if not_empty {
                 gettext("Your Proton Drive folder isn't empty")
             } else {
                 gettext("Proton Drive keeps trying to start")

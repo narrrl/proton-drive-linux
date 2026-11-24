@@ -162,7 +162,13 @@ session before it shows your files.
 
 ### `fetch My Files root: … failed to decrypt: missing key` in the log
 
-Your account keys cannot open your Drive, which happens after a password reset: Proton locks the
+If Drive on the web opens your files, run `pdfs diagnose` and check the **Keys** section.
+A missing address key can prevent My Files from opening even when sign-in succeeded. On a
+cold start with no cached root the daemon waits for key recovery. After recovering your keys,
+choose **Retry** in the app or run `systemctl --user restart proton-drive.service`. If it still
+fails, include the client version and the redacted Keys findings in your report.
+
+If the web app also shows locked files after a password reset, Proton locks the
 files that were encrypted with the old keys. Since 3.4.1 the client then starts a new, empty My
 files. Your old files are still there, locked: open [drive.proton.me](https://drive.proton.me) and
 restore them with your previous password. If your files are not locked and the error stays, run

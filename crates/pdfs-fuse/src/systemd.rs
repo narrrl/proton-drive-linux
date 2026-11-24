@@ -102,6 +102,27 @@ pub fn idle_sleep(duration: Duration) {
     }
 }
 
+/// Keep a cold daemon available for a service restart after key recovery.
+pub fn wait_for_restart() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let mut terminate = signal(SignalKind::terminate())?;
+            let mut interrupt = signal(SignalKind::interrupt())?;
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = terminate.recv() => return Ok(()),
+                    _ = interrupt.recv() => return Ok(()),
+                    _ = tick.tick() => watchdog_ping(),
+                }
+            }
+        })
+}
+
 /// How long a mount may take to start before the watchdog counts it as hung.
 ///
 /// Startup has no control socket to probe yet, and on a large account it is
