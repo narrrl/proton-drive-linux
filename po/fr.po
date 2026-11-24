@@ -3710,14 +3710,8 @@ msgstr ""
 "Trop de tentatives de connexion. Patientez quelques minutes et réessayez."
 
 #: crates/pdfs-gui/src/app/pages/login.rs:319
-msgid ""
-"Proton is temporarily refusing sign-in from this device. Your app version is "
-"not the problem. Wait several hours, up to a day, without trying again, then "
-"sign in."
-msgstr ""
-"Proton refuse temporairement la connexion depuis cet appareil. La version de "
-"l’application n’est pas en cause. Patientez plusieurs heures, jusqu’à un "
-"jour, sans réessayer, puis connectez-vous."
+msgid "Proton declined this sign-in (code 2028). Wait before trying again. If it persists, try signing in on the web and mention code 2028 when contacting Proton support."
+msgstr "Proton a refusé cette connexion (code 2028). Patientez avant de réessayer. Si le problème persiste, essayez de vous connecter sur le Web et indiquez le code 2028 à l’assistance Proton."
 
 #: crates/pdfs-gui/src/app/pages/login.rs:325
 msgid "Couldn't reach Proton. Check your internet connection and try again."

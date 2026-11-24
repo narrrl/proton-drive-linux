@@ -11,6 +11,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+- Sign-in failures with Proton code 2028 now give consistent recovery guidance in the desktop app and CLI (#39).
+
 ## [3.10.0] — 2026-11-22
 
 Schema: **47**. The trash table gets an index on the original folder, and its stored rows are

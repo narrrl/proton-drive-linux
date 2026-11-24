@@ -2273,22 +2273,7 @@ fn cmd_login(username: Option<String>, remember: bool) -> Result<()> {
         get_mailbox,
         get_hv,
     ))
-    .map_err(|e| {
-        // Proton words this block as "update the app", which the user can't
-        // act on: the release is current and only waiting helps.
-        let blocked =
-            matches!(&e, pdfs_core::Error::Proton(p) if pdfs_core::error::sign_in_blocked(p));
-        let e = anyhow::Error::new(e).context("login failed");
-        if blocked {
-            e.context(
-                "Proton is temporarily refusing sign-in from this device (code 2028). \
-                 Your version is not the problem. Wait several hours, up to a day, \
-                 without trying again, then sign in.",
-            )
-        } else {
-            e
-        }
-    })?;
+    .map_err(login_failure)?;
 
     // A daemon that is already up is parked in `wait_for_session`, sleeping
     // between keyring checks; restart it so the mount appears now instead of
@@ -2302,6 +2287,18 @@ fn cmd_login(username: Option<String>, remember: bool) -> Result<()> {
     println!("Logged in as {username}. Session stored in the system keyring.");
     report_key_state();
     Ok(())
+}
+
+fn login_failure(error: pdfs_core::Error) -> anyhow::Error {
+    if matches!(&error, pdfs_core::Error::Proton(e) if pdfs_core::error::sign_in_blocked(e)) {
+        // The SDK logs the response code at debug level. Its server text
+        // would give contradictory instructions in the displayed cause chain.
+        anyhow::anyhow!(
+            "Proton declined this sign-in (code 2028). Wait before trying again. If it persists, try signing in on the web and mention code 2028 when contacting Proton support."
+        )
+    } else {
+        anyhow::Error::new(error).context("login failed")
+    }
 }
 
 /// Ask for the mailbox password of a two-password account, without echo.
@@ -4883,6 +4880,25 @@ mod diagnose_tests {
 #[cfg(test)]
 mod login_wait_tests {
     use super::*;
+
+    #[test]
+    fn login_failure_preserves_only_actionable_upgrade_advice() {
+        use pdfs_core::proton_sdk::{ProtonApiError, ProtonError, api::ResponseCode};
+        for (code, blocked) in [
+            (ResponseCode::Blocked, true),
+            (ResponseCode::OutdatedApp, false),
+        ] {
+            let error = ProtonError::Api(ProtonApiError {
+                code,
+                http_status: 422,
+                message: "Please update the app".into(),
+                details: None,
+            });
+            let rendered = format!("{:#}", login_failure(error.into()));
+            assert_eq!(rendered.contains("2028"), blocked);
+            assert_eq!(rendered.contains("Please update"), !blocked);
+        }
+    }
 
     /// The mount retry backs off from 5 s to a ceiling of minutes, rather than
     /// asking Proton every 5 s forever (`docs/BUGS.md` B263).
