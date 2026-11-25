@@ -39,3 +39,4 @@ parking_lot.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

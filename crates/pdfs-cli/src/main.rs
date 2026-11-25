@@ -2706,7 +2706,8 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
                     error: error.clone(),
                     since: failure.as_ref().map_or(now, |f| f.since),
                     attempts,
-                    next_attempt: delay.map(|delay| now + delay.as_secs() as i64),
+                    next_attempt: now + delay.map_or(0, |delay| delay.as_secs() as i64),
+                    awaiting_keys: delay.is_none(),
                     not_empty: not_empty_cause(&e),
                 };
                 if let Err(e) = pdfs_core::mountfail::record(&state_dir, &record) {
@@ -4657,7 +4658,7 @@ fn cmd_diagnose() -> Result<()> {
                         "failing for {}, {} attempt(s): {}",
                         human_secs(unix_now().saturating_sub(failure.since).max(0) as u64),
                         failure.attempts,
-                        if failure.next_attempt.is_none() {
+                        if failure.awaiting_keys {
                             format!("{} — after recovering your account keys, restart proton-drive.service", failure.error)
                         } else {
                             failure.error

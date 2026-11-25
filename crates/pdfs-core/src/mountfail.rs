@@ -22,8 +22,11 @@ impl RootLookup {
     pub fn needs_account_keys(&self) -> bool {
         use proton_sdk::{ProtonError, crypto::CryptoError};
 
-        // SDK 0.12 exposes the underlying PGP missing-key reason as the
-        // payload of Decrypt. Never park for an unrelated decryption error.
+        // SDK 0.12 carries rpgp's `MissingKey` as the text of Decrypt.
+        // `a_real_missing_key_failure_waits_for_keys` pins that wording, so
+        // an SDK or rpgp update that changes it fails the test instead of
+        // silently going back to the retry loop. Never park for an unrelated
+        // decryption error.
         matches!(self.0, ProtonError::KeysLocked)
             || matches!(&self.0, ProtonError::Crypto(CryptoError::Decrypt(reason)) if reason == "missing key")
     }
@@ -38,8 +41,14 @@ pub struct MountFailure {
     pub since: i64,
     /// Failed attempts in a row.
     pub attempts: u32,
-    /// Unix seconds of the next attempt, or None while waiting for key recovery.
-    pub next_attempt: Option<i64>,
+    /// Unix seconds of the next attempt. Meaningless while `awaiting_keys`.
+    pub next_attempt: i64,
+    /// The daemon stopped retrying because the account keys cannot open My
+    /// Files, and waits for a restart after key recovery. A separate field
+    /// rather than an optional `next_attempt`, so an older version reading
+    /// the file after a downgrade still understands it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub awaiting_keys: bool,
     /// Set when the mount was refused because the folder already has files in
     /// it, so the app can explain that in the user's language. Absent in a
     /// file an older daemon wrote.
@@ -83,7 +92,8 @@ mod tests {
             error: "fetch My Files root: missing key".into(),
             since: 1_700_000_000,
             attempts: 3,
-            next_attempt: Some(1_700_000_040),
+            next_attempt: 1_700_000_040,
+            awaiting_keys: false,
             not_empty: None,
         };
         record(&dir, &failure).unwrap();
@@ -97,8 +107,59 @@ mod tests {
     fn a_failure_an_older_daemon_wrote_still_reads() {
         let old = r#"{"error":"missing key","since":1,"attempts":2,"next_attempt":3}"#;
         let failure: MountFailure = serde_json::from_str(old).unwrap();
-        assert_eq!(failure.next_attempt, Some(3));
+        assert_eq!(failure.next_attempt, 3);
+        assert!(!failure.awaiting_keys);
         assert_eq!(failure.not_empty, None);
         assert_eq!(failure.attempts, 2);
+    }
+
+    /// An older daemon, after a downgrade, must still read what this one
+    /// writes while it waits for key recovery.
+    #[test]
+    fn a_key_wait_reads_as_a_plain_failure_without_the_new_field() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OlderFailure {
+            error: String,
+            since: i64,
+            attempts: u32,
+            next_attempt: i64,
+        }
+        let failure = MountFailure {
+            error: "fetch My Files root: missing key".into(),
+            since: 1,
+            attempts: 1,
+            next_attempt: 1,
+            awaiting_keys: true,
+            not_empty: None,
+        };
+        let json = serde_json::to_string(&failure).unwrap();
+        let older: OlderFailure = serde_json::from_str(&json).unwrap();
+        assert_eq!(older.next_attempt, 1);
+        let back: MountFailure = serde_json::from_str(&json).unwrap();
+        assert!(back.awaiting_keys);
+    }
+
+    /// The error a key that is not the message's recipient really produces,
+    /// not a hand-written payload.
+    #[test]
+    fn a_real_missing_key_failure_waits_for_keys() {
+        use proton_sdk::crypto::{PrivateKey, generate_node_key};
+
+        let unlock = |generated: proton_sdk::crypto::GeneratedNodeKey| {
+            PrivateKey::from_armored(&generated.locked_armored, &generated.passphrase).unwrap()
+        };
+        let recipient = unlock(generate_node_key().unwrap());
+        let stranger = unlock(generate_node_key().unwrap());
+        let message = recipient.encrypt(b"root share key").unwrap();
+
+        let single = stranger.decrypt_armored_message(&message).unwrap_err();
+        assert!(RootLookup(single.into()).needs_account_keys());
+        let any = proton_sdk::crypto::decrypt_armored_with_keys(&message, &[stranger]).unwrap_err();
+        assert!(RootLookup(any.into()).needs_account_keys());
+        assert!(
+            !RootLookup(proton_sdk::ProtonError::invalid_operation("missing key"))
+                .needs_account_keys()
+        );
     }
 }

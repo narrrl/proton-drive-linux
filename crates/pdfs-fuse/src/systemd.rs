@@ -112,15 +112,32 @@ pub fn wait_for_restart() -> std::io::Result<()> {
         .block_on(async {
             let mut terminate = signal(SignalKind::terminate())?;
             let mut interrupt = signal(SignalKind::interrupt())?;
-            let mut tick = tokio::time::interval(Duration::from_secs(10));
-            loop {
+            let stop = async {
                 tokio::select! {
-                    _ = terminate.recv() => return Ok(()),
-                    _ = interrupt.recv() => return Ok(()),
-                    _ = tick.tick() => watchdog_ping(),
+                    _ = terminate.recv() => {}
+                    _ = interrupt.recv() => {}
                 }
-            }
+            };
+            park_until(stop, Duration::from_secs(10), watchdog_ping).await;
+            Ok(())
         })
+}
+
+/// Call `ping` every `every` until `stop` completes. The parked daemon's whole
+/// loop, apart from which signals end it.
+async fn park_until(
+    stop: impl std::future::Future<Output = ()>,
+    every: Duration,
+    mut ping: impl FnMut(),
+) {
+    let mut tick = tokio::time::interval(every);
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            _ = &mut stop => return,
+            _ = tick.tick() => ping(),
+        }
+    }
 }
 
 /// How long a mount may take to start before the watchdog counts it as hung.
@@ -176,4 +193,27 @@ pub(crate) fn watchdog_period() -> Option<Duration> {
     }
     let usec: u64 = std::env::var("WATCHDOG_USEC").ok()?.parse().ok()?;
     (usec > 0).then(|| Duration::from_micros(usec / 2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A parked daemon keeps the watchdog fed and returns once stopped, so the
+    /// restart after key recovery is a clean exit, not a kill.
+    #[test]
+    fn a_parked_daemon_pings_until_it_is_stopped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let pings = std::cell::Cell::new(0);
+        runtime.block_on(async {
+            let stop = tokio::time::sleep(Duration::from_secs(35));
+            park_until(stop, Duration::from_secs(10), || pings.set(pings.get() + 1)).await;
+        });
+        // Ticks at 0, 10, 20 and 30 seconds, then the stop at 35.
+        assert_eq!(pings.get(), 4);
+    }
 }

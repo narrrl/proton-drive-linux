@@ -1430,7 +1430,7 @@ pub(crate) fn paint_disconnected(ui: &Rc<Ui>) {
             match failure {
                 Some(failure) => SyncState::CannotOpen {
                     not_empty: failure.not_empty.is_some(),
-                    waiting_for_keys: failure.next_attempt.is_none(),
+                    waiting_for_keys: failure.awaiting_keys,
                 },
                 None => SyncState::Disconnected,
             },

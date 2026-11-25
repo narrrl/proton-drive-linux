@@ -1993,7 +1993,7 @@ pub(crate) fn service_unreachable(
                     offer_not_empty(&ui, found);
                 }
             }
-            Some(failure) if failure.next_attempt.is_none() => status(
+            Some(failure) if failure.awaiting_keys => status(
                 &ui,
                 "dialog-warning-symbolic",
                 &gettext("Can't open your Drive"),

@@ -200,7 +200,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
                     if let Some(failure) = socket.parent().and_then(pdfs_core::mountfail::read) =>
                 {
                     (
-                        if failure.next_attempt.is_none() {
+                        if failure.awaiting_keys {
                             gettext(
                                 "Your account keys could not open My Files. After recovering your keys, choose Retry.",
                             )
