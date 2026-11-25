@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use pdfs_core::control::SyncEngineState;
 use tracing::error;
 
+use std::collections::BTreeMap;
+
+use super::trace::PassTrace;
 use super::*;
 
 /// How long the watcher must go quiet before a burst counts as finished.
@@ -73,6 +76,10 @@ pub(crate) struct EngineHealth {
     running: AtomicBool,
     pass: Mutex<Option<PassClock>>,
     panics: AtomicU64,
+    /// The running pass's trace, while a pass runs.
+    trace: Mutex<Option<PassTrace>>,
+    /// The last trace of each folder's pass that got past its checks.
+    traces: Mutex<BTreeMap<i64, PassTrace>>,
 }
 
 #[derive(Clone, Copy)]
@@ -109,12 +116,26 @@ impl EngineHealth {
     /// a report must not wait on the thing it reports about.
     pub(crate) fn report(&self) -> SyncEngineState {
         let pass = self.pass.try_lock().and_then(|pass| *pass);
+        let mut traces: Vec<_> = self
+            .traces
+            .try_lock()
+            .map(|t| t.values().map(PassTrace::summary).collect())
+            .unwrap_or_default();
+        if let Some(running) = self
+            .trace
+            .try_lock()
+            .and_then(|t| t.as_ref().map(PassTrace::summary))
+        {
+            traces.retain(|t| t.folder_id != running.folder_id);
+            traces.insert(0, running);
+        }
         SyncEngineState {
             running: self.running.load(Ordering::Relaxed),
             pass_folder: pass.map(|p| p.folder),
             pass_age_secs: pass.map_or(0, |p| p.started.elapsed().as_secs()),
             pass_idle_secs: pass.map_or(0, |p| p.moved.elapsed().as_secs()),
             panics: self.panics.load(Ordering::Relaxed),
+            traces,
         }
     }
 
@@ -128,12 +149,37 @@ impl EngineHealth {
             moved: now,
             logged: now,
         });
+        *self.trace.lock() = Some(PassTrace::new(folder));
         let finished = std::panic::catch_unwind(AssertUnwindSafe(pass)).is_ok();
         *self.pass.lock() = None;
         if !finished {
             self.panics.fetch_add(1, Ordering::Relaxed);
+            self.end_trace("panicked");
+        }
+        // A pass that never ended its trace was skipped (paused, on-demand,
+        // stopping) and has nothing worth keeping.
+        if let Some(trace) = self.trace.lock().take()
+            && trace.is_ended()
+        {
+            self.traces.lock().insert(trace.folder_id(), trace);
         }
         finished
+    }
+
+    /// Apply `f` to the running pass's trace. Does nothing outside a pass.
+    pub(crate) fn trace(&self, f: impl FnOnce(&mut PassTrace)) {
+        if let Some(trace) = self.trace.lock().as_mut() {
+            f(trace);
+        }
+    }
+
+    /// Note that the running pass ended, `how`, and return its trace for the
+    /// journal.
+    pub(crate) fn end_trace(&self, how: &'static str) -> Option<PassTrace> {
+        let mut trace = self.trace.lock();
+        let trace = trace.as_mut()?;
+        trace.end(how);
+        Some(trace.clone())
     }
 }
 

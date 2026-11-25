@@ -1647,6 +1647,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The trace of the last finished pass over `folder` that `done` accepts.
+    fn traced_pass(
+        daemon: &Daemon,
+        folder: i64,
+        done: impl Fn(&control::SyncPassTrace) -> bool,
+    ) -> Option<control::SyncPassTrace> {
+        let mut found = None;
+        wait_until(Duration::from_secs(30), || {
+            let Ok(Response::Diagnostics { diagnostics }) = daemon.request(&Request::Diagnostics)
+            else {
+                return false;
+            };
+            found = diagnostics.sync.and_then(|sync| {
+                sync.traces
+                    .into_iter()
+                    .find(|t| t.folder_id == folder && t.ended == "finished" && done(t))
+            });
+            found.is_some()
+        });
+        found
+    }
+
+    fn calls(trace: &control::SyncPassTrace, name: &str) -> u64 {
+        trace
+            .calls
+            .iter()
+            .find(|c| c.name == name)
+            .map_or(0, |c| c.count)
+    }
+
+    fn counted(trace: &control::SyncPassTrace, name: &str) -> u64 {
+        trace
+            .counts
+            .iter()
+            .find(|c| c.name == name)
+            .map_or(0, |c| c.value)
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_mirror_pass_reports_where_its_time_went() {
+        // A pass over a large folder said only that it started and, hours
+        // later, that a stop cut it short (B294). Its trace says what each
+        // stage did, in `pdfs diagnostics` and in the journal.
+        let drive = FakeDrive::new();
+        let dir = scratch("mirror-pass-trace");
+        let (daemon, folder, _client) = start_mirror(
+            &drive,
+            &dir,
+            &[("a.txt", b"one"), ("b.txt", b"two"), ("c.txt", b"three")],
+        );
+        let first = traced_pass(&daemon, folder, |t| calls(t, "upload") > 0)
+            .expect("the first pass is traced");
+        assert_eq!(calls(&first, "upload"), 3);
+        assert_eq!(counted(&first, "local entries"), 3);
+        assert!(counted(&first, "remote folders") >= 1);
+        for phase in ["baseline", "local walk", "remote walk", "apply"] {
+            assert!(
+                first.phases.iter().any(|p| p.name == phase),
+                "no {phase} in {first}"
+            );
+        }
+        assert!(
+            take_logged()
+                .iter()
+                .any(|line| line.contains("sync: pass trace"))
+        );
+
+        // Drive does not list a node it has just made at once, so the read
+        // back after an upload has no revision id to record. The next pass
+        // reads those files in full, one key unlock each, and records it.
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+        let filled = traced_pass(&daemon, folder, |t| counted(t, "revisions recorded") == 3)
+            .expect("the pass after the uploads is traced");
+        assert_eq!(counted(&filled, "nodes full"), 3, "{filled}");
+
+        // Every pass after that reads every node without a key unlock and
+        // applies nothing.
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+        let quiet = traced_pass(&daemon, folder, |t| {
+            counted(t, "nodes") == 3 && counted(t, "nodes full") == 0
+        })
+        .expect("a quiet pass is traced");
+        assert_eq!(calls(&quiet, "upload"), 0, "{quiet}");
+        assert_eq!(counted(&quiet, "queued"), 0, "{quiet}");
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_mirror_edit_does_not_replace_a_revision_another_computer_made_since() {

@@ -441,6 +441,12 @@ Not changed: a pass still walks both trees before it applies anything, so a fold
 be walked in one run still never syncs. Applying changes per subtree as the walk goes is the
 fix for that, and is not done. The two-minute poll still walks every folder in turn.
 
+Later: every pass keeps a trace of where its time went (`crates/pdfs-fuse/src/sync/trace.rs`),
+in the journal as `sync: pass trace` and in `pdfs diagnostics`. The sim test
+`a_mirror_pass_reports_where_its_time_went` showed that a file uploaded by a pass also gets a
+baseline row without a revision id, because Drive does not list it at once and the upload
+returns only its uid. The next pass reads it in full once and records the id.
+
 **Verified:** `revision_ids_fill_only_rows_without_one`, `baseline_rows_are_counted_per_folder`,
 `folders_left_syncing_are_reset_to_error`, `only_an_unchanged_row_without_an_id_takes_the_revision`
 and `the_smallest_folders_run_first_in_a_burst` on 2026-11-25. Not yet checked on the reporter's
