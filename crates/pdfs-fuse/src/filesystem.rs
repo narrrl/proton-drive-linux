@@ -467,21 +467,16 @@ impl Filesystem for ProtonFs {
             let handled = {
                 let mut st = self.core.state();
                 match st.active_writes.get_mut(&ino.0) {
-                    Some(aw) => {
-                        if size < aw.len {
-                            // Shrink: drop authored ranges past the new end.
-                            aw.written.clip(size);
-                        } else if size > aw.len {
-                            // Grow: the new tail is defined as zeros, so claim
-                            // it as authored rather than base content.
-                            aw.written.add(aw.len, size);
-                        }
-                        let _ = aw.file.set_len(size);
-                        aw.len = size;
-                        aw.dirty = true;
-                        true
-                    }
-                    None => false,
+                    Some(aw) => aw.resize(size).map(|()| true).map_err(Errno::from),
+                    None => Ok(false),
+                }
+            };
+            let handled = match handled {
+                Ok(handled) => handled,
+                Err(error) => {
+                    debug!(ino = ino.0, size, ?error, "setattr resize refused");
+                    reply.error(error);
+                    return;
                 }
             };
             debug!(ino = ino.0, size, fh = ?fh, handled, "setattr resize");

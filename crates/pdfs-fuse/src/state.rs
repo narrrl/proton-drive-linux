@@ -167,6 +167,27 @@ impl WriteHandle {
         self.base_revision_id = crate::node_revision_id(node);
     }
 
+    /// Resize the file to `size`, as `setattr` does through an open handle.
+    ///
+    /// The scratch file goes first: a resize it refuses (a full disk on a
+    /// grow) fails with nothing recorded. Otherwise the length and the
+    /// authored ranges would describe bytes the scratch file does not hold,
+    /// and the call would have succeeded.
+    pub(crate) fn resize(&mut self, size: u64) -> std::io::Result<()> {
+        self.file.set_len(size)?;
+        if size < self.len {
+            // Shrink: drop authored ranges past the new end.
+            self.written.clip(size);
+        } else if size > self.len {
+            // Grow: the new tail is defined as zeros, so claim it as authored
+            // rather than base content.
+            self.written.add(self.len, size);
+        }
+        self.len = size;
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Account for `[offset, end)` having been written through this handle.
     ///
     /// A write past the end leaves a hole that reads as zeros, exactly like a
@@ -2302,6 +2323,26 @@ mod tests {
             dirty: false,
             open_count: 1,
         }
+    }
+
+    #[test]
+    fn a_resize_the_scratch_file_refuses_changes_nothing() {
+        let mut h = handle(4, 4);
+        h.written.add(0, 4);
+        // A read-only descriptor refuses `ftruncate`, as a full disk does a grow.
+        let path = std::env::temp_dir().join(format!("pdfs-resize-test-{}", std::process::id()));
+        std::fs::write(&path, b"kept").unwrap();
+        h.file = Arc::new(File::open(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        assert!(h.resize(10).is_err());
+        assert_eq!((h.len, h.dirty), (4, false));
+        assert_eq!(h.written.segments(4, 10), vec![(4, 10, false)]);
+
+        let mut h = handle(4, 4);
+        h.resize(10).unwrap();
+        assert_eq!((h.len, h.dirty), (10, true));
+        assert_eq!(h.written.segments(4, 10), vec![(4, 10, true)]);
     }
 
     /// A file created offline is written while its queued create lands. The

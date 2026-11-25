@@ -397,6 +397,29 @@ a live account since.
 
 Newest first.
 
+### B295 — A resize the scratch file refused still succeeded
+
+**Status:** Fixed
+
+**Found:** 2026-11-25, in a review of the mount's write path.
+
+**Where:** `crates/pdfs-fuse/src/filesystem.rs` `setattr`; `crates/pdfs-fuse/src/state.rs`
+`WriteHandle::resize`
+
+**Repro:** Open a file for writing in the mount, then `ftruncate` it larger while the disk that
+holds the cache is full.
+
+**Cause:** A resize through an open handle recorded the new length and claimed the grown tail as
+written, then called `set_len` on the scratch file and ignored the result. When the scratch file
+refused, the call still succeeded. The handle's length and written ranges then described bytes the
+scratch file did not hold, and the version sent to Drive was built from that.
+
+**Fix:** `WriteHandle::resize` resizes the scratch file first and records the new length and
+ranges only when that succeeds. `setattr` answers the scratch file's error.
+
+**Verified:** `state::tests::a_resize_the_scratch_file_refuses_changes_nothing`, which resizes a
+handle whose scratch file refuses `ftruncate`, 2026-11-25.
+
 ### B294 — A mirror folder too large to finish in one run never syncs, and holds back the others
 
 **Status:** Fixed (unverified)

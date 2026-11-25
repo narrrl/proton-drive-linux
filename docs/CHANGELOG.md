@@ -108,6 +108,9 @@ dropped once so they are read again with real deletion times.
 
 ### Fixed
 
+- A resize of an open file in the mount that the disk refused, for example a grow on a full disk,
+  failed with nothing changed. It used to succeed, and the file then had a length and content the
+  disk never held (B295).
 - A large trash listed only its first items and never refreshed, and Empty Trash
   never emptied it (B293). Empty Trash no longer reports the server's "Accepted"
   answer as an error. Needs proton-sdk and proton-drive-rs 0.12.6.
