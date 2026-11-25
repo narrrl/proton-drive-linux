@@ -15,7 +15,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 - Files and folders drag out of My files into a file manager, the desktop or any app
   that takes files, as the real files under `~/ProtonDrive`. Dragging a selected row
-  drags the whole selection.
+  drags the whole selection. The drag offers a copy only, so a file manager can never
+  move a file out of the mount, which would delete it from Proton Drive.
+- Files dragged in from a file manager that is browsing `~/ProtonDrive` are copied
+  inside Proton Drive instead of uploaded again.
 - Files and folders uploaded in My files, dropped in or picked with Upload Files or
   Upload Folder, show in their folder at once, faded, until Proton Drive lists
   them. One that never arrives (a failed upload) goes once nothing is transferring

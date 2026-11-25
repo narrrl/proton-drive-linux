@@ -1067,6 +1067,9 @@ pub(crate) fn open_entry_with(ui: &Rc<Ui>, entry: &DirEntry) {
 /// password of. A listed link carries no URL, since the password fragment is
 /// only known when the link is made, so otherwise open the Share dialog.
 pub(crate) fn copy_entry_link(ui: &Rc<Ui>, entry: &DirEntry) {
+    if is_pending_upload(entry) {
+        return;
+    }
     let req = if entry.path.is_empty() && !entry.uid.is_empty() {
         Request::ListShareByUid {
             uid: entry.uid.clone(),
@@ -1399,11 +1402,11 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
         gtk4::gdk::DragAction::COPY | gtk4::gdk::DragAction::MOVE,
     );
     let ui_enter = ui.clone();
-    drop.connect_enter(move |target, _, _| {
+    drop.connect_enter(move |_, _, _| {
         ui_enter.browser.content.add_css_class("files-drop-active");
-        browser_drop_action(target.current_drop())
+        browser_drop_action()
     });
-    drop.connect_motion(|target, _, _| browser_drop_action(target.current_drop()));
+    drop.connect_motion(|_, _, _| browser_drop_action());
     let ui_leave = ui.clone();
     drop.connect_leave(move |_| {
         ui_leave
@@ -1412,7 +1415,7 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
             .remove_css_class("files-drop-active");
     });
     let ui_drop = ui.clone();
-    drop.connect_drop(move |_, value, _, _| {
+    drop.connect_drop(move |target, value, _, _| {
         ui_drop
             .browser
             .content
@@ -1425,7 +1428,7 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
             return false;
         }
         let dest = ui_drop.browser.path.borrow().clone();
-        drop_files(&ui_drop, &dest, &files)
+        drop_files(&ui_drop, &dest, &files, from_this_app(target))
     });
     ui.browser.content.add_controller(drop);
 }
@@ -2702,12 +2705,22 @@ pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
 /// [`start_upload`] into `parent`, a mountpoint-relative folder that need not be
 /// the one on screen (a folder that files were dropped onto).
 pub(crate) fn start_upload_into(ui: &Rc<Ui>, parent: String, sources: Vec<String>) {
-    let placeholders: Vec<DirEntry> = sources
-        .iter()
-        .filter_map(|source| pending_entry(Path::new(source)))
-        .collect();
+    let paths = sources.clone();
     start_upload_request(ui, parent.clone(), sources, move |ui| {
-        add_pending_uploads(ui, &parent, placeholders)
+        // A dropped path can sit on a slow or stalled mount (sshfs, NFS, a
+        // phone over MTP), so it is read off the main thread.
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            let placeholders = gio::spawn_blocking(move || {
+                paths
+                    .iter()
+                    .filter_map(|source| pending_entry(Path::new(source)))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            add_pending_uploads(&ui, &parent, placeholders);
+        });
     });
 }
 
@@ -2734,10 +2747,18 @@ pub(crate) struct PendingUpload {
 }
 
 /// The placeholder row for uploading the local `source`: its name, size and
-/// modification time, and [`PENDING_UPLOAD_UID`].
+/// modification time, and [`PENDING_UPLOAD_UID`]. None for a symlink, which
+/// the daemon does not upload, so its placeholder would never be replaced.
+/// Blocks on the file system: call it off the main thread.
 fn pending_entry(source: &Path) -> Option<DirEntry> {
     let name = source.file_name()?.to_str()?.to_string();
-    let meta = std::fs::metadata(source).ok();
+    let meta = std::fs::symlink_metadata(source).ok();
+    if meta
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_symlink())
+    {
+        return None;
+    }
     let is_dir = meta.as_ref().is_some_and(|meta| meta.is_dir());
     let size = meta
         .as_ref()
@@ -2812,7 +2833,14 @@ fn watch_pending_uploads(ui: &Rc<Ui>) {
     }
     let ui = ui.clone();
     glib::timeout_add_local(Duration::from_secs(2), move || {
-        if ui.status.active_transfers.get() == 0 {
+        if ui.status.active_transfers.get() > 0 {
+            // The daemon is still working through what it was handed (a big
+            // folder can take a while to walk), so the grace starts over.
+            let now = Instant::now();
+            for upload in ui.browser.pending_uploads.borrow_mut().iter_mut() {
+                upload.since = now;
+            }
+        } else {
             let expired = {
                 let mut pending = ui.browser.pending_uploads.borrow_mut();
                 let before = pending.len();
@@ -2933,7 +2961,11 @@ pub(crate) fn apply_badge(badge: &gtk4::Image, entry: &DirEntry) {
 /// shows.
 pub(crate) fn attach_drag(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box) {
     let source = gtk4::DragSource::new();
-    source.set_actions(gtk4::gdk::DragAction::COPY | gtk4::gdk::DragAction::MOVE);
+    // Copy only. A file manager that is offered a move (Shift in Nautilus, a
+    // drop on the Trash) takes the file out of the mount, which deletes it from
+    // Proton Drive. A drop back onto this page still moves: it checks where the
+    // drag came from, not the action (see [`drop_files`]).
+    source.set_actions(gtk4::gdk::DragAction::COPY);
     let ui = ui.clone();
     let item = item.clone();
     source.connect_prepare(move |source, x, y| {
@@ -2993,17 +3025,17 @@ pub(crate) fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box
                 .contains_type(gtk4::gdk::FileList::static_type())
     });
     let anchor_enter = anchor.clone();
-    target.connect_enter(move |target, _, _| {
+    target.connect_enter(move |_, _, _| {
         anchor_enter.add_css_class("files-drop-folder");
-        browser_drop_action(target.current_drop())
+        browser_drop_action()
     });
-    target.connect_motion(|target, _, _| browser_drop_action(target.current_drop()));
+    target.connect_motion(|_, _, _| browser_drop_action());
     let anchor_leave = anchor.clone();
     target.connect_leave(move |_| anchor_leave.remove_css_class("files-drop-folder"));
     let ui = ui.clone();
     let item = item.clone();
     let anchor_drop = anchor.clone();
-    target.connect_drop(move |_, value, _, _| {
+    target.connect_drop(move |target, value, _, _| {
         anchor_drop.remove_css_class("files-drop-folder");
         let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() else {
             return false;
@@ -3018,46 +3050,73 @@ pub(crate) fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box
         let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
             return false;
         };
-        drop_files(&ui, &dest, &files)
+        drop_files(&ui, &dest, &files, from_this_app(target))
     });
     anchor.add_controller(target);
 }
 
-/// The action to answer a drag over the browser with: a move for rows dragged
-/// from this app (so the cursor says what happens), a copy for anything from
-/// elsewhere. An outside drag is never answered with a move: the upload copies,
-/// and a move would have the source delete what it handed over.
+/// The action to answer a drag over the browser with: always a copy. Rows
+/// dragged from this app offer nothing else (see [`attach_drag`]), and an
+/// outside drag is never answered with a move, which would have the source
+/// delete what it handed over. What a drop does is decided in [`drop_files`].
 ///
 /// The answer is not checked against [`gtk4::gdk::Drop::actions`]: on Wayland
 /// that is the one action the compositor has picked so far (a file manager's
 /// drag shows up as MOVE alone), not every action the source supports. The
 /// answer is what makes the compositor pick again, so a copy has to be asked
 /// for even while the drop says move, or the drop is refused.
-fn browser_drop_action(drop: Option<gtk4::gdk::Drop>) -> gtk4::gdk::DragAction {
-    use gtk4::gdk::DragAction;
-    if drop.is_some_and(|drop| drop.drag().is_some()) {
-        DragAction::MOVE
-    } else {
-        DragAction::COPY
-    }
+fn browser_drop_action() -> gtk4::gdk::DragAction {
+    gtk4::gdk::DragAction::COPY
 }
 
-/// Act on `files` dropped into `dest`, a mountpoint-relative folder: the ones
-/// already in Proton Drive move there, the ones from elsewhere upload into it.
-/// Returns whether anything was done, which is what the drop reports back.
-fn drop_files(ui: &Rc<Ui>, dest: &str, files: &gtk4::gdk::FileList) -> bool {
+/// Whether the drop on `target` is rows dragged from this app, as opposed to
+/// files from a file manager or another app.
+fn from_this_app(target: &gtk4::DropTarget) -> bool {
+    target
+        .current_drop()
+        .is_some_and(|drop| drop.drag().is_some())
+}
+
+/// Act on `files` dropped into `dest`, a mountpoint-relative folder. Files
+/// from outside Proton Drive upload into it. Files already in Proton Drive move
+/// there when they are rows dragged within this app, and are copied there when
+/// they come from a file manager browsing the mount: a drag from outside the
+/// app is always a copy (see [`browser_drop_action`]). Sources that cannot go
+/// to `dest` (into themselves, or a move into the folder they are in) are left
+/// out. Returns whether anything was done, which is what the drop reports back.
+fn drop_files(ui: &Rc<Ui>, dest: &str, files: &gtk4::gdk::FileList, from_app: bool) -> bool {
     let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
-    let (moves, uploads) =
+    let (in_drive, uploads) =
         split_dropped(&mountpoint, files.files().iter().filter_map(|f| f.path()));
-    let movable = !moves.is_empty() && move_target_allowed(&moves, dest);
-    if !movable && uploads.is_empty() {
+    let in_drive = drop_targets(in_drive, dest, from_app);
+    if in_drive.is_empty() && uploads.is_empty() {
         return false;
     }
-    if movable {
-        run_bulk_move(ui, moves, dest.to_string());
+    if !in_drive.is_empty() {
+        if from_app {
+            run_bulk_move(ui, in_drive, dest.to_string());
+        } else {
+            run_bulk_copy(ui, in_drive, dest.to_string());
+        }
     }
     start_upload_into(ui, dest.to_string(), uploads);
     true
+}
+
+/// Which of `sources`, mountpoint-relative, can go to `dest`: none into
+/// itself or its own subtree, and for a move none already in `dest`.
+pub(crate) fn drop_targets(sources: Vec<String>, dest: &str, moving: bool) -> Vec<String> {
+    sources
+        .into_iter()
+        .filter(|src| {
+            let one = std::slice::from_ref(src);
+            if moving {
+                move_target_allowed(one, dest)
+            } else {
+                copy_target_allowed(one, dest)
+            }
+        })
+        .collect()
 }
 
 /// Split dropped local paths into those inside the mount at `mountpoint`, as
@@ -3070,6 +3129,18 @@ pub(crate) fn split_dropped(
     let mut moves = Vec::new();
     let mut uploads = Vec::new();
     for path in paths {
+        // A path with `..` in it could name something other than it seems to
+        // once made relative; file managers never send one, so it is not
+        // worth resolving. (`components` already drops an inner `.`.)
+        let plain = path.components().all(|part| {
+            matches!(
+                part,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        });
+        if !plain {
+            continue;
+        }
         match path.strip_prefix(mountpoint) {
             Ok(rel) => {
                 if let Some(rel) = rel.to_str().filter(|rel| !rel.is_empty()) {
@@ -3493,8 +3564,9 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MoveTarget, badge_for, copy_target_allowed, hit_location, icon_base_for, listing_summary,
-        move_target_allowed, show_thumbnail_build_progress, sort_entries, split_dropped,
+        MoveTarget, badge_for, copy_target_allowed, drop_targets, hit_location, icon_base_for,
+        listing_summary, move_target_allowed, show_thumbnail_build_progress, sort_entries,
+        split_dropped,
     };
     use std::path::{Path, PathBuf};
 
@@ -3542,6 +3614,7 @@ mod tests {
                 PathBuf::from("/home/me/ProtonDrive"),
                 PathBuf::from("/home/me/ProtonDriveOther/c.txt"),
                 PathBuf::from("/home/me/ProtonDrive/Photos"),
+                PathBuf::from("/home/me/ProtonDrive/../.ssh/id_ed25519"),
             ],
         );
         assert_eq!(moves, ["Docs/a.pdf", "Photos"]);
@@ -3551,6 +3624,25 @@ mod tests {
                 "/home/me/Documents/b.txt",
                 "/home/me/ProtonDriveOther/c.txt"
             ]
+        );
+    }
+
+    #[test]
+    fn a_drop_leaves_out_only_the_sources_that_cannot_go() {
+        let sources = || {
+            vec![
+                "Docs/a.pdf".to_string(),
+                "Photos/b.jpg".to_string(),
+                "Docs".to_string(),
+            ]
+        };
+        // Moving into Docs: a.pdf is already there, and Docs cannot go into
+        // itself; b.jpg still moves.
+        assert_eq!(drop_targets(sources(), "Docs", true), ["Photos/b.jpg"]);
+        // A copy into the folder it is in is fine; into itself is not.
+        assert_eq!(
+            drop_targets(sources(), "Docs", false),
+            ["Docs/a.pdf", "Photos/b.jpg"]
         );
     }
     use pdfs_core::config::{FileSort, FilesView};
