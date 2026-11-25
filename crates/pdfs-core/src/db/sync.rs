@@ -294,6 +294,63 @@ impl Db {
         Ok(())
     }
 
+    /// How many baseline rows each synced folder has, by folder id. A folder
+    /// with none is absent.
+    pub fn sync_entry_counts(&self) -> Result<HashMap<i64, usize>> {
+        let conn = self.read();
+        let mut stmt =
+            conn.prepare("SELECT folder_id, COUNT(*) FROM sync_entry GROUP BY folder_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (id, n) = row?;
+            counts.insert(id, usize::try_from(n).unwrap_or(0));
+        }
+        Ok(counts)
+    }
+
+    /// Give baseline rows that have no revision id the one Drive reports, in
+    /// one transaction. `rows` holds `(rel_path, revision_id)`. A row that has
+    /// an id already keeps it. Returns how many rows changed.
+    ///
+    /// A remote walk calls this as it goes, so a pass cut short still keeps
+    /// what it learned. Without it, every row without an id cost a key unlock
+    /// on every walk until one pass got all the way to the end (B294).
+    pub fn sync_entries_set_revision(
+        &self,
+        folder_id: i64,
+        rows: &[(String, String)],
+    ) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut changed = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE sync_entry SET remote_revision_id = ?3
+                 WHERE folder_id = ?1 AND rel_path = ?2 AND remote_revision_id IS NULL",
+            )?;
+            for (rel_path, revision) in rows {
+                changed += stmt.execute(params![folder_id, rel_path, revision])?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Mark folders a killed daemon left in `syncing` as `error`, keeping
+    /// their last sync time. Nothing else moves a folder out of `syncing`
+    /// until its next pass ends, and that can be hours away (B294).
+    pub fn sync_folders_reset_syncing(&self) -> Result<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "UPDATE sync_folder SET state = 'error' WHERE state = 'syncing'",
+            [],
+        )?)
+    }
+
     /// Drop one baseline row (a path that left the sync set on both sides).
     pub fn sync_entry_remove(&self, folder_id: i64, rel_path: &str) -> Result<()> {
         let conn = self.conn.lock();

@@ -399,6 +399,13 @@ pub(super) fn unchanged_remote_size(
     }
 }
 
+/// Whether a baseline row without a revision id can take the one Drive now
+/// reports: the file's modification time and the size just read for real are
+/// the ones the row recorded, so the revision is the one it was synced at.
+pub(super) fn revision_confirms_baseline(base: &StoredSyncEntry, mtime: i64, size: i64) -> bool {
+    base.remote_revision_id.is_none() && remote_sig(base) == Some((mtime, size))
+}
+
 /// Join a child `name` onto a walk's `prefix`, giving a rel path.
 pub(super) fn join_rel(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
@@ -813,6 +820,23 @@ mod file_plan_tests {
         let rows = HashMap::from([("file".to_string(), baseline(10, 20, 30, 40))]);
         assert_eq!(unchanged_remote_size(&rows, "file", 30, Some("r1")), None);
         assert_eq!(unchanged_remote_size(&rows, "file", 30, None), Some(40));
+    }
+
+    /// A walk cut short still keeps the revision ids it confirmed, but only
+    /// for a row the size it read proves unchanged (`docs/BUGS.md` B294).
+    #[test]
+    fn only_an_unchanged_row_without_an_id_takes_the_revision() {
+        let base = baseline(10, 20, 30, 40);
+        assert!(revision_confirms_baseline(&base, 30, 40));
+        // Another computer's revision in the same second shows in the size.
+        assert!(!revision_confirms_baseline(&base, 30, 41));
+        assert!(!revision_confirms_baseline(&base, 31, 40));
+        let mut known = base.clone();
+        known.remote_revision_id = Some("r1".into());
+        assert!(!revision_confirms_baseline(&known, 30, 40));
+        let mut unsigned = base;
+        unsigned.remote_hash = None;
+        assert!(!revision_confirms_baseline(&unsigned, 30, 40));
     }
 
     #[test]

@@ -51,7 +51,7 @@ mod planner;
 pub(crate) use engine::SYNC_CONCURRENCY;
 pub(crate) use engine::{EngineHealth, SyncMsg, spawn};
 #[cfg(test)]
-use engine::{Running, burst_order, keep_wanted};
+use engine::{Running, burst_order, keep_wanted, smallest_first};
 #[cfg(test)]
 use engine::{classify, event_target, settle_with};
 #[cfg(test)]
@@ -66,8 +66,8 @@ use planner::conflict_path_as;
 use planner::{
     FilePlan, RemoteGaps, Unscanned, classification_order, conflict_path_with_suffix,
     filter_baseline, guard_local_wipe, guard_remote_wipe, join_rel, local_deletions, parent_rel,
-    plan_file, rel_to_path, remote_sig, remote_subtree_changed, revision_moved, tracked_baseline,
-    unchanged_remote_size,
+    plan_file, rel_to_path, remote_sig, remote_subtree_changed, revision_confirms_baseline,
+    revision_moved, tracked_baseline, unchanged_remote_size,
 };
 
 /// A pass that took at least this long is logged at info even when it changed
@@ -208,6 +208,7 @@ impl Core {
                 result => result,
             }
         };
+        let progress = self.sync_progress.lock().get(&folder.id).cloned();
         self.progress_end(folder.id);
         match result {
             Ok(outcome) => {
@@ -228,7 +229,16 @@ impl Core {
                 };
                 let _ = self.db.sync_folder_set_state(folder.id, state, now_secs());
                 let elapsed = started.elapsed();
-                if folder.last_sync == 0 || !outcome.is_empty() || elapsed >= SLOW_PASS {
+                if let Some(first_error) = &outcome.first_error {
+                    warn!(
+                        id = folder.id,
+                        state,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        summary = %outcome.summary(),
+                        first_error,
+                        "sync: pass finished"
+                    );
+                } else if folder.last_sync == 0 || !outcome.is_empty() || elapsed >= SLOW_PASS {
                     info!(
                         id = folder.id,
                         state,
@@ -274,7 +284,24 @@ impl Core {
             // A push pass is never interrupted, so only the stop gets here: the
             // folder keeps the state it had, which the next start's pass updates.
             Err(PassAbort::Stopped | PassAbort::Interrupted) => {
-                info!(id = folder.id, "sync: pass cut short by the stop");
+                info!(
+                    id = folder.id,
+                    elapsed_s = started.elapsed().as_secs(),
+                    phase = ?progress.as_ref().map(|p| p.phase),
+                    done = progress.as_ref().map_or(0, |p| p.done),
+                    total = progress.as_ref().map_or(0, |p| p.total),
+                    "sync: pass cut short by the stop"
+                );
+                let _ = self
+                    .db
+                    .sync_folder_set_state(folder.id, &current.state, current.last_sync);
+            }
+            Err(PassAbort::Abandoned) => {
+                info!(
+                    id = folder.id,
+                    elapsed_s = started.elapsed().as_secs(),
+                    "sync: pass stopped for the folder's removal"
+                );
                 let _ = self
                     .db
                     .sync_folder_set_state(folder.id, &current.state, current.last_sync);
@@ -294,6 +321,9 @@ impl Core {
                 }
             }
         }
+        // A removal that gave up waiting leaves its request behind; the next
+        // pass runs whole unless the removal is asked for again.
+        self.sync_abandon.lock().remove(&folder.id);
     }
 
     /// Tell the activity feed what a pass over this folder had to leave out
@@ -536,7 +566,7 @@ impl Core {
                         && let Err(e) = self.baseline_dir(folder_id, rel, uid)
                     {
                         warn!(rel, error = %e, "sync: folder step failed; continuing");
-                        outcome.errors += 1;
+                        outcome.failed(&format!("{rel}: {e}"));
                     }
                     continue;
                 }
@@ -547,7 +577,7 @@ impl Core {
                     }),
                     None => {
                         warn!(rel, "sync: no remote parent for folder; continuing");
-                        outcome.errors += 1;
+                        outcome.failed(&format!("{rel}: no remote parent for folder"));
                     }
                 }
                 continue;
@@ -570,7 +600,7 @@ impl Core {
                     }),
                     None => {
                         warn!(rel, "sync: no remote parent for file; continuing");
-                        outcome.errors += 1;
+                        outcome.failed(&format!("{rel}: no remote parent for file"));
                     }
                 },
                 Some(uid) => {
@@ -596,7 +626,7 @@ impl Core {
                                 }),
                                 None => {
                                     warn!(rel, "sync: no remote parent for file; continuing");
-                                    outcome.errors += 1;
+                                    outcome.failed(&format!("{rel}: no remote parent for file"));
                                 }
                             }
                             continue;
@@ -610,7 +640,7 @@ impl Core {
                             }),
                             None => {
                                 warn!(rel, "sync: no remote parent for file; continuing");
-                                outcome.errors += 1;
+                                outcome.failed(&format!("{rel}: no remote parent for file"));
                             }
                         }
                     } else {
@@ -675,7 +705,7 @@ impl Core {
             {
                 warn!(rel, error = %e, "sync: trash remote failed");
                 self.log_activity(ActivityKind::Trash, base_name(rel), e.to_string(), false);
-                outcome.errors += 1;
+                outcome.failed(&format!("{rel}: {e}"));
                 continue;
             }
             trashed.push(rel.clone());
@@ -810,7 +840,7 @@ impl Core {
                     (true, true) => {
                         if let Err(e) = self.baseline_dir(folder_id, rel, &remote[rel].uid) {
                             warn!(rel, error = %e, "sync: folder step failed; continuing");
-                            outcome.errors += 1;
+                            outcome.failed(&format!("{rel}: {e}"));
                         }
                     }
                     (true, false) if !in_base => {
@@ -822,7 +852,7 @@ impl Core {
                             }),
                             None => {
                                 warn!(rel, "sync: no remote parent for folder; continuing");
-                                outcome.errors += 1;
+                                outcome.failed(&format!("{rel}: no remote parent for folder"));
                             }
                         }
                     }
@@ -837,7 +867,7 @@ impl Core {
                             .and_then(|()| self.baseline_dir(folder_id, rel, &remote[rel].uid))
                         {
                             warn!(rel, error = %e, "sync: folder step failed; continuing");
-                            outcome.errors += 1;
+                            outcome.failed(&format!("{rel}: {e}"));
                         }
                     }
                     (false, true) => {
@@ -928,7 +958,7 @@ impl Core {
                     }),
                     None => {
                         warn!(rel, "sync: no remote parent for file; continuing");
-                        outcome.errors += 1;
+                        outcome.failed(&format!("{rel}: no remote parent for file"));
                     }
                 },
                 FilePlan::DeleteLocal => {
@@ -950,7 +980,7 @@ impl Core {
                             e.to_string(),
                             false,
                         );
-                        outcome.errors += 1;
+                        outcome.failed(&format!("{rel}: {e}"));
                         continue;
                     }
                     let _ = self.db.sync_entry_remove(folder_id, rel);
@@ -971,7 +1001,7 @@ impl Core {
                             e.to_string(),
                             false,
                         );
-                        outcome.errors += 1;
+                        outcome.failed(&format!("{rel}: {e}"));
                         continue;
                     }
                     if let Some(parent) = parent_uid_of(rel, &remote_dirs, &baseline) {
@@ -1041,7 +1071,7 @@ impl Core {
                             e.to_string(),
                             false,
                         );
-                        outcome.errors += 1;
+                        outcome.failed(&format!("{rel}: {e}"));
                     }
                 }
             }
@@ -1071,7 +1101,7 @@ impl Core {
             {
                 warn!(rel, error = %e, "sync: trash remote folder failed");
                 self.log_activity(ActivityKind::Trash, base_name(&rel), e.to_string(), false);
-                outcome.errors += 1;
+                outcome.failed(&format!("{rel}: {e}"));
                 continue;
             }
             if let Some(parent) = parent_uid_of(&rel, &remote_dirs, &baseline) {
@@ -1173,6 +1203,9 @@ impl Core {
         if self.shutdown.is_stopping() {
             return Err(PassAbort::Stopped);
         }
+        if self.pass_abandoned(folder_id) {
+            return Err(PassAbort::Abandoned);
+        }
         if self.ondemand_queued(folder_id) {
             return Err(PassAbort::Interrupted);
         }
@@ -1255,6 +1288,7 @@ impl Core {
                 .collect()
         };
         let stale: HashSet<String> = stale.iter().map(|u| u.to_string()).collect();
+        self.record_revisions(folder_id, prefix, &nodes, &sized, baseline);
 
         for node in nodes {
             if node.trashed {
@@ -1314,6 +1348,30 @@ impl Core {
             }
         }
         Ok(())
+    }
+
+    /// Store the revision id of each file in one listing whose baseline row has
+    /// none, when the size the walk just read shows that file unchanged.
+    ///
+    /// The classification step does the same, but only a pass that gets all the
+    /// way through the walk reaches it. A large folder whose walk is cut short
+    /// every time (a restart, a logout) then reads the size of every such file
+    /// again, one key unlock each, on every pass, and never finishes (B294).
+    fn record_revisions(
+        &self,
+        folder_id: i64,
+        prefix: &str,
+        nodes: &[Node],
+        sized: &HashMap<String, (i64, Option<String>)>,
+        baseline: &HashMap<String, StoredSyncEntry>,
+    ) {
+        let rows = revisions_to_record(prefix, nodes, sized, baseline);
+        if rows.is_empty() {
+            return;
+        }
+        if let Err(e) = self.db.sync_entries_set_revision(folder_id, &rows) {
+            debug!(folder = prefix, error = ?e, "sync: cannot record revision ids");
+        }
     }
 
     /// Record a folder's baseline row (folders carry no content signature).
@@ -1403,7 +1461,7 @@ impl Core {
                 }
                 Err(e) => {
                     warn!(error = %e, "sync: step failed; continuing");
-                    outcome.errors += 1;
+                    outcome.failed(&e);
                 }
             }
         }
@@ -1413,7 +1471,15 @@ impl Core {
         if self.shutdown.is_stopping() {
             return Err(PassAbort::Stopped);
         }
+        if self.pass_abandoned(folder_id) {
+            return Err(PassAbort::Abandoned);
+        }
         Ok(())
+    }
+
+    /// Whether a removal of `folder_id` is waiting for its running pass.
+    fn pass_abandoned(&self, folder_id: i64) -> bool {
+        self.sync_abandon.lock().contains(&folder_id)
     }
 
     /// Apply one [`Pending`] op (async, so it can run concurrently in a batch),
@@ -1937,6 +2003,27 @@ fn local_sha1(path: &Path) -> std::io::Result<Option<(LocalSig, String)>> {
 /// upload starts — a build or a test tree cleaned up mid-pass. That is not a
 /// failure: the next pass sees the deletion. Counting it as one put the folder
 /// in `error` for a file nobody wanted any more (B108).
+/// The `(rel_path, revision_id)` pairs [`Core::record_revisions`] stores for
+/// one listing: files whose size was read for real and matches the baseline.
+fn revisions_to_record(
+    prefix: &str,
+    nodes: &[Node],
+    sized: &HashMap<String, (i64, Option<String>)>,
+    baseline: &HashMap<String, StoredSyncEntry>,
+) -> Vec<(String, String)> {
+    nodes
+        .iter()
+        .filter(|node| !node.trashed && !node.is_folder())
+        .filter_map(|node| {
+            let revision = crate::node_revision_id(node)?;
+            let (size, _) = sized.get(&node.uid.to_string())?;
+            let rel = join_rel(prefix, &node.name);
+            revision_confirms_baseline(baseline.get(&rel)?, node.modification_time, *size)
+                .then_some((rel, revision))
+        })
+        .collect()
+}
+
 fn open_to_upload(path: &Path, rel: &str) -> Result<Option<std::fs::File>, String> {
     match std::fs::File::open(path) {
         Ok(file) => Ok(Some(file)),
@@ -2545,6 +2632,19 @@ mod tests {
         assert_eq!(burst_order(&HashSet::new(), &[1, 4]), [1, 4]);
         // A folder the list no longer has still gets the pass it asked for.
         assert_eq!(burst_order(&[12].into(), &[1]), [12, 1]);
+    }
+
+    /// A folder too large to finish before the daemon stops no longer takes
+    /// the first turn of every start from the others (`docs/BUGS.md` B294).
+    #[test]
+    fn the_smallest_folders_run_first_in_a_burst() {
+        let counts: HashMap<i64, usize> = [(2, 493_000), (3, 60_000), (4, 45_000), (7, 40)].into();
+        assert_eq!(smallest_first(&[2, 3, 4, 7], &counts), [7, 4, 3, 2]);
+        // A folder with no baseline yet is the cheapest of all; ties keep their order.
+        assert_eq!(smallest_first(&[9, 2, 8], &counts), [9, 8, 2]);
+        // Named folders still go before the rest.
+        let order = burst_order(&[2].into(), &smallest_first(&[2, 3, 7], &counts));
+        assert_eq!(order, [2, 7, 3]);
     }
 
     /// A folder removed and added again keeps its watch under the new id;

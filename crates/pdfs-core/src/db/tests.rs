@@ -8004,3 +8004,82 @@ fn warm_photo_months_exclude_hidden_groups_with_thirteen_thousand_rows() {
     assert_eq!(months.iter().map(|month| month.2).sum::<usize>(), 12_998);
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
+
+fn revisionless_row(rel: &str, revision: Option<&str>) -> StoredSyncEntry {
+    StoredSyncEntry {
+        rel_path: rel.into(),
+        remote_uid: Some(format!("vol~{rel}")),
+        local_mtime: 5,
+        local_mtime_ns: None,
+        local_size: 6,
+        remote_rev: Some("7".into()),
+        remote_hash: Some("8".into()),
+        remote_revision_id: revision.map(Into::into),
+    }
+}
+
+/// A remote walk stores the revision ids it confirms as it goes, so a pass
+/// cut short keeps them; a row that has an id keeps its own
+/// (`docs/BUGS.md` B294).
+#[test]
+fn revision_ids_fill_only_rows_without_one() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~l", "s").unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("a", None))
+        .unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("b", Some("old")))
+        .unwrap();
+    let changed = db
+        .sync_entries_set_revision(
+            id,
+            &[
+                ("a".into(), "r1".into()),
+                ("b".into(), "r2".into()),
+                ("gone".into(), "r3".into()),
+            ],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    let rows = db.sync_entries(id).unwrap();
+    assert_eq!(rows["a"].remote_revision_id.as_deref(), Some("r1"));
+    assert_eq!(rows["b"].remote_revision_id.as_deref(), Some("old"));
+    assert_eq!(db.sync_entries_set_revision(id, &[]).unwrap(), 0);
+}
+
+#[test]
+fn baseline_rows_are_counted_per_folder() {
+    let db = Db::open_in_memory().unwrap();
+    let big = db.sync_folder_add("/home/me/Big", "v~big", "s").unwrap();
+    let small = db
+        .sync_folder_add("/home/me/Small", "v~small", "s")
+        .unwrap();
+    let empty = db
+        .sync_folder_add("/home/me/Empty", "v~empty", "s")
+        .unwrap();
+    for rel in ["a", "b", "c"] {
+        db.sync_entry_upsert(big, &revisionless_row(rel, None))
+            .unwrap();
+    }
+    db.sync_entry_upsert(small, &revisionless_row("a", None))
+        .unwrap();
+    let counts = db.sync_entry_counts().unwrap();
+    assert_eq!(counts.get(&big), Some(&3));
+    assert_eq!(counts.get(&small), Some(&1));
+    assert_eq!(counts.get(&empty), None);
+}
+
+/// A daemon killed mid-pass leaves its folder in `syncing`; the next start
+/// says `error` instead and keeps the time of the last finished pass.
+#[test]
+fn folders_left_syncing_are_reset_to_error() {
+    let db = Db::open_in_memory().unwrap();
+    let busy = db.sync_folder_add("/home/me/Busy", "v~busy", "s").unwrap();
+    let idle = db.sync_folder_add("/home/me/Idle", "v~idle", "s").unwrap();
+    db.sync_folder_set_state(busy, "syncing", 100).unwrap();
+    db.sync_folder_set_state(idle, "idle", 200).unwrap();
+    assert_eq!(db.sync_folders_reset_syncing().unwrap(), 1);
+    let busy = db.sync_folder_get(busy).unwrap().unwrap();
+    assert_eq!((busy.state.as_str(), busy.last_sync), ("error", 100));
+    let idle = db.sync_folder_get(idle).unwrap().unwrap();
+    assert_eq!((idle.state.as_str(), idle.last_sync), ("idle", 200));
+}
