@@ -100,14 +100,14 @@ The page then runs without WebKit's isolation, so use this only for the sign-in.
 session keeps working without it. Signing in from your usual network, without a VPN, often avoids
 the CAPTCHA in the first place.
 
-### "This version of the app is no longer supported" or "Proton is temporarily refusing sign-in from this device"
+### "This version of the app is no longer supported" or sign-in code 2028
 
-Proton blocks sign-in for a while after too many attempts, or from a network it distrusts. It sends
-the first message even when your version is current. Do not retry for several hours, up to a day,
-then sign in once.
+For code 2028, pause before trying again. Proton does not give the client an expiry time.
+If the block persists, check whether you can sign in at [Drive on the web](https://drive.proton.me)
+and mention the code, client version and web sign-in result when contacting Proton support.
 
-If it still fails, run `RUST_LOG=debug pdfs login` and look for `code=` in the
-`proton api request failed` line. 2028 is this block; 5003 is a release Proton no longer accepts.
+If an older client only says to update, look for the `proton api request failed` line in
+`RUST_LOG=debug pdfs login`. Code 5003 means Proton no longer accepts that app version.
 
 ### Sign-in works but is forgotten after a restart
 

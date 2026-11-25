@@ -316,7 +316,7 @@ pub(crate) fn login_error_message(error: &pdfs_core::Error) -> String {
         // Proton's text for this one asks the user to update an app that is
         // already current.
         pdfs_core::Error::Proton(e) if pdfs_core::error::sign_in_blocked(e) => gettext(
-            "Proton is temporarily refusing sign-in from this device. Your app version is not the problem. Wait several hours, up to a day, without trying again, then sign in.",
+            "Proton declined this sign-in (code 2028). Wait before trying again. If it persists, try signing in on the web and mention code 2028 when contacting Proton support.",
         ),
         pdfs_core::Error::Proton(ProtonError::Api(api)) if !api.message.is_empty() => {
             api.message.clone()
@@ -770,8 +770,29 @@ mod tests {
             details: None,
         }));
         let message = login_error_message(&error);
-        assert!(message.contains("temporarily refusing"), "{message}");
+        assert!(message.contains("code 2028"), "{message}");
         assert!(!message.contains("update"), "{message}");
+    }
+
+    #[test]
+    fn outdated_clients_and_rate_limits_keep_their_own_guidance() {
+        use pdfs_core::proton_sdk::{ProtonApiError, ProtonError, api::ResponseCode};
+        for (code, status, expected) in [
+            (ResponseCode::OutdatedApp, 422, "Please update the app"),
+            (
+                ResponseCode::TooManyRequests,
+                429,
+                "Too many sign-in attempts",
+            ),
+        ] {
+            let error = ProtonError::Api(ProtonApiError {
+                code,
+                http_status: status,
+                message: "Please update the app".into(),
+                details: None,
+            });
+            assert!(login_error_message(&error.into()).contains(expected));
+        }
     }
 
     #[test]
