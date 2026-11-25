@@ -8,7 +8,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::Db;
 use super::ops::{OP_CREATE, OP_MKDIR, OP_RENAME, local_lid, local_uid, wake_ops_waiting_for_tx};
-use crate::{Access, Result};
+use pdfs_core::{Access, Result};
 use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{Node, NodeKind};
 

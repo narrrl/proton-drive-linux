@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use proton_gallery_rs::grouping::{Grouped, group_photos, name_stem};
 
 use super::Db;
-use crate::Result;
+use pdfs_core::Result;
 
 /// A photo whose thumbnail state is not known yet: it has never been asked for.
 pub const THUMB_UNKNOWN: i64 = 0;
@@ -33,7 +33,7 @@ pub struct StoredPhoto {
     pub thumb_state: i64,
     /// Which Photos-page tab this entry belongs to, derived from its name and
     /// media type when the timeline was last replaced.
-    pub kind: crate::control::PhotoKind,
+    pub kind: pdfs_core::control::PhotoKind,
     /// Whether the photo carries Proton's `Favorite` tag.
     pub favorite: bool,
     /// How many photos this photo's group holds — one shot taken as RAW+JPEG is
@@ -46,7 +46,7 @@ pub struct StoredPhoto {
     pub place_id: Option<u32>,
 }
 
-/// A town photos were taken in: its GeoNames id (see [`crate::places`]), how
+/// A town photos were taken in: its GeoNames id (see [`pdfs_core::places`]), how
 /// many photos it holds, and the newest of them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredPlace {
@@ -102,7 +102,7 @@ struct Learned {
     content_hash: Option<String>,
     main_uid: Option<String>,
     location: Option<(f64, f64)>,
-    /// What its thumbnail looks like (see [`crate::similar`]).
+    /// What its thumbnail looks like (see [`pdfs_core::similar`]).
     similar_hash: Option<i64>,
     /// When this photo's node was last resolved, kept so a refresh that skips it
     /// does not make it look unresolved again.
@@ -143,7 +143,7 @@ fn stored_photo(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPhoto> {
         name: r.get(2)?,
         ratio: r.get(3)?,
         thumb_state: r.get(4)?,
-        kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+        kind: pdfs_core::control::PhotoKind::from_i64(r.get(5)?),
         favorite: r.get::<_, i64>(6)? != 0,
         group_size: r.get::<_, i64>(7)?.max(1) as usize,
         has_raw: r.get::<_, i64>(8)? != 0,
@@ -324,7 +324,7 @@ impl Db {
                     resolved_at=?11 WHERE uid=?1",
             )?;
             for row in rows.iter().filter(|row| row.resolved_at.is_some()) {
-                let kind = crate::control::PhotoKind::classify(
+                let kind = pdfs_core::control::PhotoKind::classify(
                     row.name.as_deref(),
                     row.media_type.as_deref(),
                 );
@@ -339,7 +339,7 @@ impl Db {
                     row.location.map(|p| p.0),
                     row.location.map(|p| p.1),
                     row.location
-                        .and_then(|(lat, lon)| crate::places::nearest(lat, lon))
+                        .and_then(|(lat, lon)| pdfs_core::places::nearest(lat, lon))
                         .map(|city| city.id),
                     row.resolved_at
                 ])?;
@@ -356,8 +356,8 @@ impl Db {
                     Ok((
                         Grouped {
                             uid: r.get(0)?,
-                            raw: crate::control::PhotoKind::from_i64(r.get(1)?)
-                                == crate::control::PhotoKind::Raw,
+                            raw: pdfs_core::control::PhotoKind::from_i64(r.get(1)?)
+                                == pdfs_core::control::PhotoKind::Raw,
                             main_uid: r.get(2)?,
                             day: r.get(3)?,
                             stem: name_stem(name.as_deref()),
@@ -467,7 +467,7 @@ impl Db {
         };
 
         // Everything the insert and the grouping need, resolved once per photo.
-        let resolved: Vec<(&TimelineRow, Learned, crate::control::PhotoKind)> = items
+        let resolved: Vec<(&TimelineRow, Learned, pdfs_core::control::PhotoKind)> = items
             .iter()
             .filter(|row| !tombstones.contains(&row.uid))
             .map(|row| {
@@ -502,7 +502,7 @@ impl Db {
                 // The tab this photo lands in is derived here, once, so a page or
                 // count query is a plain indexed `WHERE kind = ?` rather than a
                 // reclassification of every row.
-                let kind = crate::control::PhotoKind::classify(
+                let kind = pdfs_core::control::PhotoKind::classify(
                     carried.name.as_deref(),
                     carried.media_type.as_deref(),
                 );
@@ -514,7 +514,7 @@ impl Db {
             .iter()
             .map(|(row, carried, kind)| Grouped {
                 uid: row.uid.clone(),
-                raw: *kind == crate::control::PhotoKind::Raw,
+                raw: *kind == pdfs_core::control::PhotoKind::Raw,
                 main_uid: carried.main_uid.clone(),
                 day: capture_day(&tx, row.capture_time),
                 stem: name_stem(carried.name.as_deref()),
@@ -553,7 +553,7 @@ impl Db {
                     carried.location.map(|(_, lon)| lon),
                     carried
                         .location
-                        .and_then(|(lat, lon)| crate::places::nearest(lat, lon))
+                        .and_then(|(lat, lon)| pdfs_core::places::nearest(lat, lon))
                         .map(|city| city.id),
                     carried.similar_hash,
                 ])?;
@@ -652,7 +652,7 @@ impl Db {
         &self,
         offset: usize,
         limit: usize,
-        kind: Option<crate::control::PhotoKind>,
+        kind: Option<pdfs_core::control::PhotoKind>,
         range: Option<(i64, i64)>,
         favorites: bool,
         not_in_album: bool,
@@ -665,7 +665,7 @@ impl Db {
         &self,
         offset: usize,
         limit: usize,
-        kind: Option<crate::control::PhotoKind>,
+        kind: Option<pdfs_core::control::PhotoKind>,
         range: Option<(i64, i64)>,
         favorites: bool,
         not_in_album: bool,
@@ -681,7 +681,7 @@ impl Db {
             binds.push(excluded.to_owned().into());
             conds.push("p.uid NOT IN (SELECT value FROM json_each(?1))".to_owned());
         }
-        if kind != Some(crate::control::PhotoKind::Raw) {
+        if kind != Some(pdfs_core::control::PhotoKind::Raw) {
             conds.push("p.uid = COALESCE(p.group_key, p.uid)".to_string());
         }
         if let Some(k) = kind {
@@ -780,21 +780,21 @@ impl Db {
     /// scopes the counts to one tab when set.
     pub fn photos_months(
         &self,
-        kind: Option<crate::control::PhotoKind>,
+        kind: Option<pdfs_core::control::PhotoKind>,
     ) -> Result<Vec<(i32, i32, usize)>> {
         self.photos_months_visible(kind, "[]")
     }
 
     pub fn photos_months_visible(
         &self,
-        kind: Option<crate::control::PhotoKind>,
+        kind: Option<pdfs_core::control::PhotoKind>,
         excluded: &str,
     ) -> Result<Vec<(i32, i32, usize)>> {
         let conn = self.read()?;
         // The scrubber has to agree with the page it scrubs, so it counts what
         // the page shows: groups everywhere except on the Raw tab.
         let filter = match kind {
-            Some(crate::control::PhotoKind::Raw) => "kind = ?2",
+            Some(pdfs_core::control::PhotoKind::Raw) => "kind = ?2",
             Some(_) => "uid = COALESCE(group_key, uid) AND kind = ?2",
             None => "uid = COALESCE(group_key, uid) AND ?2 IS NULL",
         };
@@ -1018,7 +1018,7 @@ impl Db {
             )?;
             stmt.query_map(
                 params![
-                    crate::control::PhotoKind::Video.as_i64(),
+                    pdfs_core::control::PhotoKind::Video.as_i64(),
                     THUMB_NONE,
                     limit as i64
                 ],
@@ -1030,7 +1030,7 @@ impl Db {
     }
 
     /// Record the look of photo `uid`: its difference hash, or
-    /// [`crate::similar::NO_HASH`] when its thumbnail gave none.
+    /// [`pdfs_core::similar::NO_HASH`] when its thumbnail gave none.
     pub fn photo_set_similar_hash(&self, uid: &str, hash: u64) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
@@ -1049,13 +1049,13 @@ impl Db {
                 GROUP BY COALESCE(group_key, uid) \
                 HAVING MAX(similar_hash) IS NOT NULL \
                     OR MAX(kind != ?1 AND thumb_state != ?2))",
-            params![crate::control::PhotoKind::Video.as_i64(), THUMB_NONE],
+            params![pdfs_core::control::PhotoKind::Video.as_i64(), THUMB_NONE],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         Ok((hashed.max(0) as usize, total.max(0) as usize))
     }
 
-    /// Sets of shots that look alike (see [`crate::similar`]), one photo per
+    /// Sets of shots that look alike (see [`pdfs_core::similar`]), one photo per
     /// shot in capture order, and the sets newest first. A set whose photos
     /// are all byte-identical copies is left to [`Self::photo_duplicates`].
     pub fn photo_similar(&self) -> Result<Vec<Vec<StoredPhoto>>> {
@@ -1067,13 +1067,13 @@ impl Db {
                  FROM photos GROUP BY k \
                  HAVING MAX(similar_hash) IS NOT NULL AND MAX(similar_hash) != ?1",
             )?;
-            stmt.query_map(params![crate::similar::NO_HASH as i64], |r| {
+            stmt.query_map(params![pdfs_core::similar::NO_HASH as i64], |r| {
                 Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?))
             })?
             .collect::<rusqlite::Result<_>>()?
         };
         let hashes: Vec<u64> = rows.iter().map(|(_, hash, _)| *hash).collect();
-        let found: Vec<Vec<usize>> = crate::similar::sets(&hashes)
+        let found: Vec<Vec<usize>> = pdfs_core::similar::sets(&hashes)
             .into_iter()
             .filter(|set| {
                 let first = &rows[set[0]].2;
@@ -1108,7 +1108,7 @@ impl Db {
     }
 
     pub fn photos_counts_visible(&self, excluded: &str) -> Result<(usize, usize, usize)> {
-        use crate::control::PhotoKind;
+        use pdfs_core::control::PhotoKind;
         let conn = self.read()?;
         // Photos and Videos count groups — one shot is one entry, however many
         // files it was stored as. Raw counts files, because the Raw tab lists

@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Datelike, Local, TimeZone};
-use pdfs_core::cache::Pin;
 use pdfs_core::config::{AppDirs, KEYRING_SERVICE};
+use pdfs_core::control::Pin;
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, DeviceInfo, DirEntry, Event, LocalHit, PhotoItem,
     PhotoKind, PhotoLocation, PhotoMonth, PhotoThumb, PlaceInfo, Request, Response, SearchHit,

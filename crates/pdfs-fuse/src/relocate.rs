@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use pdfs_core::db::{StoredSyncEntry, StoredSyncFolder};
 use pdfs_core::{CoreError, CoreResult};
+use pdfs_store::db::{StoredSyncEntry, StoredSyncFolder};
 use proton_drive_rs::NodeKind;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{info, warn};

@@ -13,10 +13,10 @@ use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppConfig;
 use pdfs_core::control::{self, PendingOpInfo, Request, Response};
-use pdfs_core::db::Db;
+use pdfs_store::cache::ContentCache;
+use pdfs_store::db::Db;
 use proton_drive_rs::ProtonDriveClient;
 use proton_drive_rs::proton_sdk::config::ProtonClientConfiguration;
 use proton_drive_rs::proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};

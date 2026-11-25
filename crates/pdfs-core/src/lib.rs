@@ -5,10 +5,8 @@
 pub mod access;
 pub mod auth;
 pub mod batch;
-pub mod cache;
 pub mod config;
 pub mod control;
-pub mod db;
 pub mod error;
 pub mod kernelkey;
 pub mod keycheck;

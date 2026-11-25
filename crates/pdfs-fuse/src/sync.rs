@@ -42,8 +42,8 @@ use crate::transfers::{CountingWriter, OwnedCountingReader};
 use crate::{Core, now_secs, parse_uid};
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
-use pdfs_core::db::{SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 use pdfs_core::syncignore::IgnoreRules;
+use pdfs_store::db::{SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 
 mod engine;
 mod local_scan;

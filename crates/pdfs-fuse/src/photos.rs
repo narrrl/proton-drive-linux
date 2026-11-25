@@ -1,7 +1,7 @@
 //! The photos timeline and its thumbnails.
 //!
 //! The timeline is a flat, newest-first projection of the photo share, persisted
-//! by [`pdfs_core::db`] so the gallery opens instantly and refreshes behind the
+//! by [`pdfs_store::db`] so the gallery opens instantly and refreshes behind the
 //! user. Thumbnails the server has none for (anything a camera wrote rather than
 //! a phone) are generated locally and stored as if the server had served them.
 
@@ -22,8 +22,8 @@ use pdfs_core::control::{
     ThumbnailBuildStatus, Topic, is_audio_file_name, is_raw_image_name, is_thumbnail_image_name,
     is_thumbnail_media_name,
 };
-use pdfs_core::db::{self, StoredPhoto};
 use pdfs_core::{CoreError, CoreResult};
+use pdfs_store::db::{self, StoredPhoto};
 
 use proton_drive_rs::proton_sdk::error::Result as DriveResult;
 use proton_drive_rs::proton_sdk::ids::NodeUid;

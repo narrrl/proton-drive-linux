@@ -8,7 +8,7 @@
 use rusqlite::OptionalExtension;
 
 use super::Db;
-use crate::Result;
+use pdfs_core::Result;
 
 /// Current schema version. Bump on every forward migration added below.
 pub(super) const SCHEMA_VERSION: i64 = 49;
@@ -34,7 +34,7 @@ impl Db {
             .unwrap_or(0);
 
         if current > SCHEMA_VERSION {
-            return Err(crate::Error::Other(format!(
+            return Err(pdfs_core::Error::Other(format!(
                 "database schema {current} is newer than this build supports ({SCHEMA_VERSION}); refusing to open it to avoid corrupting user data"
             )));
         }
@@ -788,7 +788,7 @@ CREATE INDEX pending_op_parent ON pending_op(parent_uid);
 /// Schema v13: photos record their media type and a derived `kind` so the
 /// timeline can be split into Photos / Videos / Raw tabs. `media_type` is
 /// nullable — it is filled once the daemon resolves a photo's node — while
-/// `kind` (see [`crate::control::PhotoKind`]) defaults to `0` (still photo), the
+/// `kind` (see [`pdfs_core::control::PhotoKind`]) defaults to `0` (still photo), the
 /// classification anything unresolved falls back to. Existing rows are
 /// reclassified for free on the next timeline refresh, so no backfill is needed.
 const MIGRATION_V13: &str = "
@@ -1237,7 +1237,7 @@ const MIGRATION_V32: &str = "UPDATE {table} SET thumb_state = 0 WHERE kind = 1 A
 ///
 /// `latitude` and `longitude` come from the location other clients write into
 /// a photo's extended attributes; `place_id` is the GeoNames id of the nearest
-/// town (see `crate::places`), so the Places view is a plain `GROUP BY`.
+/// town (see `pdfs_core::places`), so the Places view is a plain `GROUP BY`.
 ///
 /// Every photo is marked unresolved, so the next refresh reads the location of
 /// the whole library once. That is the backfill: the metadata is on the node
@@ -1253,7 +1253,7 @@ UPDATE photos SET resolved_at = NULL;
 /// Schema v34: what each photo looks like, for finding similar ones.
 ///
 /// `similar_hash` is a 64-bit difference hash of the photo's thumbnail (see
-/// `crate::similar`): resized and re-encoded copies of one picture land a few
+/// `pdfs_core::similar`): resized and re-encoded copies of one picture land a few
 /// bits apart, where the server's `content_hash` only matches byte-identical
 /// files. `NULL` until the daemon has hashed the thumbnail, which it does as
 /// thumbnails arrive and when the similar-photo finder asks for the rest.

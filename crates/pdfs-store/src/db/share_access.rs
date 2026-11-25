@@ -6,7 +6,7 @@ use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};
 use rusqlite::{OptionalExtension, params};
 
 use super::Db;
-use crate::{Access, Error, Result};
+use pdfs_core::{Access, Error, Result};
 
 impl Db {
     /// Load the complete, deliberately small shared-root authority map.

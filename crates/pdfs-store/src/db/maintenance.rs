@@ -10,7 +10,7 @@
 use rusqlite::OptionalExtension;
 
 use super::Db;
-use crate::Result;
+use pdfs_core::Result;
 
 /// A point-in-time picture of the database's size and contents.
 ///

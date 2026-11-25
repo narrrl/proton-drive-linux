@@ -4,8 +4,8 @@
 use rusqlite::{OptionalExtension, params};
 
 use super::Db;
-use crate::Result;
-use crate::localindex::LocalEntry;
+use pdfs_core::Result;
+use pdfs_core::localindex::LocalEntry;
 
 use super::nodes::candidate_trigrams;
 use super::utils::{TRIGRAM_MIN, like_escape};

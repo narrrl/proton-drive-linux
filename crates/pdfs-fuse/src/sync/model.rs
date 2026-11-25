@@ -6,7 +6,7 @@ use super::*;
 /// recognise the same content again, and no more.
 ///
 /// `mtime_ns` is the whole reason this is a struct rather than a pair — see
-/// [`StoredSyncEntry::local_mtime_ns`](pdfs_core::db::StoredSyncEntry).
+/// [`StoredSyncEntry::local_mtime_ns`](pdfs_store::db::StoredSyncEntry).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LocalSig {
     pub(super) mtime: i64,

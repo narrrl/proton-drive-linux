@@ -30,7 +30,7 @@ const LEGACY_USER_AGENT: &str = "proton-drive-linux/0.1.0";
 pub const KEYRING_SERVICE: &str = "proton-drive-linux";
 
 /// Default soft cap on the on-disk content cache (5 GiB). LRU-evicts unpinned
-/// blobs back under this; pinned files are exempt. See [`crate::cache`].
+/// blobs back under this; pinned files are exempt. See `pdfs_store::cache`.
 pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Environment override for [`AppConfig::resolved_conflict_sweep`]. Exists so a

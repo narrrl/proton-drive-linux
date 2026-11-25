@@ -11,6 +11,7 @@ description = "FUSE on-demand filesystem for Proton Drive"
 
 [dependencies]
 pdfs-core.workspace = true
+pdfs-store.workspace = true
 zip.workspace = true
 sha1.workspace = true
 proton-drive-rs.workspace = true

@@ -4,7 +4,7 @@
 use rusqlite::{OptionalExtension, params};
 
 use super::Db;
-use crate::Result;
+use pdfs_core::Result;
 
 impl Db {
     pub fn get_event_cursor(&self) -> Result<Option<String>> {

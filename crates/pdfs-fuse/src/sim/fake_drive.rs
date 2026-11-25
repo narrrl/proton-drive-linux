@@ -370,7 +370,7 @@ impl FakeDrive {
             next_link: 0,
             next_revision: 0,
             events: Vec::new(),
-            block_pattern: vec![pdfs_core::cache::BLOCK_SIZE],
+            block_pattern: vec![pdfs_store::cache::BLOCK_SIZE],
             max_space: 1 << 40,
             devices: Vec::new(),
         };

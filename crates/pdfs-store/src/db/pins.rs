@@ -5,7 +5,7 @@ use rusqlite::{OptionalExtension, params};
 
 use super::Db;
 use super::utils::MAX_PATH_DEPTH;
-use crate::Result;
+use pdfs_core::Result;
 
 /// One row of [`Db::pin_list`]. `recursive` is pin *policy* — whether the whole
 /// subtree is kept — while `is_dir` is the node's kind as the node cache knows

@@ -3,8 +3,8 @@
 use rusqlite::params;
 
 use super::Db;
-use crate::Result;
-use crate::control::{ActivityEntry, ActivityKind};
+use pdfs_core::Result;
+use pdfs_core::control::{ActivityEntry, ActivityKind};
 
 /// How many activity rows to keep. Older rows are pruned on insert, so the feed
 /// stays a bounded "recent history" rather than growing without limit.

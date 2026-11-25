@@ -4,7 +4,7 @@
 use rusqlite::params;
 
 use super::Db;
-use crate::Result;
+use pdfs_core::Result;
 
 pub struct CacheEntryInput<'a> {
     /// On-disk filename of the blob or block.

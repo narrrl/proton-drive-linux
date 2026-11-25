@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Db;
 use super::nodes::{adopt_placeholder_row_tx, node_lid};
-use crate::Result;
+use pdfs_core::Result;
 
 /// The `kind` of a [`PendingOp`] that uploads a staged file as a new revision.
 pub const OP_REVISION: &str = "revision";

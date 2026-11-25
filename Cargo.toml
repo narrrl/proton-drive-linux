@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pdfs-core", "crates/pdfs-fuse", "crates/pdfs-cli", "crates/pdfs-gui"]
+members = ["crates/pdfs-core", "crates/pdfs-store", "crates/pdfs-fuse", "crates/pdfs-cli", "crates/pdfs-gui"]
 
 [workspace.package]
 version = "3.10.0"
@@ -24,6 +24,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Internal crates.
 pdfs-core = { path = "crates/pdfs-core" }
+pdfs-store = { path = "crates/pdfs-store" }
 pdfs-fuse = { path = "crates/pdfs-fuse" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time", "signal"] }

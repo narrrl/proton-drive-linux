@@ -4,7 +4,7 @@
 use rusqlite::{OptionalExtension, params};
 
 use super::Db;
-use crate::Result;
+use pdfs_core::Result;
 use std::collections::HashMap;
 
 /// What a mirror pass has walked of Drive, saved so a pass cut short
