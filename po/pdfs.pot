@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 3.10.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-22 02:24+0100\n"
+"POT-Creation-Date: 2026-11-24 21:18+0100\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -3533,9 +3533,9 @@ msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/login.rs:319
 msgid ""
-"Proton is temporarily refusing sign-in from this device. Your app version is "
-"not the problem. Wait several hours, up to a day, without trying again, then "
-"sign in."
+"Proton declined this sign-in (code 2028). Wait before trying again. If it "
+"persists, try signing in on the web and mention code 2028 when contacting "
+"Proton support."
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/login.rs:325

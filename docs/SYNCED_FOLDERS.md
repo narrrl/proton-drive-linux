@@ -128,6 +128,7 @@ pdfs sync ignore reset           # back to the built-in patterns
 pdfs sync ignore add 'cache/' --folder ~/Projects    # only in ~/Projects/.pdfsignore
 pdfs sync ignore list --folder ~/Projects
 pdfs sync ignore check ~/Projects/app/node_modules
+pdfs sync ignore check ~/Projects/data/cache.db   # shows which rule applies
 ```
 
 The rules apply to folders kept on this computer. Files you save into `~/ProtonDrive` itself or into
