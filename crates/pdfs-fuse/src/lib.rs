@@ -567,6 +567,10 @@ struct Core {
     /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
     /// Persisted, so a pause survives a restart (see [`Core::sync_paused`]).
     sync_paused_until: Arc<AtomicI64>,
+    /// When Drive's event stream was last read to the end of a batch, in Unix
+    /// seconds; `0` until the first time. A mirror pass relies on the dirty
+    /// marks the stream makes only while this is recent (see `docs/SYNC_ENGINE.md`).
+    events_read_at: Arc<AtomicI64>,
     /// Writes accepted from the kernel but not yet uploaded, keyed by node.
     /// The in-memory face of the `pending_op` table, from
     /// which it is rebuilt on mount.

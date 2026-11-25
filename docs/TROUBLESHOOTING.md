@@ -298,6 +298,11 @@ What the parts mean:
   recorded. A high count here on a folder that has not changed is the slow case from B294. Each
   pass records what it read, so the count falls on the next pass even if this one is cut short.
 - **`slowest listing`** names the folder on Proton Drive that took longest to list.
+- **`reused`** and **`dirty folders`:** once a pass has listed the whole folder on Proton Drive,
+  later passes start from that listing (`reused` paths) and list only the folders Proton Drive
+  reported a change in (`dirty folders`). A pass with no `reused` count listed everything. That
+  happens on the first pass, once a day, and after the daemon lost track of Proton Drive's
+  changes. **`resumed`** counts the paths a pass took from a listing that a restart cut short.
 
 Please include these lines when you report a slow folder.
 

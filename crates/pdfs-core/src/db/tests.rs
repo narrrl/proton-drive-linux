@@ -8106,18 +8106,19 @@ fn a_saved_walk_resumes_where_it_stopped() {
     assert_eq!(db.sync_walk_load(id).unwrap(), None);
     db.sync_walk_begin(id, "v~root", 100).unwrap();
     assert!(
-        db.sync_walk_record(id, "", false, &[walked("a", true), walked("f", false)])
+        db.sync_walk_record(id, "", false, &[walked("a", true), walked("f", false)], &[])
             .unwrap()
     );
     assert!(
-        db.sync_walk_record(id, "a", true, &[walked("a/g", false)])
+        db.sync_walk_record(id, "a", true, &[walked("a/g", false)], &[])
             .unwrap()
     );
     // A folder the walk never found is not something it can list.
-    assert!(!db.sync_walk_record(id, "nowhere", false, &[]).unwrap());
+    assert!(!db.sync_walk_record(id, "nowhere", false, &[], &[]).unwrap());
 
     let walk = db.sync_walk_load(id).unwrap().unwrap();
     assert_eq!((walk.root_uid.as_str(), walk.started), ("v~root", 100));
+    assert!(!walk.complete);
     let mut dirs: Vec<(String, bool, bool)> = walk
         .dirs
         .iter()
@@ -8156,7 +8157,7 @@ fn a_baseline_change_drops_the_saved_walk() {
     let saved = |db: &Db| db.sync_walk_load(id).unwrap().is_some();
     let begin = |db: &Db| {
         db.sync_walk_begin(id, "v~root", 1).unwrap();
-        db.sync_walk_record(id, "", false, &[walked("a", false)])
+        db.sync_walk_record(id, "", false, &[walked("a", false)], &[])
             .unwrap();
     };
 
@@ -8192,4 +8193,159 @@ fn a_baseline_change_drops_the_saved_walk() {
     db.sync_folder_remove(id).unwrap();
     assert!(db.sync_walk_load(id).unwrap().is_none(), "folder removed");
     assert!(db.sync_walk_load(other).unwrap().is_none());
+}
+
+fn dirty(db: &Db, id: i64) -> Vec<String> {
+    let mut dirs: Vec<String> = db
+        .sync_remote_dirty(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, dir)| dir)
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// A complete walk of Drive is the next pass's picture of Drive. A change to
+/// the baseline no longer drops it: it marks the folder the change is in, so
+/// the next pass lists that folder again, and only that one.
+#[test]
+fn a_complete_walk_stays_and_marks_where_the_baseline_changed() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    let other = db
+        .sync_folder_add("/home/me/Other", "v~other", "s")
+        .unwrap();
+    db.sync_remote_mark(id, &["before".into()]).unwrap();
+    db.sync_walk_begin(id, "v~root", 1).unwrap();
+    db.sync_remote_mark(id, &["during".into()]).unwrap();
+    db.sync_walk_record(id, "", false, &[walked("a", true)], &[])
+        .unwrap();
+    assert!(db.sync_walk_complete(id).unwrap());
+    assert!(db.sync_walk_load(id).unwrap().unwrap().complete);
+    assert_eq!(
+        dirty(&db, id),
+        ["during"],
+        "the walk read what was marked before it began"
+    );
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+
+    db.sync_entry_upsert(id, &revisionless_row("a/b/f", None))
+        .unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("top", None))
+        .unwrap();
+    assert!(db.sync_walk_load(id).unwrap().is_some());
+    assert_eq!(dirty(&db, id), ["", "a/b"]);
+    // Marked again, a folder takes a new seq, even through an upsert, whose
+    // conflict clause overrides the trigger's.
+    let before = db.sync_remote_dirty(id).unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("a/b/f", Some("r9")))
+        .unwrap();
+    let after = db.sync_remote_dirty(id).unwrap();
+    let seq_of = |rows: &[(i64, String)]| rows.iter().find(|(_, d)| d == "a/b").unwrap().0;
+    assert!(seq_of(&after) > seq_of(&before));
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+
+    db.sync_entries_set_revision(id, &[("top".into(), "r1".into())])
+        .unwrap();
+    assert!(dirty(&db, id).is_empty(), "a revision id changes nothing");
+    db.sync_entries_move(id, "a/b/f", other, "x/f").unwrap();
+    assert_eq!(dirty(&db, id), ["a/b"]);
+    assert!(
+        dirty(&db, other).is_empty(),
+        "the other folder has no walk to mark"
+    );
+    db.sync_entry_remove(id, "top").unwrap();
+    assert_eq!(dirty(&db, id), ["", "a/b"]);
+
+    // A mark made after the pass read the marks survives their consumption.
+    let read: i64 = db
+        .sync_remote_dirty(id)
+        .unwrap()
+        .iter()
+        .map(|(seq, _)| *seq)
+        .max()
+        .unwrap();
+    db.sync_remote_mark(id, &["a/b".into()]).unwrap();
+    db.sync_remote_dirty_consume(id, read).unwrap();
+    assert_eq!(dirty(&db, id), ["a/b"]);
+
+    db.sync_folder_remove(id).unwrap();
+    assert!(dirty(&db, id).is_empty());
+    assert!(db.sync_walk_load(id).unwrap().is_none());
+}
+
+/// A listing done again replaces what the folder held: the paths it no
+/// longer holds go, with everything saved under them.
+#[test]
+fn a_listing_done_again_drops_what_the_folder_no_longer_holds() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    db.sync_walk_begin(id, "v~root", 1).unwrap();
+    db.sync_walk_record(id, "", false, &[walked("a", true), walked("f", false)], &[])
+        .unwrap();
+    db.sync_walk_record(id, "a", false, &[walked("a/g", false)], &[])
+        .unwrap();
+    db.sync_walk_record(
+        id,
+        "",
+        false,
+        &[walked("f", false)],
+        &["a".into(), "a/g".into()],
+    )
+    .unwrap();
+    let walk = db.sync_walk_load(id).unwrap().unwrap();
+    let items: Vec<&str> = walk.items.iter().map(|i| i.rel_path.as_str()).collect();
+    assert_eq!(items, ["f"]);
+    let dirs: Vec<&str> = walk.dirs.iter().map(|d| d.rel_path.as_str()).collect();
+    assert_eq!(dirs, [""]);
+}
+
+/// Drive's report of a change marks the folder the node is in now and the
+/// one a saved walk last saw it in, since a move names only its new parent.
+#[test]
+fn a_change_on_drive_marks_the_folders_it_touches() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    db.sync_walk_begin(id, "v~root", 1).unwrap();
+    db.sync_walk_record(
+        id,
+        "",
+        false,
+        &[walked("a", true), walked("b", true), walked("f", false)],
+        &[],
+    )
+    .unwrap();
+    db.sync_walk_record(id, "a", false, &[walked("a/g", false)], &[])
+        .unwrap();
+    assert!(db.sync_walk_complete(id).unwrap());
+
+    // `a/g` moved to `b`.
+    assert_eq!(
+        db.sync_remote_changed("vol~a/g", Some("vol~b")).unwrap(),
+        [id]
+    );
+    assert_eq!(dirty(&db, id), ["a", "b"]);
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+    // Something new at the root.
+    assert_eq!(
+        db.sync_remote_changed("vol~new", Some("v~root")).unwrap(),
+        [id]
+    );
+    assert_eq!(dirty(&db, id), [""]);
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+    // A deletion names only the node.
+    db.sync_remote_changed("vol~f", None).unwrap();
+    assert_eq!(dirty(&db, id), [""]);
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+    // Nothing this walk knows of.
+    assert!(
+        db.sync_remote_changed("vol~elsewhere", Some("vol~far"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(dirty(&db, id).is_empty());
+
+    db.sync_walks_clear_all().unwrap();
+    assert!(db.sync_walk_load(id).unwrap().is_none());
 }

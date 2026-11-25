@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -843,13 +844,6 @@ impl Core {
         // trace exists for.
         self.trace_phase(Phase::RemoteWalk, step.elapsed());
         walked?;
-        // The walk is complete and about to be acted on. Whatever this pass
-        // applies changes the baseline its listings were read against, so
-        // they must not be resumed by a later pass; nothing is applied unless
-        // they are gone.
-        self.db
-            .sync_walk_clear(folder_id)
-            .map_err(|e| format!("drop the saved walk: {e:?}"))?;
         guard_remote_wipe(&tracked_baseline(&baseline, rules, &unscanned), &remote)?;
 
         let mut order = classification_order(&local, &remote, &baseline, rules);
@@ -919,6 +913,9 @@ impl Core {
 
             if is_dir {
                 match (l.is_some(), r.is_some()) {
+                    // Written only when it changed: every baseline write
+                    // marks the folder it is in to be listed on Drive again.
+                    (true, true) if baseline.get(rel) == Some(&dir_row(rel, &remote[rel].uid)) => {}
                     (true, true) => {
                         if let Err(e) = self.baseline_dir(folder_id, rel, &remote[rel].uid) {
                             warn!(rel, error = %e, "sync: folder step failed; continuing");
@@ -1291,8 +1288,16 @@ impl Core {
         walk: &mut RemoteWalk<'_>,
         baseline: &HashMap<String, StoredSyncEntry>,
     ) -> Result<(), PassAbort> {
-        let mut todo = self.resume_walk(folder_id, root, walk);
-        while let Some((prefix, folder)) = todo.pop_front() {
+        let WalkStart {
+            mut todo,
+            mut children,
+            dirty_upto,
+        } = self.start_walk(folder_id, root, walk);
+        // Folders to list again next pass: their listing failed or came back
+        // short this time.
+        let mut again: Vec<String> = Vec::new();
+        let mut listed: HashSet<String> = HashSet::new();
+        while let Some(next) = todo.pop_front() {
             // Checked per folder, not per pass: this walk is the long pole on a
             // large tree, and a user who asks for on-demand three minutes into
             // it should not wait out the rest of a survey of files they want
@@ -1309,10 +1314,64 @@ impl Core {
             if self.ondemand_queued(folder_id) {
                 return Err(PassAbort::Interrupted);
             }
-            let Some(listing) = self.list_remote(folder_id, &folder, &prefix, walk, baseline)?
+            // Gone with a folder listed again before it, or listed already.
+            if walk.dirs.get(&next.prefix) != Some(&next.uid) || !listed.insert(next.prefix.clone())
+            {
+                continue;
+            }
+            let prefix = next.prefix;
+            // What an earlier listing could not read is read again now.
+            walk.gaps.forget(&prefix);
+            let Some(listing) = self.list_remote(folder_id, &next.uid, &prefix, walk, baseline)?
             else {
+                // What the saved walk holds of it is older than the change
+                // that marked it: its files are left out of this pass, as a
+                // folder a full walk could not list is.
+                if let Some(children) = &children {
+                    for rel in children.of(&prefix) {
+                        if !walk.dirs.contains_key(rel) {
+                            walk.out.remove(rel);
+                        }
+                    }
+                }
+                again.push(prefix);
                 continue;
             };
+            if listing.short || !listing.unread.is_empty() {
+                again.push(prefix.clone());
+            }
+            let mut removed = Vec::new();
+            let mut kept: HashSet<String> = HashSet::new();
+            if let Some(children) = &mut children {
+                // Listed again: what it held before and no longer holds goes,
+                // with all under it. A folder still there under the same uid
+                // keeps what was saved under it.
+                let fresh: HashMap<&str, &RemoteItem> = listing
+                    .items
+                    .iter()
+                    .map(|(rel, item)| (rel.as_str(), item))
+                    .collect();
+                for old in children.take(&prefix) {
+                    let same_folder = walk.dirs.get(&old).is_some_and(|uid| {
+                        fresh
+                            .get(old.as_str())
+                            .is_some_and(|item| item.is_dir && &item.uid == uid)
+                    });
+                    if same_folder {
+                        kept.insert(old);
+                    } else {
+                        children.remove_subtree(&old, walk, &mut removed);
+                    }
+                }
+                children.add(
+                    &prefix,
+                    listing
+                        .items
+                        .iter()
+                        .map(|(rel, _)| rel)
+                        .chain(&listing.unread),
+                );
+            }
             let mut saved = Vec::with_capacity(listing.items.len() + listing.unread.len());
             for (rel, item) in listing.items {
                 self.progress_scanned(folder_id, base_name(&rel));
@@ -1327,7 +1386,12 @@ impl Core {
                 });
                 if item.is_dir {
                     walk.dirs.insert(rel.clone(), item.uid.clone());
-                    todo.push_back((rel.clone(), item.uid.clone()));
+                    if !kept.contains(&rel) {
+                        todo.push_back(WalkNext {
+                            prefix: rel.clone(),
+                            uid: item.uid.clone(),
+                        });
+                    }
                 }
                 walk.out.insert(rel, item);
             }
@@ -1346,31 +1410,58 @@ impl Core {
             }
             // A walk that cannot be saved still runs; it just starts over if
             // it is cut short.
-            if let Err(e) = self
-                .db
-                .sync_walk_record(folder_id, &prefix, listing.short, &saved)
+            if let Err(e) =
+                self.db
+                    .sync_walk_record(folder_id, &prefix, listing.short, &saved, &removed)
             {
                 debug!(folder = prefix, error = ?e, "sync: cannot save the walk's progress");
             }
         }
-        // A stop that landed during the last listing: the walk is whole, but
-        // the pass must not go on to act on it, and the saved walk must stay
-        // for the next start to pick up.
+        // A stop that came during the last listing still ends the pass here,
+        // and the next one resumes a walk with nothing left to list.
         if self.shutdown.is_stopping() {
             return Err(PassAbort::Stopped);
         }
-        Ok(())
+        self.finish_walk(folder_id, dirty_upto, &again)
+            .map_err(|e| PassAbort::from(format!("save the walk of Drive: {e:?}")))
     }
 
-    /// The folders a walk of Drive still has to list. A walk saved by an
-    /// earlier pass over the same root, recent enough, is loaded into `walk`
-    /// and continues; otherwise a new one starts at the root.
-    fn resume_walk(
+    /// Keep a walk that reached its end as the next pass's picture of Drive.
+    /// A walk that listed every folder drops the dirty marks it read past; a
+    /// walk of the dirty folders only drops the marks it read, up to
+    /// `dirty_upto`. Either way, the folders in `again` stay dirty, so the
+    /// next pass lists them again.
+    fn finish_walk(
         &self,
         folder_id: i64,
-        root: &NodeUid,
-        walk: &mut RemoteWalk<'_>,
-    ) -> VecDeque<(String, NodeUid)> {
+        dirty_upto: Option<i64>,
+        again: &[String],
+    ) -> pdfs_core::Result<()> {
+        if !again.is_empty() {
+            self.db.sync_remote_mark(folder_id, again)?;
+        }
+        match dirty_upto {
+            Some(seq) => self.db.sync_remote_dirty_consume(folder_id, seq),
+            None => {
+                if !self.db.sync_walk_complete(folder_id)? {
+                    debug!(
+                        id = folder_id,
+                        "sync: the walk of Drive was dropped before its end"
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Where a walk of Drive starts.
+    ///
+    /// - A complete walk, kept up to date by the event stream, is loaded into
+    ///   `walk`, and only the folders marked dirty since are listed again.
+    /// - A walk an earlier pass did not finish is loaded and continues, when
+    ///   it is recent enough.
+    /// - Otherwise a new walk starts at the root.
+    fn start_walk(&self, folder_id: i64, root: &NodeUid, walk: &mut RemoteWalk<'_>) -> WalkStart {
         let root_uid = root.to_string();
         let saved = match self.db.sync_walk_load(folder_id) {
             Ok(saved) => saved,
@@ -1381,24 +1472,120 @@ impl Core {
         };
         if let Some(saved) = saved
             && saved.root_uid == root_uid
-            && now_secs().saturating_sub(saved.started) < WALK_MAX_AGE.as_secs() as i64
-            && let Some((todo, restored)) = restore_walk(&saved, walk)
         {
-            self.progress_scanned_many(folder_id, restored);
-            self.trace_count(Count::Resumed, restored);
-            info!(
-                id = folder_id,
-                restored,
-                folders_left = todo.len(),
-                age_s = now_secs().saturating_sub(saved.started),
-                "sync: resuming the walk of Drive"
-            );
-            return todo;
+            let age = now_secs().saturating_sub(saved.started);
+            if saved.complete
+                && age < AUDIT_INTERVAL.as_secs() as i64
+                && self.events_trusted(root)
+                && let Some(start) = self.walk_dirty(folder_id, &saved, walk)
+            {
+                return start;
+            }
+            if !saved.complete
+                && age < WALK_MAX_AGE.as_secs() as i64
+                && let Some(restored) = restore_walk(&saved, walk)
+            {
+                self.progress_scanned_many(folder_id, restored.items);
+                self.trace_count(Count::Resumed, restored.items);
+                info!(
+                    id = folder_id,
+                    restored = restored.items,
+                    folders_left = restored.todo.len(),
+                    age_s = age,
+                    "sync: resuming the walk of Drive"
+                );
+                return WalkStart {
+                    todo: restored.todo,
+                    children: None,
+                    dirty_upto: None,
+                };
+            }
+            // Loaded into `walk`, and of no use: start from nothing.
+            walk.out.clear();
+            walk.dirs.retain(|rel, _| rel.is_empty());
+            *walk.gaps = RemoteGaps::default();
         }
         if let Err(e) = self.db.sync_walk_begin(folder_id, &root_uid, now_secs()) {
             debug!(id = folder_id, error = ?e, "sync: cannot save the walk's progress");
         }
-        VecDeque::from([(String::new(), root.clone())])
+        WalkStart {
+            todo: VecDeque::from([WalkNext {
+                prefix: String::new(),
+                uid: root.clone(),
+            }]),
+            children: None,
+            dirty_upto: None,
+        }
+    }
+
+    /// Start from a complete walk: load it into `walk`, and list again the
+    /// folders marked dirty since, plus any found since and not listed yet.
+    /// `None` when it cannot be read back.
+    fn walk_dirty(
+        &self,
+        folder_id: i64,
+        saved: &SavedWalk,
+        walk: &mut RemoteWalk<'_>,
+    ) -> Option<WalkStart> {
+        let dirty = match self.db.sync_remote_dirty(folder_id) {
+            Ok(dirty) => dirty,
+            Err(e) => {
+                warn!(id = folder_id, error = ?e, "sync: cannot read what changed on Drive");
+                return None;
+            }
+        };
+        let restored = restore_walk(saved, walk)?;
+        let mut todo = restored.todo;
+        let mut dirs: Vec<&str> = dirty.iter().map(|(_, dir)| dir.as_str()).collect();
+        dirs.sort_by_key(|dir| (dir.matches('/').count(), *dir));
+        dirs.dedup();
+        // Shallowest first: a folder listed again may turn out new or gone,
+        // and is then listed whole or dropped with what is under it.
+        for dir in &dirs {
+            match walk.dirs.get(*dir) {
+                Some(uid) => todo.push_back(WalkNext {
+                    prefix: dir.to_string(),
+                    uid: uid.clone(),
+                }),
+                // Gone from Drive, or new and not listed yet: listing its
+                // parent, marked too, settles it.
+                None => debug!(id = folder_id, dir, "sync: a dirty folder is not on Drive"),
+            }
+        }
+        self.progress_scanned_many(folder_id, restored.items);
+        self.trace_count(Count::Reused, restored.items);
+        self.trace_count(Count::Dirty, dirs.len());
+        info!(
+            id = folder_id,
+            known = restored.items,
+            dirty = dirs.len(),
+            to_list = todo.len(),
+            "sync: listing only the folders changed on Drive"
+        );
+        Some(WalkStart {
+            todo,
+            children: Some(restored.children),
+            dirty_upto: Some(dirty.iter().map(|(seq, _)| *seq).max().unwrap_or(0)),
+        })
+    }
+
+    /// Whether Drive's event stream for `root` is being followed, so a
+    /// change on Drive is marked dirty by the time a pass looks. The stream
+    /// covers the account's own volume only, and must have been read lately.
+    ///
+    /// Right after a start, the stream has not been read yet: wait a little
+    /// for it rather than walk all of Drive again.
+    fn events_trusted(&self, root: &NodeUid) -> bool {
+        if root.volume_id != self.primary_root_uid.volume_id {
+            return false;
+        }
+        let started = Instant::now();
+        while self.events_read_at.load(Ordering::Relaxed) == 0
+            && started.elapsed() < EVENTS_FRESH
+            && self.shutdown.sleep(Duration::from_millis(250))
+        {}
+        let read_at = self.events_read_at.load(Ordering::Relaxed);
+        read_at > 0 && now_secs().saturating_sub(read_at) < EVENTS_FRESH.as_secs() as i64
     }
 
     /// List one folder on Drive. `None` when the listing failed: that is
@@ -1590,19 +1777,7 @@ impl Core {
     /// Record a folder's baseline row (folders carry no content signature).
     fn baseline_dir(&self, folder_id: i64, rel: &str, uid: &NodeUid) -> Result<(), String> {
         self.db
-            .sync_entry_upsert(
-                folder_id,
-                &StoredSyncEntry {
-                    rel_path: rel.to_string(),
-                    remote_uid: Some(uid.to_string()),
-                    local_mtime: 0,
-                    local_mtime_ns: None,
-                    local_size: 0,
-                    remote_rev: None,
-                    remote_hash: None,
-                    remote_revision_id: None,
-                },
-            )
+            .sync_entry_upsert(folder_id, &dir_row(rel, uid))
             .map_err(|e| format!("baseline dir {rel}: {e:?}"))
     }
 
@@ -2372,23 +2547,109 @@ struct Listing {
 /// are as old as that, as the first ones of a walk that long would be.
 const WALK_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 
-/// Load a saved walk into `walk`. Returns the folders still to list and how
-/// many paths came back, or `None` when it cannot be read back, so the walk
-/// starts over.
-fn restore_walk(
-    saved: &SavedWalk,
-    walk: &mut RemoteWalk<'_>,
-) -> Option<(VecDeque<(String, NodeUid)>, usize)> {
+/// The baseline row of a synced folder: only its uid on Drive.
+fn dir_row(rel: &str, uid: &NodeUid) -> StoredSyncEntry {
+    StoredSyncEntry {
+        rel_path: rel.to_string(),
+        remote_uid: Some(uid.to_string()),
+        local_mtime: 0,
+        local_mtime_ns: None,
+        local_size: 0,
+        remote_rev: None,
+        remote_hash: None,
+        remote_revision_id: None,
+    }
+}
+
+/// How old the picture of Drive a walk gave may grow before a pass walks all
+/// of Drive again. Between full walks, a pass lists only the folders the event
+/// stream marked dirty; this full walk catches what the stream may have missed.
+const AUDIT_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+/// How lately Drive's event stream must have been read for a pass to rely on
+/// it. A few polls' worth.
+const EVENTS_FRESH: Duration = Duration::from_secs(3 * crate::POLL_INTERVAL.as_secs());
+
+/// A folder for a walk of Drive to list.
+struct WalkNext {
+    prefix: String,
+    uid: NodeUid,
+}
+
+/// Where [`Core::walk_remote`] starts.
+struct WalkStart {
+    todo: VecDeque<WalkNext>,
+    /// What each folder held, for a walk that lists folders again.
+    children: Option<Children>,
+    /// For a walk of the dirty folders only: the last dirty mark it read.
+    dirty_upto: Option<i64>,
+}
+
+/// The paths directly in each folder of a walk, by folder.
+#[derive(Default)]
+struct Children(HashMap<String, Vec<String>>);
+
+impl Children {
+    fn of(&self, dir: &str) -> &[String] {
+        self.0.get(dir).map_or(&[], Vec::as_slice)
+    }
+
+    fn take(&mut self, dir: &str) -> Vec<String> {
+        self.0.remove(dir).unwrap_or_default()
+    }
+
+    fn add<'a>(&mut self, dir: &str, rels: impl IntoIterator<Item = &'a String>) {
+        self.0
+            .entry(dir.to_string())
+            .or_default()
+            .extend(rels.into_iter().cloned());
+    }
+
+    /// Drop `rel` and everything under it from `walk`, noting each path in
+    /// `removed`.
+    fn remove_subtree(&mut self, rel: &str, walk: &mut RemoteWalk<'_>, removed: &mut Vec<String>) {
+        let mut stack = vec![rel.to_string()];
+        while let Some(rel) = stack.pop() {
+            walk.out.remove(&rel);
+            walk.dirs.remove(&rel);
+            walk.gaps.forget(&rel);
+            stack.extend(self.take(&rel));
+            removed.push(rel);
+        }
+    }
+}
+
+/// A saved walk loaded back into a [`RemoteWalk`].
+struct Restored {
+    /// The folders found and not listed yet.
+    todo: VecDeque<WalkNext>,
+    /// How many paths came back.
+    items: usize,
+    children: Children,
+}
+
+/// Load a saved walk into `walk`. `None` when it cannot be read back, so the
+/// walk starts over.
+fn restore_walk(saved: &SavedWalk, walk: &mut RemoteWalk<'_>) -> Option<Restored> {
     let mut todo = VecDeque::new();
     for dir in &saved.dirs {
         if dir.short {
             walk.gaps.short_listing(&dir.rel_path);
         }
         if !dir.listed {
-            todo.push_back((dir.rel_path.clone(), parse_uid(&dir.uid)?));
+            todo.push_back(WalkNext {
+                prefix: dir.rel_path.clone(),
+                uid: parse_uid(&dir.uid)?,
+            });
         }
     }
+    let mut children = Children::default();
     for item in &saved.items {
+        children
+            .0
+            .entry(parent_rel(&item.rel_path).to_string())
+            .or_default()
+            .push(item.rel_path.clone());
         let Some(uid) = &item.uid else {
             walk.gaps.unread(item.rel_path.clone());
             continue;
@@ -2409,7 +2670,11 @@ fn restore_walk(
             },
         );
     }
-    Some((todo, saved.items.len()))
+    Some(Restored {
+        todo,
+        items: saved.items.len(),
+        children,
+    })
 }
 
 /// What a remote walk fills in as it goes down the tree.

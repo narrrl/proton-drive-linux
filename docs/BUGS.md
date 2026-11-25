@@ -454,6 +454,23 @@ than 24 hours starts over. Verified by `a_saved_walk_resumes_where_it_stopped`,
 `a_baseline_change_drops_the_saved_walk` and the sim test
 `a_walk_of_drive_cut_short_resumes_where_it_stopped`.
 
+Later: a complete walk is kept (schema 49) as the next pass's picture of Drive, and a pass lists
+again only the folders marked in `sync_remote_dirty`. The event stream marks the folder a
+changed node is in now, and the folder the walk last saw it in, since a move names only its new
+parent. Triggers on `sync_entry` mark the folder of every baseline row a pass writes, so a pass
+never relies on the echo of its own change arriving in time. A folder new on Drive is listed
+whole, which covers changes deep inside it that no walk could map yet. A pass trusts the marks
+only while the event stream for the account's own volume has been read in the last 30 seconds,
+and walks all of Drive once a day, on `ContinuityLost` and after a new cursor. A folder row
+written again unchanged on every pass marked its parent every time, so the row is now written
+only when it changes. The triggers delete a folder's mark and insert it again rather than use
+`INSERT OR REPLACE`, because the conflict clause of an upsert on `sync_entry` overrides the
+trigger's: the second mark of a folder failed the baseline write with a UNIQUE error. Verified
+by `a_complete_walk_stays_and_marks_where_the_baseline_changed`,
+`a_change_on_drive_marks_the_folders_it_touches`,
+`a_listing_done_again_drops_what_the_folder_no_longer_holds` and the sim test
+`a_pass_lists_only_the_folders_changed_on_drive`.
+
 Later: every pass keeps a trace of where its time went (`crates/pdfs-fuse/src/sync/trace.rs`),
 in the journal as `sync: pass trace` and in `pdfs diagnostics`. The sim test
 `a_mirror_pass_reports_where_its_time_went` showed that a file uploaded by a pass also gets a

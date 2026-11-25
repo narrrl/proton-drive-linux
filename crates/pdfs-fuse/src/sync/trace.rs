@@ -120,12 +120,17 @@ pub(crate) enum Count {
     Revisions,
     /// Paths queued for the apply stage.
     Queued,
-    /// Paths on Drive read back from a walk an earlier pass saved.
+    /// Paths on Drive read back from a walk an earlier pass did not finish.
     Resumed,
+    /// Paths on Drive read back from the last complete walk, which the event
+    /// stream keeps up to date.
+    Reused,
+    /// Folders on Drive marked as changed since the last pass listed them.
+    Dirty,
 }
 
 impl Count {
-    const ALL: [Count; 7] = [
+    const ALL: [Count; 9] = [
         Count::LocalEntries,
         Count::RemoteFolders,
         Count::Nodes,
@@ -133,6 +138,8 @@ impl Count {
         Count::Revisions,
         Count::Queued,
         Count::Resumed,
+        Count::Reused,
+        Count::Dirty,
     ];
 
     fn name(self) -> &'static str {
@@ -144,6 +151,8 @@ impl Count {
             Count::Revisions => "revisions recorded",
             Count::Queued => "queued",
             Count::Resumed => "resumed",
+            Count::Reused => "reused",
+            Count::Dirty => "dirty folders",
         }
     }
 }

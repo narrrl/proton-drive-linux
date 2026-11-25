@@ -11,7 +11,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **48**. New tables save a mirror folder's walk of Proton Drive while a pass runs.
+Schema: **49**. New tables save a mirror folder's walk of Proton Drive (48). A finished walk is
+kept, with a list of the folders that changed on Proton Drive since (49).
 
 ### Added
 - **`pdfs diagnostics` and the journal say where a sync pass spends its time.** Each pass over a
@@ -37,6 +38,13 @@ Schema: **48**. New tables save a mirror folder's walk of Proton Drive while a p
   never finished syncing. Each listing is now saved as it comes in, and the next pass lists only
   the folders that are left. A saved listing is dropped whenever what it was read against
   changes (B294).
+- **A sync pass lists only the folders that changed on Proton Drive.** Every pass used to list
+  the whole folder on Proton Drive to find a few changes, so its cost grew with the size of the
+  folder. Now the last full listing is kept. The daemon already follows Proton Drive's change
+  feed, and it marks the folders each change touches. A pass lists those folders again and
+  takes the rest from the kept listing. A change made on another device also starts a pass at
+  once, instead of at the next two-minute poll. A full listing still runs once a day, on the
+  first pass, and whenever the change feed lost track (#53).
 
 ### Fixed
 - Files dragged in from a file manager on Wayland upload. The compositor offers

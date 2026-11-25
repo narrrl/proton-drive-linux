@@ -285,6 +285,14 @@ impl RemoteGaps {
         self.unlisted.insert(folder.to_string());
     }
 
+    /// `rel` is no longer on Drive, or is about to be read again: whatever
+    /// was noted of it goes.
+    pub(super) fn forget(&mut self, rel: &str) {
+        self.short.remove(rel);
+        self.unread.remove(rel);
+        self.unlisted.remove(rel);
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.short.is_empty() && self.unread.is_empty() && self.unlisted.is_empty()
     }

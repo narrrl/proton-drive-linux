@@ -7,16 +7,25 @@ use super::Db;
 use crate::Result;
 use std::collections::HashMap;
 
-/// What a mirror pass has walked of Drive so far, saved so a pass cut short
-/// resumes the walk instead of listing every folder again (B294).
+/// What a mirror pass has walked of Drive, saved so a pass cut short
+/// resumes the walk instead of listing every folder again (B294), and so a
+/// finished walk serves as the next pass's picture of Drive.
 ///
-/// The database drops it whenever the folder's baseline changes, so a saved
-/// listing never meets a baseline newer than itself.
+/// While a walk is not complete, the database drops it whenever the folder's
+/// baseline changes, so a resumed listing never meets a baseline newer than
+/// itself. Once it is complete, a change to the baseline instead marks the
+/// folder it happened in as dirty (see [`Db::sync_remote_dirty`]), and the
+/// next pass lists that folder again.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SavedWalk {
     /// The folder's root on Drive when the walk began.
     pub root_uid: String,
+    /// When the last full walk began. A complete walk is kept up to date
+    /// folder by folder, so this is the age of its oldest listings.
     pub started: i64,
+    /// Whether the walk reached every folder once. Some may have been found
+    /// since, and wait unlisted in `dirs`.
+    pub complete: bool,
     pub dirs: Vec<SavedWalkDir>,
     pub items: Vec<SavedWalkItem>,
 }
@@ -383,11 +392,17 @@ impl Db {
     /// that has not finished. See [`SavedWalk`].
     pub fn sync_walk_load(&self, folder_id: i64) -> Result<Option<SavedWalk>> {
         let conn = self.conn.lock();
-        let Some((root_uid, started)) = conn
+        let Some((root_uid, started, complete)) = conn
             .query_row(
-                "SELECT root_uid, started FROM sync_walk WHERE folder_id = ?1",
+                "SELECT root_uid, started, complete FROM sync_walk WHERE folder_id = ?1",
                 params![folder_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
             )
             .optional()?
         else {
@@ -426,6 +441,7 @@ impl Db {
         Ok(Some(SavedWalk {
             root_uid,
             started,
+            complete,
             dirs,
             items,
         }))
@@ -433,12 +449,17 @@ impl Db {
 
     /// Start a saved walk of Drive for a mirror folder, from its root,
     /// dropping any saved before.
+    ///
+    /// The walk notes the last dirty mark made so far: a full walk reads
+    /// everything those marks name, so [`Db::sync_walk_complete`] drops them,
+    /// and keeps only the marks made while the walk ran.
     pub fn sync_walk_begin(&self, folder_id: i64, root_uid: &str, now: i64) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         clear_walk(&tx, folder_id)?;
         tx.execute(
-            "INSERT INTO sync_walk (folder_id, root_uid, started) VALUES (?1, ?2, ?3)",
+            "INSERT INTO sync_walk (folder_id, root_uid, started, seq)
+             VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(seq), 0) FROM sync_remote_dirty))",
             params![folder_id, root_uid, now],
         )?;
         tx.execute(
@@ -453,6 +474,9 @@ impl Db {
     /// the folders in it still to be listed. One transaction, so a stop leaves
     /// the folder either listed with all it holds or not listed at all.
     ///
+    /// `removed` names the paths a listing done again no longer holds, with
+    /// everything under them; they go first.
+    ///
     /// Does nothing once the walk has been dropped, by a change to the
     /// folder's baseline in between, for one.
     pub fn sync_walk_record(
@@ -461,6 +485,7 @@ impl Db {
         dir: &str,
         short: bool,
         items: &[SavedWalkItem],
+        removed: &[String],
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
@@ -471,6 +496,16 @@ impl Db {
         )?;
         if listed == 0 {
             return Ok(false);
+        }
+        {
+            let mut item =
+                tx.prepare("DELETE FROM sync_walk_item WHERE folder_id = ?1 AND rel_path = ?2")?;
+            let mut sub =
+                tx.prepare("DELETE FROM sync_walk_dir WHERE folder_id = ?1 AND rel_path = ?2")?;
+            for rel in removed {
+                item.execute(params![folder_id, rel])?;
+                sub.execute(params![folder_id, rel])?;
+            }
         }
         {
             let mut item = tx.prepare(
@@ -493,6 +528,142 @@ impl Db {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Mark a mirror folder's walk of Drive complete, so later passes start
+    /// from it instead of walking Drive again, and drop the dirty marks the
+    /// walk has read past: those made before it began. `false` when there is
+    /// no walk to complete: a change to the baseline dropped it meanwhile.
+    pub fn sync_walk_complete(&self, folder_id: i64) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let seq: Option<i64> = tx
+            .query_row(
+                "SELECT seq FROM sync_walk WHERE folder_id = ?1",
+                params![folder_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(seq) = seq else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE sync_walk SET complete = 1 WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
+        tx.execute(
+            "DELETE FROM sync_remote_dirty WHERE folder_id = ?1 AND seq <= ?2",
+            params![folder_id, seq],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The folders of a mirror folder to list on Drive again, as
+    /// `(seq, rel_path)`: changed on Drive since they were listed, by another
+    /// device or by a pass. [`Db::sync_remote_changed`] and the baseline's
+    /// triggers mark them.
+    pub fn sync_remote_dirty(&self, folder_id: i64) -> Result<Vec<(i64, String)>> {
+        let conn = self.read();
+        let mut stmt =
+            conn.prepare("SELECT seq, dir FROM sync_remote_dirty WHERE folder_id = ?1")?;
+        let rows = stmt
+            .query_map(params![folder_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Drop the dirty marks of a mirror folder up to `seq`, once a pass has
+    /// listed what they name. A mark made since keeps its folder dirty.
+    pub fn sync_remote_dirty_consume(&self, folder_id: i64, seq: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM sync_remote_dirty WHERE folder_id = ?1 AND seq <= ?2",
+            params![folder_id, seq],
+        )?;
+        Ok(())
+    }
+
+    /// Mark folders of a mirror folder to list on Drive again.
+    pub fn sync_remote_mark(&self, folder_id: i64, dirs: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut mark = tx.prepare(
+                "INSERT OR REPLACE INTO sync_remote_dirty (folder_id, dir) VALUES (?1, ?2)",
+            )?;
+            for dir in dirs {
+                mark.execute(params![folder_id, dir])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Note that Drive reported a change to `node_uid`, now in `parent_uid`:
+    /// mark dirty the folder that holds it in a saved walk, and the folder it
+    /// is in now. A move names only its new parent, so the old one is found
+    /// through the walk. Returns the mirror folders marked.
+    pub fn sync_remote_changed(
+        &self,
+        node_uid: &str,
+        parent_uid: Option<&str>,
+    ) -> Result<Vec<i64>> {
+        // Looked up on a reader: most events are about nodes no walk holds,
+        // and those must not queue behind the writer.
+        let marked: Vec<(i64, String)> = {
+            let conn = self.read();
+            let mut marked: Vec<(i64, String)> = conn
+                .prepare_cached(
+                    "SELECT folder_id, rtrim(rtrim(rel_path, replace(rel_path, '/', '')), '/')
+                       FROM sync_walk_item WHERE uid = ?1
+                     UNION SELECT folder_id, '' FROM sync_walk WHERE root_uid = ?1",
+                )?
+                .query_map(params![node_uid], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if let Some(parent) = parent_uid {
+                marked.extend(
+                    conn.prepare_cached(
+                        "SELECT folder_id, rel_path FROM sync_walk_item
+                           WHERE uid = ?1 AND is_dir = 1
+                         UNION SELECT folder_id, '' FROM sync_walk WHERE root_uid = ?1",
+                    )?
+                    .query_map(params![parent], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<(i64, String)>>>()?,
+                );
+            }
+            marked
+        };
+        if marked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut mark = tx.prepare(
+                "INSERT OR REPLACE INTO sync_remote_dirty (folder_id, dir) VALUES (?1, ?2)",
+            )?;
+            for (folder_id, dir) in &marked {
+                mark.execute(params![folder_id, dir])?;
+            }
+        }
+        tx.commit()?;
+        let mut folders: Vec<i64> = marked.into_iter().map(|(id, _)| id).collect();
+        folders.sort_unstable();
+        folders.dedup();
+        Ok(folders)
+    }
+
+    /// Drop every saved walk of Drive and every dirty mark. Used when the
+    /// event stream lost changes, so no saved picture of Drive can be
+    /// trusted to be up to date.
+    pub fn sync_walks_clear_all(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute_batch(
+            "DELETE FROM sync_walk; DELETE FROM sync_walk_dir; DELETE FROM sync_walk_item;
+             DELETE FROM sync_remote_dirty;",
+        )?;
+        Ok(())
     }
 
     /// Drop a mirror folder's saved walk of Drive.
@@ -624,7 +795,12 @@ impl Db {
 }
 
 fn clear_walk(tx: &rusqlite::Transaction<'_>, folder_id: i64) -> Result<()> {
-    for table in ["sync_walk", "sync_walk_dir", "sync_walk_item"] {
+    for table in [
+        "sync_walk",
+        "sync_walk_dir",
+        "sync_walk_item",
+        "sync_remote_dirty",
+    ] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE folder_id = ?1"),
             params![folder_id],
