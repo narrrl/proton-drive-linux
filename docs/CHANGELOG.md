@@ -11,6 +11,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+Schema: **48**. New tables save a mirror folder's walk of Proton Drive while a pass runs.
+
 ### Added
 
 - **`pdfs diagnostics` and the journal say where a sync pass spends its time.** Each pass over a
@@ -18,6 +20,15 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   and apply. It also records how many calls to Proton Drive it made of each kind, how long they
   took, and which folder on Drive was slowest to list. The trace shows the running pass and the
   last pass over each folder, in the journal as `sync: pass trace` (B294).
+
+### Changed
+
+- **A sync pass over a large folder picks up where a restart stopped it.** A pass lists the
+  folder on Proton Drive before it changes anything, and on a folder of hundreds of thousands
+  of files that takes hours. A restart used to throw the listing away, so a large enough folder
+  never finished syncing. Each listing is now saved as it comes in, and the next pass lists only
+  the folders that are left. A saved listing is dropped whenever what it was read against
+  changes (B294).
 
 ## [3.10.0] — 2026-11-22
 

@@ -1742,6 +1742,73 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_walk_of_drive_cut_short_resumes_where_it_stopped() {
+        // A pass over a large folder lists Drive folder by folder before it
+        // applies anything. A stop threw all of that away, and a folder too
+        // large to walk between two restarts never synced (B294). Now each
+        // listing is saved, and the next pass lists only what is left.
+        let drive = FakeDrive::new();
+        let dir = scratch("mirror-walk-resume");
+        let local = dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        for sub in ["a", "b", "c"] {
+            std::fs::create_dir(local.join(sub)).unwrap();
+            std::fs::write(local.join(sub).join("f.txt"), sub.as_bytes()).unwrap();
+        }
+        let (daemon, folder, _client) = start_mirror(&drive, &dir, &[]);
+        assert!(wait_until(Duration::from_secs(30), || {
+            ["a", "b", "c"]
+                .iter()
+                .all(|sub| drive.lookup(&format!("mirrored/{sub}/f.txt")).is_some())
+        }));
+        assert!(wait_for_pass(&daemon, folder, 0));
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+
+        // The next start's pass is stopped while it lists the second folder.
+        let client = drive.client(1, Faults::lan());
+        let b = drive.lookup("mirrored/b").unwrap();
+        let listing = client.hold_next_children_of(&b);
+        let daemon = Daemon::start(&dir, client).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || listing.reached()));
+        let socket = daemon.socket.clone();
+        let stopping = std::thread::spawn(move || daemon.stop());
+        assert!(wait_until(Duration::from_secs(30), || !socket.exists()));
+        drop(listing);
+        assert!(matches!(
+            stopping.join().unwrap(),
+            Ok(MountOutcome::Shutdown)
+        ));
+        let saved = reopen(&dir).sync_walk_load(folder).unwrap();
+        let saved = saved.expect("the walk was saved");
+        // Which folders were listed depends on the order Drive lists them
+        // in; a walk that is still saved is one that did not end.
+        assert!(saved.dirs.iter().any(|d| d.rel_path.is_empty() && d.listed));
+
+        // The start after that picks the walk up instead of starting over.
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let resumed = traced_pass(&daemon, folder, |t| counted(t, "resumed") > 0)
+            .expect("the resumed pass finishes");
+        assert!(
+            counted(&resumed, "remote folders") < 4,
+            "listed everything again: {resumed}"
+        );
+        assert!(wait_for_pass(&daemon, folder, 0));
+        // Nothing moved: the walk read every path, and a complete walk is
+        // not kept for the next pass.
+        assert_eq!(counted(&resumed, "queued"), 0, "{resumed}");
+        for sub in ["a", "b", "c"] {
+            assert_eq!(
+                std::fs::read(local.join(sub).join("f.txt")).unwrap(),
+                sub.as_bytes()
+            );
+        }
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        assert_eq!(reopen(&dir).sync_walk_load(folder).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_mirror_edit_does_not_replace_a_revision_another_computer_made_since() {
         // A local edit went up as a new revision of whatever Drive held at the
         // time of the upload, from a plan made before another computer saved

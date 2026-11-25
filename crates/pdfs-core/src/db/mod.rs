@@ -62,7 +62,7 @@ pub use ops::{
 };
 pub use photos::{StoredPhoto, StoredPlace, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN, TimelineRow};
 pub use pins::PinRow;
-pub use sync::{StoredSyncEntry, StoredSyncFolder};
+pub use sync::{SavedWalk, SavedWalkDir, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 pub use trash::StoredTrash;
 
 /// Size the WAL is truncated back to after a checkpoint. Comfortably above the

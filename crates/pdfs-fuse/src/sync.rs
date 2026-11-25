@@ -24,7 +24,7 @@
 //! pass, after the writer has closed them.
 
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,7 +41,7 @@ use crate::transfers::{CountingWriter, OwnedCountingReader};
 use crate::{Core, now_secs, parse_uid};
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
-use pdfs_core::db::{StoredSyncEntry, StoredSyncFolder};
+use pdfs_core::db::{SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 use pdfs_core::syncignore::IgnoreRules;
 
 mod engine;
@@ -464,6 +464,11 @@ impl Core {
         remote_root: &NodeUid,
         rules: &IgnoreRules,
     ) -> Result<Outcome, PassAbort> {
+        // This pass uploads without walking Drive, so a walk saved by an
+        // earlier pass would not know what it sent; see `do_reconcile`.
+        self.db
+            .sync_walk_clear(folder_id)
+            .map_err(|e| format!("drop the saved walk: {e:?}"))?;
         let step = Instant::now();
         let baseline = self
             .db
@@ -827,7 +832,6 @@ impl Core {
         let walked = self.walk_remote(
             folder_id,
             remote_root,
-            "",
             &mut RemoteWalk {
                 out: &mut remote,
                 dirs: &mut remote_dirs,
@@ -839,6 +843,13 @@ impl Core {
         // trace exists for.
         self.trace_phase(Phase::RemoteWalk, step.elapsed());
         walked?;
+        // The walk is complete and about to be acted on. Whatever this pass
+        // applies changes the baseline its listings were read against, so
+        // they must not be resumed by a later pass; nothing is applied unless
+        // they are gone.
+        self.db
+            .sync_walk_clear(folder_id)
+            .map_err(|e| format!("drop the saved walk: {e:?}"))?;
         guard_remote_wipe(&tracked_baseline(&baseline, rules, &unscanned), &remote)?;
 
         let mut order = classification_order(&local, &remote, &baseline, rules);
@@ -1250,8 +1261,9 @@ impl Core {
         Ok(())
     }
 
-    /// Recursively walk a remote folder into `out`, recording every descendant's
-    /// relative path, and mapping each subfolder's rel path to its uid in `dirs`.
+    /// Walk the remote tree of a mirror folder into `walk`, folder by folder,
+    /// recording every descendant's relative path, and mapping each subfolder's
+    /// rel path to its uid in `walk.dirs`.
     ///
     /// A file's size comes from its extended attributes, which only its own node
     /// key can decrypt — and unlocking that key costs an S2K derivation (tens of
@@ -1264,29 +1276,142 @@ impl Core {
     ///
     /// What the walk could not read goes to `walk.gaps`, never silently out of
     /// the map: a missing path reads as deleted on Drive.
+    ///
+    /// Each folder's listing is saved as it comes in. A walk cut short by a
+    /// stop resumes from what was saved and lists only the folders it had not
+    /// reached, where it used to start over and, on a folder large enough,
+    /// never finish (B294). The database drops a saved walk whenever the
+    /// folder's baseline changes, so a resumed walk never meets a baseline
+    /// newer than its listings; it is as old as a long walk's first listings
+    /// would be, and the apply step checks each file again before it acts.
     fn walk_remote(
+        &self,
+        folder_id: i64,
+        root: &NodeUid,
+        walk: &mut RemoteWalk<'_>,
+        baseline: &HashMap<String, StoredSyncEntry>,
+    ) -> Result<(), PassAbort> {
+        let mut todo = self.resume_walk(folder_id, root, walk);
+        while let Some((prefix, folder)) = todo.pop_front() {
+            // Checked per folder, not per pass: this walk is the long pole on a
+            // large tree, and a user who asks for on-demand three minutes into
+            // it should not wait out the rest of a survey of files they want
+            // deleted. Bailing out here is safe precisely because the walk has
+            // applied nothing — a *partial* remote map, on the other hand,
+            // would be read as "the remote deleted everything we haven't
+            // reached yet", so it must never reach the diff.
+            if self.shutdown.is_stopping() {
+                return Err(PassAbort::Stopped);
+            }
+            if self.pass_abandoned(folder_id) {
+                return Err(PassAbort::Abandoned);
+            }
+            if self.ondemand_queued(folder_id) {
+                return Err(PassAbort::Interrupted);
+            }
+            let Some(listing) = self.list_remote(folder_id, &folder, &prefix, walk, baseline)?
+            else {
+                continue;
+            };
+            let mut saved = Vec::with_capacity(listing.items.len() + listing.unread.len());
+            for (rel, item) in listing.items {
+                self.progress_scanned(folder_id, base_name(&rel));
+                saved.push(SavedWalkItem {
+                    rel_path: rel.clone(),
+                    uid: Some(item.uid.to_string()),
+                    is_dir: item.is_dir,
+                    mtime: item.mtime,
+                    size: item.size,
+                    revision: item.revision.clone(),
+                    sha1: item.sha1.clone(),
+                });
+                if item.is_dir {
+                    walk.dirs.insert(rel.clone(), item.uid.clone());
+                    todo.push_back((rel.clone(), item.uid.clone()));
+                }
+                walk.out.insert(rel, item);
+            }
+            for rel in listing.unread {
+                self.progress_scanned(folder_id, base_name(&rel));
+                saved.push(SavedWalkItem {
+                    rel_path: rel.clone(),
+                    uid: None,
+                    is_dir: false,
+                    mtime: 0,
+                    size: 0,
+                    revision: None,
+                    sha1: None,
+                });
+                walk.gaps.unread(rel);
+            }
+            // A walk that cannot be saved still runs; it just starts over if
+            // it is cut short.
+            if let Err(e) = self
+                .db
+                .sync_walk_record(folder_id, &prefix, listing.short, &saved)
+            {
+                debug!(folder = prefix, error = ?e, "sync: cannot save the walk's progress");
+            }
+        }
+        // A stop that landed during the last listing: the walk is whole, but
+        // the pass must not go on to act on it, and the saved walk must stay
+        // for the next start to pick up.
+        if self.shutdown.is_stopping() {
+            return Err(PassAbort::Stopped);
+        }
+        Ok(())
+    }
+
+    /// The folders a walk of Drive still has to list. A walk saved by an
+    /// earlier pass over the same root, recent enough, is loaded into `walk`
+    /// and continues; otherwise a new one starts at the root.
+    fn resume_walk(
+        &self,
+        folder_id: i64,
+        root: &NodeUid,
+        walk: &mut RemoteWalk<'_>,
+    ) -> VecDeque<(String, NodeUid)> {
+        let root_uid = root.to_string();
+        let saved = match self.db.sync_walk_load(folder_id) {
+            Ok(saved) => saved,
+            Err(e) => {
+                warn!(id = folder_id, error = ?e, "sync: cannot read the saved walk; starting over");
+                None
+            }
+        };
+        if let Some(saved) = saved
+            && saved.root_uid == root_uid
+            && now_secs().saturating_sub(saved.started) < WALK_MAX_AGE.as_secs() as i64
+            && let Some((todo, restored)) = restore_walk(&saved, walk)
+        {
+            self.progress_scanned_many(folder_id, restored);
+            self.trace_count(Count::Resumed, restored);
+            info!(
+                id = folder_id,
+                restored,
+                folders_left = todo.len(),
+                age_s = now_secs().saturating_sub(saved.started),
+                "sync: resuming the walk of Drive"
+            );
+            return todo;
+        }
+        if let Err(e) = self.db.sync_walk_begin(folder_id, &root_uid, now_secs()) {
+            debug!(id = folder_id, error = ?e, "sync: cannot save the walk's progress");
+        }
+        VecDeque::from([(String::new(), root.clone())])
+    }
+
+    /// List one folder on Drive. `None` when the listing failed: that is
+    /// noted in `walk.gaps`, and the folder is not saved as listed, so a
+    /// resumed walk asks again. A failure at the root fails the pass.
+    fn list_remote(
         &self,
         folder_id: i64,
         folder: &NodeUid,
         prefix: &str,
         walk: &mut RemoteWalk<'_>,
         baseline: &HashMap<String, StoredSyncEntry>,
-    ) -> Result<(), PassAbort> {
-        // Checked per folder, not per pass: this walk is the long pole on a large
-        // tree, and a user who asks for on-demand three minutes into it should not
-        // wait out the rest of a survey of files they want deleted. Bailing out here
-        // is safe precisely because the walk has applied nothing — a *partial*
-        // remote map, on the other hand, would be read as "the remote deleted
-        // everything we haven't reached yet", so it must never reach the diff.
-        if self.shutdown.is_stopping() {
-            return Err(PassAbort::Stopped);
-        }
-        if self.pass_abandoned(folder_id) {
-            return Err(PassAbort::Abandoned);
-        }
-        if self.ondemand_queued(folder_id) {
-            return Err(PassAbort::Interrupted);
-        }
+    ) -> Result<Option<Listing>, PassAbort> {
         let listing = Instant::now();
         let step = Instant::now();
         let uids = self
@@ -1295,12 +1420,12 @@ impl Core {
             .map_err(|e| format!("enumerate {folder}: {e}"));
         self.trace_call(Call::ListChildren, step.elapsed());
         self.trace_count(Count::RemoteFolders, 1);
-        let uids = match unlisted_gap(walk, prefix, uids)? {
-            Some(uids) => uids,
-            None => return Ok(()),
+        let Some(uids) = unlisted_gap(walk, prefix, uids)? else {
+            return Ok(None);
         };
+        let mut out = Listing::default();
         if uids.is_empty() {
-            return Ok(());
+            return Ok(Some(out));
         }
         let step = Instant::now();
         let nodes = self
@@ -1308,9 +1433,8 @@ impl Core {
             .block_on(self.drive.enumerate_nodes_light(&uids))
             .map_err(|e| format!("resolve nodes: {e}"));
         self.trace_call(Call::ReadNodes, step.elapsed());
-        let nodes = match unlisted_gap(walk, prefix, nodes)? {
-            Some(nodes) => nodes,
-            None => return Ok(()),
+        let Some(nodes) = unlisted_gap(walk, prefix, nodes)? else {
+            return Ok(None);
         };
         // The SDK leaves out a node it cannot decrypt, and says so only in its
         // log. Its name went with it, so all this can record is the folder.
@@ -1322,6 +1446,7 @@ impl Core {
                 "sync: some nodes on Drive cannot be read; leaving them out"
             );
             walk.gaps.short_listing(prefix);
+            out.short = true;
         }
         let nodes: Vec<Node> = nodes
             .into_iter()
@@ -1363,7 +1488,7 @@ impl Core {
             self.trace_call(Call::ReadNodesFull, step.elapsed());
             self.trace_count(Count::NodesFull, stale.len());
             let Some(full) = unlisted_gap(walk, prefix, full)? else {
-                return Ok(());
+                return Ok(None);
             };
             full.iter()
                 .map(|n| {
@@ -1377,7 +1502,6 @@ impl Core {
         let stale: HashSet<String> = stale.iter().map(|u| u.to_string()).collect();
         self.record_revisions(folder_id, prefix, &nodes, &sized, baseline);
         self.trace_count(Count::Nodes, nodes.len());
-        // This folder's own listing, before the walk goes into its subfolders.
         self.sync_engine
             .trace(|t| t.listing(prefix, listing.elapsed()));
 
@@ -1386,59 +1510,56 @@ impl Core {
                 continue;
             }
             let rel = join_rel(prefix, &node.name);
-            self.progress_scanned(folder_id, base_name(&rel));
             if node.is_folder() {
-                walk.dirs.insert(rel.clone(), node.uid.clone());
-                walk.out.insert(
-                    rel.clone(),
+                out.items.push((
+                    rel,
                     RemoteItem {
-                        uid: node.uid.clone(),
+                        uid: node.uid,
                         is_dir: true,
                         mtime: 0,
                         size: 0,
                         revision: None,
                         sha1: None,
                     },
-                );
-                self.walk_remote(folder_id, &node.uid, &rel, walk, baseline)?;
-            } else {
-                let (size, sha1) = if stale.contains(&node.uid.to_string()) {
-                    match sized.get(&node.uid.to_string()) {
-                        Some(sized) => sized.clone(),
-                        // Its size was needed but could not be read (the full
-                        // enumeration skipped it as undecryptable). Leave it out
-                        // rather than record a stale size, and say so: missing,
-                        // it would read as deleted on Drive.
-                        None => {
-                            walk.gaps.unread(rel);
-                            continue;
-                        }
-                    }
-                } else {
-                    match unchanged_remote_size(
-                        baseline,
-                        &rel,
-                        node.modification_time,
-                        crate::node_revision_id(&node).as_deref(),
-                    ) {
-                        Some(size) => (size, None),
-                        None => continue,
-                    }
-                };
-                walk.out.insert(
-                    rel,
-                    RemoteItem {
-                        revision: crate::node_revision_id(&node),
-                        uid: node.uid,
-                        is_dir: false,
-                        mtime: node.modification_time,
-                        size,
-                        sha1,
-                    },
-                );
+                ));
+                continue;
             }
+            let (size, sha1) = if stale.contains(&node.uid.to_string()) {
+                match sized.get(&node.uid.to_string()) {
+                    Some(sized) => sized.clone(),
+                    // Its size was needed but could not be read (the full
+                    // enumeration skipped it as undecryptable). Leave it out
+                    // rather than record a stale size, and say so: missing,
+                    // it would read as deleted on Drive.
+                    None => {
+                        out.unread.push(rel);
+                        continue;
+                    }
+                }
+            } else {
+                match unchanged_remote_size(
+                    baseline,
+                    &rel,
+                    node.modification_time,
+                    crate::node_revision_id(&node).as_deref(),
+                ) {
+                    Some(size) => (size, None),
+                    None => continue,
+                }
+            };
+            out.items.push((
+                rel,
+                RemoteItem {
+                    revision: crate::node_revision_id(&node),
+                    uid: node.uid,
+                    is_dir: false,
+                    mtime: node.modification_time,
+                    size,
+                    sha1,
+                },
+            ));
         }
-        Ok(())
+        Ok(Some(out))
     }
 
     /// Store the revision id of each file in one listing whose baseline row has
@@ -2235,6 +2356,60 @@ fn remove_local_dirs(
             }
         })
         .collect()
+}
+
+/// What one folder's listing on Drive held.
+#[derive(Default)]
+struct Listing {
+    items: Vec<(String, RemoteItem)>,
+    /// Files seen whose size could not be read.
+    unread: Vec<String>,
+    /// The listing named nodes that could not be read.
+    short: bool,
+}
+
+/// How old a saved walk of Drive may be and still be resumed. Its listings
+/// are as old as that, as the first ones of a walk that long would be.
+const WALK_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// Load a saved walk into `walk`. Returns the folders still to list and how
+/// many paths came back, or `None` when it cannot be read back, so the walk
+/// starts over.
+fn restore_walk(
+    saved: &SavedWalk,
+    walk: &mut RemoteWalk<'_>,
+) -> Option<(VecDeque<(String, NodeUid)>, usize)> {
+    let mut todo = VecDeque::new();
+    for dir in &saved.dirs {
+        if dir.short {
+            walk.gaps.short_listing(&dir.rel_path);
+        }
+        if !dir.listed {
+            todo.push_back((dir.rel_path.clone(), parse_uid(&dir.uid)?));
+        }
+    }
+    for item in &saved.items {
+        let Some(uid) = &item.uid else {
+            walk.gaps.unread(item.rel_path.clone());
+            continue;
+        };
+        let uid = parse_uid(uid)?;
+        if item.is_dir {
+            walk.dirs.insert(item.rel_path.clone(), uid.clone());
+        }
+        walk.out.insert(
+            item.rel_path.clone(),
+            RemoteItem {
+                uid,
+                is_dir: item.is_dir,
+                mtime: item.mtime,
+                size: item.size,
+                revision: item.revision.clone(),
+                sha1: item.sha1.clone(),
+            },
+        );
+    }
+    Some((todo, saved.items.len()))
 }
 
 /// What a remote walk fills in as it goes down the tree.

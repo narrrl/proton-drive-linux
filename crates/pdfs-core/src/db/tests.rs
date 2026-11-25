@@ -8083,3 +8083,113 @@ fn folders_left_syncing_are_reset_to_error() {
     let idle = db.sync_folder_get(idle).unwrap().unwrap();
     assert_eq!((idle.state.as_str(), idle.last_sync), ("idle", 200));
 }
+
+fn walked(rel: &str, is_dir: bool) -> SavedWalkItem {
+    SavedWalkItem {
+        rel_path: rel.into(),
+        uid: Some(format!("vol~{rel}")),
+        is_dir,
+        mtime: 1,
+        size: 2,
+        revision: (!is_dir).then(|| "r".into()),
+        sha1: None,
+    }
+}
+
+/// A walk of Drive saved folder by folder comes back as it was saved: each
+/// folder found is queued to be listed, and only a recorded listing counts
+/// as listed (B294).
+#[test]
+fn a_saved_walk_resumes_where_it_stopped() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    assert_eq!(db.sync_walk_load(id).unwrap(), None);
+    db.sync_walk_begin(id, "v~root", 100).unwrap();
+    assert!(
+        db.sync_walk_record(id, "", false, &[walked("a", true), walked("f", false)])
+            .unwrap()
+    );
+    assert!(
+        db.sync_walk_record(id, "a", true, &[walked("a/g", false)])
+            .unwrap()
+    );
+    // A folder the walk never found is not something it can list.
+    assert!(!db.sync_walk_record(id, "nowhere", false, &[]).unwrap());
+
+    let walk = db.sync_walk_load(id).unwrap().unwrap();
+    assert_eq!((walk.root_uid.as_str(), walk.started), ("v~root", 100));
+    let mut dirs: Vec<(String, bool, bool)> = walk
+        .dirs
+        .iter()
+        .map(|d| (d.rel_path.clone(), d.listed, d.short))
+        .collect();
+    dirs.sort();
+    assert_eq!(dirs, [("".into(), true, false), ("a".into(), true, true)]);
+    let mut items: Vec<&str> = walk.items.iter().map(|i| i.rel_path.as_str()).collect();
+    items.sort();
+    assert_eq!(items, ["a", "a/g", "f"]);
+
+    // Beginning again starts from the root, with nothing listed.
+    db.sync_walk_begin(id, "v~root", 200).unwrap();
+    let walk = db.sync_walk_load(id).unwrap().unwrap();
+    assert_eq!(walk.started, 200);
+    assert_eq!(walk.dirs.len(), 1);
+    assert!(!walk.dirs[0].listed);
+    assert!(walk.items.is_empty());
+    db.sync_walk_clear(id).unwrap();
+    assert_eq!(db.sync_walk_load(id).unwrap(), None);
+}
+
+/// A saved listing never outlives a change to the baseline it was read
+/// against: a file moved to another synced folder would read as deleted on
+/// Drive, and its local copy would go. Filling in a revision id is the one
+/// change that keeps it, since the walk itself makes it (B294).
+#[test]
+fn a_baseline_change_drops_the_saved_walk() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    let other = db
+        .sync_folder_add("/home/me/Other", "v~other", "s")
+        .unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("a", None))
+        .unwrap();
+    let saved = |db: &Db| db.sync_walk_load(id).unwrap().is_some();
+    let begin = |db: &Db| {
+        db.sync_walk_begin(id, "v~root", 1).unwrap();
+        db.sync_walk_record(id, "", false, &[walked("a", false)])
+            .unwrap();
+    };
+
+    begin(&db);
+    db.sync_entries_set_revision(id, &[("a".into(), "r1".into())])
+        .unwrap();
+    assert!(saved(&db), "a revision id is filled in by the walk itself");
+    // Another folder's baseline is not this walk's business.
+    db.sync_entry_upsert(other, &revisionless_row("x", None))
+        .unwrap();
+    assert!(saved(&db));
+
+    db.sync_entry_upsert(id, &revisionless_row("b", None))
+        .unwrap();
+    assert!(!saved(&db), "insert");
+    begin(&db);
+    db.sync_entry_upsert(id, &revisionless_row("a", Some("r2")))
+        .unwrap();
+    assert!(!saved(&db), "update");
+    begin(&db);
+    db.sync_entries_move(id, "a", other, "a").unwrap();
+    assert!(!saved(&db), "moved to another folder");
+    begin(&db);
+    db.sync_entry_upsert(id, &revisionless_row("c", None))
+        .unwrap();
+    begin(&db);
+    db.sync_entry_remove(id, "c").unwrap();
+    assert!(!saved(&db), "delete");
+    begin(&db);
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    assert!(!saved(&db), "mode switch");
+    begin(&db);
+    db.sync_folder_remove(id).unwrap();
+    assert!(db.sync_walk_load(id).unwrap().is_none(), "folder removed");
+    assert!(db.sync_walk_load(other).unwrap().is_none());
+}

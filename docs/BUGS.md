@@ -439,7 +439,20 @@ it got every five minutes, when it is cut short, and the first failed step when 
 
 Not changed: a pass still walks both trees before it applies anything, so a folder that cannot
 be walked in one run still never syncs. Applying changes per subtree as the walk goes is the
-fix for that, and is not done. The two-minute poll still walks every folder in turn.
+fix for that, and is not done. The two-minute poll still walks every folder in turn. The walk
+of Drive, the slow half, now resumes across restarts (below); the local walk still starts over.
+
+Later: the walk of Drive is saved folder by folder (schema 48, tables `sync_walk`,
+`sync_walk_dir` and `sync_walk_item`), and a pass cut short resumes it, listing only the
+folders it had not reached. Planning and the wipe guards still see the whole tree. SQLite
+triggers drop a folder's saved walk on any change to its baseline other than a filled-in
+revision id, and on a change to the folder's path, root or mode. The pass drops the walk once
+it is complete, before applying anything. Without that, a listing taken before a move to
+another synced folder would read the moved file as deleted on Drive and delete its local copy.
+A listing that failed is not saved, so a resumed walk asks for it again. A saved walk older
+than 24 hours starts over. Verified by `a_saved_walk_resumes_where_it_stopped`,
+`a_baseline_change_drops_the_saved_walk` and the sim test
+`a_walk_of_drive_cut_short_resumes_where_it_stopped`.
 
 Later: every pass keeps a trace of where its time went (`crates/pdfs-fuse/src/sync/trace.rs`),
 in the journal as `sync: pass trace` and in `pdfs diagnostics`. The sim test

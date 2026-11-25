@@ -120,16 +120,19 @@ pub(crate) enum Count {
     Revisions,
     /// Paths queued for the apply stage.
     Queued,
+    /// Paths on Drive read back from a walk an earlier pass saved.
+    Resumed,
 }
 
 impl Count {
-    const ALL: [Count; 6] = [
+    const ALL: [Count; 7] = [
         Count::LocalEntries,
         Count::RemoteFolders,
         Count::Nodes,
         Count::NodesFull,
         Count::Revisions,
         Count::Queued,
+        Count::Resumed,
     ];
 
     fn name(self) -> &'static str {
@@ -140,6 +143,7 @@ impl Count {
             Count::NodesFull => "nodes full",
             Count::Revisions => "revisions recorded",
             Count::Queued => "queued",
+            Count::Resumed => "resumed",
         }
     }
 }
