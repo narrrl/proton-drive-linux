@@ -68,6 +68,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B297](#b297--the-simulations-fail-or-hang-about-one-run-in-two-on-code-that-passes-them-alone) | The simulations fail or hang about one run in two, on code that passes them alone | Cause not found; several tests and one hang |
 | [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy) | On a slow link, a file's last write can land only in a conflict copy | Cause not found; seen once in CI |
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
@@ -396,6 +397,61 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B297 — The simulations fail or hang about one run in two, on code that passes them alone
+
+**Status:** Open
+**Found:** 2026-11-25, while running the full simulation suite three times for each of #134, #135
+and the 4.0 crate moves. CI on main fails too (`0b9e849`, [run](https://github.com/narrrl/proton-drive-linux/actions/runs/45694939718)).
+**Where:** not located. The failing tests are in `crates/pdfs-fuse/src/sim/daemon.rs` and
+`crates/pdfs-fuse/src/sim/run.rs`; the drain's retry and backoff in
+`crates/pdfs-fuse/src/drain.rs` is the first suspect for most of them
+
+**Repro:** `cargo test -p pdfs-fuse --lib -- --ignored sim::`, the whole suite, several times.
+Of 12 local runs on three branches that share main as their base, 5 passed, 6 failed and 1
+hung. Some runs had a build going at the same time, and those failed more often, but runs
+with no other load failed too. Each failing test passes when run alone, and each failing seed passes when replayed.
+The failures:
+
+- `a_write_that_failed_on_a_short_outage_goes_out_soon_after_the_link_returns`, 4 runs. With
+  the client offline, the write to `f.txt` never shows an attempt in the pending list within
+  30 s (`daemon.rs`, the second `wait_until`).
+- `a_file_removed_with_its_folder_while_uploading_stays_removed`, 2 runs. The
+  removed folder is still in the database.
+- `three_clients_one_writer_each`, 2 runs. Seed 1: "no loss: Drive does not hold what the
+  clients wrote, 60s after the links came up", `x/d` only in client 1's model. Seed 2:
+  "liveness: the queues did not drain within 4s", Drive holds a shorter `d` than client 0
+  wrote. CI on #134 failed seed 3 with an EACCES.
+- `one_client_with_stale_hashes_and_reordered_echoes`, 2 runs. Seed 3: Drive holds `vwxyz`
+  for `y/z/b.txt`, an older and shorter content than the client wrote. Seed 6: `unlink
+  x/x/c.bin` answered ENOENT; it passes 3 times out of 3 when replayed alone.
+- `one_client_on_a_good_link`, seed 5: "liveness: the queues did not drain within 4s".
+- `a_move_blocked_by_trash_can_be_retried_after_restore`, in CI on main.
+
+The hung run reached the 900 s timeout with eight tests still running, among them
+`one_client_on_a_good_link`, `one_client_on_a_slow_link`, `three_clients_one_writer_each` and
+`half_of_a_wide_folder_unlinked_at_once_leaves_the_other_half`. After the kill, the test
+process stayed a zombie: one thread was in state D in `request_wait_answer`, waiting on a FUSE
+request to a mount served by its own process. Its mounts stay until their connections are
+aborted in `/sys/fs/fuse/connections/<n>/abort`. Earlier hung runs left more such
+connections behind.
+
+**Cause.** Not known, and probably more than one. The "Drive holds an older, shorter content"
+failures look like B275. The hang means that some FUSE request is never answered, which
+the watchdog (B91) should report but did not get the chance to in a test.
+
+**Fix.** Not done. Next steps:
+
+1. Run each failing test in a loop under load, and keep the state directory and daemon log of
+   a failing run.
+2. Make a hung simulation fail with the stacks of its threads instead of hanging the suite,
+   and abort its FUSE connections so the next run starts clean.
+3. Until then, a PR's simulation result says which of these failed, and that they fail on
+   main too.
+
+---
+
+---
 
 ### B295 — A resize the scratch file refused still succeeded
 
