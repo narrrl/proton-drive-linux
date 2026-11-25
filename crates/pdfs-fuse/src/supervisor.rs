@@ -305,6 +305,7 @@ mod tests {
             pass_age_secs: SYNC_STALL_AFTER.as_secs() * 4,
             pass_idle_secs: 5,
             panics: 0,
+            traces: Vec::new(),
         };
         assert!(!report_stalls(&with_sync(busy.clone()), (0, 0)));
         let quiet = SyncEngineState {

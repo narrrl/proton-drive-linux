@@ -2360,6 +2360,111 @@ pub struct SyncEngineState {
     pub pass_idle_secs: u64,
     /// Passes that ended in a panic since the daemon started.
     pub panics: u64,
+    /// Where the running pass, and the last pass over each folder, spent their
+    /// time. Empty from a daemon that predates the field.
+    #[serde(default)]
+    pub traces: Vec<SyncPassTrace>,
+}
+
+/// Where one sync pass spent its time, in a [`SyncEngineState`].
+///
+/// A pass over a large folder used to say only that it started and, hours
+/// later, that it was cut short. Nothing said whether the hours went into the
+/// local walk, listing Drive, unlocking node keys or uploading
+/// (`docs/BUGS.md` B294).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SyncPassTrace {
+    pub folder_id: i64,
+    /// How the pass ended: `finished`, `cut short`, `abandoned`, `failed` or
+    /// `panicked`. Empty while it is still running.
+    pub ended: String,
+    /// How long the pass ran, or has run so far.
+    pub elapsed_ms: u64,
+    /// The stages of the pass, in order.
+    pub phases: Vec<SyncTraceStat>,
+    /// Calls to Drive, and the work applied per kind.
+    pub calls: Vec<SyncTraceStat>,
+    /// How many items each stage handled.
+    pub counts: Vec<SyncTraceCount>,
+    /// The folder on Drive whose listing took longest, and how long, in ms.
+    pub slowest_listing: Option<(String, u64)>,
+}
+
+/// One line for the journal and `pdfs diagnostics`: `remote walk 2h10m,
+/// local walk 41m05s; read nodes full 480000x/1h50m (max 3.0s); nodes full
+/// 480000; slowest listing "a/b" 9.0s`. Stages and calls that never happened
+/// are left out.
+impl std::fmt::Display for SyncPassTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        let phases: Vec<String> = self
+            .phases
+            .iter()
+            .map(|s| format!("{} {}", s.name, human_ms(s.total_ms)))
+            .collect();
+        if !phases.is_empty() {
+            parts.push(phases.join(", "));
+        }
+        let calls: Vec<String> = self
+            .calls
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} {}x/{} (max {})",
+                    s.name,
+                    s.count,
+                    human_ms(s.total_ms),
+                    human_ms(s.max_ms)
+                )
+            })
+            .collect();
+        if !calls.is_empty() {
+            parts.push(calls.join(", "));
+        }
+        let counts: Vec<String> = self
+            .counts
+            .iter()
+            .map(|c| format!("{} {}", c.name, c.value))
+            .collect();
+        if !counts.is_empty() {
+            parts.push(counts.join(", "));
+        }
+        if let Some((rel, ms)) = &self.slowest_listing {
+            let rel = if rel.is_empty() { "/" } else { rel.as_str() };
+            parts.push(format!("slowest listing {rel:?} {}", human_ms(*ms)));
+        }
+        f.write_str(&parts.join("; "))
+    }
+}
+
+/// `950ms`, `12.3s`, `41m05s`, `2h10m`.
+fn human_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if secs < 60 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// How often one thing happened in a pass, and how long it took.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncTraceStat {
+    pub name: String,
+    pub count: u64,
+    pub total_ms: u64,
+    pub max_ms: u64,
+}
+
+/// One counter of a [`SyncPassTrace`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncTraceCount {
+    pub name: String,
+    pub value: u64,
 }
 
 /// The daemon's reply to a [`Request`].
@@ -3002,6 +3107,14 @@ fn poll_legacy(socket: &Path, on: &mut impl FnMut(Feed) -> bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_in_a_trace_read_at_a_glance() {
+        assert_eq!(human_ms(950), "950ms");
+        assert_eq!(human_ms(12_345), "12.3s");
+        assert_eq!(human_ms(2_465_000), "41m05s");
+        assert_eq!(human_ms(7_800_000), "2h10m");
+    }
 
     #[test]
     fn polls_wait_briefly_and_real_work_waits_long() {

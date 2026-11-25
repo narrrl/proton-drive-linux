@@ -263,6 +263,38 @@ pdfs sync reset 1
 This downloads what Proton Drive has and uploads what only this computer has. Nothing is deleted.
 If you deleted the files on purpose, delete them on Proton Drive too, or stop syncing the folder.
 
+### A synced folder takes hours, or never finishes
+
+Every pass over a synced folder leaves a trace of where its time went. `pdfs diagnostics` shows
+the running pass and the last pass over each folder (one line each, wrapped here):
+
+```
+sync engine: pass on folder 2 for 2h14m, last progress 0s ago
+  folder 2 pass (running, 2h14m): baseline 3.1s, local walk 41m05s, remote walk 1h32m;
+    list children 1200x/4m10s (max 3.0s), read nodes 1200x/12m40s (max 4.2s),
+    read nodes full 1100x/1h15m (max 9.8s); local entries 493000, remote folders 1200,
+    nodes 310000, nodes full 290000, revisions recorded 290000; slowest listing "Fotos/2019" 9.8s
+```
+
+The journal has the same line as `sync: pass trace` when a pass ends, is cut short or takes longer
+than 30 seconds:
+
+```bash
+journalctl --user -u proton-drive.service | grep 'sync: pass trace'
+```
+
+What the parts mean:
+
+- **Stages:** `local walk` reads this computer's copy, `remote walk` lists Proton Drive, `plan`
+  decides what to do with each path, `apply` uploads, downloads and creates folders, and `cleanup`
+  removes deleted folders. `lock wait` is time spent waiting for a mode switch or a move to finish.
+- **`read nodes full`** unlocks one key per file, to read a size that changed or was never
+  recorded. A high count here on a folder that has not changed is the slow case from B294. Each
+  pass records what it read, so the count falls on the next pass even if this one is cut short.
+- **`slowest listing`** names the folder on Proton Drive that took longest to list.
+
+Please include these lines when you report a slow folder.
+
 ### Files named `(sync-conflict …)` appeared
 
 The file changed in two places at once. Nothing was lost. See

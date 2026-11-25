@@ -11,6 +11,14 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+
+- **`pdfs diagnostics` and the journal say where a sync pass spends its time.** Each pass over a
+  synced folder records how long it took to walk this computer's copy, list Proton Drive, plan
+  and apply. It also records how many calls to Proton Drive it made of each kind, how long they
+  took, and which folder on Drive was slowest to list. The trace shows the running pass and the
+  last pass over each folder, in the journal as `sync: pass trace` (B294).
+
 ## [3.10.0] — 2026-11-22
 
 Schema: **47**. The trash table gets an index on the original folder, and its stored rows are

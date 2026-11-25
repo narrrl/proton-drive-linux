@@ -3608,6 +3608,18 @@ fn cmd_diagnostics() -> Result<()> {
             }
             if let Some(sync) = &d.sync {
                 println!("sync engine: {}", sync_engine_line(sync));
+                for trace in &sync.traces {
+                    let how = if trace.ended.is_empty() {
+                        "running"
+                    } else {
+                        trace.ended.as_str()
+                    };
+                    println!(
+                        "  folder {} pass ({how}, {}): {trace}",
+                        trace.folder_id,
+                        human_secs(trace.elapsed_ms / 1000),
+                    );
+                }
             }
             if d.inflight.is_empty() {
                 println!("in-flight requests: none");
