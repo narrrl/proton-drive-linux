@@ -24,7 +24,7 @@
 //! pass, after the writer has closed them.
 
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,13 +41,14 @@ use crate::transfers::{CountingWriter, OwnedCountingReader};
 use crate::{Core, now_secs, parse_uid};
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
-use pdfs_core::db::{StoredSyncEntry, StoredSyncFolder};
+use pdfs_core::db::{SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 use pdfs_core::syncignore::IgnoreRules;
 
 mod engine;
 mod local_scan;
 mod model;
 mod planner;
+mod trace;
 pub(crate) use engine::SYNC_CONCURRENCY;
 pub(crate) use engine::{EngineHealth, SyncMsg, spawn};
 #[cfg(test)]
@@ -69,6 +70,7 @@ use planner::{
     plan_file, rel_to_path, remote_sig, remote_subtree_changed, revision_confirms_baseline,
     revision_moved, tracked_baseline, unchanged_remote_size,
 };
+use trace::{Call, Count, Phase};
 
 /// A pass that took at least this long is logged at info even when it changed
 /// nothing, so the journal says where a slow engine spends its time.
@@ -123,7 +125,9 @@ impl Core {
         // Hold the folder's lock for the whole pass so a mode switch can't evict the
         // local tree (and mount FUSE over it) while we walk and upload it.
         let lock = self.sync_lock(folder.id);
+        let waited = Instant::now();
         let _guard = lock.lock();
+        self.trace_phase(Phase::LockWait, waited.elapsed());
         // `folder` was read before the lock; a switch may have landed in between, so
         // re-read and re-check the mode rather than trusting the snapshot.
         let current = match self.db.sync_folder_get(folder.id) {
@@ -210,6 +214,7 @@ impl Core {
         };
         let progress = self.sync_progress.lock().get(&folder.id).cloned();
         self.progress_end(folder.id);
+        self.log_trace(folder, &result, started.elapsed());
         match result {
             Ok(outcome) => {
                 // A folder only reaches `idle` when every path applied cleanly —
@@ -326,6 +331,46 @@ impl Core {
         self.sync_abandon.lock().remove(&folder.id);
     }
 
+    /// End the running pass's trace and put it in the journal: at info for
+    /// a pass worth hearing about (a first, slow or unfinished one), else at
+    /// debug, so the poll over a quiet folder adds nothing every two minutes.
+    fn log_trace(
+        &self,
+        folder: &StoredSyncFolder,
+        result: &Result<Outcome, PassAbort>,
+        elapsed: Duration,
+    ) {
+        let how = match result {
+            Ok(_) => "finished",
+            Err(PassAbort::Stopped | PassAbort::Interrupted) => "cut short",
+            Err(PassAbort::Abandoned) => "abandoned",
+            Err(PassAbort::Failed(_)) => "failed",
+        };
+        let Some(trace) = self.sync_engine.end_trace(how) else {
+            return;
+        };
+        if how != "finished" || folder.last_sync == 0 || elapsed >= SLOW_PASS {
+            info!(id = folder.id, how, trace = %trace, "sync: pass trace");
+        } else {
+            debug!(id = folder.id, how, trace = %trace, "sync: pass trace");
+        }
+    }
+
+    /// Add `took` to a stage of the running pass's trace.
+    fn trace_phase(&self, phase: Phase, took: Duration) {
+        self.sync_engine.trace(|t| t.phase(phase, took));
+    }
+
+    /// Add one call that took `took` to the running pass's trace.
+    fn trace_call(&self, call: Call, took: Duration) {
+        self.sync_engine.trace(|t| t.call(call, took));
+    }
+
+    /// Add `n` to a counter of the running pass's trace.
+    fn trace_count(&self, count: Count, n: usize) {
+        self.sync_engine.trace(|t| t.count(count, n));
+    }
+
     /// Tell the activity feed what a pass over this folder had to leave out
     /// because it cannot be read, once each time that changes. Every other path
     /// in the folder still synced, so this does not make the folder's state an
@@ -419,15 +464,23 @@ impl Core {
         remote_root: &NodeUid,
         rules: &IgnoreRules,
     ) -> Result<Outcome, PassAbort> {
+        // This pass uploads without walking Drive, so a walk saved by an
+        // earlier pass would not know what it sent; see `do_reconcile`.
+        self.db
+            .sync_walk_clear(folder_id)
+            .map_err(|e| format!("drop the saved walk: {e:?}"))?;
+        let step = Instant::now();
         let baseline = self
             .db
             .sync_entries(folder_id)
             .map_err(|e| format!("load baseline: {e:?}"))?;
+        self.trace_phase(Phase::Baseline, step.elapsed());
         // Only the local side is walked here, so each baseline path is checked once.
         self.progress_scan_total(folder_id, baseline.len());
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
         let mut unscanned = Unscanned::default();
+        let step = Instant::now();
         let writing = open_for_write_set(local_root);
         self.walk_local(
             folder_id,
@@ -437,6 +490,8 @@ impl Core {
             &mut local,
             &mut unscanned,
         )?;
+        self.trace_phase(Phase::LocalWalk, step.elapsed());
+        self.trace_count(Count::LocalEntries, local.len());
         // The guard compares against the paths this pass could still see: an
         // ignored or unreadable path is absent from `local` by rule or by
         // failure, not by loss, and counting those as missing would trip the
@@ -743,15 +798,18 @@ impl Core {
         // unchanged and so can skip decrypting their claimed size, and its size is
         // the only estimate available of how much this pass has to check — the walks
         // discover the real figure only by finishing.
+        let step = Instant::now();
         let baseline = self
             .db
             .sync_entries(folder_id)
             .map_err(|e| format!("load baseline: {e:?}"))?;
+        self.trace_phase(Phase::Baseline, step.elapsed());
         // Both sides are walked, so each baseline path is checked about twice.
         self.progress_scan_total(folder_id, baseline.len() * 2);
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
         let mut unscanned = Unscanned::default();
+        let step = Instant::now();
         let writing = open_for_write_set(local_root);
         self.walk_local(
             folder_id,
@@ -761,6 +819,8 @@ impl Core {
             &mut local,
             &mut unscanned,
         )?;
+        self.trace_phase(Phase::LocalWalk, step.elapsed());
+        self.trace_count(Count::LocalEntries, local.len());
         // See `push_pass`: the guard must not count excluded paths as lost.
         guard_local_wipe(&tracked_baseline(&baseline, rules, &unscanned), &local)?;
 
@@ -768,17 +828,28 @@ impl Core {
         let mut remote_dirs: HashMap<String, NodeUid> = HashMap::new();
         let mut gaps = RemoteGaps::default();
         remote_dirs.insert(String::new(), remote_root.clone());
-        self.walk_remote(
+        let step = Instant::now();
+        let walked = self.walk_remote(
             folder_id,
             remote_root,
-            "",
             &mut RemoteWalk {
                 out: &mut remote,
                 dirs: &mut remote_dirs,
                 gaps: &mut gaps,
             },
             &baseline,
-        )?;
+        );
+        // Timed even when cut short: a walk that never ends is the case the
+        // trace exists for.
+        self.trace_phase(Phase::RemoteWalk, step.elapsed());
+        walked?;
+        // The walk is complete and about to be acted on. Whatever this pass
+        // applies changes the baseline its listings were read against, so
+        // they must not be resumed by a later pass; nothing is applied unless
+        // they are gone.
+        self.db
+            .sync_walk_clear(folder_id)
+            .map_err(|e| format!("drop the saved walk: {e:?}"))?;
         guard_remote_wipe(&tracked_baseline(&baseline, rules, &unscanned), &remote)?;
 
         let mut order = classification_order(&local, &remote, &baseline, rules);
@@ -811,21 +882,32 @@ impl Core {
         // counted, never fatal.
         let mut batch: Vec<Pending> = Vec::new();
         let mut batch_depth = 0usize;
+        // The plan stage is the loop's time without the batches it flushes,
+        // which `flush_batch` times as the apply stage.
+        let planning = Instant::now();
+        let mut applying = Duration::ZERO;
 
         for rel in &order {
             let depth = rel.matches('/').count();
             if depth > batch_depth {
-                self.flush_batch(
+                let step = Instant::now();
+                let flushed = self.flush_batch(
                     folder_id,
                     local_root,
                     &mut remote_dirs,
                     std::mem::take(&mut batch),
                     &mut outcome,
-                )?;
+                );
+                applying += step.elapsed();
+                if flushed.is_err() {
+                    self.trace_phase(Phase::Plan, planning.elapsed().saturating_sub(applying));
+                }
+                flushed?;
                 batch_depth = depth;
                 // A depth boundary is the pass's natural checkpoint — everything
                 // queued has been applied, so stopping here leaves nothing half done.
                 if self.ondemand_queued(folder_id) {
+                    self.trace_phase(Phase::Plan, planning.elapsed().saturating_sub(applying));
                     return Err(PassAbort::Interrupted);
                 }
             }
@@ -989,11 +1071,13 @@ impl Core {
                 }
                 FilePlan::DeleteRemote => {
                     let remote = r.expect("remote deletion requires a remote file");
-                    if let Err(e) = self
+                    let step = Instant::now();
+                    let trashed = self
                         .rt
                         .block_on(self.drive.trash_nodes(std::slice::from_ref(&remote.uid)))
-                        .and_then(batch::into_unit)
-                    {
+                        .and_then(batch::into_unit);
+                    self.trace_call(Call::Trash, step.elapsed());
+                    if let Err(e) = trashed {
                         warn!(rel, error = %e, "sync: trash remote failed");
                         self.log_activity(
                             ActivityKind::Trash,
@@ -1021,6 +1105,7 @@ impl Core {
                 }
             }
         }
+        self.trace_phase(Phase::Plan, planning.elapsed().saturating_sub(applying));
         // Flush the deepest level's batch.
         self.flush_batch(
             folder_id,
@@ -1029,6 +1114,7 @@ impl Core {
             std::mem::take(&mut batch),
             &mut outcome,
         )?;
+        let cleanup = Instant::now();
 
         // Deferred folder deletions, deepest first. A folder that holds what
         // Drive never had stays, and its baseline row goes, so the next pass
@@ -1094,11 +1180,13 @@ impl Core {
                 );
                 continue;
             }
-            if let Err(e) = self
+            let step = Instant::now();
+            let trashed = self
                 .rt
                 .block_on(self.drive.trash_nodes(&[uid]))
-                .and_then(batch::into_unit)
-            {
+                .and_then(batch::into_unit);
+            self.trace_call(Call::Trash, step.elapsed());
+            if let Err(e) = trashed {
                 warn!(rel, error = %e, "sync: trash remote folder failed");
                 self.log_activity(ActivityKind::Trash, base_name(&rel), e.to_string(), false);
                 outcome.failed(&format!("{rel}: {e}"));
@@ -1116,6 +1204,7 @@ impl Core {
             );
             outcome.deleted += 1;
         }
+        self.trace_phase(Phase::Cleanup, cleanup.elapsed());
 
         Ok(outcome)
     }
@@ -1172,8 +1261,9 @@ impl Core {
         Ok(())
     }
 
-    /// Recursively walk a remote folder into `out`, recording every descendant's
-    /// relative path, and mapping each subfolder's rel path to its uid in `dirs`.
+    /// Walk the remote tree of a mirror folder into `walk`, folder by folder,
+    /// recording every descendant's relative path, and mapping each subfolder's
+    /// rel path to its uid in `walk.dirs`.
     ///
     /// A file's size comes from its extended attributes, which only its own node
     /// key can decrypt — and unlocking that key costs an S2K derivation (tens of
@@ -1186,47 +1276,165 @@ impl Core {
     ///
     /// What the walk could not read goes to `walk.gaps`, never silently out of
     /// the map: a missing path reads as deleted on Drive.
+    ///
+    /// Each folder's listing is saved as it comes in. A walk cut short by a
+    /// stop resumes from what was saved and lists only the folders it had not
+    /// reached, where it used to start over and, on a folder large enough,
+    /// never finish (B294). The database drops a saved walk whenever the
+    /// folder's baseline changes, so a resumed walk never meets a baseline
+    /// newer than its listings; it is as old as a long walk's first listings
+    /// would be, and the apply step checks each file again before it acts.
     fn walk_remote(
+        &self,
+        folder_id: i64,
+        root: &NodeUid,
+        walk: &mut RemoteWalk<'_>,
+        baseline: &HashMap<String, StoredSyncEntry>,
+    ) -> Result<(), PassAbort> {
+        let mut todo = self.resume_walk(folder_id, root, walk);
+        while let Some((prefix, folder)) = todo.pop_front() {
+            // Checked per folder, not per pass: this walk is the long pole on a
+            // large tree, and a user who asks for on-demand three minutes into
+            // it should not wait out the rest of a survey of files they want
+            // deleted. Bailing out here is safe precisely because the walk has
+            // applied nothing — a *partial* remote map, on the other hand,
+            // would be read as "the remote deleted everything we haven't
+            // reached yet", so it must never reach the diff.
+            if self.shutdown.is_stopping() {
+                return Err(PassAbort::Stopped);
+            }
+            if self.pass_abandoned(folder_id) {
+                return Err(PassAbort::Abandoned);
+            }
+            if self.ondemand_queued(folder_id) {
+                return Err(PassAbort::Interrupted);
+            }
+            let Some(listing) = self.list_remote(folder_id, &folder, &prefix, walk, baseline)?
+            else {
+                continue;
+            };
+            let mut saved = Vec::with_capacity(listing.items.len() + listing.unread.len());
+            for (rel, item) in listing.items {
+                self.progress_scanned(folder_id, base_name(&rel));
+                saved.push(SavedWalkItem {
+                    rel_path: rel.clone(),
+                    uid: Some(item.uid.to_string()),
+                    is_dir: item.is_dir,
+                    mtime: item.mtime,
+                    size: item.size,
+                    revision: item.revision.clone(),
+                    sha1: item.sha1.clone(),
+                });
+                if item.is_dir {
+                    walk.dirs.insert(rel.clone(), item.uid.clone());
+                    todo.push_back((rel.clone(), item.uid.clone()));
+                }
+                walk.out.insert(rel, item);
+            }
+            for rel in listing.unread {
+                self.progress_scanned(folder_id, base_name(&rel));
+                saved.push(SavedWalkItem {
+                    rel_path: rel.clone(),
+                    uid: None,
+                    is_dir: false,
+                    mtime: 0,
+                    size: 0,
+                    revision: None,
+                    sha1: None,
+                });
+                walk.gaps.unread(rel);
+            }
+            // A walk that cannot be saved still runs; it just starts over if
+            // it is cut short.
+            if let Err(e) = self
+                .db
+                .sync_walk_record(folder_id, &prefix, listing.short, &saved)
+            {
+                debug!(folder = prefix, error = ?e, "sync: cannot save the walk's progress");
+            }
+        }
+        // A stop that landed during the last listing: the walk is whole, but
+        // the pass must not go on to act on it, and the saved walk must stay
+        // for the next start to pick up.
+        if self.shutdown.is_stopping() {
+            return Err(PassAbort::Stopped);
+        }
+        Ok(())
+    }
+
+    /// The folders a walk of Drive still has to list. A walk saved by an
+    /// earlier pass over the same root, recent enough, is loaded into `walk`
+    /// and continues; otherwise a new one starts at the root.
+    fn resume_walk(
+        &self,
+        folder_id: i64,
+        root: &NodeUid,
+        walk: &mut RemoteWalk<'_>,
+    ) -> VecDeque<(String, NodeUid)> {
+        let root_uid = root.to_string();
+        let saved = match self.db.sync_walk_load(folder_id) {
+            Ok(saved) => saved,
+            Err(e) => {
+                warn!(id = folder_id, error = ?e, "sync: cannot read the saved walk; starting over");
+                None
+            }
+        };
+        if let Some(saved) = saved
+            && saved.root_uid == root_uid
+            && now_secs().saturating_sub(saved.started) < WALK_MAX_AGE.as_secs() as i64
+            && let Some((todo, restored)) = restore_walk(&saved, walk)
+        {
+            self.progress_scanned_many(folder_id, restored);
+            self.trace_count(Count::Resumed, restored);
+            info!(
+                id = folder_id,
+                restored,
+                folders_left = todo.len(),
+                age_s = now_secs().saturating_sub(saved.started),
+                "sync: resuming the walk of Drive"
+            );
+            return todo;
+        }
+        if let Err(e) = self.db.sync_walk_begin(folder_id, &root_uid, now_secs()) {
+            debug!(id = folder_id, error = ?e, "sync: cannot save the walk's progress");
+        }
+        VecDeque::from([(String::new(), root.clone())])
+    }
+
+    /// List one folder on Drive. `None` when the listing failed: that is
+    /// noted in `walk.gaps`, and the folder is not saved as listed, so a
+    /// resumed walk asks again. A failure at the root fails the pass.
+    fn list_remote(
         &self,
         folder_id: i64,
         folder: &NodeUid,
         prefix: &str,
         walk: &mut RemoteWalk<'_>,
         baseline: &HashMap<String, StoredSyncEntry>,
-    ) -> Result<(), PassAbort> {
-        // Checked per folder, not per pass: this walk is the long pole on a large
-        // tree, and a user who asks for on-demand three minutes into it should not
-        // wait out the rest of a survey of files they want deleted. Bailing out here
-        // is safe precisely because the walk has applied nothing — a *partial*
-        // remote map, on the other hand, would be read as "the remote deleted
-        // everything we haven't reached yet", so it must never reach the diff.
-        if self.shutdown.is_stopping() {
-            return Err(PassAbort::Stopped);
-        }
-        if self.pass_abandoned(folder_id) {
-            return Err(PassAbort::Abandoned);
-        }
-        if self.ondemand_queued(folder_id) {
-            return Err(PassAbort::Interrupted);
-        }
+    ) -> Result<Option<Listing>, PassAbort> {
+        let listing = Instant::now();
+        let step = Instant::now();
         let uids = self
             .rt
             .block_on(self.drive.enumerate_folder_children_node_uids(folder))
             .map_err(|e| format!("enumerate {folder}: {e}"));
-        let uids = match unlisted_gap(walk, prefix, uids)? {
-            Some(uids) => uids,
-            None => return Ok(()),
+        self.trace_call(Call::ListChildren, step.elapsed());
+        self.trace_count(Count::RemoteFolders, 1);
+        let Some(uids) = unlisted_gap(walk, prefix, uids)? else {
+            return Ok(None);
         };
+        let mut out = Listing::default();
         if uids.is_empty() {
-            return Ok(());
+            return Ok(Some(out));
         }
+        let step = Instant::now();
         let nodes = self
             .rt
             .block_on(self.drive.enumerate_nodes_light(&uids))
             .map_err(|e| format!("resolve nodes: {e}"));
-        let nodes = match unlisted_gap(walk, prefix, nodes)? {
-            Some(nodes) => nodes,
-            None => return Ok(()),
+        self.trace_call(Call::ReadNodes, step.elapsed());
+        let Some(nodes) = unlisted_gap(walk, prefix, nodes)? else {
+            return Ok(None);
         };
         // The SDK leaves out a node it cannot decrypt, and says so only in its
         // log. Its name went with it, so all this can record is the folder.
@@ -1238,6 +1446,7 @@ impl Core {
                 "sync: some nodes on Drive cannot be read; leaving them out"
             );
             walk.gaps.short_listing(prefix);
+            out.short = true;
         }
         let nodes: Vec<Node> = nodes
             .into_iter()
@@ -1271,12 +1480,15 @@ impl Core {
         let sized: HashMap<String, (i64, Option<String>)> = if stale.is_empty() {
             HashMap::new()
         } else {
+            let step = Instant::now();
             let full = self
                 .rt
                 .block_on(self.drive.enumerate_nodes(&stale))
                 .map_err(|e| format!("resolve nodes: {e}"));
+            self.trace_call(Call::ReadNodesFull, step.elapsed());
+            self.trace_count(Count::NodesFull, stale.len());
             let Some(full) = unlisted_gap(walk, prefix, full)? else {
-                return Ok(());
+                return Ok(None);
             };
             full.iter()
                 .map(|n| {
@@ -1289,65 +1501,65 @@ impl Core {
         };
         let stale: HashSet<String> = stale.iter().map(|u| u.to_string()).collect();
         self.record_revisions(folder_id, prefix, &nodes, &sized, baseline);
+        self.trace_count(Count::Nodes, nodes.len());
+        self.sync_engine
+            .trace(|t| t.listing(prefix, listing.elapsed()));
 
         for node in nodes {
             if node.trashed {
                 continue;
             }
             let rel = join_rel(prefix, &node.name);
-            self.progress_scanned(folder_id, base_name(&rel));
             if node.is_folder() {
-                walk.dirs.insert(rel.clone(), node.uid.clone());
-                walk.out.insert(
-                    rel.clone(),
+                out.items.push((
+                    rel,
                     RemoteItem {
-                        uid: node.uid.clone(),
+                        uid: node.uid,
                         is_dir: true,
                         mtime: 0,
                         size: 0,
                         revision: None,
                         sha1: None,
                     },
-                );
-                self.walk_remote(folder_id, &node.uid, &rel, walk, baseline)?;
-            } else {
-                let (size, sha1) = if stale.contains(&node.uid.to_string()) {
-                    match sized.get(&node.uid.to_string()) {
-                        Some(sized) => sized.clone(),
-                        // Its size was needed but could not be read (the full
-                        // enumeration skipped it as undecryptable). Leave it out
-                        // rather than record a stale size, and say so: missing,
-                        // it would read as deleted on Drive.
-                        None => {
-                            walk.gaps.unread(rel);
-                            continue;
-                        }
-                    }
-                } else {
-                    match unchanged_remote_size(
-                        baseline,
-                        &rel,
-                        node.modification_time,
-                        crate::node_revision_id(&node).as_deref(),
-                    ) {
-                        Some(size) => (size, None),
-                        None => continue,
-                    }
-                };
-                walk.out.insert(
-                    rel,
-                    RemoteItem {
-                        revision: crate::node_revision_id(&node),
-                        uid: node.uid,
-                        is_dir: false,
-                        mtime: node.modification_time,
-                        size,
-                        sha1,
-                    },
-                );
+                ));
+                continue;
             }
+            let (size, sha1) = if stale.contains(&node.uid.to_string()) {
+                match sized.get(&node.uid.to_string()) {
+                    Some(sized) => sized.clone(),
+                    // Its size was needed but could not be read (the full
+                    // enumeration skipped it as undecryptable). Leave it out
+                    // rather than record a stale size, and say so: missing,
+                    // it would read as deleted on Drive.
+                    None => {
+                        out.unread.push(rel);
+                        continue;
+                    }
+                }
+            } else {
+                match unchanged_remote_size(
+                    baseline,
+                    &rel,
+                    node.modification_time,
+                    crate::node_revision_id(&node).as_deref(),
+                ) {
+                    Some(size) => (size, None),
+                    None => continue,
+                }
+            };
+            out.items.push((
+                rel,
+                RemoteItem {
+                    revision: crate::node_revision_id(&node),
+                    uid: node.uid,
+                    is_dir: false,
+                    mtime: node.modification_time,
+                    size,
+                    sha1,
+                },
+            ));
         }
-        Ok(())
+        Ok(Some(out))
     }
 
     /// Store the revision id of each file in one listing whose baseline row has
@@ -1369,8 +1581,9 @@ impl Core {
         if rows.is_empty() {
             return;
         }
-        if let Err(e) = self.db.sync_entries_set_revision(folder_id, &rows) {
-            debug!(folder = prefix, error = ?e, "sync: cannot record revision ids");
+        match self.db.sync_entries_set_revision(folder_id, &rows) {
+            Ok(n) => self.trace_count(Count::Revisions, n),
+            Err(e) => debug!(folder = prefix, error = ?e, "sync: cannot record revision ids"),
         }
     }
 
@@ -1414,6 +1627,8 @@ impl Core {
             return Ok(());
         }
         self.progress_queued(folder_id, batch.len());
+        self.trace_count(Count::Queued, batch.len());
+        let applying = Instant::now();
         let core = self.clone();
         let root = local_root.to_path_buf();
         let results = self.rt.block_on(async move {
@@ -1449,6 +1664,7 @@ impl Core {
             }
             (out, join_errors)
         });
+        self.trace_phase(Phase::Apply, applying.elapsed());
         let (results, join_errors) = results;
         outcome.errors += join_errors;
         for result in results {
@@ -1493,7 +1709,9 @@ impl Core {
         op: Pending,
     ) -> Result<Applied, String> {
         self.progress_started(folder_id, base_name(op.rel()));
+        let step = Instant::now();
         let result = self.apply_one(folder_id, local_root, &op).await;
+        self.trace_call(op.call(), step.elapsed());
         self.progress_finished(folder_id);
         let name = base_name(op.rel());
         match &result {
@@ -2140,6 +2358,60 @@ fn remove_local_dirs(
         .collect()
 }
 
+/// What one folder's listing on Drive held.
+#[derive(Default)]
+struct Listing {
+    items: Vec<(String, RemoteItem)>,
+    /// Files seen whose size could not be read.
+    unread: Vec<String>,
+    /// The listing named nodes that could not be read.
+    short: bool,
+}
+
+/// How old a saved walk of Drive may be and still be resumed. Its listings
+/// are as old as that, as the first ones of a walk that long would be.
+const WALK_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// Load a saved walk into `walk`. Returns the folders still to list and how
+/// many paths came back, or `None` when it cannot be read back, so the walk
+/// starts over.
+fn restore_walk(
+    saved: &SavedWalk,
+    walk: &mut RemoteWalk<'_>,
+) -> Option<(VecDeque<(String, NodeUid)>, usize)> {
+    let mut todo = VecDeque::new();
+    for dir in &saved.dirs {
+        if dir.short {
+            walk.gaps.short_listing(&dir.rel_path);
+        }
+        if !dir.listed {
+            todo.push_back((dir.rel_path.clone(), parse_uid(&dir.uid)?));
+        }
+    }
+    for item in &saved.items {
+        let Some(uid) = &item.uid else {
+            walk.gaps.unread(item.rel_path.clone());
+            continue;
+        };
+        let uid = parse_uid(uid)?;
+        if item.is_dir {
+            walk.dirs.insert(item.rel_path.clone(), uid.clone());
+        }
+        walk.out.insert(
+            item.rel_path.clone(),
+            RemoteItem {
+                uid,
+                is_dir: item.is_dir,
+                mtime: item.mtime,
+                size: item.size,
+                revision: item.revision.clone(),
+                sha1: item.sha1.clone(),
+            },
+        );
+    }
+    Some((todo, saved.items.len()))
+}
+
 /// What a remote walk fills in as it goes down the tree.
 struct RemoteWalk<'a> {
     /// Every path it read, by rel path.
@@ -2620,6 +2892,42 @@ mod tests {
         assert_eq!(report.pass_folder, None);
         assert!(health.contain(7, || {}));
         assert_eq!(health.report().panics, 1);
+    }
+
+    /// Each folder's last traced pass stays in the report, the running one
+    /// comes first, and a pass that never got going leaves none (B294).
+    #[test]
+    fn the_last_pass_of_each_folder_is_traced() {
+        let health = EngineHealth::default();
+        health.contain(2, || {
+            health.trace(|t| t.call(Call::ReadNodesFull, Duration::from_secs(2)));
+            health.end_trace("cut short");
+        });
+        health.contain(3, || {});
+        assert!(!health.contain(4, || panic!("a pass that panics")));
+        let mut running = None;
+        health.contain(3, || {
+            health.trace(|t| t.count(Count::Nodes, 5));
+            running = Some(health.report().traces);
+        });
+
+        let running = running.unwrap();
+        assert_eq!(running[0].folder_id, 3);
+        assert_eq!(running[0].ended, "");
+        let ended: Vec<(i64, String)> = health
+            .report()
+            .traces
+            .into_iter()
+            .map(|t| (t.folder_id, t.ended))
+            .collect();
+        assert_eq!(
+            ended,
+            [(2, "cut short".into()), (4, "panicked".into())],
+            "folder 3 never ended its trace"
+        );
+        let cut = &health.report().traces[0];
+        assert_eq!(cut.calls[0].name, "read nodes full");
+        assert_eq!(cut.calls[0].total_ms, 2000);
     }
 
     /// Folders named by id run before the rest of a `ReconcileAll` in the

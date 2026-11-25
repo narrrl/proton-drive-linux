@@ -218,7 +218,7 @@ commands are for scripts and for cases where the mount is not available.
 | Command | Description |
 |---|---|
 | `pdfs diagnose` | Check the installation and print a report. Works without the service. When the service does not answer, also asks Proton which of your keys open. Exits non-zero if a check fails. |
-| `pdfs diagnostics` | What a running service is doing now: worker threads, queues, requests in flight, memory. For a service that has stopped answering. |
+| `pdfs diagnostics` | What a running service is doing now: worker threads, queues, requests in flight, memory, and where each synced folder's last pass spent its time. For a service that has stopped answering, or a synced folder that never finishes. |
 | `pdfs cache inspect [--deep]` | Database size, reclaimable space, row counts, cache use against the limit. `--deep` also runs SQLite's integrity check (slow). |
 | `pdfs cache vacuum` | Compact the database. Needs free space for a second copy of it while it runs. |
 | `pdfs cache clear` | Delete cached file content. Files kept available offline stay. |

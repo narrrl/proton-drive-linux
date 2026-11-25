@@ -11,8 +11,14 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-### Added
+Schema: **48**. New tables save a mirror folder's walk of Proton Drive while a pass runs.
 
+### Added
+- **`pdfs diagnostics` and the journal say where a sync pass spends its time.** Each pass over a
+  synced folder records how long it took to walk this computer's copy, list Proton Drive, plan
+  and apply. It also records how many calls to Proton Drive it made of each kind, how long they
+  took, and which folder on Drive was slowest to list. The trace shows the running pass and the
+  last pass over each folder, in the journal as `sync: pass trace` (B294).
 - Files and folders drag out of My files into a file manager, the desktop or any app
   that takes files, as the real files under `~/ProtonDrive`. Dragging a selected row
   drags the whole selection. The drag offers a copy only, so a file manager can never
@@ -24,8 +30,15 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   them. One that never arrives (a failed upload) goes once nothing is transferring
   any more.
 
-### Fixed
+### Changed
+- **A sync pass over a large folder picks up where a restart stopped it.** A pass lists the
+  folder on Proton Drive before it changes anything, and on a folder of hundreds of thousands
+  of files that takes hours. A restart used to throw the listing away, so a large enough folder
+  never finished syncing. Each listing is now saved as it comes in, and the next pass lists only
+  the folders that are left. A saved listing is dropped whenever what it was read against
+  changes (B294).
 
+### Fixed
 - Files dragged in from a file manager on Wayland upload. The compositor offers
   such a drag as a move at first, and My files, answering only to a copy, refused
   it without a word. It now asks for a copy, which the compositor then picks.

@@ -7,6 +7,45 @@ use super::Db;
 use crate::Result;
 use std::collections::HashMap;
 
+/// What a mirror pass has walked of Drive so far, saved so a pass cut short
+/// resumes the walk instead of listing every folder again (B294).
+///
+/// The database drops it whenever the folder's baseline changes, so a saved
+/// listing never meets a baseline newer than itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedWalk {
+    /// The folder's root on Drive when the walk began.
+    pub root_uid: String,
+    pub started: i64,
+    pub dirs: Vec<SavedWalkDir>,
+    pub items: Vec<SavedWalkItem>,
+}
+
+/// A folder on Drive the saved walk found.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedWalkDir {
+    pub rel_path: String,
+    pub uid: String,
+    /// Whether its listing is saved. One that failed stays unlisted, so a
+    /// resumed walk asks again.
+    pub listed: bool,
+    /// Its listing named nodes that could not be read.
+    pub short: bool,
+}
+
+/// A path the saved walk read on Drive. `uid` is `None` for a file it saw
+/// but could not read the size of.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedWalkItem {
+    pub rel_path: String,
+    pub uid: Option<String>,
+    pub is_dir: bool,
+    pub mtime: i64,
+    pub size: i64,
+    pub revision: Option<String>,
+    pub sha1: Option<String>,
+}
+
 pub struct StoredSyncFolder {
     pub id: i64,
     /// `device` backup or `attached` My files mirror.
@@ -340,6 +379,131 @@ impl Db {
         Ok(changed)
     }
 
+    /// The saved walk of Drive of a mirror folder, if a pass started one
+    /// that has not finished. See [`SavedWalk`].
+    pub fn sync_walk_load(&self, folder_id: i64) -> Result<Option<SavedWalk>> {
+        let conn = self.conn.lock();
+        let Some((root_uid, started)) = conn
+            .query_row(
+                "SELECT root_uid, started FROM sync_walk WHERE folder_id = ?1",
+                params![folder_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let mut stmt = conn.prepare(
+            "SELECT rel_path, uid, listed, short FROM sync_walk_dir WHERE folder_id = ?1",
+        )?;
+        let dirs = stmt
+            .query_map(params![folder_id], |row| {
+                Ok(SavedWalkDir {
+                    rel_path: row.get(0)?,
+                    uid: row.get(1)?,
+                    listed: row.get::<_, i64>(2)? != 0,
+                    short: row.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt = conn.prepare(
+            "SELECT rel_path, uid, is_dir, mtime, size, revision, sha1
+             FROM sync_walk_item WHERE folder_id = ?1",
+        )?;
+        let items = stmt
+            .query_map(params![folder_id], |row| {
+                Ok(SavedWalkItem {
+                    rel_path: row.get(0)?,
+                    uid: row.get(1)?,
+                    is_dir: row.get::<_, i64>(2)? != 0,
+                    mtime: row.get(3)?,
+                    size: row.get(4)?,
+                    revision: row.get(5)?,
+                    sha1: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(SavedWalk {
+            root_uid,
+            started,
+            dirs,
+            items,
+        }))
+    }
+
+    /// Start a saved walk of Drive for a mirror folder, from its root,
+    /// dropping any saved before.
+    pub fn sync_walk_begin(&self, folder_id: i64, root_uid: &str, now: i64) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        clear_walk(&tx, folder_id)?;
+        tx.execute(
+            "INSERT INTO sync_walk (folder_id, root_uid, started) VALUES (?1, ?2, ?3)",
+            params![folder_id, root_uid, now],
+        )?;
+        tx.execute(
+            "INSERT INTO sync_walk_dir (folder_id, rel_path, uid) VALUES (?1, '', ?2)",
+            params![folder_id, root_uid],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Save the listing of one folder of a saved walk: what it holds, and
+    /// the folders in it still to be listed. One transaction, so a stop leaves
+    /// the folder either listed with all it holds or not listed at all.
+    ///
+    /// Does nothing once the walk has been dropped, by a change to the
+    /// folder's baseline in between, for one.
+    pub fn sync_walk_record(
+        &self,
+        folder_id: i64,
+        dir: &str,
+        short: bool,
+        items: &[SavedWalkItem],
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let listed = tx.execute(
+            "UPDATE sync_walk_dir SET listed = 1, short = ?3
+             WHERE folder_id = ?1 AND rel_path = ?2",
+            params![folder_id, dir, short],
+        )?;
+        if listed == 0 {
+            return Ok(false);
+        }
+        {
+            let mut item = tx.prepare(
+                "INSERT OR REPLACE INTO sync_walk_item
+                   (folder_id, rel_path, uid, is_dir, mtime, size, revision, sha1)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            let mut sub = tx.prepare(
+                "INSERT OR IGNORE INTO sync_walk_dir (folder_id, rel_path, uid)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for i in items {
+                item.execute(params![
+                    folder_id, i.rel_path, i.uid, i.is_dir, i.mtime, i.size, i.revision, i.sha1
+                ])?;
+                if let (true, Some(uid)) = (i.is_dir, &i.uid) {
+                    sub.execute(params![folder_id, i.rel_path, uid])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Drop a mirror folder's saved walk of Drive.
+    pub fn sync_walk_clear(&self, folder_id: i64) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        clear_walk(&tx, folder_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Mark folders a killed daemon left in `syncing` as `error`, keeping
     /// their last sync time. Nothing else moves a folder out of `syncing`
     /// until its next pass ends, and that can be hours away (B294).
@@ -457,4 +621,14 @@ impl Db {
         )?;
         Ok(())
     }
+}
+
+fn clear_walk(tx: &rusqlite::Transaction<'_>, folder_id: i64) -> Result<()> {
+    for table in ["sync_walk", "sync_walk_dir", "sync_walk_item"] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE folder_id = ?1"),
+            params![folder_id],
+        )?;
+    }
+    Ok(())
 }

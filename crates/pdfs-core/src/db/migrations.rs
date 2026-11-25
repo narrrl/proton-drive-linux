@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 47;
+pub(super) const SCHEMA_VERSION: i64 = 48;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -509,6 +509,18 @@ impl Db {
             )?;
             if has_trash {
                 tx.execute_batch(MIGRATION_V47)?;
+            }
+        }
+        if current < 48 {
+            // The triggers need the tables they watch; a fixture may lack them.
+            let has_sync: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name IN ('sync_entry', 'sync_folder')",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n == 2),
+            )?;
+            if has_sync {
+                tx.execute_batch(MIGRATION_V48)?;
             }
         }
         tx.execute(
@@ -1489,6 +1501,83 @@ CREATE TABLE IF NOT EXISTS photo_tombstones(uid TEXT PRIMARY KEY);
 const MIGRATION_V46_ALBUM_PHOTOS: &str = "
 ALTER TABLE album_photos ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0;
 UPDATE album_photos SET resolved=1 WHERE name IS NOT NULL;
+";
+
+/// The saved progress of a mirror pass's walk of Drive, so a pass cut short
+/// resumes the walk instead of listing everything again (B294).
+///
+/// A saved listing is only as good as the baseline it was read against: a
+/// listing from before a file moved to another synced folder reads that file
+/// as deleted on Drive. So any change to a folder's baseline or to the folder
+/// itself drops its saved walk. Filling in a revision id is the one exception,
+/// since the walk itself does that. The engine drops the walk too once it is
+/// complete, before the pass applies anything.
+const MIGRATION_V48: &str = "
+CREATE TABLE IF NOT EXISTS sync_walk (
+  folder_id INTEGER PRIMARY KEY,
+  root_uid  TEXT NOT NULL,
+  started   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sync_walk_dir (
+  folder_id INTEGER NOT NULL,
+  rel_path  TEXT NOT NULL,
+  uid       TEXT NOT NULL,
+  listed    INTEGER NOT NULL DEFAULT 0,
+  short     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (folder_id, rel_path)
+);
+CREATE TABLE IF NOT EXISTS sync_walk_item (
+  folder_id INTEGER NOT NULL,
+  rel_path  TEXT NOT NULL,
+  uid       TEXT,
+  is_dir    INTEGER NOT NULL,
+  mtime     INTEGER NOT NULL DEFAULT 0,
+  size      INTEGER NOT NULL DEFAULT 0,
+  revision  TEXT,
+  sha1      TEXT,
+  PRIMARY KEY (folder_id, rel_path)
+);
+CREATE TRIGGER IF NOT EXISTS sync_walk_drop_on_entry_insert
+AFTER INSERT ON sync_entry
+WHEN EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = NEW.folder_id)
+BEGIN
+  DELETE FROM sync_walk WHERE folder_id = NEW.folder_id;
+  DELETE FROM sync_walk_dir WHERE folder_id = NEW.folder_id;
+  DELETE FROM sync_walk_item WHERE folder_id = NEW.folder_id;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_walk_drop_on_entry_update
+AFTER UPDATE OF folder_id, rel_path, remote_uid, local_mtime, local_mtime_ns, local_size,
+  remote_hash, remote_rev
+ON sync_entry
+WHEN EXISTS (SELECT 1 FROM sync_walk WHERE folder_id IN (OLD.folder_id, NEW.folder_id))
+BEGIN
+  DELETE FROM sync_walk WHERE folder_id IN (OLD.folder_id, NEW.folder_id);
+  DELETE FROM sync_walk_dir WHERE folder_id IN (OLD.folder_id, NEW.folder_id);
+  DELETE FROM sync_walk_item WHERE folder_id IN (OLD.folder_id, NEW.folder_id);
+END;
+CREATE TRIGGER IF NOT EXISTS sync_walk_drop_on_entry_delete
+AFTER DELETE ON sync_entry
+WHEN EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = OLD.folder_id)
+BEGIN
+  DELETE FROM sync_walk WHERE folder_id = OLD.folder_id;
+  DELETE FROM sync_walk_dir WHERE folder_id = OLD.folder_id;
+  DELETE FROM sync_walk_item WHERE folder_id = OLD.folder_id;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_walk_drop_on_folder_update
+AFTER UPDATE OF local_path, remote_uid, mode ON sync_folder
+WHEN EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = OLD.id)
+BEGIN
+  DELETE FROM sync_walk WHERE folder_id = OLD.id;
+  DELETE FROM sync_walk_dir WHERE folder_id = OLD.id;
+  DELETE FROM sync_walk_item WHERE folder_id = OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS sync_walk_drop_on_folder_delete
+AFTER DELETE ON sync_folder
+BEGIN
+  DELETE FROM sync_walk WHERE folder_id = OLD.id;
+  DELETE FROM sync_walk_dir WHERE folder_id = OLD.id;
+  DELETE FROM sync_walk_item WHERE folder_id = OLD.id;
+END;
 ";
 
 /// Index the trash by parent, for browsing it by folder. The rows are dropped

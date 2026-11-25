@@ -420,6 +420,7 @@ impl FakeDrive {
             lose_read: Mutex::new(None),
             unrevised_reads: Mutex::new(None),
             hold_listing: Mutex::new(None),
+            hold_children: Mutex::new(None),
         }))
     }
 
@@ -719,6 +720,9 @@ struct ClientInner {
     /// The listing [`FakeClient::hold_answer_to_next_listing`] is waiting
     /// for, and the file it lists without an active revision.
     hold_listing: Mutex<Option<(Arc<HoldState>, NodeUid)>>,
+    /// The folder whose next listing [`FakeClient::hold_next_children_of`]
+    /// is waiting for.
+    hold_children: Mutex<Option<Arc<HoldState>>>,
 }
 
 struct HoldState {
@@ -821,6 +825,18 @@ impl FakeClient {
             released: AtomicBool::new(false),
         });
         *self.0.hold_answer.lock() = Some(state.clone());
+        Held(state)
+    }
+
+    /// Hold the next listing of the children of `folder`, before it reaches
+    /// Drive, until the answer is dropped.
+    pub(crate) fn hold_next_children_of(&self, folder: &NodeUid) -> Held {
+        let state = Arc::new(HoldState {
+            uid: folder.clone(),
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *self.0.hold_children.lock() = Some(state.clone());
         Held(state)
     }
 
@@ -1260,6 +1276,8 @@ impl DriveApi for FakeClient {
         &self,
         folder_uid: &NodeUid,
     ) -> Result<Vec<NodeUid>> {
+        self.wait_if_held(&self.0.hold_children, std::slice::from_ref(folder_uid))
+            .await;
         let lag = self.lag();
         self.request(false, |server| {
             let now = Instant::now();

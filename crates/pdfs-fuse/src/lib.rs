@@ -6210,6 +6210,12 @@ impl Core {
         });
     }
 
+    /// Note that the scan has checked `n` more items at once, read back from
+    /// a walk an earlier pass saved.
+    pub(crate) fn progress_scanned_many(&self, folder_id: i64, n: usize) {
+        self.progress_update(folder_id, |p| p.done += n);
+    }
+
     /// Note that `n` more items have been queued for this pass, and that it has
     /// moved on from scanning to applying the diff. The scan's counts are dropped:
     /// they measured a different quantity (items checked, not items to apply), so

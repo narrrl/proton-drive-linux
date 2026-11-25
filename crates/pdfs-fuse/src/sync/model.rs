@@ -267,6 +267,18 @@ impl Pending {
         }
     }
 
+    /// Which call of the pass's trace this op counts as.
+    pub(super) fn call(&self) -> Call {
+        match self {
+            Pending::CreateDir { .. } => Call::CreateFolder,
+            Pending::UploadNew { .. } | Pending::PushConflict { .. } => Call::Upload,
+            Pending::UploadRevision { .. } => Call::UploadRevision,
+            Pending::Download { .. } => Call::Download,
+            Pending::Adopt { .. } => Call::Adopt,
+            Pending::Conflict { .. } => Call::Conflict,
+        }
+    }
+
     /// How this op reads in the activity feed.
     pub(super) fn kind(&self) -> ActivityKind {
         match self {
