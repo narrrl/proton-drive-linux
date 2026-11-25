@@ -291,7 +291,7 @@ fn fetch_or_recall_root(
         None if start == Start::SessionExpired => Err(std::io::Error::other(format!(
             "Proton refused the session ({err}); run `pdfs login`"
         ))),
-        None => Err(std::io::Error::other(format!("fetch My Files root: {err}"))),
+        None => Err(std::io::Error::other(pdfs_core::mountfail::RootLookup(err))),
     }
 }
 

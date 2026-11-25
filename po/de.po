@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-22 02:24+0100\n"
+"POT-Creation-Date: 2026-11-24 21:18+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: German\n"
@@ -56,6 +56,10 @@ msgstr "%-d. %b %Y"
 #: crates/pdfs-gui/src/app/dates.rs:89
 msgid "%A, %B %-d, %Y, %H:%M"
 msgstr "%A, %-d. %B %Y, %H:%M"
+
+#: crates/pdfs-gui/src/app/main.rs crates/pdfs-gui/src/app/pages/status.rs crates/pdfs-gui/src/main.rs
+msgid "Your account keys could not open My Files. After recovering your keys, choose Retry."
+msgstr "Deine Kontoschlüssel konnten „Meine Dateien“ nicht öffnen. Stelle die Schlüssel wieder her und wähle „Erneut versuchen“."
 
 #: crates/pdfs-gui/src/app/main.rs:961
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:543
@@ -3711,13 +3715,13 @@ msgstr "Zu viele Anmeldeversuche. Einige Minuten warten und erneut versuchen."
 
 #: crates/pdfs-gui/src/app/pages/login.rs:319
 msgid ""
-"Proton is temporarily refusing sign-in from this device. Your app version is "
-"not the problem. Wait several hours, up to a day, without trying again, then "
-"sign in."
+"Proton declined this sign-in (code 2028). Wait before trying again. If it "
+"persists, try signing in on the web and mention code 2028 when contacting "
+"Proton support."
 msgstr ""
-"Proton lehnt Anmeldungen von diesem Gerät vorübergehend ab. Die App-Version "
-"ist nicht das Problem. Einige Stunden, bis zu einem Tag, warten, ohne es "
-"erneut zu versuchen, dann anmelden."
+"Proton hat diese Anmeldung abgelehnt (Code 2028). Vor einem erneuten Versuch "
+"warten. Bleibt das Problem bestehen, die Anmeldung im Browser versuchen und "
+"dem Proton-Support den Code 2028 nennen."
 
 #: crates/pdfs-gui/src/app/pages/login.rs:325
 msgid "Couldn't reach Proton. Check your internet connection and try again."

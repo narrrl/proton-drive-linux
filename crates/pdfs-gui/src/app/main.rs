@@ -530,6 +530,8 @@ fn build_window(app: &adw::Application) {
             summary: browser_widgets.summary.clone(),
             zoom: browser_widgets.zoom.clone(),
             zoom_save: RefCell::new(None),
+            pending_uploads: RefCell::new(Vec::new()),
+            pending_watch: Cell::new(false),
         },
         details: DetailsState {
             details: browser_widgets.details,
@@ -1993,6 +1995,15 @@ pub(crate) fn service_unreachable(
                     offer_not_empty(&ui, found);
                 }
             }
+            Some(failure) if failure.awaiting_keys => status(
+                &ui,
+                "dialog-warning-symbolic",
+                &gettext("Can't open your Drive"),
+                &gettext(
+                    "Your account keys could not open My Files. After recovering your keys, choose Retry.",
+                ),
+                true,
+            ),
             Some(failure) => status(
                 &ui,
                 "dialog-warning-symbolic",

@@ -2273,22 +2273,7 @@ fn cmd_login(username: Option<String>, remember: bool) -> Result<()> {
         get_mailbox,
         get_hv,
     ))
-    .map_err(|e| {
-        // Proton words this block as "update the app", which the user can't
-        // act on: the release is current and only waiting helps.
-        let blocked =
-            matches!(&e, pdfs_core::Error::Proton(p) if pdfs_core::error::sign_in_blocked(p));
-        let e = anyhow::Error::new(e).context("login failed");
-        if blocked {
-            e.context(
-                "Proton is temporarily refusing sign-in from this device (code 2028). \
-                 Your version is not the problem. Wait several hours, up to a day, \
-                 without trying again, then sign in.",
-            )
-        } else {
-            e
-        }
-    })?;
+    .map_err(login_failure)?;
 
     // A daemon that is already up is parked in `wait_for_session`, sleeping
     // between keyring checks; restart it so the mount appears now instead of
@@ -2302,6 +2287,18 @@ fn cmd_login(username: Option<String>, remember: bool) -> Result<()> {
     println!("Logged in as {username}. Session stored in the system keyring.");
     report_key_state();
     Ok(())
+}
+
+fn login_failure(error: pdfs_core::Error) -> anyhow::Error {
+    if matches!(&error, pdfs_core::Error::Proton(e) if pdfs_core::error::sign_in_blocked(e)) {
+        // The SDK logs the response code at debug level. Its server text
+        // would give contradictory instructions in the displayed cause chain.
+        anyhow::anyhow!(
+            "Proton declined this sign-in (code 2028). Wait before trying again. If it persists, try signing in on the web and mention code 2028 when contacting Proton support."
+        )
+    } else {
+        anyhow::Error::new(error).context("login failed")
+    }
 }
 
 /// Ask for the mailbox password of a two-password account, without echo.
@@ -2688,18 +2685,26 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
                 let error = format!("{e:#}");
                 let now = unix_now();
                 let attempts = failure.as_ref().map_or(1, |f| f.attempts.saturating_add(1));
-                let delay = mount_retry_delay(attempts);
-                tracing::error!(
-                    error,
-                    attempts,
-                    retry_secs = delay.as_secs(),
-                    "mount failed; retrying"
-                );
+                let delay = mount_retry_schedule(&e, attempts);
+                match delay {
+                    Some(delay) => tracing::error!(
+                        error,
+                        attempts,
+                        retry_secs = delay.as_secs(),
+                        "mount failed; retrying"
+                    ),
+                    None => tracing::error!(
+                        error,
+                        attempts,
+                        "account keys could not open My Files; waiting for service restart"
+                    ),
+                }
                 let record = pdfs_core::mountfail::MountFailure {
                     error: error.clone(),
                     since: failure.as_ref().map_or(now, |f| f.since),
                     attempts,
-                    next_attempt: now + delay.as_secs() as i64,
+                    next_attempt: now + delay.map_or(0, |delay| delay.as_secs() as i64),
+                    awaiting_keys: delay.is_none(),
                     not_empty: not_empty_cause(&e),
                 };
                 if let Err(e) = pdfs_core::mountfail::record(&state_dir, &record) {
@@ -2707,7 +2712,12 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
                 }
                 pdfs_fuse::notify_status(&format!("Mount failing: {error}"));
                 failure = Some(record);
-                pdfs_fuse::idle_sleep(delay);
+                // Retry and a successful login restart the service. Keep the
+                // watchdog alive while parked without contacting Proton.
+                match delay {
+                    Some(delay) => pdfs_fuse::idle_sleep(delay),
+                    None => return pdfs_fuse::wait_for_restart().context("wait for key recovery"),
+                }
             }
         }
     }
@@ -2728,6 +2738,20 @@ fn not_empty_cause(error: &anyhow::Error) -> Option<pdfs_core::mountpoint::NotEm
             })
             .cloned()
     })
+}
+
+fn mount_retry_schedule(error: &anyhow::Error, attempts: u32) -> Option<std::time::Duration> {
+    let root = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()?
+            .get_ref()?
+            .downcast_ref::<pdfs_core::mountfail::RootLookup>()
+    });
+    if root.is_some_and(|root| root.needs_account_keys()) {
+        None
+    } else {
+        Some(mount_retry_delay(attempts))
+    }
 }
 
 /// How long to wait before mount attempt `attempts + 1`, after `attempts`
@@ -4643,7 +4667,11 @@ fn cmd_diagnose() -> Result<()> {
                         "failing for {}, {} attempt(s): {}",
                         human_secs(unix_now().saturating_sub(failure.since).max(0) as u64),
                         failure.attempts,
-                        failure.error
+                        if failure.awaiting_keys {
+                            format!("{} — after recovering your account keys, restart proton-drive.service", failure.error)
+                        } else {
+                            failure.error
+                        }
                     ),
                 ),
                 None => println!(
@@ -4896,6 +4924,25 @@ mod diagnose_tests {
 mod login_wait_tests {
     use super::*;
 
+    #[test]
+    fn login_failure_preserves_only_actionable_upgrade_advice() {
+        use pdfs_core::proton_sdk::{ProtonApiError, ProtonError, api::ResponseCode};
+        for (code, blocked) in [
+            (ResponseCode::Blocked, true),
+            (ResponseCode::OutdatedApp, false),
+        ] {
+            let error = ProtonError::Api(ProtonApiError {
+                code,
+                http_status: 422,
+                message: "Please update the app".into(),
+                details: None,
+            });
+            let rendered = format!("{:#}", login_failure(error.into()));
+            assert_eq!(rendered.contains("2028"), blocked);
+            assert_eq!(rendered.contains("Please update"), !blocked);
+        }
+    }
+
     /// The mount retry backs off from 5 s to a ceiling of minutes, rather than
     /// asking Proton every 5 s forever (`docs/BUGS.md` B263).
     #[test]
@@ -4903,6 +4950,26 @@ mod login_wait_tests {
         let secs: Vec<u64> = (1..=8).map(|n| mount_retry_delay(n).as_secs()).collect();
         assert_eq!(secs, [5, 10, 20, 40, 80, 120, 120, 120]);
         assert_eq!(mount_retry_delay(u32::MAX).as_secs(), 120);
+    }
+
+    #[test]
+    fn cold_root_key_failures_wait_for_a_restart() {
+        use pdfs_core::proton_sdk::{ProtonError, crypto::CryptoError};
+        for (cause, parked) in [
+            (ProtonError::KeysLocked, true),
+            (CryptoError::Decrypt("missing key".into()).into(), true),
+            (CryptoError::Decrypt("malformed data".into()).into(), false),
+            (ProtonError::invalid_operation("missing key"), false),
+        ] {
+            let io = std::io::Error::other(pdfs_core::mountfail::RootLookup(cause));
+            let error = anyhow::Error::new(io).context("mount failed");
+            assert_eq!(mount_retry_schedule(&error, 1).is_none(), parked);
+        }
+        let io = std::io::Error::from(std::io::ErrorKind::NetworkUnreachable);
+        assert_eq!(
+            mount_retry_schedule(&io.into(), 1),
+            Some(mount_retry_delay(1))
+        );
     }
 
     /// A refusal over a folder with files in it reaches the failure record
