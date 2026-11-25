@@ -239,9 +239,11 @@ fn stack_signal() -> i32 {
 fn install_stack_handler() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     extern "C" fn handler(_: i32) {
-        // Not async-signal-safe: the capture allocates. The process is being
-        // taken down for a hang anyway, and a thread interrupted inside the
-        // allocator only fails to answer.
+        // Not async-signal-safe: the capture allocates, and a thread caught
+        // inside the allocator never comes back. That is only acceptable in a
+        // process that is hung already and being taken down; never fire it
+        // in one whose other threads must go on (the stack test runs alone
+        // for this reason).
         let stack = std::backtrace::Backtrace::force_capture();
         STACKS.lock().insert(gettid(), stack);
     }
@@ -288,9 +290,32 @@ mod tests {
     use super::*;
     use crate::sim::daemon::scratch;
 
+    /// Set in the child process the stack test runs in.
+    const ALONE: &str = "PDFS_SIM_WATCHDOG_ALONE";
+
     #[test]
-    #[ignore = "signals every thread of the test process: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    #[ignore = "mounts nothing, but runs beside the sims: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_call_past_its_limit_is_reported_with_the_stacks() {
+        // Taking stacks signals every thread of the process, and the handler
+        // allocates. In the test process that is every other sim's daemon: a
+        // thread caught inside the allocator, or holding the database, never
+        // came back, and the sims beside this test hung. So it runs alone, in
+        // a process of its own.
+        if std::env::var_os(ALONE).is_none() {
+            let name = "sim::watchdog::tests::a_call_past_its_limit_is_reported_with_the_stacks";
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "--nocapture", name])
+                .env(ALONE, "1")
+                .output()
+                .expect("run the test in a process of its own");
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && out.contains("1 passed"),
+                "{out}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let dir = scratch("watchdog");
         let mut watchdog = Watchdog::new(&dir);
         {
