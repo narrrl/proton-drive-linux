@@ -319,6 +319,7 @@ pub(crate) fn bind_file_thumbnail(
     if entry.is_dir
         || !is_thumbnail_media_name(&entry.name, Some(entry.size))
         || entry.uid.is_empty()
+        || is_pending_upload(entry)
     {
         return;
     }

@@ -530,6 +530,8 @@ fn build_window(app: &adw::Application) {
             summary: browser_widgets.summary.clone(),
             zoom: browser_widgets.zoom.clone(),
             zoom_save: RefCell::new(None),
+            pending_uploads: RefCell::new(Vec::new()),
+            pending_watch: Cell::new(false),
         },
         details: DetailsState {
             details: browser_widgets.details,

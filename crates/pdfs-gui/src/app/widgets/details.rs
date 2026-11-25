@@ -436,6 +436,10 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
 /// Fill the Sharing and Versions rows, and a folder's size, which need the
 /// network. The answers land only if the pane still shows the same entry.
 fn load_details_extras(ui: &Rc<Ui>, entry: &DirEntry) {
+    if is_pending_upload(entry) {
+        // Proton Drive has no such node yet: nothing to ask about.
+        return;
+    }
     let by_uid = entry.path.is_empty() && !entry.uid.is_empty();
     let rel = entry_rel(ui, entry);
     let share_req = if by_uid {
