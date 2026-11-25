@@ -68,7 +68,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
-| [B297](#b297--the-simulations-fail-or-hang-about-one-run-in-two-on-code-that-passes-them-alone) | The simulations fail or hang about one run in two, on code that passes them alone | Cause not found; several tests and one hang |
+| [B297](#b297--the-simulations-fail-and-hang-when-run-in-parallel-and-nothing-stops-that) | The simulations fail and hang when run in parallel, and nothing stops that | Not fixed |
 | [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy) | On a slow link, a file's last write can land only in a conflict copy | Cause not found; seen once in CI |
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
@@ -398,56 +398,39 @@ a live account since.
 
 Newest first.
 
-### B297 — The simulations fail or hang about one run in two, on code that passes them alone
+### B297 — The simulations fail and hang when run in parallel, and nothing stops that
 
 **Status:** Open
-**Found:** 2026-11-25, while running the full simulation suite three times for each of #134, #135
-and the 4.0 crate moves. CI on main fails too (`0b9e849`, [run](https://github.com/narrrl/proton-drive-linux/actions/runs/45694939718)).
-**Where:** not located. The failing tests are in `crates/pdfs-fuse/src/sim/daemon.rs` and
-`crates/pdfs-fuse/src/sim/run.rs`; the drain's retry and backoff in
-`crates/pdfs-fuse/src/drain.rs` is the first suspect for most of them
+**Found:** 2026-11-25, while running the full simulation suite several times each for #134, #135
+and the 4.0 crate moves, with `cargo test -p pdfs-fuse --lib -- --ignored sim::`. That command
+leaves out `--test-threads=1`, which CI and [TESTING.md](TESTING.md) use, so libtest ran up to
+eight simulations at once in one process.
+**Where:** `crates/pdfs-fuse/src/sim/daemon.rs`, `Daemon::start` and `Daemon::shut_down`
 
-**Repro:** `cargo test -p pdfs-fuse --lib -- --ignored sim::`, the whole suite, several times.
-Of 12 local runs on three branches that share main as their base, 5 passed, 6 failed and 1
-hung. Some runs had a build going at the same time, and those failed more often, but runs
-with no other load failed too. Each failing test passes when run alone, and each failing seed passes when replayed.
-The failures:
+**Repro:** Run the suite without `--test-threads=1`. Of 18 such runs on three branches based on
+main, 6 passed, 10 failed and 2 hung until a 900 s timeout. The failures were timing asserts
+in many tests, among them `a_write_that_failed_on_a_short_outage_goes_out_soon_after_the_link_returns`,
+`three_clients_one_writer_each` and `one_client_with_stale_hashes_and_reordered_echoes`.
+Each passes when run alone.
 
-- `a_write_that_failed_on_a_short_outage_goes_out_soon_after_the_link_returns`, 4 runs. With
-  the client offline, the write to `f.txt` never shows an attempt in the pending list within
-  30 s (`daemon.rs`, the second `wait_until`).
-- `a_file_removed_with_its_folder_while_uploading_stays_removed`, 2 runs. The
-  removed folder is still in the database.
-- `three_clients_one_writer_each`, 2 runs. Seed 1: "no loss: Drive does not hold what the
-  clients wrote, 60s after the links came up", `x/d` only in client 1's model. Seed 2:
-  "liveness: the queues did not drain within 4s", Drive holds a shorter `d` than client 0
-  wrote. CI on #134 failed seed 3 with an EACCES.
-- `one_client_with_stale_hashes_and_reordered_echoes`, 2 runs. Seed 3: Drive holds `vwxyz`
-  for `y/z/b.txt`, an older and shorter content than the client wrote. Seed 6: `unlink
-  x/x/c.bin` answered ENOENT; it passes 3 times out of 3 when replayed alone.
-- `one_client_on_a_good_link`, seed 5: "liveness: the queues did not drain within 4s".
-- `a_move_blocked_by_trash_can_be_retried_after_restore`, in CI on main.
+In a hung run, one test thread stayed in state D in `request_wait_answer`, waiting on a FUSE
+request to a mount its own process serves. Killing the process left it a zombie and left its
+mounts in place until their connections were aborted through
+`/sys/fs/fuse/connections/<n>/abort`.
 
-The hung run reached the 900 s timeout with eight tests still running, among them
-`one_client_on_a_good_link`, `one_client_on_a_slow_link`, `three_clients_one_writer_each` and
-`half_of_a_wide_folder_unlinked_at_once_leaves_the_other_half`. After the kill, the test
-process stayed a zombie: one thread was in state D in `request_wait_answer`, waiting on a FUSE
-request to a mount served by its own process. Its mounts stay until their connections are
-aborted in `/sys/fs/fuse/connections/<n>/abort`. Earlier hung runs left more such
-connections behind.
+Run serially, the same branches pass in CI (#133 to #137).
 
-**Cause.** Not known, and probably more than one. The "Drive holds an older, shorter content"
-failures look like B275. The hang means that some FUSE request is never answered, which
-the watchdog (B91) should report but did not get the chance to in a test.
+**Cause.** The simulations share process-wide state: `isolate_from_the_developer` sets the XDG
+variables once, which is sound only while no other test reads the environment, and every
+daemon runs drain workers, a sync engine and a runtime on the same few cores. In parallel the
+timing asserts miss their deadlines, and the harness has no way out of a mount that stops
+answering.
 
-**Fix.** Not done. Next steps:
+**Fix.** Not done.
 
-1. Run each failing test in a loop under load, and keep the state directory and daemon log of
-   a failing run.
-2. Make a hung simulation fail with the stacks of its threads instead of hanging the suite,
-   and abort its FUSE connections so the next run starts clean.
-3. Until then, a PR's simulation result says which of these failed, and that they fail on
-   main too.
+Separately, CI on main (`0b9e849`) failed `a_move_blocked_by_trash_can_be_retried_after_restore`
+once, serially ([run](https://github.com/narrrl/proton-drive-linux/actions/runs/45694939718)):
+the assert at `daemon.rs:2209` found an empty list. It has not failed since.
 
 ---
 
