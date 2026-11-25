@@ -21,7 +21,7 @@ again.
 | [Arch Linux](#arch-linux-aur) | `proton-drive-for-linux` in the AUR | With your AUR helper |
 | [Debian, Ubuntu 24.04 or newer](#debian-and-ubuntu-2404-or-newer) | `.deb` from the release page | Download each release |
 | [NixOS](#nixos-flake) | The flake in this repository | With `nix flake update` |
-| [Fedora Atomic](#fedora-atomic-silverblue-kinoite-bazzite-bluefin) (Silverblue, Kinoite, Bazzite, Bluefin) | The COPR repository, layered with `rpm-ostree` | With `rpm-ostree upgrade` |
+| [Fedora Atomic](#fedora-atomic-silverblue-kinoite-bazzite-bluefin) (Silverblue, Kinoite, Bazzite, Bluefin) | Home-directory tarball or COPR package layered with `rpm-ostree` | Rerun the tarball installer or use `rpm-ostree upgrade` |
 | [Anything else](#other-distributions), immutable ones included | `.tar.gz` from the release page, installed into your home folder by its `install.sh`, or [build from source](#build-from-source) | Run the new release's `install.sh` |
 
 Release packages are for x86_64. You also need a Secret Service provider, such as GNOME
@@ -142,7 +142,9 @@ it video thumbnails, override the package with `withFfmpeg = false`. The recipe 
 
 ### Fedora Atomic (Silverblue, Kinoite, Bazzite, Bluefin)
 
-The system is read-only, so layer the COPR package on top of it. It brings its libraries along:
+To install in your home folder, unpack the x86-64 tarball and run its
+`install.sh --check` on the host desktop. See [Other distributions](#other-distributions).
+For installation and updates through the system image, layer the COPR package:
 
 ```bash
 sudo curl -o /etc/yum.repos.d/proton-drive-linux.repo \
@@ -156,10 +158,11 @@ systemctl reboot
 ### Other distributions
 
 The `.tar.gz` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest)
-installs into your home folder, without root, so it also works where the system is read-only:
+installs into your home folder, without root, on hosts that provide its runtime dependencies. Check those before installing:
 
 ```bash
 tar -xzf proton-drive-linux-*-x86_64.tar.gz
+proton-drive-linux-*-x86_64/install.sh --check
 proton-drive-linux-*-x86_64/install.sh
 ```
 
