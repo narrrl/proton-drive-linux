@@ -25,7 +25,8 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use proton_drive_rs::proton_sdk::account::Quota;
-use proton_drive_rs::proton_sdk::error::Result;
+use proton_drive_rs::proton_sdk::api::ResponseCode;
+use proton_drive_rs::proton_sdk::error::{ProtonError, Result};
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid, ShareId};
 use proton_drive_rs::{
     AvailableNameTarget, Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeMoveItem,
@@ -33,14 +34,14 @@ use proton_drive_rs::{
 };
 
 /// One outcome per node of a batch request; see [`ProtonDriveClient::trash_nodes`].
-pub(crate) type NodeOutcomes = Vec<(NodeUid, Result<()>)>;
+pub type NodeOutcomes = Vec<(NodeUid, Result<()>)>;
 
 /// The outcomes of a streaming batch request, one item per node as it lands.
-pub(crate) type OutcomeStream<'a> = BoxStream<'a, Result<(NodeUid, Result<()>)>>;
+pub type OutcomeStream<'a> = BoxStream<'a, Result<(NodeUid, Result<()>)>>;
 
 /// Drive as the sync core sees it. See the module documentation.
 #[async_trait]
-pub(crate) trait DriveApi: Send + Sync {
+pub trait DriveApi: Send + Sync {
     async fn get_my_files_folder(&self) -> Result<Node>;
 
     async fn context_share_id(&self, uid: &NodeUid) -> Result<ShareId>;
@@ -210,14 +211,13 @@ pub(crate) trait DriveApi: Send + Sync {
     /// `uid` that landed, or retired the create that made `uid`, before the
     /// tree has the node, so a simulation can hold it there. Blocks the drain
     /// worker it is called on.
-    #[cfg(test)]
     fn landing(&self, _uid: &NodeUid) {}
 }
 
 /// The generic signatures of the client, over the object-safe ones above.
 impl dyn DriveApi {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn upload_file_from<R: Read + Send>(
+    pub async fn upload_file_from<R: Read + Send>(
         &self,
         parent_uid: &NodeUid,
         name: &str,
@@ -242,7 +242,7 @@ impl dyn DriveApi {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn upload_file_replacing_draft_from<R: Read + Send>(
+    pub async fn upload_file_replacing_draft_from<R: Read + Send>(
         &self,
         parent_uid: &NodeUid,
         name: &str,
@@ -266,7 +266,7 @@ impl dyn DriveApi {
         .await
     }
 
-    pub(crate) async fn upload_new_revision_from<R: Read + Send>(
+    pub async fn upload_new_revision_from<R: Read + Send>(
         &self,
         file_uid: &NodeUid,
         mut reader: R,
@@ -284,7 +284,7 @@ impl dyn DriveApi {
         .await
     }
 
-    pub(crate) async fn download_file_to<W: Write + Send>(
+    pub async fn download_file_to<W: Write + Send>(
         &self,
         uid: &NodeUid,
         output: &mut W,
@@ -292,7 +292,7 @@ impl dyn DriveApi {
         self.download_file_to_dyn(uid, output).await
     }
 
-    pub(crate) async fn download_revision_to<W: Write + Send>(
+    pub async fn download_revision_to<W: Write + Send>(
         &self,
         file_uid: &NodeUid,
         revision_id: &str,
@@ -305,7 +305,7 @@ impl dyn DriveApi {
 
 /// An open revision that block reads are served from; see [`RevisionReader`].
 #[async_trait]
-pub(crate) trait RevisionRead: Send + Sync {
+pub trait RevisionRead: Send + Sync {
     /// Plaintext size of the revision.
     fn size(&self) -> u64;
 
@@ -575,3 +575,27 @@ impl DriveApi for ProtonDriveClient {
         ProtonDriveClient::create_device(self, name, device_type).await
     }
 }
+
+/// Whether a failed call failed because Proton could not be reached, rather
+/// than because it answered and refused.
+///
+/// A transport error is the network. So is a request timeout: the SDK reports
+/// Proton's own "try again" codes that way, and the daemon's `no_answer` reports its
+/// deadline that way. Anything else Proton actually said, and says again on a
+/// retry, so it must reach the caller rather than be queued.
+pub fn is_network_error(e: &ProtonError) -> bool {
+    match e {
+        ProtonError::Transport(_) => true,
+        ProtonError::Api(api) => {
+            matches!(
+                api.code,
+                ResponseCode::RequestTimeout | ResponseCode::Timeout
+            )
+        }
+        _ => false,
+    }
+}
+
+/// An in-memory Drive and the seeded randomness the simulations share.
+#[cfg(feature = "sim")]
+pub mod sim;
