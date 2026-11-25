@@ -84,6 +84,7 @@ SECTIONS = [
     ("Contributing", [
         ("DEVELOPMENT.md", "Development"),
         ("ARCHITECTURE.md", "Architecture"),
+        ("SYNC_ENGINE.md", "Sync-Engine"),
         ("TESTING.md", "Testing"),
         ("TRANSLATING.md", "Translating"),
         ("ROADMAP.md", "Roadmap"),
