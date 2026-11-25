@@ -80,14 +80,29 @@ struct PassClock {
     folder: i64,
     started: Instant,
     moved: Instant,
+    /// When the journal last heard about this pass.
+    logged: Instant,
 }
 
+/// How often a running pass says in the journal how far it has got. A pass
+/// over a large folder logs nothing else between its start and its end, and
+/// one cut short by a stop hours in left no trace of where the time went
+/// (`docs/BUGS.md` B294).
+const PASS_HEARTBEAT: Duration = Duration::from_secs(300);
+
 impl EngineHealth {
-    /// Note that the running pass reported progress.
-    pub(crate) fn moved(&self) {
-        if let Some(pass) = self.pass.lock().as_mut() {
-            pass.moved = Instant::now();
+    /// Note that the running pass reported progress. Returns the pass's folder
+    /// and age once every [`PASS_HEARTBEAT`], when it is time to log it.
+    pub(crate) fn moved(&self) -> Option<(i64, Duration)> {
+        let mut pass = self.pass.lock();
+        let pass = pass.as_mut()?;
+        let now = Instant::now();
+        pass.moved = now;
+        if now.duration_since(pass.logged) < PASS_HEARTBEAT {
+            return None;
         }
+        pass.logged = now;
+        Some((pass.folder, now.duration_since(pass.started)))
     }
 
     /// The engine's state now. `try_lock`, like the rest of the diagnostics:
@@ -111,6 +126,7 @@ impl EngineHealth {
             folder,
             started: now,
             moved: now,
+            logged: now,
         });
         let finished = std::panic::catch_unwind(AssertUnwindSafe(pass)).is_ok();
         *self.pass.lock() = None;
@@ -180,6 +196,17 @@ fn run_pass_by_id(core: &Core, id: i64) {
 fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
     let health = core.sync_engine.clone();
     let _running = Running::start(&health);
+    // No pass runs before this thread starts one, so a folder in `syncing` was
+    // left there by a daemon that was killed mid-pass. It would read as busy
+    // until its next pass ends, which on a large folder is hours away.
+    match core.db.sync_folders_reset_syncing() {
+        Ok(0) => {}
+        Ok(n) => info!(
+            folders = n,
+            "sync: folders left syncing by the last run set to error"
+        ),
+        Err(e) => warn!(error = ?e, "sync: cannot reset folders left syncing"),
+    }
     // Paths the watcher currently covers, mapped to their folder id, so an event
     // path can be resolved back to the folder it belongs to.
     let watched: Arc<Mutex<Vec<(PathBuf, i64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -315,6 +342,17 @@ fn run_burst(core: &Core, ids: &HashSet<i64>, all: bool) {
         Vec::new()
     };
     let listed: Vec<i64> = folders.iter().map(|f| f.id).collect();
+    let listed = if listed.len() > 1 {
+        match core.db.sync_entry_counts() {
+            Ok(counts) => smallest_first(&listed, &counts),
+            Err(e) => {
+                warn!(error = ?e, "sync: cannot count baseline rows; keeping the folder order");
+                listed
+            }
+        }
+    } else {
+        listed
+    };
     for id in burst_order(ids, &listed) {
         if core.sync_paused() {
             break;
@@ -326,6 +364,21 @@ fn run_burst(core: &Core, ids: &HashSet<i64>, all: bool) {
             _ => run_pass_by_id(core, id),
         }
     }
+}
+
+/// `listed` with the folders that have the fewest baseline rows first, ties
+/// in their own order.
+///
+/// A burst over every folder used to go by id. A folder so large that its pass
+/// could not finish before the daemon stopped then took the first turn after
+/// every start, and the folders after it never got one: a user who restarts to
+/// get sync going waits on the same pass each time (`docs/BUGS.md` B294).
+/// Small folders first keeps the large one from holding back the rest; it
+/// still runs once in every burst.
+pub(super) fn smallest_first(listed: &[i64], counts: &HashMap<i64, usize>) -> Vec<i64> {
+    let mut order = listed.to_vec();
+    order.sort_by_key(|id| counts.get(id).copied().unwrap_or(0));
+    order
 }
 
 /// The order of a burst's passes: the folders named by id, lowest first, then

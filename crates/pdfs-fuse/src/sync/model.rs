@@ -143,9 +143,20 @@ pub(super) struct Outcome {
     /// unreadable from one poll to the next, so the pass reports it once, when
     /// the set changes, rather than on every poll.
     pub(super) unscanned: Vec<String>,
+    /// The first step that failed in this pass, so the line that ends a pass
+    /// in `error` says why without a search back through the journal.
+    pub(super) first_error: Option<String>,
 }
 
 impl Outcome {
+    /// Count one failed step, keeping the first one's message.
+    pub(super) fn failed(&mut self, error: &str) {
+        self.errors += 1;
+        if self.first_error.is_none() {
+            self.first_error = Some(error.to_string());
+        }
+    }
+
     /// Fold in one applied op.
     pub(super) fn record(&mut self, applied: &Applied) {
         match applied {
@@ -296,6 +307,9 @@ pub(super) enum PassAbort {
     /// will be cancelled with the runtime; nothing more is sent, and the next
     /// start's pass picks up from the baseline.
     Stopped,
+    /// The folder is being removed. The pass stops where it is, as for
+    /// [`Stopped`](Self::Stopped), so the removal can take the folder's lock.
+    Abandoned,
 }
 
 impl From<String> for PassAbort {

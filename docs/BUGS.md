@@ -108,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B294](#b294--a-mirror-folder-too-large-to-finish-in-one-run-never-syncs-and-holds-back-the-others) | A mirror folder too large to finish in one run never syncs, and holds back the others |
 | [B66](#b66--local-only-pending-data-is-not-protected-at-shutdown-high-21) | Local-only pending data is not protected at shutdown (HIGH-21) |
 | [B291](#b291--on-fedora-45s-oo7-every-saved-sign-in-is-lost-at-the-next-reboot) | On Fedora 45's oo7, every saved sign-in is lost at the next reboot |
 | [B289](#b289--the-takeout-import-mixes-in-other-services-and-drops-location-and-live-photos) | The Takeout import mixes in other services and drops location and live photos |
@@ -395,6 +396,55 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B294 — A mirror folder too large to finish in one run never syncs, and holds back the others
+
+**Status:** Fixed (unverified)
+
+**Found:** 2026-11-25, issue #53. A user with four mirror folders, one of them close to half a
+million files, saw two folders stay at `error, synced: 10-29` for a month while the other two
+synced. Nothing they added reached Drive. The journal showed only `sync: pass cut short by the
+stop` for those two folders, once per restart. Restarting the daemon seemed to get sync going
+now and then.
+
+**Where:** `crates/pdfs-fuse/src/sync.rs` `Core::reconcile_pass` and `Core::walk_remote`;
+`crates/pdfs-fuse/src/sync/engine.rs` `run_burst`; `crates/pdfs-fuse/src/devices.rs`
+`Core::remove_sync_folder` and `Core::list_sync_folders`
+
+**Repro:** A mirror folder with a few hundred thousand files whose baseline rows have no
+revision id (written before schema 44, or by an upload Drive did not list at once), next to a
+smaller folder with a higher id. Restart the daemon before the large folder's pass ends. The
+smaller folder's pass never starts, and the large folder's next pass reads every file's size
+again.
+
+**Cause:** Every way a pass ends records the time, except a stop: that puts back the state and
+time the folder had before, so a month-old `error` read as current. A pass walks both trees
+before it applies anything, and only the classification after the walk stored the revision ids
+it had confirmed. A pass cut short kept none of them, so each walk unlocked the key of every
+such file again, which on half a million files takes hours. A burst over every folder ran in id
+order, so after each start the large folder took the first turn, and a folder with a higher id
+waited for a pass that never ended. A removal took the folder's lock with no limit and held a
+control handler for as long as the pass ran. Listing the folders held the progress lock that
+the scan takes for every entry while it queried the database. A daemon killed mid-pass left its
+folder in `syncing` until the next pass ended.
+
+**Fix:** The remote walk stores the revision ids it confirms after each listing, so a later walk
+trusts the recorded sizes even when the pass before it was cut short. A burst runs the folders
+named in it first, as before (B260), and then the others with the fewest baseline rows first.
+A removal asks the running pass to stop at its next checkpoint, after a remote listing or a
+batch of transfers, and waits up to a minute for it. Listing the folders copies the progress
+first. The engine sets a folder left in `syncing` to `error` when it starts. A pass logs how far
+it got every five minutes, when it is cut short, and the first failed step when it ends in
+`error`.
+
+Not changed: a pass still walks both trees before it applies anything, so a folder that cannot
+be walked in one run still never syncs. Applying changes per subtree as the walk goes is the
+fix for that, and is not done. The two-minute poll still walks every folder in turn.
+
+**Verified:** `revision_ids_fill_only_rows_without_one`, `baseline_rows_are_counted_per_folder`,
+`folders_left_syncing_are_reset_to_error`, `only_an_unchanged_row_without_an_id_takes_the_revision`
+and `the_smallest_folders_run_first_in_a_burst` on 2026-11-25. Not yet checked on the reporter's
+folders.
 
 ### B293 — A large trash never lists, and Empty Trash never empties it
 

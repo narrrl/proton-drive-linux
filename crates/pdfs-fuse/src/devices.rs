@@ -33,6 +33,11 @@ use super::{
     now_secs, parse_uid, spawn_session, sync_folder_info, this_hostname,
 };
 
+/// How long a removal waits for a running pass to reach a checkpoint and let
+/// go of the folder. A checkpoint comes after each remote folder listing and
+/// each batch of transfers, so a minute covers all but a very large upload.
+const REMOVE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Registration validates local and remote root overlap before inserting a
 /// mapping. Serialize all registration paths so concurrent control requests
 /// cannot both validate against the same old set of roots.
@@ -609,7 +614,9 @@ impl Core {
     /// List this device's synced folders for the front-ends, each carrying the
     /// live progress of its pass when one is running.
     pub(crate) fn list_sync_folders(&self) -> CoreResult<Vec<SyncFolderInfo>> {
-        let progress = self.sync_progress.lock();
+        // Copied out rather than held: the pass takes this lock for every
+        // entry it scans, and the queries below need not stall it.
+        let progress = self.sync_progress.lock().clone();
         Ok(self
             .db
             .sync_folder_list()
@@ -699,7 +706,17 @@ impl Core {
     /// folder under the device root; otherwise the cloud copy is left in place.
     pub(crate) fn remove_sync_folder(&self, id: i64, delete_remote: bool) -> CoreResult<()> {
         let lock = self.sync_lock(id);
-        let _guard = lock.lock();
+        // A pass holds the lock for as long as it runs, hours on a large
+        // folder. Ask it to stop at its next checkpoint rather than wait it
+        // out on a control handler (B294).
+        self.sync_abandon.lock().insert(id);
+        let guard = lock.try_lock_for(REMOVE_LOCK_WAIT);
+        let Some(_guard) = guard else {
+            return Err(CoreError::conflict(
+                "the folder is in the middle of a sync step; try again in a minute",
+            ));
+        };
+        self.sync_abandon.lock().remove(&id);
         let folder = self
             .db
             .sync_folder_get(id)

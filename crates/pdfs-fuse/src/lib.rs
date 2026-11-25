@@ -758,6 +758,11 @@ struct Core {
     /// Per-sync-folder paths the last pass could not read, so the activity feed
     /// says so when the set changes rather than on every poll (B196).
     sync_unscanned: Arc<Mutex<HashMap<i64, Vec<String>>>>,
+    /// Sync folders whose running pass should stop at its next checkpoint,
+    /// because a removal is waiting for the folder's lock. A pass over a large
+    /// folder holds that lock for hours, and a removal that waited for it
+    /// held a control handler just as long (B294).
+    sync_abandon: Arc<Mutex<HashSet<i64>>>,
     /// Nodes this daemon changed on the remote itself, and how many echoes of
     /// those changes the event feed still owes us.
     ///
@@ -6167,10 +6172,23 @@ impl Core {
 
     /// Apply `f` to a folder's live progress, if a pass is running for it.
     fn progress_update(&self, folder_id: i64, f: impl FnOnce(&mut SyncProgress)) {
-        if let Some(p) = self.sync_progress.lock().get_mut(&folder_id) {
+        let now = self.sync_progress.lock().get_mut(&folder_id).map(|p| {
             f(p);
+            (p.phase, p.done, p.total)
+        });
+        if let Some((folder, age)) = self.sync_engine.moved()
+            && let Some((phase, done, total)) = now
+            && folder == folder_id
+        {
+            info!(
+                id = folder,
+                ?phase,
+                done,
+                total,
+                elapsed_s = age.as_secs(),
+                "sync: pass still running"
+            );
         }
-        self.sync_engine.moved();
     }
 
     /// Set the number of items the scan expects to check, from the size of the

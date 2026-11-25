@@ -557,6 +557,7 @@ pub(crate) fn mount_with(
         mounts: Arc::new(Mutex::new(SecondaryMountRegistry::default())),
         sync_locks: Arc::new(Mutex::new(HashMap::new())),
         sync_unscanned: Arc::new(Mutex::new(HashMap::new())),
+        sync_abandon: Arc::default(),
         states: Arc::new(StateRegistry::default()),
     };
     // Before anything can queue work against it: the drain thread below reaches
