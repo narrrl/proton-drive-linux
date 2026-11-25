@@ -36,6 +36,17 @@ if PATH="$work/tools:$PATH" "$src/install.sh" --check >"$work/check.log" 2>&1; t
 fi
 grep -q 'libmissing.so' "$work/check.log" || fail "check did not name the missing library"
 [ -z "$(find "$HOME" -mindepth 1 -print -quit)" ] || fail "compatibility check wrote into HOME"
+# ldd refusing the binary outright must fail the check too, not pass it.
+cat >"$work/tools/ldd" <<'EOF'
+#!/bin/sh
+echo 'not a dynamic executable' >&2
+exit 1
+EOF
+if PATH="$work/tools:$PATH" "$src/install.sh" --check >"$work/check.log" 2>&1; then
+  fail "compatibility check accepted a binary ldd could not load"
+fi
+grep -q 'not a dynamic executable' "$work/check.log" || fail "check did not say why ldd failed"
+[ -z "$(find "$HOME" -mindepth 1 -print -quit)" ] || fail "compatibility check wrote into HOME"
 
 "$src/install.sh" --no-service --force >"$work/install.log" 2>&1 ||
   { cat "$work/install.log" >&2; fail "install.sh failed"; }

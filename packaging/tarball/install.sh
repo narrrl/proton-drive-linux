@@ -111,7 +111,9 @@ missing="$(for exe in pdfs pdfs-app pdfs-tray pdfs-prompt; do
     if output="$(LC_ALL=C ldd "$here/bin/$exe" 2>&1)"; then
         grep -F 'not found' <<<"$output" || true
     else
-        printf '%s: %s\n' "$exe" "$output"
+        # ldd itself failed (not an x86-64 ELF, unreadable, ...): its first
+        # line says why, the rest is noise.
+        printf '%s: %s\n' "$exe" "$(head -n1 <<<"$output")"
     fi
 done | sort -u)"
 if [[ -n "$missing" ]]; then
@@ -138,7 +140,16 @@ elif [[ ! -u "$fusermount" ]]; then
     warn "$fusermount is not setuid root; My files may not mount"
 fi
 
+# --check only warns about it: the tarball can still be checked on a host that
+# has the package, it just must not be installed there.
+package_installed() {
+    [[ -e /usr/bin/pdfs || -e /usr/lib/systemd/user/$unit ]]
+}
+
 if [[ $check -eq 1 ]]; then
+    if package_installed; then
+        warn "a package already installs Proton Drive for Linux (/usr/bin/pdfs); remove it before installing this tarball"
+    fi
     [[ -n "$fusermount" && -u "$fusermount" && "$(stat -Lc %u "$fusermount")" == 0 ]] ||
         die "the mount requires a setuid-root fusermount3"
     [[ -c /dev/fuse && -r /dev/fuse && -w /dev/fuse ]] || die "the current user needs access to /dev/fuse"
@@ -149,7 +160,7 @@ fi
 
 # A package and this install would each bring a service unit, and the one in
 # ~/.config wins: the two would run different versions against one database.
-if [[ $force -eq 0 && ( -e /usr/bin/pdfs || -e /usr/lib/systemd/user/$unit ) ]]; then
+if [[ $force -eq 0 ]] && package_installed; then
     die "a package already installs Proton Drive for Linux (/usr/bin/pdfs). Remove it first, or keep using it."
 fi
 
