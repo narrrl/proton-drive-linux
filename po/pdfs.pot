@@ -60,6 +60,10 @@ msgstr ""
 msgid "%A, %B %-d, %Y, %H:%M"
 msgstr ""
 
+#: crates/pdfs-gui/src/app/main.rs crates/pdfs-gui/src/app/pages/status.rs crates/pdfs-gui/src/main.rs
+msgid "Your account keys could not open My Files. After recovering your keys, choose Retry."
+msgstr ""
+
 #: crates/pdfs-gui/src/app/main.rs:961
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:543
 #: crates/pdfs-gui/src/app/pages/browser.rs:473

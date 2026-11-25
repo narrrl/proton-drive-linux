@@ -11,6 +11,7 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+- A cold mount whose account keys cannot open My Files waits for Retry or a fresh sign-in (#40).
 - Sign-in failures with Proton code 2028 now give consistent recovery guidance in the desktop app and CLI (#39).
 
 ## [3.10.0] — 2026-11-22

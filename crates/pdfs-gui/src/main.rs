@@ -197,18 +197,21 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
                 // A daemon whose mount fails on every try never opens the
                 // socket; the app says why (B263).
                 Ok(s)
-                    if socket
-                        .parent()
-                        .and_then(pdfs_core::mountfail::read)
-                        .is_some() =>
+                    if let Some(failure) = socket.parent().and_then(pdfs_core::mountfail::read) =>
                 {
                     (
-                        // Translators: {username} is the Proton account name. The
-                        // service keeps failing to start; the app shows the error.
-                        gettext_f(
-                            "Signed in as {username} — can't open your Drive",
-                            &[("username", &s.username)],
-                        ),
+                        if failure.awaiting_keys {
+                            gettext(
+                                "Your account keys could not open My Files. After recovering your keys, choose Retry.",
+                            )
+                        } else {
+                            // Translators: {username} is the Proton account name. The
+                            // service keeps failing to start; the app shows the error.
+                            gettext_f(
+                                "Signed in as {username} — can't open your Drive",
+                                &[("username", &s.username)],
+                            )
+                        },
                         Phase::Attention,
                     )
                 }

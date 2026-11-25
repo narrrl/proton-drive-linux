@@ -1335,7 +1335,7 @@ and stop.
 
 ### B263 — A mount that can never succeed retries every 5 s and tells only the journal
 
-**Status:** Partly fixed. Errors that no retry fixes are not told apart from network errors yet.
+**Status:** Partly fixed. A cold root lookup that needs account keys waits for recovery. Other persistent startup errors still back off and retry.
 **Found:** 2026-10-31, issue #40: the app showed "Connecting… waiting for the Proton Drive
 service" for days, `pdfs diagnose` only reported the control socket missing, and the reporter
 uninstalled.
@@ -1363,7 +1363,7 @@ the error is written nowhere a front end can read it.
 - The app shows "Can't open your Drive" with the error and a Retry button instead of
   "Connecting…". The tray says "Signed in as … — can't open your Drive". `pdfs diagnose` reports
   `[FAIL] mount: failing for …`. `systemctl --user status` shows the error as the unit's status.
-- Not done: key, `KeysLocked` and 4xx errors still retry like network errors, only less often.
+- With no cached root, a locked keychain or a missing decryption key parks the daemon until Retry or a fresh login restarts the service (#40). Other crypto and HTTP errors still use the bounded retry schedule.
 
 **Test:** `a_failing_mount_backs_off_to_a_ceiling` in `pdfs-cli`;
 `a_recorded_failure_reads_back_until_cleared` in `pdfs-core`. On 2026-10-31 a second
