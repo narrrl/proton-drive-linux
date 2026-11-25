@@ -1995,6 +1995,15 @@ pub(crate) fn service_unreachable(
                     offer_not_empty(&ui, found);
                 }
             }
+            Some(failure) if failure.awaiting_keys => status(
+                &ui,
+                "dialog-warning-symbolic",
+                &gettext("Can't open your Drive"),
+                &gettext(
+                    "Your account keys could not open My Files. After recovering your keys, choose Retry.",
+                ),
+                true,
+            ),
             Some(failure) => status(
                 &ui,
                 "dialog-warning-symbolic",
