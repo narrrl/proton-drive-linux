@@ -559,6 +559,31 @@ impl Device<'_> {
         }
     }
 
+    /// Make a folder at `path`.
+    pub(crate) fn mkdir(&self, path: &str) -> NodeUid {
+        let (parent, name) = split_path(path);
+        let parent = self
+            .0
+            .lookup(parent)
+            .expect("device mkdir into a missing folder");
+        let mut server = self.0.server.lock();
+        assert!(server.live_child_named(&parent, name).is_none());
+        let uid = server.mint_uid();
+        let now = now_secs();
+        server.put(
+            &uid,
+            Some(Remote {
+                parent: Some(parent),
+                name: name.to_owned(),
+                trashed: false,
+                created: now,
+                modified: now,
+                file: None,
+            }),
+        );
+        uid
+    }
+
     /// Move the node at `path` to the trash.
     pub(crate) fn trash(&self, path: &str) {
         let uid = self.0.lookup(path).expect("device trash of a missing node");

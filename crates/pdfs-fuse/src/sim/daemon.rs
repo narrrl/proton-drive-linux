@@ -1677,6 +1677,33 @@ mod tests {
             .map_or(0, |c| c.count)
     }
 
+    /// Ask for passes over `folder` until one lists nothing on Drive, and
+    /// return its trace. The passes right after a change list the folders
+    /// it touched once more, for the echo of their own changes.
+    fn quiet_pass(daemon: &Daemon, folder: i64) -> Option<control::SyncPassTrace> {
+        let mut quiet = None;
+        wait_until(Duration::from_secs(90), || {
+            // Spaced out: the engine waits for requests to settle before it
+            // starts a pass.
+            let _ = daemon.request(&Request::SyncNow { id: Some(folder) });
+            std::thread::sleep(Duration::from_secs(4));
+            let Ok(Response::Diagnostics { diagnostics }) = daemon.request(&Request::Diagnostics)
+            else {
+                return false;
+            };
+            quiet = diagnostics.sync.and_then(|sync| {
+                sync.traces.into_iter().find(|t| {
+                    t.folder_id == folder
+                        && t.ended == "finished"
+                        && counted(t, "remote folders") == 0
+                        && counted(t, "reused") > 0
+                })
+            });
+            quiet.is_some()
+        });
+        quiet
+    }
+
     fn counted(trace: &control::SyncPassTrace, name: &str) -> u64 {
         trace
             .counts
@@ -1725,15 +1752,10 @@ mod tests {
             .expect("the pass after the uploads is traced");
         assert_eq!(counted(&filled, "nodes full"), 3, "{filled}");
 
-        // Every pass after that reads every node without a key unlock and
-        // applies nothing.
-        daemon
-            .request(&Request::SyncNow { id: Some(folder) })
-            .unwrap();
-        let quiet = traced_pass(&daemon, folder, |t| {
-            counted(t, "nodes") == 3 && counted(t, "nodes full") == 0
-        })
-        .expect("a quiet pass is traced");
+        // Once nothing changes, a pass lists nothing on Drive: it starts from
+        // the last walk, which Drive's event stream keeps up to date.
+        let quiet = quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        assert_eq!(counted(&quiet, "reused"), 3, "{quiet}");
         assert_eq!(calls(&quiet, "upload"), 0, "{quiet}");
         assert_eq!(counted(&quiet, "queued"), 0, "{quiet}");
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
@@ -1763,6 +1785,9 @@ mod tests {
         }));
         assert!(wait_for_pass(&daemon, folder, 0));
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        // As after a gap in the event stream: the next pass walks all of
+        // Drive again.
+        reopen(&dir).sync_walks_clear_all().unwrap();
 
         // The next start's pass is stopped while it lists the second folder.
         let client = drive.client(1, Faults::lan());
@@ -1781,8 +1806,9 @@ mod tests {
         let saved = reopen(&dir).sync_walk_load(folder).unwrap();
         let saved = saved.expect("the walk was saved");
         // Which folders were listed depends on the order Drive lists them
-        // in; a walk that is still saved is one that did not end.
+        // in; what matters is that the walk did not end.
         assert!(saved.dirs.iter().any(|d| d.rel_path.is_empty() && d.listed));
+        assert!(!saved.complete, "{:?}", saved.dirs);
 
         // The start after that picks the walk up instead of starting over.
         let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
@@ -1793,8 +1819,8 @@ mod tests {
             "listed everything again: {resumed}"
         );
         assert!(wait_for_pass(&daemon, folder, 0));
-        // Nothing moved: the walk read every path, and a complete walk is
-        // not kept for the next pass.
+        // Nothing moved: the walk read every path, and the complete walk is
+        // kept as the next pass's picture of Drive.
         assert_eq!(counted(&resumed, "queued"), 0, "{resumed}");
         for sub in ["a", "b", "c"] {
             assert_eq!(
@@ -1803,7 +1829,60 @@ mod tests {
             );
         }
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
-        assert_eq!(reopen(&dir).sync_walk_load(folder).unwrap(), None);
+        let kept = reopen(&dir).sync_walk_load(folder).unwrap();
+        assert!(kept.is_some_and(|walk| walk.complete));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_pass_lists_only_the_folders_changed_on_drive() {
+        // Every pass listed every folder on Drive to find a few changes, so
+        // its cost grew with the size of the folder, not of the change. On a
+        // folder of 500k files that was hours per pass (#53). Now a pass
+        // starts from the last walk and lists only the folders Drive's event
+        // stream reported a change in.
+        let drive = FakeDrive::new();
+        let dir = scratch("mirror-dirty-folders");
+        let local = dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        for sub in ["a", "b", "c"] {
+            std::fs::create_dir(local.join(sub)).unwrap();
+            std::fs::write(local.join(sub).join("f.txt"), sub.as_bytes()).unwrap();
+        }
+        let (daemon, folder, client) = start_mirror(&drive, &dir, &[]);
+        assert!(wait_until(Duration::from_secs(30), || {
+            ["a", "b", "c"]
+                .iter()
+                .all(|sub| drive.lookup(&format!("mirrored/{sub}/f.txt")).is_some())
+        }));
+        quiet_pass(&daemon, folder).expect("the folder settles");
+        // A listing of the folder nothing changes in would wait here.
+        let untouched = client.hold_next_children_of(&drive.lookup("mirrored/a").unwrap());
+
+        // Another computer edits a file, adds a folder with a folder in it,
+        // and deletes a folder.
+        drive
+            .device()
+            .write("mirrored/b/f.txt", b"edited elsewhere");
+        drive.device().mkdir("mirrored/new");
+        drive.device().mkdir("mirrored/new/deep");
+        drive.device().write("mirrored/new/deep/g.txt", b"new");
+        drive.device().trash("mirrored/c");
+        assert!(wait_until(Duration::from_secs(60), || {
+            std::fs::read(local.join("b/f.txt")).is_ok_and(|b| b == b"edited elsewhere")
+                && std::fs::read(local.join("new/deep/g.txt")).is_ok_and(|b| b == b"new")
+                && !local.join("c").exists()
+        }));
+        assert_eq!(std::fs::read(local.join("a/f.txt")).unwrap(), b"a");
+
+        // The passes that brought them listed the changed folders, and the
+        // new ones whole, but not the folder nothing changed in.
+        let quiet = quiet_pass(&daemon, folder).expect("the folder settles again");
+        assert!(counted(&quiet, "reused") > 0, "{quiet}");
+        assert!(!untouched.reached(), "listed a folder nothing changed in");
+        drop(untouched);
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

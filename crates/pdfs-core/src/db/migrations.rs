@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 48;
+pub(super) const SCHEMA_VERSION: i64 = 49;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -521,6 +521,26 @@ impl Db {
             )?;
             if has_sync {
                 tx.execute_batch(MIGRATION_V48)?;
+            }
+        }
+        if current < 49 {
+            let has_walk: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_walk'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )?;
+            if has_walk {
+                // A database stamped with an older version over a newer
+                // schema, as the migration tests build, has the columns.
+                let has_columns: bool = tx.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('sync_walk') WHERE name = 'complete'",
+                    [],
+                    |row| row.get::<_, i64>(0).map(|n| n > 0),
+                )?;
+                if !has_columns {
+                    tx.execute_batch(MIGRATION_V49_COLUMNS)?;
+                }
+                tx.execute_batch(MIGRATION_V49)?;
             }
         }
         tx.execute(
@@ -1501,6 +1521,132 @@ CREATE TABLE IF NOT EXISTS photo_tombstones(uid TEXT PRIMARY KEY);
 const MIGRATION_V46_ALBUM_PHOTOS: &str = "
 ALTER TABLE album_photos ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0;
 UPDATE album_photos SET resolved=1 WHERE name IS NOT NULL;
+";
+
+/// Schema 49: a complete walk of Drive stays, as the picture of Drive the
+/// next pass starts from, and only the folders marked dirty since are listed
+/// again (`docs/SYNC_ENGINE.md`).
+///
+/// - `sync_walk.complete`: the walk reached every folder once.
+/// - `sync_walk.seq`: the last dirty mark made when the walk began. Marks up
+///   to it are read by the walk itself, and dropped when it completes.
+/// - `sync_remote_dirty`: the folders to list again. The event stream marks
+///   the folders Drive reports a change in. The triggers below mark the folder
+///   of every baseline row a pass writes, so a pass never relies on the echo
+///   of its own change arriving in time.
+///
+/// While a walk is not complete, a baseline change still drops it, as in
+/// schema 48.
+///
+/// A mark made again takes a new `seq`, so a pass that read the old one does
+/// not drop it. The triggers delete and insert rather than `INSERT OR
+/// REPLACE`: an upsert on `sync_entry` would override that conflict clause
+/// and fail on the second mark of a folder.
+const MIGRATION_V49_COLUMNS: &str = "
+ALTER TABLE sync_walk ADD COLUMN complete INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sync_walk ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+";
+
+/// See [`MIGRATION_V49_COLUMNS`].
+const MIGRATION_V49: &str = "
+CREATE TABLE IF NOT EXISTS sync_remote_dirty (
+  seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+  folder_id INTEGER NOT NULL,
+  dir       TEXT NOT NULL,
+  UNIQUE (folder_id, dir)
+);
+CREATE INDEX IF NOT EXISTS sync_walk_item_uid ON sync_walk_item(uid);
+DROP TRIGGER IF EXISTS sync_walk_drop_on_entry_insert;
+DROP TRIGGER IF EXISTS sync_walk_drop_on_entry_update;
+DROP TRIGGER IF EXISTS sync_walk_drop_on_entry_delete;
+DROP TRIGGER IF EXISTS sync_walk_drop_on_folder_update;
+DROP TRIGGER IF EXISTS sync_walk_drop_on_folder_delete;
+DROP TRIGGER IF EXISTS sync_walk_mark_on_entry_insert;
+DROP TRIGGER IF EXISTS sync_walk_mark_on_entry_update;
+DROP TRIGGER IF EXISTS sync_walk_mark_on_entry_delete;
+CREATE TRIGGER sync_walk_drop_on_entry_insert
+AFTER INSERT ON sync_entry
+WHEN EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = NEW.folder_id AND complete = 0)
+BEGIN
+  DELETE FROM sync_walk WHERE folder_id = NEW.folder_id;
+  DELETE FROM sync_walk_dir WHERE folder_id = NEW.folder_id;
+  DELETE FROM sync_walk_item WHERE folder_id = NEW.folder_id;
+END;
+CREATE TRIGGER sync_walk_drop_on_entry_update
+AFTER UPDATE OF folder_id, rel_path, remote_uid, local_mtime, local_mtime_ns, local_size,
+  remote_hash, remote_rev
+ON sync_entry
+WHEN EXISTS (SELECT 1 FROM sync_walk
+             WHERE folder_id IN (OLD.folder_id, NEW.folder_id) AND complete = 0)
+BEGIN
+  DELETE FROM sync_walk_dir WHERE folder_id IN (
+    SELECT folder_id FROM sync_walk
+    WHERE folder_id IN (OLD.folder_id, NEW.folder_id) AND complete = 0);
+  DELETE FROM sync_walk_item WHERE folder_id IN (
+    SELECT folder_id FROM sync_walk
+    WHERE folder_id IN (OLD.folder_id, NEW.folder_id) AND complete = 0);
+  DELETE FROM sync_walk WHERE folder_id IN (OLD.folder_id, NEW.folder_id) AND complete = 0;
+END;
+CREATE TRIGGER sync_walk_drop_on_entry_delete
+AFTER DELETE ON sync_entry
+WHEN EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = OLD.folder_id AND complete = 0)
+BEGIN
+  DELETE FROM sync_walk WHERE folder_id = OLD.folder_id;
+  DELETE FROM sync_walk_dir WHERE folder_id = OLD.folder_id;
+  DELETE FROM sync_walk_item WHERE folder_id = OLD.folder_id;
+END;
+CREATE TRIGGER sync_walk_mark_on_entry_insert
+AFTER INSERT ON sync_entry
+WHEN EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = NEW.folder_id AND complete = 1)
+BEGIN
+  DELETE FROM sync_remote_dirty
+  WHERE folder_id = NEW.folder_id AND dir = rtrim(rtrim(NEW.rel_path, replace(NEW.rel_path, '/', '')), '/');
+  INSERT INTO sync_remote_dirty (folder_id, dir)
+  SELECT NEW.folder_id, rtrim(rtrim(NEW.rel_path, replace(NEW.rel_path, '/', '')), '/');
+END;
+CREATE TRIGGER sync_walk_mark_on_entry_update
+AFTER UPDATE OF folder_id, rel_path, remote_uid, local_mtime, local_mtime_ns, local_size,
+  remote_hash, remote_rev
+ON sync_entry
+BEGIN
+  DELETE FROM sync_remote_dirty
+  WHERE folder_id = OLD.folder_id AND dir = rtrim(rtrim(OLD.rel_path, replace(OLD.rel_path, '/', '')), '/')
+    AND EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = OLD.folder_id AND complete = 1);
+  INSERT INTO sync_remote_dirty (folder_id, dir)
+  SELECT OLD.folder_id, rtrim(rtrim(OLD.rel_path, replace(OLD.rel_path, '/', '')), '/')
+  WHERE EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = OLD.folder_id AND complete = 1);
+  DELETE FROM sync_remote_dirty
+  WHERE folder_id = NEW.folder_id AND dir = rtrim(rtrim(NEW.rel_path, replace(NEW.rel_path, '/', '')), '/')
+    AND EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = NEW.folder_id AND complete = 1);
+  INSERT INTO sync_remote_dirty (folder_id, dir)
+  SELECT NEW.folder_id, rtrim(rtrim(NEW.rel_path, replace(NEW.rel_path, '/', '')), '/')
+  WHERE EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = NEW.folder_id AND complete = 1);
+END;
+CREATE TRIGGER sync_walk_mark_on_entry_delete
+AFTER DELETE ON sync_entry
+WHEN EXISTS (SELECT 1 FROM sync_walk WHERE folder_id = OLD.folder_id AND complete = 1)
+BEGIN
+  DELETE FROM sync_remote_dirty
+  WHERE folder_id = OLD.folder_id AND dir = rtrim(rtrim(OLD.rel_path, replace(OLD.rel_path, '/', '')), '/');
+  INSERT INTO sync_remote_dirty (folder_id, dir)
+  SELECT OLD.folder_id, rtrim(rtrim(OLD.rel_path, replace(OLD.rel_path, '/', '')), '/');
+END;
+CREATE TRIGGER sync_walk_drop_on_folder_update
+AFTER UPDATE OF local_path, remote_uid, mode ON sync_folder
+BEGIN
+  DELETE FROM sync_walk WHERE folder_id = OLD.id;
+  DELETE FROM sync_walk_dir WHERE folder_id = OLD.id;
+  DELETE FROM sync_walk_item WHERE folder_id = OLD.id;
+  DELETE FROM sync_remote_dirty WHERE folder_id = OLD.id;
+END;
+CREATE TRIGGER sync_walk_drop_on_folder_delete
+AFTER DELETE ON sync_folder
+BEGIN
+  DELETE FROM sync_walk WHERE folder_id = OLD.id;
+  DELETE FROM sync_walk_dir WHERE folder_id = OLD.id;
+  DELETE FROM sync_walk_item WHERE folder_id = OLD.id;
+  DELETE FROM sync_remote_dirty WHERE folder_id = OLD.id;
+END;
 ";
 
 /// The saved progress of a mirror pass's walk of Drive, so a pass cut short

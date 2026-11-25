@@ -510,6 +510,7 @@ pub(crate) fn mount_with(
         online: Arc::new(AtomicBool::new(online)),
         link: Arc::new(link::Link::starting(start == Start::SessionExpired)),
         sync_paused_until: Arc::new(AtomicI64::new(paused_until)),
+        events_read_at: Arc::new(AtomicI64::new(0)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),
         creating: Arc::new(Mutex::new(HashMap::new())),

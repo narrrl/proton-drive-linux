@@ -132,6 +132,29 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
             });
         })
     };
+    // A mirror pass starts from its last walk of Drive and lists again only
+    // the folders marked here, so a mark that cannot be made keeps the
+    // event to be applied again.
+    let marked = match event {
+        DriveEvent::NodeUpdated {
+            node_uid,
+            parent_node_uid,
+            ..
+        } => core.db.sync_remote_changed(
+            &node_uid.to_string(),
+            parent_node_uid.as_ref().map(ToString::to_string).as_deref(),
+        ),
+        DriveEvent::NodeDeleted { node_uid, .. } => {
+            core.db.sync_remote_changed(&node_uid.to_string(), None)
+        }
+        // What changed went by unseen: every pass walks Drive whole again.
+        DriveEvent::ContinuityLost { .. } => core.db.sync_walks_clear_all().map(|()| Vec::new()),
+        _ => Ok(Vec::new()),
+    };
+    match marked {
+        Ok(folders) => dirty.synced.extend(folders),
+        Err(e) => apply_result = apply_result.and(Err(e)),
+    }
     match event {
         DriveEvent::NodeUpdated {
             node_uid,
@@ -315,6 +338,10 @@ struct DirtyParents {
     /// Pinned files and folders the batch changed, for the pin keeper to
     /// check once the listings above are dropped (`keeper`).
     kept: HashSet<NodeUid>,
+    /// Mirror folders the batch changed on Drive. The batch marked the
+    /// folders it touched dirty in their saved walk of Drive, and each gets a
+    /// pass, which lists those folders again (`docs/SYNC_ENGINE.md`).
+    synced: HashSet<i64>,
 }
 
 /// What the pin keeper has to check after a remote change to `node_uid`,
@@ -423,6 +450,14 @@ pub(super) async fn run_event_sync(
                 match client.enumerate_events(&scope, None).await {
                     Ok(events) => {
                         let head = events.last().map(|e| e.id().clone());
+                        // No walk of Drive saved before can say what
+                        // changed before this cursor either.
+                        if let Err(e) = db.sync_walks_clear_all() {
+                            warn!(error = %e, ?delay, "dropping the saved walks of Drive failed; retrying");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(ONLINE_PROBE_MAX);
+                            continue;
+                        }
                         let Some(c) = &head else {
                             break None;
                         };
@@ -467,6 +502,7 @@ pub(super) async fn run_event_sync(
             }
         };
         if events.is_empty() {
+            core.events_read_at.store(now_secs(), Ordering::Relaxed);
             continue;
         }
         debug!(count = events.len(), "applying remote events");
@@ -475,6 +511,7 @@ pub(super) async fn run_event_sync(
         // through to that flush, so an interrupted batch still publishes what it
         // did apply.
         let mut dirty = DirtyParents::default();
+        let mut whole = true;
         for event in &events {
             if recent.repeat(event) {
                 debug!(id = %event.id().as_str(), "skipping an event already applied");
@@ -488,6 +525,7 @@ pub(super) async fn run_event_sync(
             // our FUSE state, so nothing else does this.
             if let Err(e) = client.invalidate_caches_for_event(event).await {
                 warn!(error = %e, "sdk cache invalidation for event failed; retaining cursor for retry");
+                whole = false;
                 break;
             }
             let applied = match acknowledge_applied_event(
@@ -498,6 +536,7 @@ pub(super) async fn run_event_sync(
                 Ok(applied) => applied,
                 Err(e) => {
                     warn!(error = %e, "event application or acknowledgment failed; retaining prior cursor for retry");
+                    whole = false;
                     break;
                 }
             };
@@ -509,6 +548,12 @@ pub(super) async fn run_event_sync(
         flush_dirty_parents(&core, &dirty);
         for uid in &dirty.kept {
             core.recheck_pinned(uid);
+        }
+        for &id in &dirty.synced {
+            let _ = core.sync_tx.send(crate::sync::SyncMsg::Reconcile(id));
+        }
+        if whole {
+            core.events_read_at.store(now_secs(), Ordering::Relaxed);
         }
         // Another device changed the tree: whatever a front-end lists may have
         // moved, including what is shared and what is in the trash.

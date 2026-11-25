@@ -1,6 +1,7 @@
 # Sync engine redesign (draft)
 
-Status: proposal. Phase 1 (a resumable walk of Drive) is implemented; the rest is for review.
+Status: proposal. Two parts are built: a resumable walk of Drive, and the remote dirty set (a
+pass lists only the folders that changed on Drive). The rest is for review.
 
 ## Why
 
@@ -140,27 +141,73 @@ What is built:
 - **Resuming:** a pass resumes a saved walk when its root is the same and it is less than
   24 hours old. Otherwise it starts over.
 - **Invariant:** a saved listing is never used against a baseline newer than itself.
-  - SQLite triggers drop a folder's saved walk when any of its baseline rows is inserted,
-    deleted or changed (filling in a revision id is the only exception), and when the
-    folder's path, root or mode changes, or the folder is removed.
-  - The pass drops the walk itself once it is complete, before it applies anything. If that
-    fails, the pass fails.
+  - While a walk is not complete, SQLite triggers drop it when any of the folder's baseline
+    rows is inserted, deleted or changed (filling in a revision id is the only exception).
+  - Any walk is dropped when the folder's path, root or mode changes, or the folder is removed.
   - The push pass drops it as well.
   - Without this, a move to another synced folder (`relocate.rs`) would leave a listing that
     reads the moved file as deleted on Drive.
+  - A complete walk is kept, and a baseline change marks a folder dirty instead (below).
 - **Tests:** `a_saved_walk_resumes_where_it_stopped` and
   `a_baseline_change_drops_the_saved_walk` (DB), and
   `a_walk_of_drive_cut_short_resumes_where_it_stopped` (sim).
+
+## Remote dirty set as built
+
+The remote half of Steady, built before the scheduler because the remote walk is the cost
+that grows into hours: it is network-bound, while the local walk only reads the disk.
+
+- **Picture of Drive:** a complete walk stays in `sync_walk`, `sync_walk_dir` and
+  `sync_walk_item` (schema 49 adds `sync_walk.complete`). It is the remote tree as of the
+  last listing of each folder.
+- **Dirty folders:** `sync_remote_dirty(seq, folder_id, dir)`, one row per folder, with a
+  sequence number from `AUTOINCREMENT`.
+  - The event loop (`background.rs`) calls `Db::sync_remote_changed` for each
+    `NodeUpdated`/`NodeDeleted`. It marks the folder the node is in now (`parent_node_uid`)
+    and the folder a saved walk last saw it in, found by `sync_walk_item.uid`. A move names
+    only its new parent, so the old one comes from the walk.
+  - A node whose parent no walk knows cannot be mapped, and needs no mark: it is inside a
+    folder new on Drive, and the listing of that folder's parent finds the new folder and
+    lists it whole.
+  - Triggers on `sync_entry` mark the folder of every baseline row written while a complete
+    walk exists. A pass therefore never relies on the echo of its own upload arriving in
+    time: without the mark, a pass that started before the echo would read a file it just
+    uploaded as missing on Drive.
+  - The event loop sends `SyncMsg::Reconcile` for each folder it marked, so a change made on
+    another device syncs within a poll of the event stream (10 s), not at the next 120 s poll.
+- **A pass** (`start_walk`) loads the picture, then lists again each dirty folder, shallowest
+  first. What a folder no longer holds is dropped with everything under it. A folder still
+  there under the same uid keeps what was saved under it; a new or replaced folder is listed
+  whole. The pass then drops the marks it read (up to the highest `seq`); marks made meanwhile
+  stay. A folder whose listing failed or came back short is marked again.
+- **When the picture is not used** (the pass walks all of Drive, resumably, and keeps the
+  result):
+  - the folder's root is not in the account's own volume, which is the only volume whose
+    events the daemon reads;
+  - the event stream has not been read in the last 30 s (right after a start, a pass waits
+    up to 30 s for the first read);
+  - the last full walk is more than 24 h old (the audit);
+  - the stream reported `ContinuityLost`, or the daemon started without a cursor: both drop
+    every saved walk.
+- **Tests:** `a_complete_walk_stays_and_marks_where_the_baseline_changed`,
+  `a_change_on_drive_marks_the_folders_it_touches`,
+  `a_listing_done_again_drops_what_the_folder_no_longer_holds` (DB), and
+  `a_pass_lists_only_the_folders_changed_on_drive` (sim: an edit, a new folder with a folder
+  in it, and a deletion arrive, and a folder nothing changed in is never listed).
+
+What a quiet pass still costs: loading the baseline and the picture from the database, and the
+local walk. The local dirty set removes the local walk.
 
 ## Plan of work (separate PRs)
 
 1. **Frontier checkpoint.**
    - Done: a resumable walk of Drive, described above.
-   - Left: a resumable local walk; per-subtree apply, once a round-level guard exists.
-2. **Step scheduler.** Replace `run_burst` and the per-pass lock with steps and priorities.
+   - Left: per-subtree apply, once a round-level guard exists. A resumable local walk matters
+     less now that the local walk is the only full walk left, and is cheap next to Drive.
+2. **Remote dirty set.** Done, described above.
 3. **Local dirty set.** `SyncMsg::Dirty`, the `sync_dirty` table, overflow leading to FullCheck.
-4. **Remote dirty set.** Event-to-path mapping, `ContinuityLost` leading to FullCheck.
-5. **Drop the 120 s poll** for the daily audit, once 3 and 4 have run for a release with the
+4. **Step scheduler.** Replace `run_burst` and the per-pass lock with steps and priorities.
+5. **Drop the 120 s poll** for the daily audit, once 2 and 3 have run for a release with the
    poll still on, and traces show the dirty sets catch everything the poll finds.
 
 ## Testing
