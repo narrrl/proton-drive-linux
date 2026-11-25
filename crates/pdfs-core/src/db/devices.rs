@@ -15,7 +15,7 @@ pub struct StoredDevice {
 
 impl Db {
     pub fn device_get(&self) -> Result<Option<StoredDevice>> {
-        let conn = self.read();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT uid, share_id, root_uid, name, created FROM device LIMIT 1",
             [],

@@ -74,7 +74,7 @@ impl Db {
 
     /// Every local location, with synced-folder fields joined from `sync_folder`.
     pub fn mount_list(&self) -> Result<Vec<MountSpec>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT
                  m.id,

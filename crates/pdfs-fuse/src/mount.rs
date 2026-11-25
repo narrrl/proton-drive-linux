@@ -554,6 +554,7 @@ pub(crate) fn mount_with(
         indexing: Arc::new(AtomicBool::new(false)),
         sync_progress: Arc::new(Mutex::new(HashMap::new())),
         sync_engine: Arc::default(),
+        pending_probe: Arc::default(),
         sync_tx,
         mounts: Arc::new(Mutex::new(SecondaryMountRegistry::default())),
         sync_locks: Arc::new(Mutex::new(HashMap::new())),

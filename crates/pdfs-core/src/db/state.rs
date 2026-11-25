@@ -8,7 +8,7 @@ use crate::Result;
 
 impl Db {
     pub fn get_event_cursor(&self) -> Result<Option<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let v = conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = 'event_cursor'",
@@ -32,7 +32,7 @@ impl Db {
 
     /// Read a `sync_state` value as a string.
     pub fn state_str(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let v = conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = ?1",
@@ -66,7 +66,7 @@ impl Db {
     /// dropping it would leave a file that exists nowhere but this machine with
     /// nothing left to create it. (Writes to a node that is itself still queued
     pub fn state_i64(&self, key: &str) -> Result<Option<i64>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let v: Option<String> = conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = ?1",

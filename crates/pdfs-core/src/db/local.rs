@@ -152,7 +152,7 @@ impl Db {
     pub fn compact_search_indexes_if_due(&self, now: i64) -> Result<()> {
         const EVERY_SECS: i64 = 24 * 60 * 60;
         let last: i64 = self
-            .read()
+            .read()?
             .query_row(
                 "SELECT value FROM sync_state WHERE key = 'fts_compacted_at'",
                 [],
@@ -189,7 +189,7 @@ impl Db {
     /// has never been built. The daemon uses this to decide whether a fresh mount
     /// needs an immediate rescan or can serve the existing index.
     pub fn local_indexed_at(&self) -> Result<Option<i64>> {
-        let conn = self.read();
+        let conn = self.read()?;
         Ok(conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = 'local_indexed_at'",
@@ -209,7 +209,7 @@ impl Db {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt;
         let rows = if query.chars().count() < TRIGRAM_MIN {
             let pat = format!("%{}%", like_escape(query));
@@ -248,7 +248,7 @@ impl Db {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.read();
+        let conn = self.read()?;
         let terms = candidate_trigrams(query);
         let lane_limit = limit.div_ceil(2);
         let mut rows: Vec<LocalFileHit> = if terms.is_empty() {
