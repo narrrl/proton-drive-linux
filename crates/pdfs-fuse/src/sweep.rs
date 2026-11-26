@@ -30,6 +30,10 @@ use pdfs_core::control::ActivityKind;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{debug, info, warn};
 
+use pdfs_core::shutdown::Shutdown;
+use pdfs_drive::DriveApi;
+use pdfs_store::db::Db;
+
 use super::{Core, node_content_sha1, node_revision_id, node_size};
 
 /// What the conflict sweep may do, and the copies it already checked this
@@ -44,7 +48,7 @@ pub(crate) struct SweepState {
     /// Conflict copies the sweep has already checked against the activity log
     /// this run, so each pass does not ask the database again. The log itself
     /// is what keeps a copy from being flagged again after a restart. See
-    /// [`Core::run_conflict_sweep_loop`] and `docs/BUGS.md` B99.
+    /// [`Sweeper::run`] and `docs/BUGS.md` B99.
     pub(crate) conflict_notified: Arc<Mutex<HashSet<NodeUid>>>,
 }
 
@@ -107,17 +111,114 @@ pub(crate) fn conflict_base_name(name: &str) -> Option<String> {
     Some(base)
 }
 
+/// What the conflict sweep needs from the rest of the daemon: the tree of
+/// every mount and the activity feed.
+pub(crate) trait SweepHost: Send + Sync {
+    /// Whether `uid` is on this account's own volume, or a virtual node.
+    fn is_own_or_virtual(&self, uid: &NodeUid) -> bool;
+    /// Whether the mount believes Drive is reachable.
+    fn is_online(&self) -> bool;
+    /// Whether a node is being written or held open in any mount.
+    fn is_busy(&self, uid: &NodeUid) -> bool;
+    /// For one pass: whether the conflict listing can show a copy.
+    fn conflict_locator(&self) -> Box<dyn Fn(&NodeUid) -> bool + '_>;
+    /// Unhook a node Drive no longer has from every mount, and drop its
+    /// cached content and open readers.
+    fn forget(&self, uid: &NodeUid);
+    fn log_activity(&self, kind: ActivityKind, target: &str, detail: String, ok: bool);
+}
+
+impl SweepHost for Core {
+    fn is_own_or_virtual(&self, uid: &NodeUid) -> bool {
+        Core::is_own_or_virtual(self, uid)
+    }
+
+    fn is_online(&self) -> bool {
+        Core::is_online(self)
+    }
+
+    fn is_busy(&self, uid: &NodeUid) -> bool {
+        Core::is_busy(self, uid)
+    }
+
+    fn conflict_locator(&self) -> Box<dyn Fn(&NodeUid) -> bool + '_> {
+        let roots = Core::search_roots(self);
+        Box::new(move |uid| self.conflict_path(&roots, uid).is_some())
+    }
+
+    fn forget(&self, uid: &NodeUid) {
+        // Leaving a conflict copy hooked up in the tree keeps a node we have
+        // just trashed remotely visible and readable in whichever mount shows
+        // it (`docs/BUGS.md` B74).
+        self.for_each_state(|st| {
+            st.forget_or_unlink(uid);
+        });
+        self.cache.evict(uid);
+        self.evict_reader(uid);
+    }
+
+    fn log_activity(&self, kind: ActivityKind, target: &str, detail: String, ok: bool) {
+        Core::log_activity(self, kind, target, detail, ok);
+    }
+}
+
 impl Core {
+    /// The conflict sweep, with this daemon as its host.
+    pub(crate) fn sweeper(&self) -> Sweeper {
+        Sweeper {
+            drive: self.drive.clone(),
+            rt: self.rt.clone(),
+            db: self.db.clone(),
+            shutdown: self.shutdown.clone(),
+            state: self.sweep.clone(),
+            host: Arc::new(self.clone()),
+        }
+    }
+
+    /// Whether a node has a write in flight or a file handle open against it.
+    /// Read-only opens use fh 0 and are not tracked, so this is specifically the
+    /// writer/holder check.
+    /// Asked across **every** mount. The sweep runs on the primary Core but
+    /// trashes nodes anywhere in the tree, and a file open inside a sync folder
+    /// is tracked in that fork's `State` — so consulting `self.state` alone
+    /// answered "idle" for every such file and let the sweep delete one with a
+    /// writer attached (`docs/BUGS.md` B74). Busy anywhere means busy.
+    pub(crate) fn is_busy(&self, uid: &NodeUid) -> bool {
+        let mut busy = false;
+        self.for_each_state(|st| {
+            let Some(&ino) = st.by_uid.get(uid) else {
+                return;
+            };
+            busy |=
+                st.active_writes.contains_key(&ino) || st.handles.values().any(|&held| held == ino);
+        });
+        busy
+    }
+}
+
+/// Reconciles leftover conflict copies (the module documentation says how).
+/// Holds Drive, the runtime, the database, the stop signal and its own state;
+/// it reaches the mounts through [`SweepHost`].
+pub(crate) struct Sweeper {
+    drive: Arc<dyn DriveApi>,
+    rt: tokio::runtime::Handle,
+    db: Arc<Db>,
+    shutdown: Arc<Shutdown>,
+    state: SweepState,
+    host: Arc<dyn SweepHost>,
+}
+
+impl Sweeper {
     /// Sweep for stale conflict copies forever, on its own thread. See the module
     /// docs for the identical/divergent policy.
-    pub(crate) fn run_conflict_sweep_loop(&self) {
+    pub(crate) fn run(&self) {
         // Both waits are interruptible, so teardown does not have to sit out a
         // five-minute interval to join this thread (`docs/BUGS.md` B44).
         if !self.shutdown.sleep(CONFLICT_SWEEP_WARMUP) {
             return;
         }
         loop {
-            self.sweep_conflicts_once();
+            self.sweep_once();
             if !self.shutdown.sleep(CONFLICT_SWEEP_INTERVAL) {
                 return;
             }
@@ -125,7 +226,7 @@ impl Core {
     }
 
     /// One sweep pass over every node the daemon currently knows.
-    fn sweep_conflicts_once(&self) {
+    fn sweep_once(&self) {
         let stored = match self.db.load_all() {
             Ok(s) => s,
             Err(e) => {
@@ -136,7 +237,7 @@ impl Core {
         let nodes: Vec<_> = stored
             .into_iter()
             .map(|stored| stored.node)
-            .filter(|node| self.is_own_or_virtual(&node.uid))
+            .filter(|node| self.host.is_own_or_virtual(&node.uid))
             .collect();
 
         // Index live (non-trashed) files by (parent, name) for sibling lookup.
@@ -153,8 +254,8 @@ impl Core {
             by_parent_name.insert((parent, node.name.as_str()), node);
         }
 
-        let roots = self.search_roots();
-        let online = self.is_online();
+        let listed = self.host.conflict_locator();
+        let online = self.host.is_online();
         for node in &nodes {
             if node.trashed || node.is_folder() {
                 continue;
@@ -169,7 +270,7 @@ impl Core {
                 .unwrap_or_default();
             let sibling = by_parent_name.get(&(parent, base.as_str())).copied();
 
-            match decide(node, sibling, &base, self.sweep.sweep_mode) {
+            match decide(node, sibling, &base, self.state.sweep_mode) {
                 SweepAction::Remove => {
                     // Only while online — the remote trash is the point. Offline,
                     // it waits for a later pass.
@@ -181,7 +282,7 @@ impl Core {
                 // would sit in the feed as "resolved" with no way to act on
                 // it (`docs/BUGS.md` B99).
                 SweepAction::Flag(detail) => {
-                    if self.conflict_path(&roots, &node.uid).is_some() {
+                    if listed(&node.uid) {
                         self.flag_conflict(&node.uid, &node.name, detail);
                     } else {
                         debug!(uid = %node.uid, name = %node.name, "conflict sweep: copy is outside every location; not flagged");
@@ -219,12 +320,7 @@ impl Core {
                 return;
             }
         }
-        // Leaving a conflict copy hooked up in the tree keeps a node we have
-        // just trashed remotely visible and readable in whichever mount shows
-        // it (`docs/BUGS.md` B74).
-        self.for_each_state(|st| {
-            st.forget_or_unlink(uid);
-        });
+        self.host.forget(uid);
         // Deliberately *not* `discard_queued_ops`: `duplicate_still_removable`
         // proved the queue empty before the trash above, but that proof is stale
         // the moment `trash_nodes` goes to the network. A `close(2)` landing in
@@ -232,14 +328,12 @@ impl Core {
         // blob holding the only copy of them. Leaving the op queued is the
         // non-destructive outcome: the drain re-reads the node, sees it trashed,
         // and `revision_conflict` routes it to `keep_as_conflict_copy`.
-        self.cache.evict(uid);
-        self.evict_reader(uid);
         if let Err(e) = self.db.delete_node(uid) {
             warn!(%uid, error = ?e, "conflict sweep: db delete after trash failed");
         }
-        self.invalidate_trash();
-        self.sweep.conflict_notified.lock().remove(uid);
-        self.log_activity(
+        super::trash::invalidate_trash(&self.db);
+        self.state.conflict_notified.lock().remove(uid);
+        self.host.log_activity(
             ActivityKind::Trash,
             name,
             format!("auto-removed duplicate of {base}"),
@@ -273,7 +367,7 @@ impl Core {
 
         // Someone is writing to it, or holds it open. Trashing now would pull the
         // node out from under a live handle.
-        if self.is_busy(uid) {
+        if self.host.is_busy(uid) {
             debug!(%uid, name, "conflict sweep: skipping duplicate that is open or being written");
             return false;
         }
@@ -306,32 +400,12 @@ impl Core {
         }
     }
 
-    /// Whether a node has a write in flight or a file handle open against it.
-    /// Read-only opens use fh 0 and are not tracked, so this is specifically the
-    /// writer/holder check.
-    /// Asked across **every** mount. The sweep runs on the primary Core but
-    /// trashes nodes anywhere in the tree, and a file open inside a sync folder
-    /// is tracked in that fork's `State` — so consulting `self.state` alone
-    /// answered "idle" for every such file and let the sweep delete one with a
-    /// writer attached (`docs/BUGS.md` B74). Busy anywhere means busy.
-    pub(crate) fn is_busy(&self, uid: &NodeUid) -> bool {
-        let mut busy = false;
-        self.for_each_state(|st| {
-            let Some(&ino) = st.by_uid.get(uid) else {
-                return;
-            };
-            busy |=
-                st.active_writes.contains_key(&ino) || st.handles.values().any(|&held| held == ino);
-        });
-        busy
-    }
-
     /// Surface a conflict copy that needs the user's attention, once. The
     /// in-memory set spares the database each pass; the activity log itself is
     /// what keeps a restart from logging the same copy again (`docs/BUGS.md`
     /// B99). A copy's name carries its own timestamp, so the name identifies it.
     fn flag_conflict(&self, uid: &NodeUid, name: &str, detail: String) {
-        if !self.sweep.conflict_notified.lock().insert(uid.clone()) {
+        if !self.state.conflict_notified.lock().insert(uid.clone()) {
             return;
         }
         match self.db.activity_has(ActivityKind::Conflict, name) {
@@ -342,7 +416,8 @@ impl Core {
             Err(e) => warn!(%uid, name, error = ?e, "conflict sweep: activity check failed"),
         }
         debug!(%uid, name, detail, "conflict sweep: flagged divergent conflict copy");
-        self.log_activity(ActivityKind::Conflict, name, detail, false);
+        self.host
+            .log_activity(ActivityKind::Conflict, name, detail, false);
     }
 }
 

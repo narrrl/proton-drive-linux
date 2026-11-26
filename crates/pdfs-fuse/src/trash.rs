@@ -685,6 +685,6 @@ pub(super) fn expand_restore(
 
 /// Mark the stored trash listing stale, so the next listing waits for a
 /// fresh one.
-fn invalidate_trash(db: &Db) {
+pub(crate) fn invalidate_trash(db: &Db) {
     let _ = db.clear_state(TRASH_SYNCED_MS);
 }

@@ -610,7 +610,7 @@ pub(crate) fn mount_with(
         info!("conflict sweep disabled by configuration");
     } else {
         info!(mode = ?sweep_mode, "conflict sweep enabled");
-        list.push(Box::new(services::ConflictSweep(core.clone())));
+        list.push(Box::new(services::ConflictSweep(core.sweeper())));
     }
     list.push(Box::new(services::OnlineProbe(core.clone())));
     list.push(Box::new(services::PinKeeper(core.clone())));

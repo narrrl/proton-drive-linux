@@ -80,7 +80,7 @@ impl Service for SyncEngine {
 /// Reconciles leftover `(sync-conflict …)` copies: drops the ones that turned
 /// out identical to the live file and surfaces the ones that differ. It
 /// enumerates and trashes, so it must never block a FUSE call.
-pub(crate) struct ConflictSweep(pub(crate) Core);
+pub(crate) struct ConflictSweep(pub(crate) super::sweep::Sweeper);
 
 impl Service for ConflictSweep {
     fn name(&self) -> String {
@@ -88,7 +88,7 @@ impl Service for ConflictSweep {
     }
 
     fn run(self: Box<Self>) {
-        self.0.run_conflict_sweep_loop();
+        self.0.run();
     }
 }
 
