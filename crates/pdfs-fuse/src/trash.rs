@@ -2,6 +2,7 @@
 //! listing in the background, restoring from it, deleting from it for good.
 
 use super::*;
+use crate::listing::listing_stale;
 
 /// Whether a trash refresh is running, and the wake-up for requests waiting
 /// on its progress.
@@ -13,7 +14,7 @@ pub(crate) struct TrashState {
     /// Fires whenever a trash refresh persists a batch or finishes, so a
     /// `ListTrash` request waiting on a first-ever refresh wakes on progress
     /// instead of polling or blocking for the whole run. See
-    /// [`Core::await_trash_refresh`].
+    /// [`Trash::await_trash_refresh`].
     pub(crate) trash_progress: Arc<tokio::sync::Notify>,
 }
 
@@ -26,7 +27,75 @@ impl TrashState {
     }
 }
 
+/// The Drive trash as a service: listing it, refreshing that listing, and
+/// restoring or deleting from it.
+///
+/// It holds only the handles it calls, and reaches the mounted trees through
+/// [`TrashHost`]. [`Core::trash`] builds one on demand with the daemon as its
+/// host. A clone shares everything, which is how a refresh moves onto a
+/// background task.
+#[derive(Clone)]
+pub(crate) struct Trash {
+    drive: Arc<dyn DriveApi>,
+    rt: tokio::runtime::Handle,
+    db: Arc<Db>,
+    events: Arc<events::EventHub>,
+    services: pdfs_core::lifecycle::ServiceBoard,
+    writes: writes::WriteState,
+    jobs: TrashState,
+    host: Arc<dyn TrashHost>,
+}
+
+/// What the trash needs from the mounted trees.
+pub(crate) trait TrashHost: Send + Sync {
+    /// Re-enumerate these folders on next access, in every mount, because a
+    /// restored node reappears under one of them.
+    fn invalidate_listings_of(&self, parents: &[NodeUid]);
+    /// Forget nodes the server no longer has, in every mount, with any cached
+    /// content they own.
+    fn drop_local(&self, uids: &[NodeUid]);
+}
+
+impl TrashHost for Core {
+    fn invalidate_listings_of(&self, parents: &[NodeUid]) {
+        // Keyed by uid, so it applies to every mount: a restored node reappears
+        // in whichever mounts show its parent, not only the primary one.
+        self.for_each_state(|st| {
+            for parent in parents {
+                if let Some(&ino) = st.by_uid.get(parent) {
+                    st.invalidate_listing(ino);
+                }
+            }
+        });
+    }
+
+    fn drop_local(&self, uids: &[NodeUid]) {
+        Core::drop_local(self, uids);
+    }
+}
+
 impl Core {
+    /// [`Trash::invalidate_trash`], without building the service.
+    pub(super) fn invalidate_trash(&self) {
+        invalidate_trash(&self.db);
+    }
+
+    /// The trash service, with this daemon as its host.
+    pub(crate) fn trash(&self) -> Trash {
+        Trash {
+            drive: self.drive.clone(),
+            rt: self.rt.clone(),
+            db: self.db.clone(),
+            events: self.events.clone(),
+            services: self.services.clone(),
+            writes: self.writes.clone(),
+            jobs: self.trash_jobs.clone(),
+            host: Arc::new(self.clone()),
+        }
+    }
+}
+
+impl Trash {
     /// List the account's trash, from the DB. Trashed nodes are outside the
     /// mounted tree — the FUSE side forgot them when they were trashed — so the
     /// listing is persisted in its own table rather than derived from `State`, and
@@ -36,7 +105,7 @@ impl Core {
     /// Stale-while-revalidate, like the photos timeline: a persisted listing comes
     /// back at DB speed and is refreshed in the background past [`TRASH_TTL`].
     /// Our own trash mutations invalidate it outright (see
-    /// [`Core::invalidate_trash`]), so the TTL only covers changes made elsewhere.
+    /// [`Trash::invalidate_trash`]), so the TTL only covers changes made elsewhere.
     ///
     /// The refresh always runs *off* the request: a never-fetched trash waits for
     /// it, but only for [`TRASH_FIRST_WAIT`], and then answers with the batches
@@ -44,9 +113,9 @@ impl Core {
     /// made a large trash unlistable — the refresh outran the front-end's read
     /// timeout, the user asked again, and each attempt left another full refresh
     /// grinding in the daemon (`docs/BUGS.md` B72).
-    pub(super) fn list_trash(&self) -> CoreResult<Vec<DirEntry>> {
+    pub(crate) fn list_trash(&self) -> CoreResult<Vec<DirEntry>> {
         let never_fetched = self.db.state_i64(TRASH_SYNCED_MS).ok().flatten().is_none();
-        if never_fetched || self.listing_stale(TRASH_SYNCED_MS, TRASH_TTL) {
+        if never_fetched || listing_stale(&self.db, TRASH_SYNCED_MS, TRASH_TTL) {
             self.spawn_trash_refresh();
         }
         if never_fetched {
@@ -99,7 +168,7 @@ impl Core {
 
     /// What a trashed folder holds: its children on the server, and the
     /// stored trash entries trashed inside it before it went.
-    pub(super) fn list_trashed_folder(&self, uid: &str) -> CoreResult<Vec<DirEntry>> {
+    pub(crate) fn list_trashed_folder(&self, uid: &str) -> CoreResult<Vec<DirEntry>> {
         let folder =
             parse_uid(uid).ok_or_else(|| CoreError::invalid(format!("invalid uid: {uid}")))?;
         let children = self
@@ -177,7 +246,7 @@ impl Core {
     /// [`TRASH_MATERIALIZE_CHUNK`] is stored as it lands, so a large trash
     /// fills the page while it loads. Rows the server no longer lists go once
     /// the whole listing is in, never earlier.
-    pub(super) async fn refresh_trash(&self) -> CoreResult<()> {
+    pub(crate) async fn refresh_trash(&self) -> CoreResult<()> {
         let started = Instant::now();
         let uids = within_trash_call("enumerate trash", self.drive.enumerate_trash_node_uids())
             .await?
@@ -200,7 +269,7 @@ impl Core {
         let listed: HashSet<String> = uids.iter().map(ToString::to_string).collect();
         let removed = self.db.trash_retain(&listed).map_err(CoreError::from)?;
         if removed > 0 {
-            self.trash.trash_progress.notify_waiters();
+            self.jobs.trash_progress.notify_waiters();
         }
         let missing: Vec<NodeUid> = uids
             .into_iter()
@@ -235,7 +304,7 @@ impl Core {
                 .collect();
             materialized += items.len();
             self.db.trash_upsert(&items).map_err(CoreError::from)?;
-            self.trash.trash_progress.notify_waiters();
+            self.jobs.trash_progress.notify_waiters();
             self.events.publish(&[Topic::Trash]);
             debug!(
                 materialized,
@@ -258,44 +327,44 @@ impl Core {
     }
 
     /// Refresh the trash off the request path. At most one refresh at a time —
-    /// including the one a first-ever [`Core::list_trash`] waits on, so a burst
+    /// including the one a first-ever [`Trash::list_trash`] waits on, so a burst
     /// of requests against an unfetched trash joins one refresh instead of
     /// starting one apiece.
-    pub(super) fn spawn_trash_refresh(&self) {
-        if self.trash.trash_refreshing.swap(true, Ordering::SeqCst) {
+    pub(crate) fn spawn_trash_refresh(&self) {
+        if self.jobs.trash_refreshing.swap(true, Ordering::SeqCst) {
             return;
         }
-        let core = self.clone();
+        let this = self.clone();
         self.services
             .spawn_task_job(&self.rt, "pdfs-trash-refresh", async move {
-                let refreshed = core.refresh_trash().await;
-                core.trash.trash_refreshing.store(false, Ordering::SeqCst);
+                let refreshed = this.refresh_trash().await;
+                this.jobs.trash_refreshing.store(false, Ordering::SeqCst);
                 match refreshed {
-                    Ok(_) => core.events.publish(&[Topic::Trash]),
+                    Ok(_) => this.events.publish(&[Topic::Trash]),
                     Err(e) => warn!(error = %e, "background trash refresh failed"),
                 }
                 // After the flag, so a waiter that wakes on this sees it cleared.
-                core.trash.trash_progress.notify_waiters();
+                this.jobs.trash_progress.notify_waiters();
             });
     }
 
     /// Wait for the in-flight trash refresh to make progress, for at most
     /// `budget`. Returns early when it finishes; never cancels it — the refresh
     /// is a detached task, so giving up here costs the work nothing.
-    pub(super) fn await_trash_refresh(&self, budget: Duration) {
+    pub(crate) fn await_trash_refresh(&self, budget: Duration) {
         let deadline = Instant::now() + budget;
         self.rt.block_on(async {
-            while self.trash.trash_refreshing.load(Ordering::SeqCst) {
+            while self.jobs.trash_refreshing.load(Ordering::SeqCst) {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     break;
                 };
-                let notified = self.trash.trash_progress.notified();
+                let notified = self.jobs.trash_progress.notified();
                 tokio::pin!(notified);
                 // Register before re-checking the flag: a refresh that finishes
                 // in between must not leave us waiting for a notify that has
                 // already fired.
                 notified.as_mut().enable();
-                if !self.trash.trash_refreshing.load(Ordering::SeqCst) {
+                if !self.jobs.trash_refreshing.load(Ordering::SeqCst) {
                     break;
                 }
                 if tokio::time::timeout(left, notified).await.is_err() {
@@ -313,8 +382,8 @@ impl Core {
     /// trash ourselves. The next Trash page then *waits* for a fresh listing
     /// rather than painting one from before the mutation — the user just made the
     /// change and is about to look straight at it.
-    pub(super) fn invalidate_trash(&self) {
-        let _ = self.db.clear_state(TRASH_SYNCED_MS);
+    pub(crate) fn invalidate_trash(&self) {
+        invalidate_trash(&self.db);
     }
 
     /// Restore trashed nodes to the folders they were trashed from, together
@@ -335,8 +404,8 @@ impl Core {
     /// The destination parents are read *before* the restore — a restored node
     /// reappears in a listing the daemon may already have cached, so each one is
     /// invalidated and re-enumerated on next access.
-    pub(super) fn restore(&self, uids: &[String]) -> CoreResult<usize> {
-        let requested = Self::parse_uids(uids)?;
+    pub(crate) fn restore(&self, uids: &[String]) -> CoreResult<usize> {
+        let requested = Core::parse_uids(uids)?;
         // A listing we could not read is not a reason to refuse the restore: it
         // only costs the expansion, and the requested nodes still go back.
         let relations = self.db.trash_parents().unwrap_or_default();
@@ -399,13 +468,7 @@ impl Core {
         }
         // Keyed by uid, so it applies to every mount: a restored node reappears
         // in whichever mounts show its parent, not only the primary one.
-        self.for_each_state(|st| {
-            for parent in &parents {
-                if let Some(&ino) = st.by_uid.get(parent) {
-                    st.invalidate_listing(ino);
-                }
-            }
-        });
+        self.host.invalidate_listings_of(&parents);
         let back: Vec<String> = restored.iter().map(ToString::to_string).collect();
         let _ = self.db.trash_remove(&back);
         self.invalidate_trash();
@@ -414,8 +477,8 @@ impl Core {
 
     /// Permanently delete trashed nodes. Irreversible on the server; locally it
     /// drops any metadata and cached content the node still owns.
-    pub(super) fn delete_forever(&self, uids: &[String]) -> CoreResult<usize> {
-        let parsed = Self::parse_uids(uids)?;
+    pub(crate) fn delete_forever(&self, uids: &[String]) -> CoreResult<usize> {
+        let parsed = Core::parse_uids(uids)?;
         // Streamed, and each node's local state is dropped as its batch lands.
         // A permanent delete is irreversible, so the useful property is that a
         // daemon interrupted mid-batch has already forgotten exactly the nodes
@@ -430,7 +493,7 @@ impl Core {
                     let (uid, outcome) = item?;
                     match outcome {
                         Ok(()) => {
-                            self.drop_local(std::slice::from_ref(&uid));
+                            self.host.drop_local(std::slice::from_ref(&uid));
                             gone.push(uid.to_string());
                             deleted += 1;
                         }
@@ -461,7 +524,7 @@ impl Core {
     /// is what kept the delete from ever being sent (`docs/BUGS.md` B293).
     /// The stored listing is cleared at once, and the server is asked again
     /// after [`TRASH_TTL`], so anything it still holds then shows up again.
-    pub(super) fn empty_trash(&self) -> CoreResult<usize> {
+    pub(crate) fn empty_trash(&self) -> CoreResult<usize> {
         let uids: Vec<String> = self
             .db
             .trash_seen()
@@ -472,7 +535,7 @@ impl Core {
             .block_on(within_trash_call("empty trash", self.drive.empty_trash()))?
             .map_err(|e| CoreError::from_api(&e, "empty trash"))?;
         let parsed: Vec<NodeUid> = uids.iter().filter_map(|uid| parse_uid(uid)).collect();
-        self.drop_local(&parsed);
+        self.host.drop_local(&parsed);
         let _ = self.db.trash_replace(&[]);
         let _ = self.db.set_state_i64(TRASH_SYNCED_MS, now_ms());
         self.events.publish(&[Topic::Trash]);
@@ -480,7 +543,7 @@ impl Core {
     }
 }
 
-/// An entry inside a trashed folder, for [`Core::list_trashed_folder`].
+/// An entry inside a trashed folder, for [`Trash::list_trashed_folder`].
 pub(super) fn trashed_entry(
     uid: String,
     name: String,
@@ -618,4 +681,10 @@ pub(super) fn expand_restore(
     }
     waves.retain(|wave| !wave.is_empty());
     waves
+}
+
+/// Mark the stored trash listing stale, so the next listing waits for a
+/// fresh one.
+fn invalidate_trash(db: &Db) {
+    let _ = db.clear_state(TRASH_SYNCED_MS);
 }

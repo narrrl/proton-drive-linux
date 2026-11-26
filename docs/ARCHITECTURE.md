@@ -780,6 +780,11 @@ to the activity log. `Core::photos` builds one on demand with the daemon as its
 host, as `Core::syncer` does for the sync engine. Trashing photos stays on `Core`, because it
 checks write authority against the tree and drops open readers.
 
+`trash::Trash` lists the Drive trash, refreshes that listing, and restores or deletes from it. Its
+`TrashHost` port has two methods, both of which reach every mount: re-enumerate the folders a
+restored node comes back into, and forget nodes the server no longer has. `Core::trash` builds it
+on demand.
+
 The control socket answers each area's requests in a module of its own under `control/`:
 sharing, Photos, synced folders and devices, revisions, and the trash and cache. Each module
 exports a pattern macro naming its requests, and the main match hands them over in one arm, so

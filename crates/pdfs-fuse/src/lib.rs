@@ -584,7 +584,7 @@ struct Core {
     services: pdfs_core::lifecycle::ServiceBoard,
     /// Whether a trash refresh is running, and the wake-up for requests waiting
     /// on its progress.
-    trash: trash::TrashState,
+    trash_jobs: trash::TrashState,
     /// What the conflict sweep may do, and the copies it already checked this
     /// run.
     sweep: sweep::SweepState,
