@@ -231,7 +231,7 @@ impl Core {
                 claimed_size.is_none(),
             )
         };
-        if is_local_uid(&uid) || self.pending.lock().contains_key(&uid) {
+        if is_local_uid(&uid) || self.writes.is_queued(&uid) {
             return None;
         }
         let size = match provisional {

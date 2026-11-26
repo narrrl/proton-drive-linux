@@ -507,7 +507,7 @@ impl Core {
         // A queued write has not reached the remote yet, so the remote's current
         // revision is stale and the staged blob is the truth. Serve from it until
         // the drain worker lands the upload.
-        if let Some(pending) = self.pending.lock().get(uid).cloned() {
+        if let Some(pending) = self.writes.queued(uid) {
             return self.read_pending(&pending, offset, len);
         }
         // A node created offline and never written has no blob and no remote: it
@@ -1132,7 +1132,7 @@ impl Core {
             true => self.landed_stand_in_uid(&uid).unwrap_or(uid),
             false => uid,
         };
-        if let Some(pending) = self.pending.lock().get(&uid).cloned() {
+        if let Some(pending) = self.writes.queued(&uid) {
             let m = &pending.meta;
             let file = File::open(&pending.path).map_err(|e| {
                 error!(%uid, path = %pending.path.display(), error = %e, "open staged blob failed");

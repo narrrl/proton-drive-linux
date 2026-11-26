@@ -58,6 +58,11 @@ const IDLE_CHECK: Duration = Duration::from_secs(1);
 /// that fires on every change so waiters need not poll.
 #[derive(Default)]
 pub(crate) struct Link {
+    /// False while the API is unreachable and we are serving the cached tree.
+    /// Set by the probe thread; read by front-ends through
+    /// `Response::Status` so the UI can say so rather than leaving the user to
+    /// infer it from a wall of EIO.
+    online: AtomicBool,
     lost_at: Mutex<Option<Instant>>,
     changed: Condvar,
     /// Folders listed from the DB alone while offline, to relist once back.
@@ -74,10 +79,11 @@ pub(crate) struct Link {
 }
 
 impl Link {
-    /// The link of a mount that comes up with Proton refusing its session, or
-    /// not.
-    pub(crate) fn starting(session_expired: bool) -> Self {
+    /// The link of a mount that comes up online or from the cache, with
+    /// Proton refusing its session or not.
+    pub(crate) fn starting(online: bool, session_expired: bool) -> Self {
         Self {
+            online: AtomicBool::new(online),
             session_expired: AtomicBool::new(session_expired),
             ..Default::default()
         }
@@ -154,7 +160,7 @@ fn next_probe_delay(delay: Duration, outage: Duration) -> Duration {
 impl Core {
     /// Whether the mount currently believes Proton is reachable.
     pub(crate) fn is_online(&self) -> bool {
-        self.online.load(Ordering::Relaxed)
+        self.link.online.load(Ordering::Relaxed)
     }
 
     /// Whether a namespace change through the mount goes to Drive inside the
@@ -237,7 +243,7 @@ impl Core {
     /// outage logs it; the rest are the same outage.
     pub(crate) fn mark_offline(&self, what: &str, error: &dyn std::fmt::Display) {
         let mut lost_at = self.link.lost_at.lock();
-        if self.online.swap(false, Ordering::Relaxed) {
+        if self.link.online.swap(false, Ordering::Relaxed) {
             *lost_at = Some(Instant::now());
             warn!(during = what, %error,
                   "lost the connection to Proton; queueing changes until it returns");
@@ -250,7 +256,7 @@ impl Core {
     fn mark_online(&self) {
         {
             let mut lost_at = self.link.lost_at.lock();
-            self.online.store(true, Ordering::Relaxed);
+            self.link.online.store(true, Ordering::Relaxed);
             match lost_at.take() {
                 Some(since) => {
                     info!(

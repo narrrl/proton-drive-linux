@@ -693,7 +693,7 @@ impl Core {
         self.for_each_state(|st| {
             st.forget_or_unlink(uid);
         });
-        self.hidden.lock().insert(uid.clone());
+        self.writes.hide(uid);
         if open_now {
             if let Err(error) = self.withdraw_queued_ops(uid) {
                 error!(%uid, "remote replacement landed but queued-op cleanup failed");
@@ -763,7 +763,7 @@ impl Core {
             .and_then(batch::into_unit)
         {
             Ok(()) => {
-                self.hidden.lock().remove(uid);
+                self.writes.unhide(uid);
                 self.for_each_mount(|st, notify| {
                     if let Some(&ino) = st.by_uid.get(parent) {
                         st.invalidate_listing(ino);

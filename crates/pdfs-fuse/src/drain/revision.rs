@@ -552,7 +552,7 @@ impl Core {
         // This function's whole job is to bring the tree level with the revision
         // we just sealed, so the feed's report of that revision has nothing left
         // to tell us. Claimed here rather than at the upload call so it is only
-        // recorded when the node was actually re-read (`Core::self_changes`).
+        // recorded when the node was actually re-read (`WriteState::note_echo`).
         self.note_self_change(uid);
         // Rebase any *open* write handles targeting this node. A handle opened
         // before this upload carries a stale base — its `base_mtime`/`base_size`
@@ -680,7 +680,7 @@ impl Core {
             hash: None,
             revision_id: node_revision_id(sealed),
         };
-        let mut pending = self.pending.lock();
+        let mut pending = self.writes.pending.lock();
         let Some(p) = pending.get_mut(uid) else {
             return false;
         };

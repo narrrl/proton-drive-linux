@@ -379,7 +379,7 @@ impl Core {
                         let (uid, outcome) = item?;
                         match outcome {
                             Ok(()) => {
-                                self.hidden.lock().remove(&uid);
+                                self.writes.unhide(&uid);
                                 restored.push(uid);
                             }
                             Err(e) => {

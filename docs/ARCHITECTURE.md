@@ -752,9 +752,22 @@ Step 3 so far: the daemon's long-lived threads and async loops start and stop th
 `photos::PhotoJobs`, `drain::DrainState`, `reads::ReadState`, `sizes::SizeState`,
 `trash::TrashState`, `shared::SharedState`, `sharing::QuotaCache` and `sweep::SweepState`.
 `Core`'s methods are split by area out of `lib.rs` into their own modules. The daemon's run loop
-moved out of `pdfs-cli` into `pdfs-daemon`, which is where the services will be built. What is left in `Core`
-is shared by several owners (the tree, the database, the queue's `pending` map) and needs ports
-before it can move.
+moved out of `pdfs-cli` into `pdfs-daemon`, which is where the services will be built.
+
+State that several owners share sits behind a narrow interface of its own:
+
+- `writes::WriteState` holds the write-back's queued writes, the nodes removed here and the echoes
+  the event feed owes. The queue, the drain and recovery own it. The read path, listings, the pin
+  keeper and the event feed ask it whether a node has a queued write, what size it gives the file,
+  and which nodes to leave out. They do not take its locks.
+- `session::SessionCells` holds what belongs to one mount's FUSE session: whether it is the
+  primary mount, its root inode, its kernel channel and whether it is up. An on-demand fork gets
+  fresh cells from `SessionCells::fork`, and shares the rest of `Core`.
+- `link::Link` holds whether Drive answers, next to when the link went down. Code reads it through
+  `Core::is_online`.
+
+What is left in `Core` is the tree, the database, the cache and the Drive client, which most
+owners use, plus single fields that belong to one module each.
 
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and

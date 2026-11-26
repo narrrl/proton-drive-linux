@@ -325,7 +325,7 @@ impl Filesystem for ProtonFs {
                     };
                     let is_video =
                         PhotoKind::classify(Some(&e.node.name), media_type) == PhotoKind::Video;
-                    let queued = self.core.pending.lock().get(&e.uid).map(|p| p.meta.len);
+                    let queued = self.core.writes.queued_len(&e.uid);
                     // Still the cheap enumeration's ciphertext size (B12).
                     let provisional = queued.is_none()
                         && matches!(
@@ -1160,7 +1160,7 @@ impl ProtonFs {
     /// the folder an on-demand location shows).
     pub(super) fn new(core: Core, root: Node) -> Self {
         let root = core.state().install_root(root);
-        let _ = core.root.set(root);
+        let _ = core.session.root.set(root);
         // SAFETY: geteuid/getegid are infallible and have no preconditions.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         Self {
@@ -1413,7 +1413,7 @@ impl ProtonFs {
                         }
                     }
                 }
-                let pending_base = self.core.pending.lock().get(&uid).cloned();
+                let pending_base = self.core.writes.queued(&uid);
                 let (file, path) = match self.core.cache.create_scratch() {
                     Ok(x) => x,
                     Err(e) => {
@@ -2234,7 +2234,7 @@ impl ProtonFs {
                     // before it lets those updates overwrite our invalidation
                     // and retain an empty destination readdir page.
                     reply.ok();
-                    if let Some(notifier) = self.core.notifier.get() {
+                    if let Some(notifier) = self.core.session.notifier.get() {
                         let _ = notifier.inval_entry(parent, OsStr::new(&name));
                         let _ = notifier.inval_entry(newparent, OsStr::new(&newname));
                         let _ = notifier.inval_inode(parent);
@@ -2402,7 +2402,7 @@ impl ProtonFs {
         }
         // Only remove the namespace entry after Drive accepted the mutation.
         // Otherwise an EIO response still made the path disappear locally.
-        self.core.hidden.lock().insert(uid.clone());
+        self.core.writes.hide(&uid);
         self.core.state().forget_or_unlink(&uid);
         if open_now {
             // The open handle keeps the staged bytes; the drain must not send

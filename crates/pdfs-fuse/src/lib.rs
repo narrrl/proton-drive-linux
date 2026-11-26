@@ -108,6 +108,8 @@ mod inhibit;
 mod keeper;
 mod link;
 mod listing;
+mod session;
+mod writes;
 pub use filesystem::ProtonFs;
 mod maintenance;
 mod mount;
@@ -533,14 +535,15 @@ struct Core {
     /// The daemon's My Files root. Forked on-demand sessions retain this value
     /// so ownership checks never mistake their own mount root for account scope.
     primary_root_uid: NodeUid,
-    /// False only for a forked on-demand device mount. The synthetic shared
-    /// directory belongs exclusively to the primary My Files mount.
-    primary: bool,
+    /// What belongs to one mount's FUSE session rather than to the daemon: whether
+    /// it is the primary My Files mount, the tree inode it is rooted at, its
+    /// kernel channel and whether the session is up.
+    ///
+    /// Every other part of `Core` is shared between the primary mount and its
+    /// on-demand forks. A fork gets fresh cells from [`SessionCells::fork`].
+    session: session::SessionCells,
     /// The one tree every mount of the daemon serves from.
     state: Arc<Ranked<State>>,
-    /// The tree inode this mount's session is rooted at, set when the session
-    /// is built ([`ProtonFs::new`]). Each fork has its own cell.
-    root: Arc<OnceLock<u64>>,
     cache: Arc<ContentCache>,
     /// What the read path keeps between reads: open revision readers, decrypted
     /// blocks, fetches in flight and prefetch. See [`reads::ReadState`].
@@ -556,29 +559,21 @@ struct Core {
     /// Publication of the shared listing, and what invalidates a listing on the
     /// wire or suppresses its next refresh.
     shared: shared::SharedState,
-    /// False while the API is unreachable and we are serving the cached tree.
-    /// Set by the probe thread; read by front-ends through
-    /// `Response::Status` so the UI can say so rather than leaving the user to
-    /// infer it from a wall of EIO.
-    online: Arc<AtomicBool>,
-    /// When the link went down and a condvar for its coming back; the other
-    /// half of `online` (see [`link`]).
+    /// Whether Drive answers, when the link went down and a condvar for its
+    /// coming back (see [`link`]).
     link: Arc<link::Link>,
     /// When the user paused syncing, the Unix second it resumes by itself;
     /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
     /// Persisted, so a pause survives a restart (see [`Core::sync_paused`]).
     sync_paused_until: Arc<AtomicI64>,
-    /// Writes accepted from the kernel but not yet uploaded, keyed by node.
-    /// The in-memory face of the `pending_op` table, from
-    /// which it is rebuilt on mount.
+    /// The write-back's state: writes accepted from the kernel and not yet sent,
+    /// nodes removed here that a stale listing may still return, and the changes
+    /// this daemon made that Drive's event feed will echo back.
     ///
-    /// Two things read it: [`Core::read_range`], because until the op drains the
-    /// staged blob *is* the file's content and the remote still holds the old
-    /// revision; and the drain worker, which performs the uploads.
-    pending: Arc<Mutex<HashMap<NodeUid, PendingRevision>>>,
-    /// Nodes removed through this daemon which a briefly stale remote listing
-    /// may still return. Uids are not reused; an explicit restore clears one.
-    hidden: Arc<Mutex<HashSet<NodeUid>>>,
+    /// The drain, the queue and recovery own it. Everything else, the read path,
+    /// listings, the pin keeper and the event feed, asks through the methods
+    /// below instead of taking its locks.
+    writes: writes::WriteState,
     /// The drain's own bookkeeping: its wake-up, the creates and uploads on
     /// the wire, and what they left behind. See [`drain::DrainState`].
     drain: drain::DrainState,
@@ -617,19 +612,6 @@ struct Core {
     /// The size upgrades running now, and the replies parked on them. Shared
     /// by every mount: the bound that matters is per daemon.
     sizes: sizes::SizeState,
-    /// This mount's kernel notification channel, for telling the kernel to drop
-    /// metadata it has cached. Set once the session exists — which is *after*
-    /// the `Core` it is built from, hence the cell.
-    ///
-    /// Per mount, not per daemon: each session calls its own root inode 1.
-    /// [`Core::fork_state`] gives each fork an empty cell of its own. Work that
-    /// changes the tree for every mount tells every session
-    /// ([`Core::for_each_mount`]).
-    notifier: Arc<OnceLock<KernelChannel>>,
-    /// True only after this mount's FUSE session spawned successfully.
-    /// Registration happens earlier for the primary drain, so registration
-    /// alone cannot answer whether the location is mounted.
-    session_live: Arc<AtomicBool>,
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
@@ -653,26 +635,6 @@ struct Core {
     /// FUSE connection id and the fork's exact liveness flag so teardown first
     /// makes that mount unroutable.
     mounts: Arc<Mutex<mount::SecondaryMountRegistry<SecondaryMount>>>,
-    /// Nodes this daemon changed on the remote itself, and how many echoes of
-    /// those changes the event feed still owes us.
-    ///
-    /// The feed replays our own writes back at us seconds later, and a
-    /// `NodeUpdated` carries no revision id — nothing in it distinguishes "another
-    /// device changed this file" from "you changed this file". Treating the echo
-    /// as foreign is not free: it evicts the content blob we just uploaded, so the
-    /// next read re-downloads a revision the API may not be serving yet. That is
-    /// how a SQLite database written on the mount came back `malformed`, and how a
-    /// mount doing bulk uploads spent its time re-fetching its own bytes.
-    ///
-    /// So the first event for a node we changed ourselves, within
-    /// [`SELF_CHANGE_TTL_MS`], is consumed rather than applied: the tree already
-    /// holds what that event describes, because [`Core::refresh_after_upload`] put
-    /// it there. Anything beyond that applies normally, which bounds the staleness
-    /// a genuine remote change can suffer to one event.
-    ///
-    /// Shared across forks like `pending`: the drain that records the change and
-    /// the event task that consumes the echo are both per-daemon.
-    self_changes: Arc<Mutex<HashMap<NodeUid, echoes::SelfChange>>>,
     /// Every live mount: the primary and one per on-demand fork
     /// ([`Core::fork_state`]), with its mountpoint, root and kernel channel.
     /// Shared by every fork.
@@ -820,16 +782,16 @@ impl Core {
     fn register_state(&self, mountpoint: &Path) {
         self.states.register(
             mountpoint,
-            &self.notifier,
-            self.session_live.clone(),
-            self.root.clone(),
+            &self.session.notifier,
+            self.session.session_live.clone(),
+            self.session.root.clone(),
         );
     }
 
     /// The tree inode this mount is rooted at. [`ROOT_INO`] until the session
     /// is built, which is where a test that builds a bare tree puts its root.
     pub(crate) fn root_ino(&self) -> u64 {
-        self.root.get().copied().unwrap_or(ROOT_INO)
+        self.session.root.get().copied().unwrap_or(ROOT_INO)
     }
 
     /// Whether `uid` names an owned node reachable from the root of a mounted
@@ -857,14 +819,16 @@ impl Core {
         let mount = self.states.covering(abs)?;
         let rel = abs.strip_prefix(&mount.mountpoint).ok()?.to_path_buf();
         let mut core = self.clone();
-        if !Arc::ptr_eq(&mount.notifier, &self.notifier) {
+        if !Arc::ptr_eq(&mount.notifier, &self.session.notifier) {
             // Another mount, so adopt its per-mount half wholesale. `primary`
             // is a property of the mount, and the only mount this `Core` can
             // be the primary of is the one it was built for.
-            core.primary = false;
-            core.notifier = mount.notifier;
-            core.session_live = mount.session_live;
-            core.root = mount.root;
+            core.session = session::SessionCells {
+                primary: false,
+                notifier: mount.notifier,
+                session_live: mount.session_live,
+                root: mount.root,
+            };
         }
         Some((core, rel))
     }
@@ -1398,7 +1362,7 @@ impl Core {
     /// swaps the map entry to point at it, so an unchanged path means the base a
     /// caller sampled earlier is still the base now (`docs/BUGS.md` B32).
     fn pending_blob(&self, uid: &NodeUid) -> Option<PathBuf> {
-        self.pending.lock().get(uid).map(|p| p.path.clone())
+        self.writes.queued(uid).map(|queued| queued.path)
     }
 
     /// Nudge the drain worker to re-examine the queue now.
@@ -3924,7 +3888,7 @@ mod tests {
         assert_before(revision, "preserve_on_access_denied", "fill_gaps");
 
         let staged = function_source(source, "fn enqueue_staged_write(");
-        assert_before(staged, "preserve_on_access_denied", "self.pending.lock()");
+        assert_before(staged, "preserve_on_access_denied", "self.writes.queued(");
         assert_before(
             staged,
             "preserve_on_access_denied",
@@ -3932,7 +3896,7 @@ mod tests {
         );
 
         let truncate = function_source(source, "fn queue_truncate(");
-        assert_before(truncate, "require_uid_writable", "self.pending.lock()");
+        assert_before(truncate, "require_uid_writable", "self.writes.queued(");
         assert_before(truncate, "require_uid_writable", "create_scratch");
 
         for (signature, first_side_effect) in [
@@ -4081,7 +4045,7 @@ mod tests {
         assert_before(
             restore,
             "self.drive.restore_nodes(",
-            "self.hidden.lock().remove(uid)",
+            "self.writes.unhide(uid)",
         );
         assert!(restore.contains("st.invalidate_listing(ino)"));
         assert!(restore.contains("notify.inval_entry(ino, name.to_string())"));
@@ -4328,7 +4292,7 @@ mod tests {
         // once; the bytes the handle reads go with the last close.
         let withdraw = function_source(CORE_SOURCE, "fn withdraw_queued_ops(");
         assert_before(withdraw, "self.pending_blob(uid)", "release_dropped_below");
-        assert!(!withdraw.contains("self.pending.lock().remove(uid)"));
+        assert!(!withdraw.contains("self.writes.pending.lock().remove(uid)"));
 
         let filesystem = include_str!("filesystem.rs");
         let trash = function_source(filesystem, "fn trash_child(");

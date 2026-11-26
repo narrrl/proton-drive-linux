@@ -394,7 +394,7 @@ impl Core {
             // the wire, so trashing its folder kept it as a trash; claimed
             // only to be handed back, it was kept although nothing had sent
             // it (`docs/BUGS.md` B178).
-            let online = self.online.load(Ordering::Relaxed);
+            let online = self.is_online();
             let paused = self.sync_paused();
             // One row, chosen and *claimed* by the database. Reading the whole
             // queue to pick one op made a long queue quadratic to drain, and
@@ -773,7 +773,7 @@ impl Core {
     /// is disarmed, letting a gap-fill read from a revision that no longer
     /// describes the file.
     pub(crate) fn release_pending(&self, uid: &NodeUid, blob: &Path) {
-        let mut pending = self.pending.lock();
+        let mut pending = self.writes.pending.lock();
         if let Some(current) = pending.get(uid)
             && current.path == blob
         {

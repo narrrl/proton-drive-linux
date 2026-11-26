@@ -122,7 +122,7 @@ impl Core {
     }
 
     pub(super) fn ensure_shared_children(&self, ino: u64) -> Result<(), Errno> {
-        let online = self.online.load(Ordering::Relaxed);
+        let online = self.is_online();
         let resident = self.state().children.contains_key(&ino);
         match shared_listing_plan(
             resident,
@@ -235,7 +235,7 @@ impl Core {
         drop(st);
         self.flush_access_changes();
         self.mark_shared_refresh_success(SHARED_WITH_ME_SYNCED_MS);
-        if let Some(notifier) = self.notifier.get() {
+        if let Some(notifier) = self.session.notifier.get() {
             let _ = notifier.inval_inode(ino);
         }
         Ok(())
