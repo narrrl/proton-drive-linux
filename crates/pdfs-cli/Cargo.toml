@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 pdfs-core.workspace = true
+pdfs-store.workspace = true
 pdfs-fuse.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

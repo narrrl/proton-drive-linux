@@ -55,21 +55,23 @@ use fuser::{
 };
 use futures::StreamExt as _;
 use pdfs_core::batch;
-use pdfs_core::cache::{BLOCK_SIZE, Baseline, BlockGeometry, BlockSpan, ContentCache, StagedWrite};
 use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
     SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncIssue, SyncPhase, SyncProgress,
     ThumbnailBuildStatus, Topic, TransferDirection,
 };
-use pdfs_core::db::{
-    Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
-    PublishedSharedRoot, RenameMeta, StoredNode, StoredSyncFolder, StoredTrash,
-};
 use pdfs_core::localindex;
 use pdfs_core::search::relevance_score;
 use pdfs_core::syncignore::is_transient_name;
 use pdfs_core::{Access, CoreError, CoreResult, access_for, perm_bits};
+use pdfs_store::cache::{
+    BLOCK_SIZE, Baseline, BlockGeometry, BlockSpan, ContentCache, StagedWrite,
+};
+use pdfs_store::db::{
+    Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
+    PublishedSharedRoot, RenameMeta, StoredNode, StoredSyncFolder, StoredTrash,
+};
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
@@ -87,8 +89,12 @@ use control::run_control_socket;
 mod devices;
 mod diagnostics;
 mod drain;
-mod drive;
 use drive::{DriveApi, RevisionRead};
+use pdfs_drive as drive;
+use pdfs_drive::node_revision_id;
+#[cfg(test)]
+use pdfs_sync::naming::{conflict_label, conflict_label_of, conflict_name_as};
+use pdfs_sync::naming::{conflict_name, this_hostname};
 mod events;
 mod filesystem;
 mod gallery;
@@ -500,6 +506,8 @@ struct Core {
     /// downloads, renames, moves and trashes. The real client in production, an
     /// in-memory Drive in the simulation tests. See [`drive`].
     drive: Arc<dyn DriveApi>,
+    /// What [`Core::drive`] has been asked, for the diagnostics report.
+    drive_calls: Arc<pdfs_drive::counted::CallStats>,
     /// The concrete client, for what [`DriveApi`] does not cover: sharing,
     /// Photos, devices, invitations and public links.
     client: ProtonDriveClient,
@@ -3350,7 +3358,7 @@ impl Core {
 
     /// [`Core::landed_row_uid`] for a node known by its stand-in `uid`.
     pub(crate) fn landed_stand_in_uid(&self, uid: &NodeUid) -> Option<NodeUid> {
-        pdfs_core::db::local_lid(&uid.to_string()).and_then(|lid| self.landed_lid_uid(lid))
+        pdfs_store::db::local_lid(&uid.to_string()).and_then(|lid| self.landed_lid_uid(lid))
     }
 
     fn landed_lid_uid(&self, lid: i64) -> Option<NodeUid> {
@@ -4682,7 +4690,7 @@ impl Core {
     /// Every pin, with `cached` saying whether a pinned file's content is on
     /// disk, so a front-end listing pins can badge them without a round-trip
     /// per file.
-    fn list_pins(&self) -> Vec<pdfs_core::cache::Pin> {
+    fn list_pins(&self) -> Vec<pdfs_core::control::Pin> {
         let mut pins = self.cache.list_pins();
         for pin in pins.iter_mut().filter(|pin| pin.is_dir == Some(false)) {
             if let Ok(Some(node)) = self.db.node_by_uid(&pin.uid) {
@@ -6410,7 +6418,7 @@ fn parse_node_uid(s: &str) -> Option<NodeUid> {
 
 /// The uid a node made on this machine goes by until it lands, so it can be
 /// interned, listed and written to before the server has ever heard of it:
-/// its row's local id, as [`pdfs_core::db::local_uid`]
+/// its row's local id, as [`pdfs_store::db::local_uid`]
 /// has it.
 fn local_node_uid(lid: i64) -> NodeUid {
     NodeUid::new(VolumeId::from(LOCAL_VOLUME), LinkId::from(lid.to_string()))
@@ -6501,70 +6509,6 @@ fn is_gone(e: &(dyn std::error::Error + 'static)) -> bool {
     api_code(e) == Some(ResponseCode::DoesNotExist)
 }
 
-/// A variant of `name` to fall back on when the remote already has that name.
-///
-/// Deliberately the same shape the sync engine uses for its conflict copies
-/// (`sync.rs`, `conflict_path`), so the two halves of the product name the same
-/// situation the same way and a user only has to learn it once.
-fn conflict_name(name: &str, stamp: i64) -> String {
-    conflict_name_as(name, conflict_label(), stamp)
-}
-
-/// [`conflict_name`] with the machine's label given.
-fn conflict_name_as(name: &str, label: &str, stamp: i64) -> String {
-    let path = Path::new(name);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
-    let tag = conflict_tag(label, stamp, 0);
-    match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) => format!("{stem} (sync-conflict {tag}).{ext}"),
-        None => format!("{stem} (sync-conflict {tag})"),
-    }
-}
-
-/// This machine's name as its conflict copies carry it (`docs/BUGS.md` B251).
-///
-/// Two computers syncing one folder that each keep a copy of the same file in
-/// the same second would otherwise make the same name on Drive, and nobody
-/// could tell which computer a copy came from. Read once, from the hostname.
-fn conflict_label() -> &'static str {
-    static LABEL: OnceLock<String> = OnceLock::new();
-    LABEL.get_or_init(|| conflict_label_of(&this_hostname()))
-}
-
-/// `host` as one token: anything but ASCII letters, digits, `-`, `_` and `.`
-/// becomes `-`, so the label holds no space for `conflict_base_name` to trip
-/// on and no `/` or `)` to break the name.
-fn conflict_label_of(host: &str) -> String {
-    let label: String = host
-        .chars()
-        .take(32)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    label.trim_matches('-').to_string()
-}
-
-/// The inside of a conflict copy's marker: `<label> <stamp>`, with `-<n>`
-/// when an earlier copy already holds that name. Without a label it is the
-/// bare stamp that copies had before B251.
-fn conflict_tag(label: &str, stamp: i64, suffix: u32) -> String {
-    let suffix = if suffix == 0 {
-        String::new()
-    } else {
-        format!("-{suffix}")
-    };
-    if label.is_empty() {
-        format!("{stamp}{suffix}")
-    } else {
-        format!("{label} {stamp}{suffix}")
-    }
-}
-
 /// Fabricate the node the server would have returned, for a `create`/`mkdir`
 /// that could not reach it. Everything the kernel asks about a fresh node —
 /// name, kind, size, times — is knowable locally; the uid is the only invention,
@@ -6604,16 +6548,6 @@ fn local_node(uid: NodeUid, parent_uid: NodeUid, name: String, is_dir: bool) -> 
         direct_role: None,
         share_id: None,
     }
-}
-
-/// This machine's hostname, used to name (and later recover) its Proton Drive
-/// Device. Reads the live kernel hostname, falling back to a generic label.
-fn this_hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Linux device".to_string())
 }
 
 /// Whether `dir` has no entries.
@@ -7127,17 +7061,6 @@ fn expand_restore(
     waves
 }
 
-/// The server revision id of a node's active revision, if it is a file that has
-/// one. The stable identity the drain conflict-checks against (see [`Baseline`]).
-fn node_revision_id(node: &Node) -> Option<String> {
-    match &node.kind {
-        NodeKind::Folder => None,
-        NodeKind::File {
-            active_revision_id, ..
-        } => active_revision_id.clone(),
-    }
-}
-
 /// The plaintext content SHA-1 of a file node, if its active revision carried one.
 /// A download-free content fingerprint the conflict sweep uses to prove two files
 /// hold identical bytes before it removes one.
@@ -7317,7 +7240,7 @@ fn unix_secs(secs: i64) -> SystemTime {
 #[cfg(test)]
 mod merge_over_pending_tests {
     use super::{PendingRevision, merge_over_pending};
-    use pdfs_core::cache::{Baseline, StagedWrite};
+    use pdfs_store::cache::{Baseline, StagedWrite};
     use std::io::Write as _;
     use std::path::PathBuf;
 
@@ -7822,13 +7745,13 @@ mod local_uid_tests {
         let uid = local_node_uid(42);
         assert!(is_local_uid(&uid));
         assert!(is_local_uid_str(&uid.to_string()));
-        assert_eq!(uid.to_string(), pdfs_core::db::local_uid(42));
+        assert_eq!(uid.to_string(), pdfs_store::db::local_uid(42));
 
         // It has to survive the trip through `pending_op.uid` as text, like any
         // other uid does, and give back the row it stands for.
         let parsed = parse_node_uid(&uid.to_string()).expect("parses back");
         assert_eq!(parsed, uid);
-        assert_eq!(pdfs_core::db::local_lid(&uid.to_string()), Some(42));
+        assert_eq!(pdfs_store::db::local_lid(&uid.to_string()), Some(42));
     }
 
     #[test]
@@ -8150,8 +8073,8 @@ mod tests {
         }
     }
     use crate::filesystem::access_allowed;
-    use pdfs_core::cache::{Baseline, StagedWrite};
-    use pdfs_core::db::{OP_REVISION, OP_TRASH, PendingOp};
+    use pdfs_store::cache::{Baseline, StagedWrite};
+    use pdfs_store::db::{OP_REVISION, OP_TRASH, PendingOp};
 
     fn session_flag(live: bool) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(live))
@@ -9964,7 +9887,7 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir_path).unwrap();
-        let db = pdfs_core::db::Db::open(&dir_path.join("cache.db")).unwrap();
+        let db = pdfs_store::db::Db::open(&dir_path.join("cache.db")).unwrap();
         let share_access = db.all_share_access().unwrap();
         let st = crate::state::State::new(std::sync::Arc::new(db), share_access);
         (st, TestDir(dir_path))

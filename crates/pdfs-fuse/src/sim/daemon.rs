@@ -13,10 +13,10 @@ use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppConfig;
 use pdfs_core::control::{self, PendingOpInfo, Request, Response};
-use pdfs_core::db::Db;
+use pdfs_store::cache::ContentCache;
+use pdfs_store::db::Db;
 use proton_drive_rs::ProtonDriveClient;
 use proton_drive_rs::proton_sdk::config::ProtonClientConfiguration;
 use proton_drive_rs::proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
@@ -508,6 +508,34 @@ mod tests {
         restarted.stop().unwrap();
         other.join().unwrap();
         assert!(second_up.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn diagnostics_count_the_calls_made_to_drive() {
+        let drive = FakeDrive::new();
+        let daemon =
+            Daemon::start(&scratch("drive-calls"), drive.client(1, Faults::lan())).unwrap();
+        std::fs::write(daemon.mountpoint.join("a.txt"), b"a").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || drive
+            .tree()
+            .contains_key("a.txt")));
+
+        let Ok(Response::Diagnostics { diagnostics }) = daemon.request(&Request::Diagnostics)
+        else {
+            panic!("no diagnostics");
+        };
+        let calls: BTreeMap<_, _> = diagnostics
+            .drive_calls
+            .iter()
+            .map(|stat| (stat.call.as_str(), stat))
+            .collect();
+        assert!(calls.contains_key("get_my_files_folder"), "{calls:?}");
+        let uploads = calls
+            .get("upload_file_from")
+            .or_else(|| calls.get("upload_file_replacing_draft_from"))
+            .unwrap_or_else(|| panic!("no upload counted: {calls:?}"));
+        assert!(uploads.count >= 1);
     }
 
     #[test]

@@ -479,7 +479,7 @@ impl Core {
 }
 
 /// Only device backups belong in the device's cross-machine profile.
-fn profile_folders(folders: Vec<pdfs_core::db::StoredSyncFolder>) -> Vec<ProfileFolder> {
+fn profile_folders(folders: Vec<pdfs_store::db::StoredSyncFolder>) -> Vec<ProfileFolder> {
     folders
         .into_iter()
         .filter(|f| f.kind == "device")
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn attached_my_files_folders_are_not_in_the_device_profile() {
         let dir = crate::sim::daemon::scratch("profile-folder-kinds");
-        let db = pdfs_core::db::Db::open(&dir.join("cache.db")).unwrap();
+        let db = pdfs_store::db::Db::open(&dir.join("cache.db")).unwrap();
         db.sync_folder_add("/backup", "vol~backup", "device-share")
             .unwrap();
         db.sync_folder_attach("/work", "vol~work", "my-files-share")

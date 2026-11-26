@@ -4,7 +4,7 @@
 //! side. Drive names come from the `nodes` FTS index; local names come from the
 //! `local_files` index this module feeds. The daemon runs [`scan`] on a
 //! background thread — never on a FUSE or control-socket thread — and streams
-//! batches into [`crate::db::Db::local_upsert_batch`].
+//! batches into `pdfs_store::db::Db::local_upsert_batch`.
 //!
 //! Walking is deliberately shallow on cost: we stat each entry once (the walker
 //! already has the `DirEntry` metadata) and skip the directories that dominate a

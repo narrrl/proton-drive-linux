@@ -11,7 +11,7 @@ use super::*;
 use std::io::Write;
 
 use pdfs_core::control::{PendingOpInfo, SyncIssue};
-use pdfs_core::db::{FAILING_ATTEMPTS, PARK_UNTIL};
+use pdfs_store::db::{FAILING_ATTEMPTS, PARK_UNTIL};
 
 impl Core {
     /// Every queued op, oldest first, with a path a person can read.

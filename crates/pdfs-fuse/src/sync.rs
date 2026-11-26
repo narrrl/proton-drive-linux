@@ -33,8 +33,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 
 use notify::{RecursiveMode, Watcher};
+use proton_drive_rs::Node;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
-use proton_drive_rs::{Node, NodeKind};
 use sha1::{Digest as _, Sha1};
 use tracing::{debug, info, warn};
 
@@ -42,14 +42,11 @@ use crate::transfers::{CountingWriter, OwnedCountingReader};
 use crate::{Core, now_secs, parse_uid};
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
-use pdfs_core::db::{SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 use pdfs_core::syncignore::IgnoreRules;
+use pdfs_store::db::{SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 
 mod engine;
 mod local_scan;
-mod model;
-mod planner;
-mod trace;
 pub(crate) use engine::SYNC_CONCURRENCY;
 pub(crate) use engine::{EngineHealth, SyncMsg, spawn};
 #[cfg(test)]
@@ -59,7 +56,11 @@ use engine::{classify, event_target, settle_with};
 #[cfg(test)]
 use local_scan::is_write_mode;
 use local_scan::open_for_write_set;
+use model::{Applied, remote_file_sig, system_mtime, system_mtime_ns};
 use model::{LocalItem, LocalSig, Outcome, PassAbort, Pending, RemoteItem, RemoteSeen};
+use pdfs_sync::model;
+use pdfs_sync::planner;
+use pdfs_sync::trace;
 pub(crate) use planner::base_name;
 #[cfg(test)]
 use planner::conflict_path;
@@ -76,25 +77,6 @@ use trace::{Call, Count, Phase};
 /// A pass that took at least this long is logged at info even when it changed
 /// nothing, so the journal says where a slow engine spends its time.
 const SLOW_PASS: Duration = Duration::from_secs(30);
-
-/// What a [`Pending`] op did, so the reconcile can update shared state on the
-/// engine thread (never inside a task).
-enum Applied {
-    /// A folder was created; register `uid` in `remote_dirs` for its children.
-    Dir(String, NodeUid),
-    /// A local file was uploaded (new file or new revision).
-    Uploaded,
-    /// A remote file was downloaded.
-    Downloaded,
-    /// A conflict copy was kept.
-    Conflict,
-    /// A path already the same on both sides got its first baseline. Nothing
-    /// moved, so it is neither counted nor logged.
-    Adopted,
-    /// The local file to upload was deleted after the scan planned it. There is
-    /// nothing left to send, and the next pass sees the deletion (B108).
-    Vanished,
-}
 
 impl Core {
     /// Reconcile one synced folder, then apply any mode switch queued while it was
@@ -3105,43 +3087,6 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 
 // ---- helpers --------------------------------------------------------------
 
-/// A remote node's `(mtime, size)` change signature. Size prefers the plaintext
-/// `claimed_size`; otherwise the encrypted storage size (stable either way, and
-/// only ever compared against the same node's own baseline).
-fn remote_file_sig(node: &Node) -> (i64, i64) {
-    let size = match &node.kind {
-        NodeKind::File {
-            claimed_size,
-            total_size_on_storage,
-            ..
-        } => claimed_size.unwrap_or(*total_size_on_storage),
-        NodeKind::Folder => 0,
-    };
-    (node.modification_time, size)
-}
-
-/// A file's modification time as epoch seconds (0 if unavailable).
-fn system_mtime(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// The same modification time in nanoseconds, when the filesystem reports one.
-///
-/// Whole seconds cannot distinguish an edit made in the same second as the last
-/// sync from no edit at all, and if the size did not change either, that file
-/// was never uploaded (`docs/BUGS.md` B25). `None` for a clock or filesystem that
-/// cannot answer, which falls the comparison back to seconds rather than
-/// asserting an mtime of zero.
-fn system_mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .and_then(|d| i64::try_from(d.as_nanos()).ok())
-}
 #[cfg(test)]
 mod tests {
     use super::*;

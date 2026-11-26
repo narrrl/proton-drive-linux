@@ -1,0 +1,17 @@
+[package]
+name = "pdfs-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The mirror engine's planner and pass model for the Proton Drive Linux client"
+
+[dependencies]
+pdfs-core.workspace = true
+pdfs-drive.workspace = true
+pdfs-store.workspace = true
+proton-drive-rs.workspace = true
+tracing.workspace = true

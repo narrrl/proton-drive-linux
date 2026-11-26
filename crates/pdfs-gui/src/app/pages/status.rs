@@ -1672,7 +1672,7 @@ pub(crate) fn clock_time(unix: i64) -> String {
 /// the set is unchanged (the common case on the 2s tick) it only flips the unpin
 /// buttons' `sensitive` flag, avoiding the rebuild that used to flicker the list
 /// and drop scroll/selection every tick.
-pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted: bool) {
+pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::control::Pin], mounted: bool) {
     let desired: Vec<String> = pins.iter().map(|p| p.path.clone()).collect();
     if ui.status.pins_state.borrow().as_ref() == Some(&desired) {
         for r in ui.status.pin_rows.borrow().iter() {

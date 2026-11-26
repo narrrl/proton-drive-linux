@@ -2,8 +2,8 @@
 //! the faults the real one has, and the tools to drive daemons against it.
 
 pub(crate) mod daemon;
-pub(crate) mod fake_drive;
+pub(crate) use pdfs_drive::sim::fake_drive;
 pub(crate) mod model;
-pub(crate) mod rng;
+pub(crate) use pdfs_drive::sim::rng;
 pub(crate) mod run;
 pub(crate) mod watchdog;

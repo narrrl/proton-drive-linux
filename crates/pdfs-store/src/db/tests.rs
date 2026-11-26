@@ -1,0 +1,8383 @@
+use super::activity::ACTIVITY_KEEP;
+use super::migrations::SCHEMA_VERSION;
+use super::*;
+use pdfs_core::control::{ActivityEntry, ActivityKind};
+use pdfs_core::localindex::LocalEntry;
+use proton_drive_rs::proton_sdk::ids::NodeUid;
+use proton_drive_rs::{Node, NodeKind};
+use serde_json::json;
+
+/// `Db::open` applies the pragmas that `open_in_memory` skips, so the WAL
+/// settings can only be checked against a real file.
+#[test]
+fn open_bounds_the_wal_size() {
+    let path = std::env::temp_dir().join(format!("pdfs-db-wal-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let db = Db::open(&path).unwrap();
+    let conn = db.conn.lock();
+
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    // Without this the WAL is reused in place but never shrinks, so one
+    // oversized transaction strands its high-water mark on disk forever.
+    let limit: i64 = conn
+        .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(limit, WAL_SIZE_LIMIT);
+
+    // Without a busy timeout the default is 0: a lock held by anyone else fails
+    // the statement instantly instead of waiting for it to clear.
+    let busy: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(busy, BUSY_TIMEOUT.as_millis() as i64);
+
+    drop(conn);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A second connection to the same file — a hand-started `pdfs mount` alongside
+/// the systemd service, a backup tool, a stray `sqlite3` session — holds a write
+/// lock briefly. Our write must wait for it rather than failing on the spot.
+///
+/// **This passed before the busy timeout was set explicitly**, because rusqlite
+/// already applies one. It is kept as a characterisation test, not as evidence
+/// of a fix: it states the behaviour the daemon relies on, so that losing it
+/// (dropping the pragma, or a dependency changing its default) fails here rather
+/// than in front of a user.
+#[test]
+fn a_write_waits_for_a_competing_writer() {
+    use std::time::Duration;
+
+    let path = std::env::temp_dir().join(format!("pdfs-db-busy-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let db = Db::open(&path).unwrap();
+
+    // A second process's connection takes an exclusive write lock and holds it
+    // for a moment, as any real transaction would.
+    let holder = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let other = rusqlite::Connection::open(&path).unwrap();
+            other.busy_timeout(Duration::from_secs(5)).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        })
+    };
+    // Let the holder actually acquire the lock before we contend for it.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // This is the assertion: it blocks until the holder commits, rather than
+    // returning SQLITE_BUSY.
+    db.set_state_i64("busy_probe", 7).unwrap();
+
+    holder.join().unwrap();
+    assert_eq!(db.state_i64("busy_probe").unwrap(), Some(7));
+
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+
+fn uid(link: &str) -> NodeUid {
+    NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
+}
+
+fn now_test_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+// `NodeVerification` is not re-exported, so build test nodes by
+// deserializing JSON (the field has a serde default and can be omitted).
+fn node_from(parent: serde_json::Value, link: &str, name: &str, kind: serde_json::Value) -> Node {
+    let v = serde_json::json!({
+        "uid": {"volume_id": "vol", "link_id": link},
+        "parent_uid": parent,
+        "kind": kind,
+        "name": name,
+        "creation_time": 100,
+        "modification_time": 200,
+        "trashed": false,
+        "signature_email": null,
+    });
+    serde_json::from_value(v).unwrap()
+}
+
+#[test]
+fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            media_type: Some("video/mp4".into()),
+            favorite: Some(true),
+            ..TimelineRow::new("p1", 300)
+        },
+        TimelineRow::new("p2", 200),
+        TimelineRow::new("p3", 100),
+    ])
+    .unwrap();
+
+    // A thumbnail attempt teaches us p1's ratio and that p2 can never have one.
+    db.photo_set_thumb("p1", THUMB_HAVE, Some(1.5)).unwrap();
+    db.photo_set_thumb("p2", THUMB_NONE, None).unwrap();
+
+    // The next refresh brings a new photo, keeps p1 and p2, and loses p3.
+    // p1's media type arrives as `None` this time and must not be forgotten.
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("new.jpg".into()),
+            favorite: Some(false),
+            ..TimelineRow::new("p0", 400)
+        },
+        TimelineRow::new("p1", 300),
+        TimelineRow::new("p2", 200),
+    ])
+    .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p0", "p1", "p2"],
+        "server order is preserved, and the dropped photo is gone"
+    );
+    assert_eq!(page[0].name.as_deref(), Some("new.jpg"));
+    // Ratios and verdicts cost a download to rediscover: they survive a refresh.
+    assert_eq!(page[1].ratio, Some(1.5));
+    assert_eq!(page[1].thumb_state, THUMB_HAVE);
+    assert_eq!(page[2].thumb_state, THUMB_NONE);
+    // A photo we know nothing about yet starts blank.
+    assert_eq!(page[0].ratio, None);
+    assert_eq!(page[0].thumb_state, THUMB_UNKNOWN);
+    // Media type is learned-and-kept like the ratio: p1 keeps the video type
+    // it was first seen with even though the later refresh carried `None`, so
+    // it stays classified as a video.
+    assert_eq!(page[1].kind, pdfs_core::control::PhotoKind::Video);
+
+    assert_eq!(db.photos_count().unwrap(), 3);
+    // The counts break down by tab, and a filtered page returns only its tab.
+    assert_eq!(db.photos_counts().unwrap(), (2, 1, 0));
+    let videos = db
+        .photos_page(
+            0,
+            10,
+            Some(pdfs_core::control::PhotoKind::Video),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        videos.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p1"]
+    );
+    let by_uid = db.photos_by_uid(&["p2".into()]).unwrap();
+    assert_eq!(by_uid.len(), 1);
+    assert_eq!(by_uid[0].capture_time, 200);
+
+    // A date-range page keeps only the window's photos: [150, 350) is p1+p2,
+    // not p0 at 400. Combined with a kind filter both conditions apply.
+    let ranged = db
+        .photos_page(0, 10, None, Some((150, 350)), false, false)
+        .unwrap();
+    assert_eq!(
+        ranged.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p1", "p2"]
+    );
+    let ranged_video = db
+        .photos_page(
+            0,
+            10,
+            Some(pdfs_core::control::PhotoKind::Video),
+            Some((150, 350)),
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        ranged_video
+            .iter()
+            .map(|p| p.uid.as_str())
+            .collect::<Vec<_>>(),
+        ["p1"]
+    );
+    // All three surviving photos sit in the same (1970-01) local month.
+    let months = db.photos_months(None).unwrap();
+    assert_eq!(months.len(), 1);
+    assert_eq!(months[0].2, 3);
+}
+
+#[test]
+fn favorites_are_remembered_across_refreshes_and_filter_a_page() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            favorite: Some(true),
+            ..TimelineRow::new("p1", 300)
+        },
+        TimelineRow {
+            favorite: Some(false),
+            ..TimelineRow::new("p2", 200)
+        },
+    ])
+    .unwrap();
+    let favorites = db.photos_page(0, 10, None, None, true, false).unwrap();
+    assert_eq!(
+        favorites.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p1"],
+        "only the favorited photo is in a favorites page"
+    );
+
+    // A local toggle survives a refresh that could not resolve the photo's node
+    // (`None`), and loses to one that could.
+    db.photos_set_favorite("p2", true).unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            favorite: Some(false),
+            ..TimelineRow::new("p1", 300)
+        },
+        TimelineRow::new("p2", 200),
+    ])
+    .unwrap();
+    let favorites = db.photos_page(0, 10, None, None, true, false).unwrap();
+    assert_eq!(
+        favorites.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p2"],
+        "the server's answer wins where it has one; the local flag holds where it doesn't"
+    );
+    assert!(db.photos_by_uid(&["p2".into()]).unwrap()[0].favorite);
+}
+
+/// The strip shows the same calendar day in earlier years only: not today's
+/// own photos, not the day before, and one tile per RAW+JPEG shot.
+#[test]
+fn on_this_day_finds_the_same_date_in_earlier_years() {
+    const DAY: i64 = 86_400;
+    // Noon UTC, so the local date is the same in every common time zone.
+    let today = 1_781_524_800; // 2026-06-15 12:00 UTC
+    let year_ago = today - 365 * DAY; // 2025-06-15
+    let three_years_ago = today - (365 * 3 + 1) * DAY; // 2023-06-15, past a 29 February
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow::new("today", today),
+        TimelineRow {
+            name: Some("IMG_1.JPG".into()),
+            ..TimelineRow::new("jpeg", year_ago)
+        },
+        TimelineRow {
+            name: Some("IMG_1.CR2".into()),
+            ..TimelineRow::new("raw", year_ago)
+        },
+        TimelineRow::new("day-before", year_ago - DAY),
+        TimelineRow::new("older", three_years_ago),
+    ])
+    .unwrap();
+
+    let found = db.photos_on_this_day(today, 10).unwrap();
+    assert_eq!(
+        found.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["jpeg", "older"]
+    );
+}
+
+fn hashed(uid: &str, capture_time: i64, name: &str, hash: &str) -> TimelineRow {
+    TimelineRow {
+        name: Some(name.into()),
+        content_hash: Some(hash.into()),
+        ..TimelineRow::new(uid, capture_time)
+    }
+}
+
+fn located(uid: &str, capture_time: i64, name: &str, at: (f64, f64)) -> TimelineRow {
+    TimelineRow {
+        name: Some(name.into()),
+        location: Some(at),
+        resolved_at: Some(1),
+        ..TimelineRow::new(uid, capture_time)
+    }
+}
+
+const BERLIN: (f64, f64) = (52.52, 13.405);
+const PARIS: (f64, f64) = (48.857, 2.352);
+
+/// Places count shots, not files, lead with the most photographed town, and
+/// leave out photos with no location or taken far from any town.
+#[test]
+fn places_group_photos_by_the_nearest_town() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        located("b2", 500, "IMG_5.JPG", BERLIN),
+        located("p1", 400, "IMG_4.JPG", PARIS),
+        located("b1-jpeg", 300, "IMG_3.JPG", BERLIN),
+        located("b1-raw", 300, "IMG_3.CR2", BERLIN),
+        located("sea", 200, "IMG_2.JPG", (0.0, -30.0)),
+        TimelineRow::new("nowhere", 100),
+    ])
+    .unwrap();
+
+    let places = db.photo_places().unwrap();
+    let summary: Vec<(&str, usize, &str)> = places
+        .iter()
+        .map(|place| {
+            let city = pdfs_core::places::city(place.id).expect("a known town");
+            (city.name, place.count, place.cover.uid.as_str())
+        })
+        .collect();
+    assert_eq!(summary, [("Berlin", 2, "b2"), ("Paris", 1, "p1")]);
+
+    let berlin: Vec<String> = db
+        .photos_at_place(places[0].id, 0, 10)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.uid)
+        .collect();
+    assert_eq!(berlin, ["b2", "b1-jpeg"]);
+    let visible = db.photo_places_visible(r#"["b2","p1"]"#).unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].count, 1);
+    assert_eq!(visible[0].cover.uid, "b1-jpeg");
+}
+
+/// A town's photos come with where each was taken, one per RAW+JPEG shot.
+#[test]
+fn place_photos_carry_their_own_location() {
+    let db = Db::open_in_memory().unwrap();
+    let kreuzberg = (52.497, 13.411);
+    db.photos_replace(&[
+        located("b2", 500, "IMG_5.JPG", BERLIN),
+        located("b1-jpeg", 300, "IMG_3.JPG", kreuzberg),
+        located("b1-raw", 300, "IMG_3.CR2", kreuzberg),
+    ])
+    .unwrap();
+    let id = db.photo_places().unwrap()[0].id;
+    let located: Vec<(String, (f64, f64))> = db
+        .photo_locations_at_place(id)
+        .unwrap()
+        .into_iter()
+        .map(|(photo, at)| (photo.uid, at))
+        .collect();
+    assert_eq!(
+        located,
+        [("b2".to_owned(), BERLIN), ("b1-jpeg".to_owned(), kreuzberg)]
+    );
+}
+
+/// A timeline photo names the town it was taken in, so the viewer can show it;
+/// one without a location names none.
+#[test]
+fn timeline_photos_name_their_town() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        located("b", 500, "IMG_5.JPG", BERLIN),
+        TimelineRow::new("n", 400),
+    ])
+    .unwrap();
+    let berlin = db.photo_places().unwrap()[0].id;
+    let mut photos = db.photos_by_uid(&["b".into(), "n".into()]).unwrap();
+    photos.sort_by(|a, b| a.uid.cmp(&b.uid));
+    let towns: Vec<Option<u32>> = photos.iter().map(|photo| photo.place_id).collect();
+    assert_eq!(towns, [Some(berlin), None]);
+}
+
+/// A refresh that skips an already-resolved photo keeps where it was taken; one
+/// that reads the node again takes what the node now says.
+#[test]
+fn a_skipped_refresh_keeps_a_photos_location() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[located("a", 100, "IMG_1.JPG", BERLIN)])
+        .unwrap();
+    db.photos_replace(&[TimelineRow::new("a", 100)]).unwrap();
+    assert_eq!(db.photo_places().unwrap().len(), 1);
+
+    db.photos_replace(&[TimelineRow {
+        resolved_at: Some(2),
+        ..TimelineRow::new("a", 100)
+    }])
+    .unwrap();
+    assert!(db.photo_places().unwrap().is_empty());
+}
+
+/// A copy an album holds is the one kept; the files of one RAW+JPEG shot are
+/// never copies of each other; a hash only one file carries is no set.
+#[test]
+fn duplicates_list_the_copy_to_keep_first() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        hashed("copy", 500, "IMG_2.JPG", "h2"),
+        hashed("filed", 400, "IMG_2(1).JPG", "h2"),
+        hashed("jpeg", 300, "IMG_1.JPG", "h1"),
+        hashed("raw", 300, "IMG_1.CR2", "h1"),
+        hashed("stray", 200, "IMG_1(1).CR2", "h1"),
+        hashed("alone", 100, "IMG_3.JPG", "h3"),
+    ])
+    .unwrap();
+    db.album_photos_replace("a1", &[("filed".into(), 400, None, None)])
+        .unwrap();
+
+    let sets = db.photo_duplicates().unwrap();
+    let uids: Vec<Vec<&str>> = sets
+        .iter()
+        .map(|set| set.iter().map(|p| p.uid.as_str()).collect())
+        .collect();
+    assert_eq!(uids, [vec!["filed", "copy"], vec!["jpeg", "stray"]]);
+}
+
+/// Shots that look alike form a set, one photo per shot, while a set of
+/// byte-identical copies is left to the duplicate finder.
+#[test]
+fn similar_photos_group_by_look_and_skip_exact_copies() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        hashed("big", 500, "IMG_1.JPG", "h1"),
+        hashed("small", 400, "IMG_1-small.JPG", "h2"),
+        hashed("copy", 300, "IMG_2.JPG", "h3"),
+        hashed("copy2", 200, "IMG_2(1).JPG", "h3"),
+        hashed("other", 100, "IMG_3.JPG", "h4"),
+        hashed("flat", 50, "IMG_4.JPG", "h5"),
+    ])
+    .unwrap();
+    let look = 0x0f0f_3c3c_5a5a_9696_u64;
+    db.photo_set_similar_hash("big", look).unwrap();
+    db.photo_set_similar_hash("small", look ^ 0b101).unwrap();
+    db.photo_set_similar_hash("copy", !look).unwrap();
+    db.photo_set_similar_hash("copy2", !look).unwrap();
+    db.photo_set_similar_hash("other", look ^ 0xffff_ffff)
+        .unwrap();
+    db.photo_set_similar_hash("flat", pdfs_core::similar::NO_HASH)
+        .unwrap();
+
+    let sets = db.photo_similar().unwrap();
+    let uids: Vec<Vec<&str>> = sets
+        .iter()
+        .map(|set| set.iter().map(|p| p.uid.as_str()).collect())
+        .collect();
+    assert_eq!(uids, [vec!["small", "big"]]);
+    assert_eq!(db.similar_progress().unwrap(), (6, 6));
+}
+
+/// What is left to hash skips videos and hashed shots, and a hash survives a
+/// refresh unless the photo's bytes changed.
+#[test]
+fn similar_hashes_are_kept_until_the_photo_changes() {
+    let db = Db::open_in_memory().unwrap();
+    let resolved = |uid: &str, hash: &str| TimelineRow {
+        resolved_at: Some(1),
+        ..hashed(uid, 100, &format!("{uid}.JPG"), hash)
+    };
+    db.photos_replace(&[
+        resolved("a", "h1"),
+        resolved("b", "h2"),
+        hashed("clip", 50, "clip.mp4", "h3"),
+    ])
+    .unwrap();
+    db.photo_set_similar_hash("a", 7).unwrap();
+    db.photo_set_similar_hash("b", 9).unwrap();
+    let left = |db: &Db| -> Vec<String> {
+        db.photos_unhashed(10)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.uid)
+            .collect()
+    };
+    assert!(left(&db).is_empty());
+    assert_eq!(db.similar_progress().unwrap(), (2, 2));
+
+    db.photos_replace(&[
+        resolved("a", "h1"),
+        resolved("b", "h2-edited"),
+        hashed("clip", 50, "clip.mp4", "h3"),
+    ])
+    .unwrap();
+    assert_eq!(left(&db), ["b"]);
+    assert_eq!(db.similar_progress().unwrap(), (1, 2));
+}
+
+/// Trashing the file a group is shown as leaves the rest of the group on the
+/// timeline instead of pointing at a photo that is gone.
+#[test]
+fn deleting_a_group_representative_keeps_its_other_files() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        hashed("jpeg", 300, "IMG_1.JPG", "h1"),
+        hashed("raw", 300, "IMG_1.CR2", "h2"),
+    ])
+    .unwrap();
+    assert_eq!(
+        db.photos_page(0, 10, None, None, false, false)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    db.photos_delete(&["jpeg".into()]).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["raw"]
+    );
+}
+
+#[test]
+fn not_in_album_hides_photos_any_album_holds() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow::new("p1", 300),
+        TimelineRow::new("p2", 200),
+        TimelineRow::new("p3", 100),
+    ])
+    .unwrap();
+    db.album_photos_replace("a1", &[("p1".into(), 300, None, None)])
+        .unwrap();
+    db.album_photos_replace("a2", &[("p3".into(), 100, None, None)])
+        .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false, true).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p2"]
+    );
+}
+
+/// Filing the JPEG of a RAW+JPEG shot files the shot: the grid shows it as
+/// one tile, and that tile is in an album.
+#[test]
+fn not_in_album_counts_a_raw_pair_as_filed() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            ..TimelineRow::new("jpeg", 300)
+        },
+        TimelineRow {
+            name: Some("img_1234.cr2".into()),
+            ..TimelineRow::new("raw", 300)
+        },
+        TimelineRow {
+            name: Some("IMG_9999.JPG".into()),
+            ..TimelineRow::new("alone", 200)
+        },
+    ])
+    .unwrap();
+    db.album_photos_replace("a1", &[("raw".into(), 300, None, None)])
+        .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false, true).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["alone"]
+    );
+}
+
+#[test]
+fn photos_page_slices_the_timeline_in_order() {
+    let db = Db::open_in_memory().unwrap();
+    let items: Vec<_> = (0..5)
+        .map(|i| TimelineRow::new(format!("p{i}"), 500 - i as i64))
+        .collect();
+    db.photos_replace(&items).unwrap();
+
+    let page = db.photos_page(2, 2, None, None, false, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p2", "p3"]
+    );
+    assert!(
+        db.photos_page(9, 2, None, None, false, false)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn trash_replace_lists_folders_first() {
+    let db = Db::open_in_memory().unwrap();
+    db.trash_replace(&[
+        StoredTrash {
+            uid: "t1".into(),
+            name: "zeta.txt".into(),
+            is_dir: false,
+            size: 10,
+            mtime: 1,
+            parent_uid: Some("t2".into()),
+            trashed_at: Some(100),
+        },
+        StoredTrash {
+            uid: "t2".into(),
+            name: "Alpha".into(),
+            is_dir: true,
+            size: 0,
+            mtime: 2,
+            parent_uid: None,
+            trashed_at: None,
+        },
+    ])
+    .unwrap();
+
+    let items = db.trash_list().unwrap();
+    assert_eq!(
+        items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        ["Alpha", "zeta.txt"]
+    );
+
+    // The parent links come back with the rows: a restore reads the tree shape
+    // from them.
+    let mut parents = db.trash_parents().unwrap();
+    parents.sort();
+    assert_eq!(
+        parents,
+        [
+            ("t1".to_string(), Some("t2".to_string())),
+            ("t2".to_string(), None),
+        ]
+    );
+
+    // The first-seen times round-trip, unknown ones included.
+    let mut seen: Vec<_> = db.trash_seen().unwrap().into_iter().collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [("t1".to_string(), Some(100)), ("t2".to_string(), None)]
+    );
+    assert_eq!(items[1].trashed_at, Some(100));
+
+    // A replace is a replace: emptying the trash on the server empties it here.
+    db.trash_replace(&[]).unwrap();
+    assert!(db.trash_list().unwrap().is_empty());
+}
+
+fn stored_trash(uid: &str, name: &str, trashed_at: Option<i64>) -> StoredTrash {
+    StoredTrash {
+        uid: uid.into(),
+        name: name.into(),
+        is_dir: false,
+        size: 1,
+        mtime: 1,
+        parent_uid: None,
+        trashed_at,
+    }
+}
+
+#[test]
+fn trash_upsert_keeps_other_rows_and_retain_drops_unlisted_ones() {
+    let db = Db::open_in_memory().unwrap();
+    db.trash_upsert(&[
+        stored_trash("a", "a.txt", Some(1)),
+        stored_trash("b", "b.txt", None),
+    ])
+    .unwrap();
+    // A later refresh adds what is new without touching what it kept.
+    db.trash_upsert(&[
+        stored_trash("c", "c.txt", Some(3)),
+        stored_trash("b", "b2.txt", Some(2)),
+    ])
+    .unwrap();
+    let mut names: Vec<String> = db
+        .trash_list()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.txt", "b2.txt", "c.txt"]);
+
+    // Rows the server no longer lists go; the listed ones stay.
+    let keep: std::collections::HashSet<String> = ["a", "c"].map(String::from).into();
+    assert_eq!(db.trash_retain(&keep).unwrap(), 1);
+    assert_eq!(db.trash_remove(&["a".into(), "gone".into()]).unwrap(), 1);
+    let left: Vec<String> = db
+        .trash_list()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.uid)
+        .collect();
+    assert_eq!(left, ["c"]);
+}
+
+#[test]
+fn state_stamps_round_trip_and_clear() {
+    let db = Db::open_in_memory().unwrap();
+    assert_eq!(db.state_i64("photos_synced_ms").unwrap(), None);
+    db.set_state_i64("photos_synced_ms", 1234).unwrap();
+    assert_eq!(db.state_i64("photos_synced_ms").unwrap(), Some(1234));
+    db.clear_state("photos_synced_ms").unwrap();
+    assert_eq!(
+        db.state_i64("photos_synced_ms").unwrap(),
+        None,
+        "a cleared stamp reads as never fetched, so the next request blocks on a refresh"
+    );
+}
+
+fn folder(link: &str, parent: Option<&str>, name: &str) -> Node {
+    let parent = match parent {
+        Some(p) => serde_json::json!({"volume_id": "vol", "link_id": p}),
+        None => serde_json::Value::Null,
+    };
+    node_from(parent, link, name, serde_json::json!("Folder"))
+}
+
+fn file(link: &str, parent: &str, name: &str, size: i64) -> Node {
+    let kind = serde_json::json!({
+        "File": {
+            "media_type": "text/plain",
+            "total_size_on_storage": size + 10,
+            "claimed_size": size,
+            "claimed_modification_time": null,
+        }
+    });
+    node_from(
+        serde_json::json!({"volume_id": "vol", "link_id": parent}),
+        link,
+        name,
+        kind,
+    )
+}
+
+fn foreign_folder(volume: &str, link: &str, parent: NodeUid, name: &str) -> Node {
+    let mut node = folder(link, None, name);
+    node.uid = NodeUid::new(VolumeId::from(volume), LinkId::from(link));
+    node.parent_uid = Some(parent);
+    node
+}
+
+/// Recovering the root by uid is what lets the daemon mount offline:
+/// the uid is remembered in `sync_state`, the node
+/// itself comes back out of `nodes`.
+#[test]
+fn node_by_uid_recovers_a_stored_node() {
+    let db = Db::open_in_memory().unwrap();
+    let root = folder("root", None, "My Files");
+    db.upsert_node(&root).unwrap();
+    db.set_state_str("root_uid", &root.uid.to_string()).unwrap();
+
+    let key = db.state_str("root_uid").unwrap().unwrap();
+    let got = db.node_by_uid(&key).unwrap().expect("root recovered");
+    assert_eq!(got.uid, root.uid);
+    assert_eq!(got.name, "My Files");
+    assert!(got.is_folder());
+
+    assert!(db.node_by_uid("vol~nope").unwrap().is_none());
+    assert!(db.state_str("never_written").unwrap().is_none());
+}
+
+#[test]
+fn upsert_and_load_all_roundtrip() {
+    let db = Db::open_in_memory().unwrap();
+    let root = folder("root", None, "My Files");
+    let child = file("f1", "root", "hello.txt", 42);
+    db.upsert_node(&root).unwrap();
+    db.upsert_node(&child).unwrap();
+
+    let loaded = db.load_all().unwrap();
+    assert_eq!(loaded.len(), 2);
+    let f = loaded.iter().find(|s| s.node.uid == uid("f1")).unwrap();
+    assert_eq!(f.node.name, "hello.txt");
+    assert!(!f.listed);
+    match &f.node.kind {
+        NodeKind::File { claimed_size, .. } => assert_eq!(*claimed_size, Some(42)),
+        _ => panic!("expected file"),
+    }
+}
+
+#[test]
+fn upsert_nodes_and_load_all_roundtrip() {
+    let db = Db::open_in_memory().unwrap();
+    let root = folder("root", None, "My Files");
+    let child1 = file("f1", "root", "hello.txt", 42);
+    let child2 = file("f2", "root", "world.txt", 100);
+    db.upsert_nodes(&[root, child1, child2]).unwrap();
+
+    let loaded = db.load_all().unwrap();
+    assert_eq!(loaded.len(), 3);
+    let f1 = loaded.iter().find(|s| s.node.uid == uid("f1")).unwrap();
+    assert_eq!(f1.node.name, "hello.txt");
+    let f2 = loaded.iter().find(|s| s.node.uid == uid("f2")).unwrap();
+    assert_eq!(f2.node.name, "world.txt");
+}
+
+#[test]
+fn upsert_is_idempotent_update() {
+    let db = Db::open_in_memory().unwrap();
+    let mut n = folder("root", None, "My Files");
+    db.upsert_node(&n).unwrap();
+    n.name = "Renamed".into();
+    db.upsert_node(&n).unwrap();
+    let loaded = db.load_all().unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].node.name, "Renamed");
+}
+
+#[test]
+fn delete_node_removes_row() {
+    let db = Db::open_in_memory().unwrap();
+    let n = folder("root", None, "My Files");
+    db.upsert_node(&n).unwrap();
+    db.delete_node(&uid("root")).unwrap();
+    assert!(db.load_all().unwrap().is_empty());
+}
+
+#[test]
+fn completing_trash_atomically_removes_the_op_and_retained_node() {
+    let db = Db::open_in_memory().unwrap();
+    let node = file("trash-me", "parent", "trash-me.txt", 4);
+    let uid = node.uid.clone();
+    db.upsert_node(&node).unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_TRASH.to_string(),
+        uid: uid.to_string(),
+        parent_uid: None,
+        name: Some(node.name.clone()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    let op = db.pending_ops().unwrap().remove(0);
+
+    db.complete_trash_op(op.id, &uid).unwrap();
+
+    assert!(db.node_by_uid(&uid.to_string()).unwrap().is_none());
+    assert!(db.pending_ops().unwrap().is_empty());
+}
+
+#[test]
+fn children_if_listed_gated_on_flag() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "a.txt", 1)).unwrap();
+    db.upsert_node(&file("f2", "root", "b.txt", 2)).unwrap();
+
+    // Not listed yet → unknown, force a re-fetch.
+    assert!(db.children_if_listed(&uid("root")).unwrap().is_none());
+    // Still known, for a caller that has nothing better while offline.
+    assert_eq!(db.known_children(&uid("root")).unwrap().len(), 2);
+
+    db.set_listed(&uid("root"), true).unwrap();
+    let kids = db.children_if_listed(&uid("root")).unwrap().unwrap();
+    assert_eq!(kids.len(), 2);
+}
+
+/// The shape of the `mv`-loses-the-file bug (`docs/BUGS.md` B1): a rename deletes the
+/// moved node's row, so a destination left marked `listed` is rebuilt from the DB
+/// without it — the file is gone from the source and absent from the destination,
+/// with `rename(2)` having reported success. Clearing the flag is what forces the
+/// re-enumeration that finds it again.
+#[test]
+fn a_deleted_child_leaves_a_listed_parent_serving_a_stale_listing() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("dst", Some("root"), "dest"))
+        .unwrap();
+    db.upsert_node(&file("f1", "root", "a.txt", 1)).unwrap();
+    db.set_listed(&uid("dst"), true).unwrap();
+
+    // The rename moved a.txt into `dst` server-side, then forgot the node.
+    db.delete_node(&uid("f1")).unwrap();
+
+    // `dst` is still flagged listed, so the DB fast path answers — and the file
+    // it was just moved into is nowhere in the result.
+    assert!(
+        db.children_if_listed(&uid("dst"))
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Clearing the flag is the only thing that sends the next read to the server.
+    db.set_listed(&uid("dst"), false).unwrap();
+    assert!(db.children_if_listed(&uid("dst")).unwrap().is_none());
+}
+
+#[test]
+fn children_if_listed_excludes_trashed() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let mut trashed = file("f1", "root", "a.txt", 1);
+    trashed.trashed = true;
+    db.upsert_node(&trashed).unwrap();
+    db.set_listed(&uid("root"), true).unwrap();
+    assert_eq!(
+        db.children_if_listed(&uid("root")).unwrap().unwrap().len(),
+        0
+    );
+}
+
+#[test]
+fn shared_root_replacement_tombstones_without_losing_work_or_authority() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid.clone(), "Project");
+    let child = foreign_folder("foreign", "child", shared.uid.clone(), "Secret");
+    db.upsert_nodes(&[own_root, virtual_root, shared.clone(), child.clone()])
+        .unwrap();
+    db.set_share_access(&shared.uid, pdfs_core::Access::Editor)
+        .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: child.uid.to_string(),
+        parent_uid: Some(shared.uid.to_string()),
+        name: Some(child.name.clone()),
+        blob_path: Some("/staging/shared-edit".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    assert_eq!(db.search("Secret", 10).unwrap().len(), 1);
+
+    let removed = db.publish_shared_roots(&virtual_uid, &[], &[]).unwrap();
+    assert_eq!(removed, vec![shared.uid.clone()]);
+    assert!(db.visible_children(&virtual_uid).unwrap().is_empty());
+    assert!(
+        db.node_by_uid(&shared.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed
+    );
+    assert!(
+        db.node_by_uid(&child.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed
+    );
+    assert!(db.search("Secret", 10).unwrap().is_empty());
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.share_access(&shared.uid).unwrap(),
+        Some(pdfs_core::Access::Viewer)
+    );
+
+    let mut reappeared = shared.clone();
+    reappeared.trashed = false;
+    assert!(
+        db.publish_shared_roots(
+            &virtual_uid,
+            std::slice::from_ref(&shared.uid),
+            &[PublishedSharedRoot {
+                node: reappeared,
+                access: pdfs_core::Access::Viewer,
+            }],
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let restored = db.visible_children(&virtual_uid).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].parent_uid.as_ref(), Some(&virtual_uid));
+    assert!(!restored[0].trashed);
+    assert!(
+        db.node_by_uid(&child.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed,
+        "descendants remain hidden until their folder is re-enumerated"
+    );
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.share_access(&shared.uid).unwrap(),
+        Some(pdfs_core::Access::Viewer),
+        "reappearance stays fail-closed until an observed role refresh"
+    );
+}
+
+#[test]
+fn shared_root_node_and_authority_publication_roll_back_together() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid.clone(), "Before");
+    db.upsert_nodes(&[own_root, virtual_root, shared.clone()])
+        .unwrap();
+    db.set_share_access(&shared.uid, pdfs_core::Access::Viewer)
+        .unwrap();
+    db.set_listed(&virtual_uid, false).unwrap();
+    db.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_shared_authority
+             BEFORE UPDATE ON share_access
+             WHEN NEW.root_uid = 'foreign~share'
+             BEGIN SELECT RAISE(ABORT, 'injected authority failure'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let mut changed = shared.clone();
+    changed.name = "After".into();
+    let result = db.publish_shared_roots(
+        &virtual_uid,
+        std::slice::from_ref(&shared.uid),
+        &[PublishedSharedRoot {
+            node: changed,
+            access: pdfs_core::Access::Editor,
+        }],
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        db.node_by_uid(&shared.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .name,
+        "Before"
+    );
+    assert_eq!(
+        db.share_access(&shared.uid).unwrap(),
+        Some(pdfs_core::Access::Viewer)
+    );
+    assert!(db.children_if_listed(&virtual_uid).unwrap().is_none());
+}
+
+#[test]
+fn accepted_but_unmaterialized_shared_root_keeps_its_snapshot() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid.clone(), "Retained");
+    db.upsert_nodes(&[own_root, virtual_root, shared.clone()])
+        .unwrap();
+    db.set_share_access(&shared.uid, pdfs_core::Access::Editor)
+        .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_RENAME.to_string(),
+        uid: shared.uid.to_string(),
+        parent_uid: Some(virtual_uid.to_string()),
+        name: Some("Retained locally".to_string()),
+        blob_path: None,
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    let removed = db
+        .publish_shared_roots(&virtual_uid, std::slice::from_ref(&shared.uid), &[])
+        .unwrap();
+    assert!(removed.is_empty());
+    assert_eq!(db.visible_children(&virtual_uid).unwrap().len(), 1);
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.share_access(&shared.uid).unwrap(),
+        Some(pdfs_core::Access::Viewer),
+        "an accepted root without verified materialized membership fails closed"
+    );
+}
+
+#[test]
+fn foreign_listing_reconciles_authoritative_uids_and_survives_restart_shape() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid, "Shared");
+    let kept = foreign_folder("foreign", "kept", shared.uid.clone(), "Kept");
+    let removed = foreign_folder("foreign", "removed", shared.uid.clone(), "Removed");
+    let deep = foreign_folder("foreign", "deep", removed.uid.clone(), "Deep secret");
+    db.upsert_nodes(&[
+        own_root,
+        virtual_root,
+        shared.clone(),
+        kept.clone(),
+        removed.clone(),
+        deep.clone(),
+    ])
+    .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: deep.uid.to_string(),
+        parent_uid: Some(removed.uid.to_string()),
+        name: Some(deep.name.clone()),
+        blob_path: Some("/staging/foreign".into()),
+        meta_json: Some("{}".into()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    let removed_uids = db
+        .publish_foreign_children(&shared.uid, std::slice::from_ref(&kept.uid), &[])
+        .unwrap();
+    assert_eq!(removed_uids, vec![removed.uid.clone()]);
+    let snapshot = db.visible_children(&shared.uid).unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].uid, kept.uid);
+    assert!(
+        db.node_by_uid(&deep.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed
+    );
+    assert!(db.search("secret", 10).unwrap().is_empty());
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.children_if_listed(&shared.uid).unwrap().unwrap().len(),
+        1,
+        "restart hydration sees the completed authoritative snapshot"
+    );
+}
+
+#[test]
+fn foreign_delete_tombstones_the_subtree_without_losing_pending_work() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid, "Shared");
+    let deleted = foreign_folder("foreign", "deleted", shared.uid.clone(), "Deleted");
+    let deep = foreign_folder("foreign", "deep", deleted.uid.clone(), "Searchable deep");
+    db.upsert_nodes(&[
+        own_root,
+        virtual_root,
+        shared,
+        deleted.clone(),
+        deep.clone(),
+    ])
+    .unwrap();
+    db.set_share_access(&deleted.uid, pdfs_core::Access::Editor)
+        .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: deep.uid.to_string(),
+        parent_uid: Some(deleted.uid.to_string()),
+        name: Some(deep.name.clone()),
+        blob_path: Some("/staging/deleted-foreign".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    assert_eq!(db.search("Searchable", 10).unwrap().len(), 1);
+
+    db.tombstone_foreign_subtree(&deleted.uid).unwrap();
+
+    for uid in [&deleted.uid, &deep.uid] {
+        assert!(db.node_by_uid(&uid.to_string()).unwrap().unwrap().trashed);
+    }
+    assert!(db.search("Searchable", 10).unwrap().is_empty());
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.share_access(&deleted.uid).unwrap(),
+        Some(pdfs_core::Access::Viewer)
+    );
+}
+
+#[test]
+fn hidden_virtual_root_removes_descendants_from_fts_and_restores_them() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let mut virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid, "Shared");
+    let child = foreign_folder(
+        "foreign",
+        "child",
+        shared.uid.clone(),
+        "Findable descendant",
+    );
+    db.upsert_node(&own_root).unwrap();
+    assert!(
+        db.publish_virtual_root("shared_with_me_name", &virtual_root)
+            .unwrap()
+    );
+    db.upsert_nodes(&[shared, child.clone()]).unwrap();
+    assert_eq!(db.search("Findable", 10).unwrap().len(), 1);
+
+    virtual_root.trashed = true;
+    assert!(
+        db.publish_virtual_root("shared_with_me_name", &virtual_root)
+            .unwrap()
+    );
+    assert!(db.search("Findable", 10).unwrap().is_empty());
+    assert!(
+        !db.node_by_uid(&child.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed,
+        "valid descendants are hidden by ancestry, not revoked"
+    );
+
+    virtual_root.trashed = false;
+    assert!(
+        db.publish_virtual_root("shared_with_me_name", &virtual_root)
+            .unwrap()
+    );
+    assert_eq!(db.search("Findable", 10).unwrap().len(), 1);
+    let before = db.with_conn(|conn| Ok(conn.total_changes())).unwrap();
+    assert!(
+        !db.publish_virtual_root("shared_with_me_name", &virtual_root)
+            .unwrap()
+    );
+    let after = db.with_conn(|conn| Ok(conn.total_changes())).unwrap();
+    assert_eq!(
+        before, after,
+        "unchanged root lookup performs no DB/FTS writes"
+    );
+}
+
+#[test]
+fn shared_root_pinned_name_survives_database_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-shared-name-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.set_state_str("shared_with_me_name", "Shared with me (Proton 4)")
+            .unwrap();
+    }
+    let reopened = Db::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .state_str("shared_with_me_name")
+            .unwrap()
+            .as_deref(),
+        Some("Shared with me (Proton 4)")
+    );
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Two writers on one database is the failure mode the single-instance lock
+/// exists to prevent — a hand-run `pdfs mount` next to the systemd unit gives
+/// two daemons the same inode space, content cache, and drain queue. The second
+/// open has to fail, and it has to stop failing once the first handle is gone.
+#[test]
+fn a_second_writer_is_refused_while_the_first_holds_the_database() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-single-writer-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    let first = Db::open(&path).unwrap();
+    let second = Db::open(&path);
+    assert!(second.is_err(), "a second writer was allowed in");
+
+    drop(first);
+    // The lock lives in the kernel and dies with the descriptor, so nothing has
+    // to be cleaned up for the next daemon to start.
+    Db::open(&path).expect("reopen after the first handle is dropped");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db.lock"));
+}
+
+/// `cache.db` is derived state — every row can be re-fetched or re-scanned — so
+/// a file that is not a database at all must not stop the daemon starting. It
+/// is moved aside (not deleted: it is the only evidence) and rebuilt.
+#[test]
+fn a_corrupt_database_is_moved_aside_and_rebuilt() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-corrupt-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    std::fs::write(&path, b"this is not an SQLite database").unwrap();
+
+    let db = Db::open(&path).unwrap();
+    db.set_state_str("shared_with_me_name", "rebuilt").unwrap();
+    assert_eq!(
+        db.state_str("shared_with_me_name").unwrap().as_deref(),
+        Some("rebuilt")
+    );
+    drop(db);
+
+    let dir = path.parent().unwrap();
+    let stem = path.file_name().unwrap().to_string_lossy().to_string();
+    let quarantined: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(&format!("{stem}.corrupt-")))
+        .collect();
+    assert_eq!(quarantined.len(), 1, "the damaged file was not kept");
+
+    for name in quarantined {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db.lock"));
+}
+
+/// A rebuilt database must not lose what only this machine has: writes Drive
+/// has not received, the mirror baselines and the pins (`docs/BUGS.md` B216).
+#[test]
+fn a_rebuild_keeps_the_queue_baselines_and_pins_of_the_damaged_file() {
+    let id = now_test_id();
+    let damaged =
+        std::env::temp_dir().join(format!("pdfs-salvage-old-{}-{id}.db", std::process::id()));
+    let fresh =
+        std::env::temp_dir().join(format!("pdfs-salvage-new-{}-{id}.db", std::process::id()));
+
+    let db = Db::open(&damaged).unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("listed", "root", "listed.txt", 1))
+        .unwrap();
+    db.upsert_node(&file("queued", "root", "queued.txt", 2))
+        .unwrap();
+    db.set_listed(&uid("root"), true).unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("queued").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/queued".into()),
+        meta_json: None,
+        created_at: 1,
+        attempts: 3,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    let folder_id = db
+        .sync_folder_add("/home/me/Docs", "vol~docs", "share")
+        .unwrap();
+    db.sync_entry_upsert(
+        folder_id,
+        &StoredSyncEntry {
+            rel_path: "a.txt".into(),
+            remote_uid: Some("vol~a".into()),
+            local_mtime: 5,
+            local_mtime_ns: None,
+            local_size: 6,
+            remote_rev: Some("7".into()),
+            remote_hash: Some("8".into()),
+            remote_revision_id: None,
+        },
+    )
+    .unwrap();
+    db.pin_add("vol~pinned", "/pinned", true).unwrap();
+    drop(db);
+
+    let db = Db::open(&fresh).unwrap();
+    let results = salvage(&db.conn.lock(), &damaged);
+    assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].uid, uid("queued").to_string());
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/queued"));
+    // The op's node came with it; the rest of the tree is fetched again.
+    assert!(
+        db.node_by_uid(&uid("queued").to_string())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.node_by_uid(&uid("listed").to_string())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(db.sync_entries(folder_id).unwrap().len(), 1);
+    assert!(db.is_pinned("vol~pinned").unwrap());
+    drop(db);
+
+    for path in [&damaged, &fresh] {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(file));
+        }
+        let _ = std::fs::remove_file(path.with_extension("db.lock"));
+    }
+}
+
+fn local(path: &str, name: &str, is_dir: bool) -> LocalEntry {
+    LocalEntry {
+        path: path.into(),
+        name: name.into(),
+        is_dir,
+        size: 10,
+        mtime: 5,
+    }
+}
+
+/// A local scan is searchable by substring, and a *later* scan prunes the
+/// paths it no longer sees — including out of the FTS index, so a deleted
+/// file cannot keep surfacing in the prompt.
+#[test]
+fn local_scan_indexes_then_prunes_stale_paths() {
+    let db = Db::open_in_memory().unwrap();
+
+    let gen1 = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(
+        gen1,
+        &[
+            local("/home/u/docs/report.pdf", "report.pdf", false),
+            local("/home/u/docs/notes.md", "notes.md", false),
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.local_finish_scan(gen1, 1_000).unwrap(), 2);
+
+    // Trigram index gives substring (not just prefix) matches.
+    let hits = db.search_local("port", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].path, "/home/u/docs/report.pdf");
+    assert!(!hits[0].is_dir);
+    assert_eq!(db.local_indexed_at().unwrap(), Some(1_000));
+
+    // Second scan sees only notes.md → report.pdf is gone from disk.
+    let gen2 = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(gen2, &[local("/home/u/docs/notes.md", "notes.md", false)])
+        .unwrap();
+    assert_eq!(db.local_finish_scan(gen2, 2_000).unwrap(), 1);
+    assert!(db.search_local("report", 10).unwrap().is_empty());
+    assert_eq!(db.search_local("notes", 10).unwrap().len(), 1);
+}
+
+/// The index is maintained incrementally rather than rebuilt at the end of a
+/// scan, so the case that used to be covered for free — a file the scan sees
+/// again — needs its own test: a re-scan must neither lose the entry nor
+/// duplicate it.
+#[test]
+fn rescanning_an_unchanged_file_keeps_exactly_one_index_entry() {
+    let db = Db::open_in_memory().unwrap();
+    for (generation, mtime) in [(1_000, 5), (2_000, 9)] {
+        let g = db.local_begin_scan().unwrap();
+        let mut e = local("/home/u/docs/report.pdf", "report.pdf", false);
+        e.mtime = mtime;
+        db.local_upsert_batch(g, &[e]).unwrap();
+        assert_eq!(db.local_finish_scan(g, generation).unwrap(), 1);
+        let hits = db.search_local("report", 10).unwrap();
+        assert_eq!(hits.len(), 1, "generation {generation}");
+        assert_eq!(hits[0].mtime, mtime);
+    }
+}
+
+/// A scan that stopped early or lost a batch did not see every file, so it
+/// must not prune the ones it missed (`docs/BUGS.md` B217).
+#[test]
+fn a_partial_local_scan_prunes_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let g = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(
+        g,
+        &[
+            local("/home/u/a.txt", "a.txt", false),
+            local("/home/u/b.txt", "b.txt", false),
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.local_finish_scan(g, 1).unwrap(), 2);
+
+    let g = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(g, &[local("/home/u/a.txt", "a.txt", false)])
+        .unwrap();
+    assert_eq!(db.local_finish_partial_scan(2).unwrap(), 2);
+    assert_eq!(db.search_local("b.txt", 10).unwrap().len(), 1);
+    assert_eq!(db.local_indexed_at().unwrap(), Some(2));
+}
+
+/// Deleted entries pile up in an FTS5 index until it is compacted. The daily
+/// compaction must leave both indexes whole and searchable, and must not run
+/// again the same day (`docs/BUGS.md` B217).
+#[test]
+fn compacting_the_search_indexes_keeps_them_whole_and_runs_once_a_day() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "quarterly-report.pdf", 1))
+        .unwrap();
+    for round in 0..20 {
+        let g = db.local_begin_scan().unwrap();
+        let name = format!("churn-{round}.txt");
+        db.local_upsert_batch(
+            g,
+            &[
+                local("/home/u/keep.txt", "keep.txt", false),
+                local(&format!("/home/u/{name}"), &name, false),
+            ],
+        )
+        .unwrap();
+        // Far in the past, so no scan compacts on its own.
+        db.local_finish_scan(g, 0).unwrap();
+    }
+
+    let day = 24 * 60 * 60;
+    db.compact_search_indexes_if_due(day).unwrap();
+    {
+        let conn = db.conn.lock();
+        for table in ["local_fts", "nodes_fts"] {
+            conn.execute(
+                &format!("INSERT INTO {table}({table}) VALUES('integrity-check')"),
+                [],
+            )
+            .unwrap();
+        }
+    }
+    assert_eq!(db.search_local("keep", 10).unwrap().len(), 1);
+    assert_eq!(db.search_local("churn-19", 10).unwrap().len(), 1);
+    assert!(db.search_local("churn-3.txt", 10).unwrap().is_empty());
+    assert_eq!(db.search("quarterly", 10).unwrap().len(), 1);
+    let stamp = |db: &Db| db.state_str("fts_compacted_at").unwrap();
+    assert_eq!(stamp(&db).as_deref(), Some(day.to_string().as_str()));
+
+    db.compact_search_indexes_if_due(day + 60).unwrap();
+    assert_eq!(stamp(&db).as_deref(), Some(day.to_string().as_str()));
+}
+
+/// Queries below the trigram minimum still match, via the `LIKE` fallback.
+#[test]
+fn local_search_short_query_like_fallback() {
+    let db = Db::open_in_memory().unwrap();
+    let g = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(g, &[local("/home/u/a.txt", "a.txt", false)])
+        .unwrap();
+    db.local_finish_scan(g, 1).unwrap();
+    assert_eq!(db.search_local("a", 10).unwrap().len(), 1);
+    assert!(db.search_local("", 10).unwrap().is_empty());
+}
+
+#[test]
+fn event_cursor_roundtrip() {
+    let db = Db::open_in_memory().unwrap();
+    // Absent before first write → seed from server head on first mount.
+    assert!(db.get_event_cursor().unwrap().is_none());
+    db.set_event_cursor("evt-1").unwrap();
+    assert_eq!(db.get_event_cursor().unwrap().as_deref(), Some("evt-1"));
+    // Overwrites, not appends.
+    db.set_event_cursor("evt-2").unwrap();
+    assert_eq!(db.get_event_cursor().unwrap().as_deref(), Some("evt-2"));
+}
+
+#[test]
+fn search_trigram_substring_and_path() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("docs", Some("root"), "Documents"))
+        .unwrap();
+    db.upsert_node(&file("f1", "docs", "report.pdf", 1))
+        .unwrap();
+    db.upsert_node(&file("f2", "root", "notes.txt", 2)).unwrap();
+    db.upsert_node(&file(
+        "f3",
+        "root",
+        "Rampage Open Air 2026 - order 166765244.pdf",
+        3,
+    ))
+    .unwrap();
+
+    // Substring match (trigram), not just prefix.
+    let hits = db.search("port", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].node.name, "report.pdf");
+    // Path is mountpoint-relative, root excluded.
+    assert_eq!(hits[0].path, "Documents/report.pdf");
+
+    // Top-level file → bare name.
+    let hits = db.search("notes", 10).unwrap();
+    assert_eq!(hits[0].path, "notes.txt");
+
+    // Multi-term FTS5 query matching (out of order, separated terms)
+    let hits = db.search("rampage 2026", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].node.name,
+        "Rampage Open Air 2026 - order 166765244.pdf"
+    );
+}
+
+#[test]
+fn search_in_scope_only_returns_hits_below_the_folder() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("work", Some("root"), "Work"))
+        .unwrap();
+    db.upsert_node(&folder("sub", Some("work"), "Old")).unwrap();
+    db.upsert_node(&folder("work2", Some("root"), "Work 2"))
+        .unwrap();
+    db.upsert_node(&file("f1", "work", "report.pdf", 1))
+        .unwrap();
+    db.upsert_node(&file("f2", "sub", "report-2019.pdf", 1))
+        .unwrap();
+    db.upsert_node(&file("f3", "work2", "report-copy.pdf", 1))
+        .unwrap();
+    db.upsert_node(&file("f4", "root", "report-top.pdf", 1))
+        .unwrap();
+
+    let mut paths: Vec<String> = db
+        .search_in("report", 10, Some("Work"))
+        .unwrap()
+        .into_iter()
+        .map(|h| h.path)
+        .collect();
+    paths.sort();
+    // A sibling whose name starts with the scope is not inside it.
+    assert_eq!(paths, vec!["Work/Old/report-2019.pdf", "Work/report.pdf"]);
+    // Short queries take the LIKE path and scope the same way.
+    assert_eq!(db.search_in("re", 10, Some("Work/Old")).unwrap().len(), 1);
+    // No scope, or the root, is everywhere.
+    assert_eq!(db.search_in("report", 10, None).unwrap().len(), 4);
+    assert_eq!(db.search_in("report", 10, Some("")).unwrap().len(), 4);
+}
+
+#[test]
+fn search_excludes_trashed_and_respects_limit() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "alpha.txt", 1)).unwrap();
+    let mut gone = file("f2", "root", "alphb.txt", 1);
+    gone.trashed = true;
+    db.upsert_node(&gone).unwrap();
+
+    let hits = db.search("alph", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].node.name, "alpha.txt");
+
+    db.upsert_node(&file("f3", "root", "alphc.txt", 1)).unwrap();
+    assert_eq!(db.search("alph", 1).unwrap().len(), 1);
+}
+
+/// A device folder's root is stored in `device`/`sync_folder`, never in
+/// `nodes`, so its children's `parent_uid` points at a row that does not exist.
+/// Requiring the ancestor walk to reach a `parent_uid IS NULL` row therefore
+/// excluded every device-folder subtree from search: 2,705 of 9,252 nodes on
+/// the account this was found on, including everything under `~/Downloads`.
+#[test]
+fn search_finds_nodes_below_an_uncached_parent() {
+    let db = Db::open_in_memory().unwrap();
+    // "device-root" is deliberately never upserted.
+    db.upsert_node(&folder("downloads", Some("device-root"), "Downloads"))
+        .unwrap();
+    db.upsert_node(&file("t", "downloads", "tickets.pdf", 1))
+        .unwrap();
+
+    let hits = db.search("tickets", 10).unwrap();
+    assert_eq!(hits.len(), 1, "a device folder's files must be searchable");
+    assert_eq!(hits[0].path, "Downloads/tickets.pdf");
+}
+
+/// The relaxed rule must not also start indexing trash: a node whose *parent*
+/// is trashed stays out even though the walk now terminates happily.
+#[test]
+fn search_excludes_a_node_under_a_trashed_ancestor() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let mut folder_gone = folder("boxed", Some("root"), "Boxed");
+    folder_gone.trashed = true;
+    db.upsert_node(&folder_gone).unwrap();
+    db.upsert_node(&file("f1", "boxed", "buried.txt", 1))
+        .unwrap();
+
+    assert!(db.search("buried", 10).unwrap().is_empty());
+}
+
+/// A parent cycle is corrupt data the API can still hand us. It must stay out
+/// of the index, and — because the short-query `LIKE` lane reads `nodes`
+/// directly and never consults the index — resolving one's path must terminate
+/// rather than spin inside the daemon's only SQLite connection.
+#[test]
+fn a_parent_cycle_is_unindexed_and_never_hangs_a_search() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("a", Some("b"), "Alphaville"))
+        .unwrap();
+    db.upsert_node(&folder("b", Some("a"), "Betamax")).unwrap();
+
+    // Index lane: the cycle is not indexed, so it cannot be found.
+    assert!(db.search("alphaville", 10).unwrap().is_empty());
+    assert!(db.search("betamax", 10).unwrap().is_empty());
+
+    // LIKE lane (below the trigram minimum): the rows are reachable, and what
+    // matters is that resolving their paths returns at all.
+    let hits = db.search("al", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].path.ends_with("Alphaville"));
+}
+
+#[test]
+fn search_short_query_like_fallback() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "ab.txt", 1)).unwrap();
+    // Under trigram min length → LIKE path still finds it.
+    let hits = db.search("ab", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].node.name, "ab.txt");
+}
+
+#[test]
+fn fuzzy_candidates_include_typo_and_parent_path_matches() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("projects", Some("root"), "Projects"))
+        .unwrap();
+    db.upsert_node(&file("report", "projects", "quarterly-report.pdf", 1))
+        .unwrap();
+    db.upsert_node(&file("video", "projects", "video.mp4", 1))
+        .unwrap();
+
+    let typo = db.search_candidates("quartrly", 20).unwrap();
+    assert!(
+        typo.iter()
+            .any(|hit| hit.node.name == "quarterly-report.pdf")
+    );
+    assert!(
+        db.search_candidates("vedio", 20)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.node.name == "video.mp4")
+    );
+
+    let path = db.search_candidates("projects", 20).unwrap();
+    assert!(
+        path.iter()
+            .any(|hit| hit.node.name == "quarterly-report.pdf")
+    );
+}
+
+#[test]
+fn renaming_parent_refreshes_descendant_search_paths() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("folder", Some("root"), "zzbeforezz"))
+        .unwrap();
+    db.upsert_node(&file("child", "folder", "plain.txt", 1))
+        .unwrap();
+    assert!(
+        db.search_candidates("zzbeforezz", 20)
+            .unwrap()
+            .iter()
+            .any(|h| h.node.name == "plain.txt")
+    );
+
+    db.upsert_node(&folder("folder", Some("root"), "yyafteryy"))
+        .unwrap();
+    assert!(
+        !db.search_candidates("zzbeforezz", 20)
+            .unwrap()
+            .iter()
+            .any(|h| h.node.name == "plain.txt")
+    );
+    assert!(
+        db.search_candidates("yyafteryy", 20)
+            .unwrap()
+            .iter()
+            .any(|h| h.node.name == "plain.txt")
+    );
+}
+
+#[test]
+fn local_fuzzy_candidates_include_typo_and_parent_path() {
+    let db = Db::open_in_memory().unwrap();
+    let generation = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(
+        generation,
+        &[
+            local(
+                "/home/u/Projects/quarterly-report.pdf",
+                "quarterly-report.pdf",
+                false,
+            ),
+            local("/home/u/Videos/video.mp4", "video.mp4", false),
+        ],
+    )
+    .unwrap();
+    db.local_finish_scan(generation, 1).unwrap();
+
+    assert_eq!(db.search_local_candidates("quartrly", 20).unwrap().len(), 1);
+    assert_eq!(db.search_local_candidates("projects", 20).unwrap().len(), 1);
+    assert!(
+        db.search_local_candidates("vedio", 20)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.name == "video.mp4")
+    );
+}
+
+#[test]
+fn search_drops_fts_row_on_delete_and_trash() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "unique.txt", 1))
+        .unwrap();
+    assert_eq!(db.search("unique", 10).unwrap().len(), 1);
+
+    // Re-upsert as trashed → leaves the index.
+    let mut t = file("f1", "root", "unique.txt", 1);
+    t.trashed = true;
+    db.upsert_node(&t).unwrap();
+    assert_eq!(db.search("unique", 10).unwrap().len(), 0);
+
+    // Resurrect, then hard-delete.
+    db.upsert_node(&file("f1", "root", "unique.txt", 1))
+        .unwrap();
+    assert_eq!(db.search("unique", 10).unwrap().len(), 1);
+    db.delete_node(&uid("f1")).unwrap();
+    assert_eq!(db.search("unique", 10).unwrap().len(), 0);
+}
+
+/// Renaming re-indexes the node, which is the case delete-by-rowid has to get
+/// right: the *old* name must leave the index. A stale row here would be
+/// invisible in every other test — the new name is findable either way.
+#[test]
+fn renaming_a_node_replaces_the_name_in_the_search_index() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "beforename.txt", 1))
+        .unwrap();
+    assert_eq!(db.search("beforename", 10).unwrap().len(), 1);
+
+    db.upsert_node(&file("f1", "root", "aftername.txt", 1))
+        .unwrap();
+
+    assert_eq!(
+        db.search("aftername", 10).unwrap().len(),
+        1,
+        "the new name must be searchable"
+    );
+    assert_eq!(
+        db.search("beforename", 10).unwrap().len(),
+        0,
+        "the old name must have left the index, not merely been added alongside"
+    );
+}
+
+/// B12: the cost of writing a listing must not scale with how much is already
+/// indexed. The old `DELETE FROM nodes_fts WHERE uid = ?` scanned the whole
+/// index once per node written, so a large account paid more to write the *same*
+/// folder — measured at 6.5 ms per node against a 17k-node index on the live DB.
+///
+/// Written as a ratio between two index sizes rather than an absolute time, so
+/// it fails on the scaling regression and not on a slow machine.
+#[test]
+fn writing_nodes_does_not_scale_with_the_size_of_the_index() {
+    use std::time::Instant;
+
+    /// Fill `db` with `n` indexed nodes, then time re-writing a fixed batch.
+    fn cost_against_index_of(n: usize) -> std::time::Duration {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        let filler: Vec<_> = (0..n)
+            .map(|i| file(&format!("bg{i}"), "root", &format!("background{i}.txt"), 1))
+            .collect();
+        db.upsert_nodes(&filler).unwrap();
+
+        // The batch under test is identical in both runs; only the amount of
+        // already-indexed data around it differs.
+        let batch: Vec<_> = (0..200)
+            .map(|i| file(&format!("m{i}"), "root", &format!("measured{i}.txt"), 1))
+            .collect();
+        db.upsert_nodes(&batch).unwrap();
+
+        // The fastest of a few runs: the rest of the suite runs alongside, and
+        // one run that lost the CPU to it read as the regression.
+        (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                db.upsert_nodes(&batch).unwrap();
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    let small = cost_against_index_of(200);
+    let large = cost_against_index_of(5000);
+
+    // Calibration, measured while writing this: over the same 25× growth in
+    // index size, the old full-scan path cost 6.4× more (46 ms → 294 ms) while
+    // the rowid path costs 1.04× (39 ms → 41 ms). 3× sits well clear of both.
+    println!("B12: 200-node write — against 200 indexed {small:?}, against 5000 {large:?}");
+    assert!(
+        large < small * 3,
+        "writing a listing got dramatically more expensive as the index grew, \
+         which is the B12 full-scan regression; small={small:?} large={large:?}"
+    );
+}
+
+fn activity(target: &str, kind: ActivityKind, ok: bool) -> ActivityEntry {
+    ActivityEntry {
+        time: 1700,
+        kind,
+        target: target.into(),
+        detail: "detail".into(),
+        ok,
+    }
+}
+
+#[test]
+fn activity_reads_back_newest_first() {
+    let db = Db::open_in_memory().unwrap();
+    db.activity_add(&activity("a.txt", ActivityKind::Upload, true))
+        .unwrap();
+    db.activity_add(&activity("b.txt", ActivityKind::Download, false))
+        .unwrap();
+
+    let items = db.activity_list(10).unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].target, "b.txt");
+    assert_eq!(items[0].kind, ActivityKind::Download);
+    assert!(!items[0].ok);
+    assert_eq!(items[0].detail, "detail");
+    assert_eq!(items[0].time, 1700);
+    assert_eq!(items[1].target, "a.txt");
+
+    assert_eq!(db.activity_list(1).unwrap().len(), 1);
+}
+
+#[test]
+fn activity_has_finds_only_matching_kind_and_target() {
+    let db = Db::open_in_memory().unwrap();
+    db.activity_add(&activity(
+        "a (sync-conflict 1).txt",
+        ActivityKind::Conflict,
+        false,
+    ))
+    .unwrap();
+    db.activity_add(&activity("b.txt", ActivityKind::Upload, true))
+        .unwrap();
+
+    assert!(
+        db.activity_has(ActivityKind::Conflict, "a (sync-conflict 1).txt")
+            .unwrap()
+    );
+    assert!(
+        !db.activity_has(ActivityKind::Upload, "a (sync-conflict 1).txt")
+            .unwrap()
+    );
+    assert!(!db.activity_has(ActivityKind::Conflict, "b.txt").unwrap());
+}
+
+#[test]
+fn activity_prunes_to_the_keep_limit() {
+    let db = Db::open_in_memory().unwrap();
+    for i in 0..(ACTIVITY_KEEP + 10) {
+        db.activity_add(&activity(&format!("f{i}"), ActivityKind::Upload, true))
+            .unwrap();
+    }
+    let items = db.activity_list(ACTIVITY_KEEP as usize * 2).unwrap();
+    assert_eq!(items.len(), ACTIVITY_KEEP as usize);
+    // The newest survive; the oldest are the ones dropped.
+    assert_eq!(items[0].target, format!("f{}", ACTIVITY_KEEP + 9));
+}
+
+#[test]
+fn opens_and_migrates() {
+    let db = Db::open_in_memory().unwrap();
+    let version: String = db
+        .with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT value FROM sync_state WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION.to_string());
+}
+
+#[test]
+fn share_access_round_trips_updates_and_deletes() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("shared-root");
+
+    assert_eq!(db.share_access(&root).unwrap(), None);
+    for access in [
+        pdfs_core::Access::Owner,
+        pdfs_core::Access::Editor,
+        pdfs_core::Access::Viewer,
+        pdfs_core::Access::Unknown,
+    ] {
+        db.set_share_access(&root, access).unwrap();
+        assert_eq!(db.share_access(&root).unwrap(), Some(access));
+        assert_eq!(db.all_share_access().unwrap().get(&root), Some(&access));
+    }
+    db.delete_share_access(&root).unwrap();
+    assert_eq!(db.share_access(&root).unwrap(), None);
+    assert!(db.all_share_access().unwrap().is_empty());
+}
+
+#[test]
+fn effective_node_access_inherits_from_the_persisted_share_root() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("shared", Some("root"), "Shared"))
+        .unwrap();
+    db.upsert_node(&folder("nested", Some("shared"), "Nested"))
+        .unwrap();
+    db.upsert_node(&file("child", "nested", "child.txt", 1))
+        .unwrap();
+    db.set_share_access(&uid("shared"), pdfs_core::Access::Viewer)
+        .unwrap();
+
+    assert_eq!(
+        db.effective_node_access(&uid("child")).unwrap(),
+        Some(pdfs_core::Access::Viewer)
+    );
+    assert_eq!(
+        db.effective_node_access(&uid("root")).unwrap(),
+        Some(pdfs_core::Access::Owner)
+    );
+    assert_eq!(db.effective_node_access(&uid("missing")).unwrap(), None);
+}
+
+#[test]
+fn effective_node_access_uses_the_nearest_nested_share_root() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("outer", Some("root"), "Outer"))
+        .unwrap();
+    db.upsert_node(&folder("inner", Some("outer"), "Inner"))
+        .unwrap();
+    db.upsert_node(&file("child", "inner", "child.txt", 1))
+        .unwrap();
+    db.set_share_access(&uid("outer"), pdfs_core::Access::Editor)
+        .unwrap();
+    db.set_share_access(&uid("inner"), pdfs_core::Access::Viewer)
+        .unwrap();
+
+    assert_eq!(
+        db.effective_node_access(&uid("child")).unwrap(),
+        Some(pdfs_core::Access::Viewer)
+    );
+}
+
+#[test]
+fn effective_node_access_keeps_a_missing_share_root_tombstone_authoritative() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("shared", Some("root"), "Shared"))
+        .unwrap();
+    db.upsert_node(&folder("nested", Some("shared"), "Nested"))
+        .unwrap();
+    db.upsert_node(&file("child", "nested", "child.txt", 1))
+        .unwrap();
+    db.set_share_access(&uid("shared"), pdfs_core::Access::Viewer)
+        .unwrap();
+    db.delete_node(&uid("shared")).unwrap();
+
+    assert_eq!(
+        db.effective_node_access(&uid("child")).unwrap(),
+        Some(pdfs_core::Access::Viewer)
+    );
+}
+
+#[test]
+fn downgrade_all_share_access_leaves_unrecorded_owned_nodes_owned() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("shared", Some("root"), "Shared"))
+        .unwrap();
+    db.set_share_access(&uid("shared"), pdfs_core::Access::Editor)
+        .unwrap();
+
+    assert_eq!(db.downgrade_all_share_access().unwrap(), 1);
+    assert_eq!(
+        db.effective_node_access(&uid("shared")).unwrap(),
+        Some(pdfs_core::Access::Viewer)
+    );
+    assert_eq!(
+        db.effective_node_access(&uid("root")).unwrap(),
+        Some(pdfs_core::Access::Owner)
+    );
+}
+
+#[test]
+fn migration_v17_adds_share_access_to_a_v16_fixture() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v16-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        // Remove the later tables too, so restoring the version stamp produces
+        // the exact schema a released V16 database had.
+        let db = Db::open(&path).unwrap();
+        db.set_state_str("fixture_value", "survives").unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS mount_sync_folder_kind_update;
+             DROP TRIGGER mount_sync_folder_insert;
+             DROP TRIGGER sync_folder_attached_insert;
+             DROP TRIGGER sync_folder_attached_update;
+             ALTER TABLE sync_folder DROP COLUMN kind;
+             DROP TABLE mount;
+             DROP TABLE share_access;
+             DROP TABLE album_photos;
+             DROP TABLE albums;
+             DROP INDEX idx_photos_favorite;
+             ALTER TABLE photos DROP COLUMN favorite;
+             ALTER TABLE nodes DROP COLUMN path;
+             UPDATE sync_state SET value = '16' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(
+        db.state_str("fixture_value").unwrap().as_deref(),
+        Some("survives")
+    );
+    let root = uid("offline-share");
+    db.set_share_access(&root, pdfs_core::Access::Viewer)
+        .unwrap();
+    assert_eq!(
+        db.share_access(&root).unwrap(),
+        Some(pdfs_core::Access::Viewer)
+    );
+    // Migrating an old fixture always lands on head, whatever head is today.
+    assert_eq!(
+        db.state_str("schema_version").unwrap().as_deref(),
+        Some(SCHEMA_VERSION.to_string().as_str())
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn migration_v18_projects_v17_sync_folders_and_cascades_deletes() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v17-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        // Pin the released V17 shape that V18 reads instead of deriving a
+        // fixture from today's head schema and dropping newer objects.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO sync_state VALUES ('schema_version', '17');
+             INSERT INTO sync_state VALUES ('fixture_value', 'survives');
+             CREATE TABLE sync_folder (
+               id              INTEGER PRIMARY KEY,
+               local_path      TEXT NOT NULL UNIQUE,
+               remote_uid      TEXT NOT NULL,
+               remote_share_id TEXT NOT NULL,
+               mode            TEXT NOT NULL DEFAULT 'mirror',
+               state           TEXT NOT NULL DEFAULT 'idle',
+               last_sync       INTEGER NOT NULL DEFAULT 0,
+               pending_mode    TEXT
+             );
+             CREATE TABLE sync_entry (
+               folder_id   INTEGER NOT NULL,
+               rel_path    TEXT NOT NULL,
+               remote_uid  TEXT,
+               local_mtime INTEGER NOT NULL DEFAULT 0,
+               local_size  INTEGER NOT NULL DEFAULT 0,
+               remote_hash TEXT,
+               remote_rev  TEXT,
+               PRIMARY KEY (folder_id, rel_path)
+             );
+             INSERT INTO sync_folder
+               (id, local_path, remote_uid, remote_share_id, mode, state, last_sync)
+             VALUES
+               (41, '/home/me/Existing', 'vol~existing', 'share-existing',
+                'ondemand', 'syncing', 123);
+             -- The timeline as V17 held it: later migrations add columns to it,
+             -- so a fixture without it isn't a database any release produced.
+             CREATE TABLE photos (
+               uid          TEXT PRIMARY KEY,
+               capture_time INTEGER NOT NULL,
+               name         TEXT,
+               ratio        REAL,
+               thumb_state  INTEGER NOT NULL DEFAULT 0,
+               seq          INTEGER NOT NULL,
+               media_type   TEXT,
+               kind         INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE share_access (
+               root_uid TEXT PRIMARY KEY,
+               access   TEXT NOT NULL
+                        CHECK (access IN ('owner', 'editor', 'viewer', 'unknown'))
+             );",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let existing = 41;
+    let locations = db.mount_list().unwrap();
+    assert_eq!(locations.len(), 1);
+    let projected = &locations[0];
+    assert!(matches!(
+        projected.kind,
+        pdfs_core::mounts::MountKind::Device {
+            sync_folder_id
+        } if sync_folder_id == existing
+    ));
+    assert_eq!(projected.local_path, "/home/me/Existing");
+    assert_eq!(projected.mode, pdfs_core::mounts::MountMode::OnDemand);
+    assert_eq!(projected.state, "syncing");
+    assert_eq!(projected.last_sync, 123);
+    assert_eq!(
+        db.state_str("fixture_value").unwrap().as_deref(),
+        Some("survives")
+    );
+
+    let added = db
+        .sync_folder_add("/home/me/New", "vol~new", "share-new")
+        .unwrap();
+    assert_eq!(db.mount_list().unwrap().len(), 2);
+    assert!(db.sync_folder_remove(added).unwrap());
+    assert_eq!(
+        db.mount_list().unwrap().len(),
+        1,
+        "the V18 foreign key must remove the device projection"
+    );
+    // Migrating an old fixture always lands on head, whatever head is today.
+    assert_eq!(
+        db.state_str("schema_version").unwrap().as_deref(),
+        Some(SCHEMA_VERSION.to_string().as_str())
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn my_files_projection_retains_share_id_only_for_the_same_root() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .mount_upsert_my_files("/home/me/ProtonDrive", "vol~root", Some("share-main"))
+        .unwrap();
+    let same_id = db
+        .mount_upsert_my_files("/mnt/proton", "vol~root", None)
+        .unwrap();
+    assert_eq!(same_id, id);
+    assert_eq!(db.mount_list().unwrap()[0].root_share_id, "share-main");
+
+    db.mount_upsert_my_files("/mnt/proton", "vol~root-new", None)
+        .unwrap();
+
+    let locations = db.mount_list().unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(matches!(
+        locations[0].kind,
+        pdfs_core::mounts::MountKind::MyFiles
+    ));
+    assert_eq!(locations[0].local_path, "/mnt/proton");
+    assert_eq!(locations[0].root_uid, "vol~root-new");
+    assert_eq!(
+        locations[0].root_share_id, "",
+        "a share id must never be paired with a different root uid"
+    );
+}
+
+#[test]
+fn my_files_share_id_repair_is_conditional_on_root_uid() {
+    let db = Db::open_in_memory().unwrap();
+    db.mount_upsert_my_files("/mnt/proton", "vol~root", None)
+        .unwrap();
+
+    assert!(
+        !db.mount_repair_my_files_share_id("vol~stale", "share-stale")
+            .unwrap()
+    );
+    assert_eq!(db.mount_list().unwrap()[0].root_share_id, "");
+
+    assert!(
+        db.mount_repair_my_files_share_id("vol~root", "share-current")
+            .unwrap()
+    );
+    assert_eq!(db.mount_list().unwrap()[0].root_share_id, "share-current");
+}
+
+#[test]
+fn mount_constraints_reject_malformed_kinds_and_missing_sync_folders() {
+    let db = Db::open_in_memory().unwrap();
+    let conn = db.conn.lock();
+
+    assert!(
+        conn.execute(
+            "INSERT INTO mount (kind, local_path, root_uid)
+             VALUES ('device', '/tmp/device', 'vol~device')",
+            [],
+        )
+        .is_err(),
+        "a device projection without sync_folder_id must fail its CHECK"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO mount (kind, sync_folder_id)
+             VALUES ('device', 999999)",
+            [],
+        )
+        .is_err(),
+        "a device projection cannot reference a missing sync folder"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO mount (kind, share_root_uid, local_path, root_uid)
+             VALUES ('myfiles', 'vol~shared', '/tmp/root', 'vol~root')",
+            [],
+        )
+        .is_err(),
+        "kind-specific columns must not be mixed"
+    );
+}
+
+#[test]
+fn deleting_a_device_projection_does_not_delete_its_sync_folder() {
+    let db = Db::open_in_memory().unwrap();
+    let folder_id = db
+        .sync_folder_add("/home/me/Keep", "vol~keep", "share-keep")
+        .unwrap();
+    {
+        let conn = db.conn.lock();
+        assert_eq!(
+            conn.execute(
+                "DELETE FROM mount WHERE kind = 'device' AND sync_folder_id = ?1",
+                [folder_id],
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    assert!(db.sync_folder_get(folder_id).unwrap().is_some());
+    assert!(
+        db.mount_list().unwrap().is_empty(),
+        "the foreign key direction must not recreate or delete sync authority"
+    );
+}
+
+#[test]
+fn refuses_a_schema_newer_than_the_running_build() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-future-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT);
+         INSERT INTO sync_state VALUES ('schema_version', '9999');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let err = Db::open(&path)
+        .err()
+        .expect("future schema must fail closed");
+    assert!(err.to_string().contains("newer than this build supports"));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "9999", "failed open must not rewrite the database");
+    drop(conn);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Queueing a write syncs it to disk, and leaves the writer at NORMAL after.
+///
+/// The op row is what makes a staged blob reachable once `close()` has
+/// reported success, so its commit must survive a power loss. Everything else
+/// the writer commits is metadata the next listing re-fetches, and pays only
+/// NORMAL's cost.
+#[test]
+fn queueing_a_write_commits_at_full_sync_and_restores_normal() {
+    let path = std::env::temp_dir().join(format!("pdfs-db-sync-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let db = Db::open(&path).unwrap();
+    let level = |db: &Db| -> i64 {
+        db.conn
+            .lock()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap()
+    };
+    // 1 = NORMAL, 2 = FULL.
+    assert_eq!(level(&db), 1);
+    {
+        let durable = db.durable().unwrap();
+        let during: i64 = durable
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(during, 2);
+    }
+    assert_eq!(level(&db), 1);
+
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_TRASH.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: Some("a".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    assert_eq!(level(&db), 1);
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    drop(db);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+/// A gap-filled blob is recorded as whole only while the op still holds it.
+///
+/// A write that closes during the drain points the row at a newer blob with
+/// its own sidecar. Overwriting that sidecar with the older blob's would
+/// describe bytes the row no longer holds.
+#[test]
+fn marking_a_blob_whole_leaves_a_newer_blob_alone() {
+    let db = Db::open_in_memory().unwrap();
+    let op = PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/first".to_string()),
+        meta_json: Some(r#"{"complete":false}"#.to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op).unwrap();
+    let id = db.pending_ops().unwrap()[0].id;
+
+    assert!(
+        db.update_op_meta_for_blob(id, "/staging/first", r#"{"complete":true}"#)
+            .unwrap()
+    );
+    assert_eq!(
+        db.pending_ops().unwrap()[0].meta_json.as_deref(),
+        Some(r#"{"complete":true}"#)
+    );
+
+    assert!(
+        !db.update_op_meta_for_blob(id, "/staging/older", r#"{"stale":true}"#)
+            .unwrap(),
+        "the row holds another blob"
+    );
+    assert_eq!(
+        db.pending_ops().unwrap()[0].meta_json.as_deref(),
+        Some(r#"{"complete":true}"#)
+    );
+}
+
+/// A queued write whose baseline is restamped must keep everything else.
+///
+/// The restamp happens after our *own* upload seals a new revision under a
+/// still-queued write. If it took the blob or the retry state with it, the fix
+/// for a spurious conflict copy would cost the bytes that conflict copy was
+/// there to protect.
+#[test]
+fn restamping_a_baseline_leaves_the_blob_and_retry_state_alone() {
+    let db = Db::open_in_memory().unwrap();
+    let op = PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/blob".to_string()),
+        meta_json: Some(r#"{"based_on":"old"}"#.to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op).unwrap();
+    db.record_op_failure(db.pending_ops().unwrap()[0].id, "offline", 999)
+        .unwrap();
+
+    let updated = db
+        .update_op_meta(&uid("a").to_string(), OP_REVISION, r#"{"based_on":"new"}"#)
+        .unwrap();
+    assert!(updated, "the queued write is there to restamp");
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].meta_json.as_deref(), Some(r#"{"based_on":"new"}"#));
+    assert_eq!(
+        ops[0].blob_path.as_deref(),
+        Some("/staging/blob"),
+        "the only copy of the user's bytes"
+    );
+    assert_eq!(ops[0].attempts, 1, "backoff survives a restamp");
+    assert_eq!(ops[0].next_attempt_at, 999);
+
+    // No queued write for that node is the ordinary case, not an error: most
+    // uploads are the last one for their file.
+    assert!(
+        !db.update_op_meta(&uid("b").to_string(), OP_REVISION, "{}")
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_second_write_supersedes_the_first_pending_op() {
+    let db = Db::open_in_memory().unwrap();
+    let op = |blob: &str| PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some(blob.to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+
+    let (_, superseded) = db.enqueue_op(&op("/staging/first")).unwrap();
+    assert_eq!(superseded, None, "nothing to supersede on the first write");
+
+    // The newer blob already contains everything the older one did, so the
+    // older op must go — and its blob must be reported so it can be deleted
+    // rather than leaked.
+    let (id2, superseded) = db.enqueue_op(&op("/staging/second")).unwrap();
+    assert_eq!(superseded.as_deref(), Some("/staging/first"));
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "one queued upload per node");
+    assert_eq!(ops[0].id, id2);
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/second"));
+    assert_eq!(db.pending_op_counts().unwrap().uploads, 1);
+}
+
+#[test]
+fn failed_superseding_insert_keeps_the_old_pending_op() {
+    let db = Db::open_in_memory().unwrap();
+    let op = |blob: &str| PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("atomic").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some(blob.to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op("/staging/original")).unwrap();
+    db.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_replacement BEFORE INSERT ON pending_op
+             WHEN NEW.blob_path = '/staging/replacement'
+             BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(db.enqueue_op(&op("/staging/replacement")).is_err());
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/original"));
+}
+
+/// B53's remaining half. The insert-failure regression above proves the *row*
+/// rolls back; this proves the two things that make the rollback usable — the
+/// old blob is not reported as superseded (so the caller does not delete the
+/// bytes the surviving row still points at), and the rollback survives a
+/// restart rather than living only in the connection that failed.
+#[test]
+fn a_rolled_back_supersede_keeps_its_blob_and_survives_reopen() {
+    let dir = std::env::temp_dir().join(format!("pdfs-db-b53-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("queue.sqlite");
+    let op = |blob: &str| PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("durable").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some(blob.to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+
+    {
+        let db = Db::open(&path).unwrap();
+        db.enqueue_op(&op("/staging/original")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_replacement BEFORE INSERT ON pending_op
+                 WHEN NEW.blob_path = '/staging/replacement'
+                 BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // The failure must not hand back the old blob path. That value is the
+        // caller's instruction to delete those bytes, and the row that owns
+        // them is still queued.
+        assert!(db.enqueue_op(&op("/staging/replacement")).is_err());
+        db.with_conn(|conn| {
+            conn.execute_batch("DROP TRIGGER reject_replacement")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "old or new — never neither");
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/original"));
+
+    // And once the injected failure is gone, superseding works and *does*
+    // report the blob it retired.
+    let (_, superseded) = db.enqueue_op(&op("/staging/replacement")).unwrap();
+    assert_eq!(superseded.as_deref(), Some("/staging/original"));
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A full disk, as SQLite reports it. `max_page_count` makes the database
+/// refuse to grow, which is the same `SQLITE_FULL` an out-of-space filesystem
+/// produces — and the queue must come out of it with the acknowledged work
+/// still in it (B53).
+#[test]
+fn a_full_database_rolls_the_supersede_back_rather_than_erasing_it() {
+    let db = Db::open_in_memory().unwrap();
+    let op = |blob: &str| PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("full").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some(blob.to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op("/staging/original")).unwrap();
+
+    // Cap the file at its current size, so any page the insert needs fails.
+    let pages: i64 = db
+        .with_conn(|conn| Ok(conn.query_row("PRAGMA page_count", [], |r| r.get(0))?))
+        .unwrap();
+    db.with_conn(|conn| {
+        conn.execute_batch(&format!("PRAGMA max_page_count = {pages}"))?;
+        Ok(())
+    })
+    .unwrap();
+
+    // A payload far larger than one page, so growth is unavoidable.
+    let mut fat = op("/staging/replacement");
+    fat.meta_json = Some("x".repeat(512 * 1024));
+    let result = db.enqueue_op(&fat);
+
+    db.with_conn(|conn| {
+        conn.execute_batch("PRAGMA max_page_count = 1073741823")?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(result.is_err(), "a database that cannot grow must refuse");
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(
+        ops[0].blob_path.as_deref(),
+        Some("/staging/original"),
+        "the acknowledged upload is still queued and still owns its bytes"
+    );
+}
+
+#[test]
+fn atomic_trash_replacement_returns_owned_blobs_after_commit() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("trash-root").to_string();
+    let child = uid("trash-child").to_string();
+    let revision = |uid: &str, parent_uid: Option<&str>, blob: &str| PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid.to_string(),
+        parent_uid: parent_uid.map(str::to_string),
+        name: None,
+        blob_path: Some(blob.to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&revision(&root, None, "/staging/root"))
+        .unwrap();
+    db.enqueue_op(&revision(&child, Some(&root), "/staging/child"))
+        .unwrap();
+
+    let (trash_id, mut blobs) = db.replace_ops_with_trash(&root, "removed.txt", 2).unwrap();
+    blobs.sort();
+    assert_eq!(blobs, vec!["/staging/child", "/staging/root"]);
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].id, trash_id);
+    assert_eq!(ops[0].kind, OP_TRASH);
+    assert_eq!(ops[0].uid, root);
+    assert_eq!(ops[0].name.as_deref(), Some("removed.txt"));
+    assert!(ops[0].blob_path.is_none());
+}
+
+#[test]
+fn a_queued_trash_holds_its_name_until_it_lands() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&file("held-name", "root", "report.txt", 1))
+        .unwrap();
+    let node = uid("held-name").to_string();
+    let root = uid("root").to_string();
+    assert!(
+        !db.has_pending_trash_named("report.txt", Some(&root))
+            .unwrap()
+    );
+
+    let (trash_id, _) = db.replace_ops_with_trash(&node, "report.txt", 1).unwrap();
+    assert!(
+        db.has_pending_trash_named("report.txt", Some(&root))
+            .unwrap()
+    );
+    assert!(
+        !db.has_pending_trash_named("other.txt", Some(&root))
+            .unwrap()
+    );
+    assert!(
+        !db.has_pending_trash_named("report.txt", Some(&uid("other").to_string()))
+            .unwrap()
+    );
+
+    db.delete_op(trash_id).unwrap();
+    assert!(
+        !db.has_pending_trash_named("report.txt", Some(&root))
+            .unwrap()
+    );
+}
+
+/// A create that found its name held by a queued trash backed off. The trash
+/// landing frees the name, so the create is due at once instead of after the
+/// backoff; a parked create stays parked.
+#[test]
+fn a_landed_trash_makes_the_ops_waiting_for_its_name_due() {
+    let db = Db::open_in_memory().unwrap();
+    let old = uid("old");
+    db.upsert_node(&file("old", "root", "report.txt", 1))
+        .unwrap();
+    let (trash_id, _) = db
+        .replace_ops_with_trash(&old.to_string(), "report.txt", 1)
+        .unwrap();
+    let create = |name: &str, next_attempt_at: i64| {
+        let (id, _) = db
+            .enqueue_op(&PendingOp {
+                id: 0,
+                kind: OP_CREATE.to_string(),
+                uid: format!("local~{name}-{next_attempt_at}"),
+                parent_uid: Some(uid("root").to_string()),
+                name: Some(name.to_string()),
+                blob_path: None,
+                meta_json: None,
+                created_at: 2,
+                attempts: 0,
+                last_error: None,
+                next_attempt_at,
+            })
+            .unwrap();
+        db.record_op_failure(id, "report.txt is still held", next_attempt_at)
+            .unwrap();
+        id
+    };
+    let waiting = create("report.txt", 9_000);
+    let parked = create("report.txt", PARK_UNTIL);
+    let other = create("other.txt", 9_000);
+
+    db.complete_trash_op(trash_id, &old).unwrap();
+
+    let due = |id| {
+        db.pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|op| op.id == id)
+            .unwrap()
+            .next_attempt_at
+    };
+    assert_eq!(due(waiting), 0);
+    assert_eq!(due(parked), PARK_UNTIL);
+    assert_eq!(due(other), 9_000);
+}
+
+#[test]
+fn a_queued_rename_away_from_a_name_holds_it_until_it_lands() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    let rename = |node: &str, from: &str, to: &str| {
+        let meta = serde_json::to_string(&RenameMeta {
+            original_parent_uid: root.clone(),
+            original_name: Some(from.to_string()),
+        })
+        .unwrap();
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_RENAME.to_string(),
+            uid: uid(node).to_string(),
+            parent_uid: Some(root.clone()),
+            name: Some(to.to_string()),
+            blob_path: None,
+            meta_json: Some(meta),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap()
+        .0
+    };
+    let away = rename("away", "c.bin", "d");
+    rename("back", "e.md", "e.md");
+    let (waiting, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~waiting".to_string(),
+            parent_uid: Some(root.clone()),
+            name: Some("c.bin".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 2,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    db.record_op_failure(waiting, "c.bin is still held", 9_000)
+        .unwrap();
+
+    assert!(db.has_pending_move_from("c.bin").unwrap());
+    assert!(!db.has_pending_move_from("d").unwrap());
+    assert!(
+        !db.has_pending_move_from("e.md").unwrap(),
+        "a rename that keeps the name in its folder frees nothing"
+    );
+    db.wake_ops_waiting_for("c.bin").unwrap();
+    let due = || {
+        db.pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|op| op.id == waiting)
+            .unwrap()
+            .next_attempt_at
+    };
+    assert_eq!(due(), 9_000, "the rename still holds the name");
+
+    db.delete_op(away).unwrap();
+    db.wake_ops_waiting_for("c.bin").unwrap();
+    assert_eq!(due(), 0);
+}
+
+#[test]
+fn failed_atomic_trash_insert_keeps_prior_revision_and_blob_ownership() {
+    let db = Db::open_in_memory().unwrap();
+    let node = uid("atomic-trash").to_string();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: node.clone(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/still-owned".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    db.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_trash_insert BEFORE INSERT ON pending_op
+             WHEN NEW.kind = 'trash'
+             BEGIN SELECT RAISE(ABORT, 'injected trash insert failure'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(db.replace_ops_with_trash(&node, "removed.txt", 2).is_err());
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].kind, OP_REVISION);
+    assert_eq!(ops[0].uid, node);
+    assert_eq!(
+        ops[0].blob_path.as_deref(),
+        Some("/staging/still-owned"),
+        "the rolled-back revision still owns its staged bytes"
+    );
+}
+
+/// Discarding a change to a node Drive has drops that node's ops and nothing
+/// queued below it, and nothing at all while one of them is on the wire.
+#[test]
+fn discarding_a_nodes_change_keeps_what_is_queued_inside_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        folder("dir", Some("root"), "dir"),
+        file("inner", "dir", "inner.bin", 1),
+    ])
+    .unwrap();
+    let op = |kind: &str, link: &str, blob: Option<&str>| PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: uid(link).to_string(),
+        parent_uid: None,
+        name: Some("renamed".to_string()),
+        blob_path: blob.map(str::to_string),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op(OP_RENAME, "dir", None)).unwrap();
+    db.enqueue_op(&op(OP_REVISION, "inner", Some("/staging/inner")))
+        .unwrap();
+
+    let dir = uid("dir").to_string();
+    assert_eq!(db.discard_ops_on_node(&dir).unwrap(), Some(vec![]));
+    let left: Vec<String> = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .map(|op| op.uid)
+        .collect();
+    assert_eq!(left, vec![uid("inner").to_string()]);
+
+    let inner = uid("inner").to_string();
+    let claimed = db.claim_next_due_op(2).unwrap().unwrap();
+    assert_eq!(claimed.uid, inner);
+    assert_eq!(db.discard_ops_on_node(&inner).unwrap(), None);
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    db.record_op_failure(claimed.id, "no answer", 0).unwrap();
+    db.release_op_claim(claimed.id).unwrap();
+    assert_eq!(
+        db.discard_ops_on_node(&inner).unwrap(),
+        Some(vec!["/staging/inner".to_string()])
+    );
+    assert!(db.pending_ops().unwrap().is_empty());
+}
+
+/// A revision op names no parent, so the queue alone cannot see that its file
+/// sits inside a folder being removed. The node tree can: trashing the folder
+/// has to take the uploads of the files below it along, or they fail forever
+/// against a trashed node and keep their bytes on disk (B102). A rename that
+/// moved a node into the folder still has to land.
+#[test]
+fn trashing_a_folder_drops_the_queued_revisions_of_files_below_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        folder("doomed", Some("root"), "doomed"),
+        folder("sub", Some("doomed"), "sub"),
+        file("deep", "sub", "deep.bin", 1),
+        file("moved", "doomed", "moved.txt", 1),
+        file("kept", "root", "kept.bin", 1),
+    ])
+    .unwrap();
+    let op = |kind: &str, link: &str, blob: Option<&str>| PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: uid(link).to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: blob.map(str::to_string),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op(OP_REVISION, "deep", Some("/staging/deep")))
+        .unwrap();
+    db.enqueue_op(&op(OP_RENAME, "moved", None)).unwrap();
+    db.enqueue_op(&op(OP_REVISION, "kept", Some("/staging/kept")))
+        .unwrap();
+
+    let doomed = uid("doomed").to_string();
+    let (_, blobs) = db.replace_ops_with_trash(&doomed, "doomed", 2).unwrap();
+    assert_eq!(blobs, vec!["/staging/deep"]);
+
+    let mut left: Vec<(String, String)> = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .map(|op| (op.kind, op.uid))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            (OP_RENAME.to_string(), uid("moved").to_string()),
+            (OP_REVISION.to_string(), uid("kept").to_string()),
+            (OP_TRASH.to_string(), doomed.clone()),
+        ]
+    );
+
+    // Deleting outright follows the same tree.
+    db.enqueue_op(&op(OP_REVISION, "deep", Some("/staging/deep2")))
+        .unwrap();
+    assert_eq!(
+        db.delete_ops_for_uid(&uid("sub").to_string()).unwrap(),
+        vec!["/staging/deep2"]
+    );
+}
+
+/// A create in a subfolder that already exists on Drive names that subfolder,
+/// not the folder being trashed, as its parent. It has to go with the folder
+/// all the same, along with whatever is queued inside it, or a parked one
+/// keeps its bytes for good and a due one is made in the root (B116).
+#[test]
+fn trashing_a_folder_drops_the_queued_creates_in_its_subfolders() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        folder("doomed", Some("root"), "doomed"),
+        folder("sub", Some("doomed"), "sub"),
+        folder("other", Some("root"), "other"),
+    ])
+    .unwrap();
+    let op = |kind: &str, node: &str, parent: &str, blob: Option<&str>| PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: node.to_string(),
+        parent_uid: Some(parent.to_string()),
+        name: Some(format!("{node}.bin")),
+        blob_path: blob.map(str::to_string),
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let sub = uid("sub").to_string();
+    db.enqueue_op(&op(OP_CREATE, "local~deep", &sub, Some("/staging/deep")))
+        .unwrap();
+    db.enqueue_op(&op(OP_MKDIR, "local~dir", &sub, None))
+        .unwrap();
+    db.enqueue_op(&op(
+        OP_CREATE,
+        "local~deeper",
+        "local~dir",
+        Some("/staging/deeper"),
+    ))
+    .unwrap();
+    db.enqueue_op(&op(
+        OP_CREATE,
+        "local~kept",
+        &uid("other").to_string(),
+        Some("/staging/kept"),
+    ))
+    .unwrap();
+
+    let doomed = uid("doomed").to_string();
+    let (_, mut blobs) = db.replace_ops_with_trash(&doomed, "doomed", 2).unwrap();
+    blobs.sort();
+    assert_eq!(blobs, vec!["/staging/deep", "/staging/deeper"]);
+
+    let mut left: Vec<(String, String)> = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .map(|op| (op.kind, op.uid))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            (OP_CREATE.to_string(), "local~kept".to_string()),
+            (OP_TRASH.to_string(), doomed),
+        ]
+    );
+}
+
+/// Deleting a folder that was created offline must take the ops queued
+/// underneath it with it: they name a placeholder parent that will now never
+/// become real, so nothing could ever drain them and nothing is left to
+/// rewrite them.
+#[test]
+fn deleting_a_queued_folder_takes_its_queued_children_with_it() {
+    let db = Db::open_in_memory().unwrap();
+    let op = |kind: &str, uid: &str, parent: &str, blob: Option<&str>| PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: uid.to_string(),
+        parent_uid: Some(parent.to_string()),
+        name: Some("n".to_string()),
+        blob_path: blob.map(str::to_string),
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let root = uid("root").to_string();
+    db.enqueue_op(&op(OP_MKDIR, "local~dir", &root, None))
+        .unwrap();
+    db.enqueue_op(&op(OP_MKDIR, "local~sub", "local~dir", None))
+        .unwrap();
+    db.enqueue_op(&op(
+        OP_CREATE,
+        "local~deep",
+        "local~sub",
+        Some("/staging/deep"),
+    ))
+    .unwrap();
+    // A sibling outside the doomed subtree must survive.
+    db.enqueue_op(&op(OP_CREATE, "local~other", &root, Some("/staging/other")))
+        .unwrap();
+
+    let blobs = db.delete_ops_for_uid("local~dir").unwrap();
+    assert_eq!(
+        blobs,
+        vec!["/staging/deep"],
+        "the subtree's bytes come back"
+    );
+
+    let left: Vec<String> = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .map(|o| o.uid)
+        .collect();
+    assert_eq!(left, vec!["local~other"]);
+}
+
+/// A rename is the node's desired end state, so the newest one is the only
+/// one worth performing — but it must not disturb the queued *upload* of the
+/// same node, which is unrelated work.
+#[test]
+fn a_second_rename_supersedes_the_first_but_leaves_the_upload_alone() {
+    let db = Db::open_in_memory().unwrap();
+    let rename = |name: &str| PendingOp {
+        id: 0,
+        kind: OP_RENAME.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: Some(uid("parent").to_string()),
+        name: Some(name.to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/blob".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    db.enqueue_op(&rename("first")).unwrap();
+    let (_, superseded) = db.enqueue_op(&rename("second")).unwrap();
+    assert_eq!(superseded, None, "a rename owns no blob to clean up");
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 2, "the queued upload survives the rename");
+    let renames: Vec<_> = ops.iter().filter(|o| o.kind == OP_RENAME).collect();
+    assert_eq!(renames.len(), 1, "one rename per node");
+    assert_eq!(renames[0].name.as_deref(), Some("second"));
+
+    let counts = db.pending_op_counts().unwrap();
+    assert_eq!(counts.uploads, 1, "the revision is the only upload");
+    assert_eq!(counts.changes, 1, "the rename carries no bytes");
+}
+
+/// Renaming a node whose create has not drained rewrites the intent rather
+/// than queueing a rename against a uid the server has never issued.
+#[test]
+fn renaming_a_queued_create_rewrites_its_target() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~abc";
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: local.to_string(),
+        parent_uid: Some(uid("old").to_string()),
+        name: Some("draft.txt".to_string()),
+        blob_path: Some("/staging/blob".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    let rewritten = db
+        .rewrite_op_target(local, &uid("new").to_string(), "final.txt")
+        .unwrap();
+    assert!(rewritten);
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "a rewrite is not a second op");
+    assert_eq!(ops[0].name.as_deref(), Some("final.txt"));
+    assert_eq!(
+        ops[0].parent_uid.as_deref(),
+        Some(uid("new").to_string()).as_deref()
+    );
+    assert_eq!(
+        ops[0].blob_path.as_deref(),
+        Some("/staging/blob"),
+        "the bytes riding on the create are untouched"
+    );
+
+    // Once the create has drained there is no intent left to rewrite, and the
+    // caller has to rename the real node instead.
+    db.delete_op(ops[0].id).unwrap();
+    assert!(
+        !db.rewrite_op_target(local, &uid("new").to_string(), "final.txt")
+            .unwrap()
+    );
+}
+
+/// A create that failed on a name held by a queued change waits out a
+/// backoff. Renamed away from that name, it is due again at once; parked, it
+/// stays parked. One whose blob a write replaced as it failed is due again at
+/// once too.
+#[test]
+fn renaming_a_backing_off_create_makes_it_due() {
+    let db = Db::open_in_memory().unwrap();
+    let create = |local: &str| PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: local.to_string(),
+        parent_uid: Some(uid("dir").to_string()),
+        name: Some("a.txt".to_string()),
+        blob_path: Some(format!("/staging/{local}")),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let (failed, _) = db.enqueue_op(&create("local~failed")).unwrap();
+    db.record_op_failure(failed, "a.txt is still held", 10_000)
+        .unwrap();
+    db.enqueue_op(&create("local~parked")).unwrap();
+    db.set_create_hold("local~parked", true).unwrap();
+
+    db.rewrite_op_target("local~failed", &uid("dir").to_string(), "d")
+        .unwrap();
+    db.rewrite_op_target("local~parked", &uid("dir").to_string(), "e.tmp")
+        .unwrap();
+
+    let ops = db.pending_ops().unwrap();
+    let op = |local: &str| ops.iter().find(|o| o.uid == local).unwrap();
+    assert_eq!(op("local~failed").next_attempt_at, 0);
+    assert_eq!(op("local~failed").attempts, 1);
+    assert_eq!(op("local~parked").next_attempt_at, PARK_UNTIL);
+
+    // Renamed while an attempt was on the wire, which then failed: the
+    // failure is recorded after the rename, and the create is still due.
+    let sent = op("local~failed").clone();
+    db.rewrite_op_target("local~failed", &uid("dir").to_string(), "f")
+        .unwrap();
+    db.record_op_failure(sent.id, "d is still held", 10_000)
+        .unwrap();
+    assert!(
+        db.retry_if_retargeted(
+            sent.id,
+            sent.parent_uid.as_deref(),
+            sent.name.as_deref(),
+            sent.blob_path.as_deref()
+        )
+        .unwrap()
+    );
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(
+        ops.iter()
+            .find(|o| o.id == sent.id)
+            .unwrap()
+            .next_attempt_at,
+        0
+    );
+    assert!(
+        !db.retry_if_retargeted(
+            sent.id,
+            sent.parent_uid.as_deref(),
+            Some("f"),
+            sent.blob_path.as_deref()
+        )
+        .unwrap()
+    );
+
+    // A write replaced the blob before the attempt opened it: the old one was
+    // discarded, the attempt failed on a missing file, and the create is due
+    // again at once with the new one (`docs/BUGS.md` B185).
+    db.record_op_failure(sent.id, "No such file or directory", 10_000)
+        .unwrap();
+    db.attach_blob_to_create("local~failed", "/staging/newer", "{}")
+        .unwrap()
+        .expect("the create is still queued");
+    db.record_op_failure(sent.id, "No such file or directory", 10_000)
+        .unwrap();
+    assert!(
+        db.retry_if_retargeted(
+            sent.id,
+            sent.parent_uid.as_deref(),
+            Some("f"),
+            sent.blob_path.as_deref()
+        )
+        .unwrap()
+    );
+    assert!(
+        !db.retry_if_retargeted(
+            sent.id,
+            sent.parent_uid.as_deref(),
+            Some("f"),
+            Some("/staging/newer")
+        )
+        .unwrap()
+    );
+}
+
+/// A rename queued while an older one is on the wire waits for it. The older
+/// one, if it fails, is dropped rather than retried after the newer one, also
+/// when the newer one came after the failure was recorded.
+#[test]
+fn a_rename_on_the_wire_lands_before_the_one_that_replaces_it() {
+    let db = Db::open_in_memory().unwrap();
+    let file = uid("file").to_string();
+    let rename = |parent: &str| PendingOp {
+        id: 0,
+        kind: OP_RENAME.to_string(),
+        uid: file.clone(),
+        parent_uid: Some(uid(parent).to_string()),
+        name: Some("e.md".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let (first, _) = db.enqueue_op(&rename("x")).unwrap();
+    assert_eq!(db.claim_next_due_op(1).unwrap().unwrap().id, first);
+
+    let (second, _) = db.enqueue_op(&rename("c0")).unwrap();
+    assert!(db.claim_next_due_op(1).unwrap().is_none());
+
+    db.record_op_failure(first, "original hash is out of date", 10_000)
+        .unwrap();
+    db.release_op_claim(first).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.iter().map(|o| o.id).collect::<Vec<_>>(), [second]);
+    assert_eq!(db.claim_next_due_op(1).unwrap().unwrap().id, second);
+
+    // Unclaimed, a queued rename is replaced as before.
+    db.release_op_claim(second).unwrap();
+    let (third, _) = db.enqueue_op(&rename("x")).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.iter().map(|o| o.id).collect::<Vec<_>>(), [third]);
+
+    // Queued after the failure was recorded but before the claim went back:
+    // the older one goes then, rather than landing after the newer (B158).
+    assert_eq!(db.claim_next_due_op(1).unwrap().unwrap().id, third);
+    db.record_op_failure(third, "e.md is still held", 10_000)
+        .unwrap();
+    let (fourth, _) = db.enqueue_op(&rename("c0")).unwrap();
+    db.release_op_claim(third).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.iter().map(|o| o.id).collect::<Vec<_>>(), [fourth]);
+}
+
+#[test]
+fn a_write_folds_into_a_queued_create_instead_of_superseding_it() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~abc";
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: local.to_string(),
+        parent_uid: Some(uid("parent").to_string()),
+        name: Some("new.txt".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    let first = db
+        .attach_blob_to_create(local, "/staging/first", "{}")
+        .unwrap()
+        .expect("create is still queued");
+    assert_eq!(first.superseded, None);
+
+    // Rewriting the file before it drains replaces the bytes but must leave
+    // the create itself alone: it is the only thing that will ever bring this
+    // file into existence remotely.
+    let second = db
+        .attach_blob_to_create(local, "/staging/second", "{}")
+        .unwrap()
+        .expect("create is still queued");
+    assert_eq!(second.superseded.as_deref(), Some("/staging/first"));
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "still exactly one create");
+    assert_eq!(ops[0].kind, OP_CREATE);
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/second"));
+    assert_eq!(ops[0].name.as_deref(), Some("new.txt"));
+}
+
+#[test]
+fn attaching_to_an_already_drained_create_reports_it_is_gone() {
+    let db = Db::open_in_memory().unwrap();
+    // No create queued: the caller must fall back to a revision op rather
+    // than silently dropping the bytes.
+    let out = db
+        .attach_blob_to_create("local~gone", "/staging/x", "{}")
+        .unwrap();
+    assert!(out.is_none());
+}
+
+#[test]
+fn a_write_attached_while_its_create_uploads_becomes_a_revision() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~abc";
+    let real = uid("real").to_string();
+    let parent = uid("parent").to_string();
+    let create = |blob: Option<&str>| PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: local.to_string(),
+        parent_uid: Some(uid("parent").to_string()),
+        name: Some("new.txt".to_string()),
+        blob_path: blob.map(str::to_string),
+        meta_json: blob.map(|_| "{\"uid\":\"local~abc\"}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let (id, _) = db.enqueue_op(&create(None)).unwrap();
+    // The drain picked the create up with no blob; the file's first write
+    // closes while the empty upload is on the wire.
+    db.attach_blob_to_create(local, "/staging/written", "{\"uid\":\"local~abc\"}")
+        .unwrap()
+        .expect("create is still queued");
+
+    let newer = db
+        .finish_create(
+            id,
+            None,
+            &landing(local, &real, &parent, "new.txt"),
+            |json| Some(json.replace("local~abc", "vol~real")),
+        )
+        .unwrap();
+
+    assert_eq!(
+        newer,
+        CreateRetired::Newer {
+            blob: "/staging/written".to_string(),
+            meta: "{\"uid\":\"vol~real\"}".to_string()
+        }
+    );
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "the write is still queued");
+    assert_eq!(ops[0].kind, OP_REVISION);
+    assert_eq!(ops[0].uid, real);
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/written"));
+    assert_eq!(ops[0].parent_uid, None);
+}
+
+#[test]
+fn a_create_whose_blob_landed_is_retired() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~abc";
+    let real = uid("real").to_string();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("parent").to_string()),
+            name: Some("new.txt".to_string()),
+            blob_path: Some("/staging/sent".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: "local~child".to_string(),
+        parent_uid: Some(local.to_string()),
+        name: Some("inside.txt".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 2,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    let newer = db
+        .finish_create(
+            id,
+            Some("/staging/sent"),
+            &landing(local, &real, &parent, "new.txt"),
+            |_| panic!("an unchanged create has no sidecar to rewrite"),
+        )
+        .unwrap();
+
+    assert_eq!(newer, CreateRetired::Landed);
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "only the child is left");
+    assert_eq!(ops[0].parent_uid.as_deref(), Some(real.as_str()));
+}
+
+/// The parent and name a create was sent with, landing where it was sent.
+fn landing<'a>(local: &'a str, real: &'a str, parent: &'a str, name: &'a str) -> CreateLanding<'a> {
+    CreateLanding {
+        local,
+        real,
+        sent: (parent, name),
+        landed: (parent, name),
+    }
+}
+
+/// A queued op on a node made here, `kind` under `uid`.
+fn op_on(kind: &str, uid: &str, parent: Option<&str>) -> PendingOp {
+    PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: uid.to_string(),
+        parent_uid: parent.map(str::to_string),
+        name: parent.map(|_| "new.txt".to_string()),
+        blob_path: Some(format!("/staging/{kind}")),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    }
+}
+
+#[test]
+fn an_op_queued_under_a_stand_in_after_its_create_landed_goes_to_the_landed_node() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("parent", None, "My Files")).unwrap();
+    let parent = uid("parent").to_string();
+    let lid = db.add_local_row(&parent, "new.txt", false, 1).unwrap();
+    let local = local_uid(lid);
+    let real = uid("real").to_string();
+    let (id, _) = db
+        .enqueue_op(&op_on(OP_CREATE, &local, Some(&parent)))
+        .unwrap();
+    db.claim_next_due_op(1).unwrap().unwrap();
+    db.finish_create(
+        id,
+        Some("/staging/create"),
+        &landing(&local, &real, &parent, "new.txt"),
+        |_| None,
+    )
+    .unwrap();
+
+    // A handle opened before the create landed still names the stand-in.
+    db.enqueue_op(&op_on(OP_REVISION, &local, None)).unwrap();
+    assert!(db.has_pending_op(&real, OP_REVISION).unwrap());
+    assert!(db.has_any_op(&real).unwrap());
+    // A second write, made through the real uid, replaces it.
+    let (_, superseded) = db.enqueue_op(&op_on(OP_REVISION, &real, None)).unwrap();
+    assert_eq!(superseded.as_deref(), Some("/staging/revision"));
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(
+        ops[0].uid, real,
+        "the queue names the node by the uid it has now"
+    );
+    let claimed = db.claim_next_due_op(1).unwrap().unwrap();
+    assert_eq!(claimed.uid, real, "the drain sends the real uid");
+}
+
+#[test]
+fn a_stand_in_keeps_its_access_once_its_create_has_landed() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("parent", None, "My Files")).unwrap();
+    let parent = uid("parent").to_string();
+    let lid = db.add_local_row(&parent, "new.txt", false, 1).unwrap();
+    let local = local_uid(lid);
+    let stand_in = NodeUid::new(VolumeId::from("local"), LinkId::from(lid.to_string()));
+    let mut node = file("new", "parent", "new.txt", 1);
+    node.uid = stand_in.clone();
+    db.upsert_node(&node).unwrap();
+    let real = uid("real").to_string();
+    let (id, _) = db
+        .enqueue_op(&op_on(OP_CREATE, &local, Some(&parent)))
+        .unwrap();
+    assert_eq!(
+        db.effective_node_access(&stand_in).unwrap(),
+        Some(pdfs_core::Access::Owner)
+    );
+    db.claim_next_due_op(1).unwrap().unwrap();
+    db.finish_create(
+        id,
+        Some("/staging/create"),
+        &landing(&local, &real, &parent, "new.txt"),
+        |_| None,
+    )
+    .unwrap();
+
+    // The tree still names the file by its stand-in for a moment.
+    assert_eq!(
+        db.effective_node_access(&stand_in).unwrap(),
+        Some(pdfs_core::Access::Owner)
+    );
+    assert_eq!(
+        db.effective_node_access(&uid("real")).unwrap(),
+        Some(pdfs_core::Access::Owner)
+    );
+}
+
+#[test]
+fn a_stand_in_folder_stays_listed_once_its_create_has_landed() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("parent", None, "My Files")).unwrap();
+    let parent = uid("parent").to_string();
+    let lid = db.add_local_row(&parent, "dir", true, 1).unwrap();
+    let local = local_uid(lid);
+    let stand_in = NodeUid::new(VolumeId::from("local"), LinkId::from(lid.to_string()));
+    let mut node = folder("new", Some("parent"), "dir");
+    node.uid = stand_in.clone();
+    db.upsert_node(&node).unwrap();
+    db.set_listed(&stand_in, true).unwrap();
+    let real = uid("real").to_string();
+    let (id, _) = db
+        .enqueue_op(&op_on(OP_MKDIR, &local, Some(&parent)))
+        .unwrap();
+    db.claim_next_due_op(1).unwrap().unwrap();
+    db.finish_create(id, None, &landing(&local, &real, &parent, "dir"), |_| None)
+        .unwrap();
+
+    // The tree still names the folder by its stand-in for a moment; a listing
+    // asked by it must not go to Drive, which has never heard of it.
+    assert!(
+        db.children_if_listed(&stand_in)
+            .unwrap()
+            .is_some_and(|kids| kids.is_empty())
+    );
+    db.set_listed(&stand_in, false).unwrap();
+    assert!(db.children_if_listed(&uid("real")).unwrap().is_none());
+}
+
+#[test]
+fn a_node_queued_under_both_its_uids_is_sent_one_op_at_a_time() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("parent", None, "My Files")).unwrap();
+    let parent = uid("parent").to_string();
+    let lid = db.add_local_row(&parent, "new.txt", false, 1).unwrap();
+    let local = local_uid(lid);
+    let real = uid("real").to_string();
+    db.land_placeholder_row(&local, &real).unwrap();
+    db.enqueue_op(&op_on(OP_RENAME, &real, Some(&parent)))
+        .unwrap();
+    db.enqueue_op(&op_on(OP_REVISION, &local, None)).unwrap();
+
+    let first = db.claim_next_due_op(1).unwrap().unwrap();
+    assert_eq!(first.kind, OP_RENAME);
+    assert!(
+        db.claim_next_due_op(1).unwrap().is_none(),
+        "the write waits for the rename of the same node"
+    );
+    db.delete_op(first.id).unwrap();
+    let second = db.claim_next_due_op(1).unwrap().unwrap();
+    assert_eq!(
+        (second.kind.as_str(), second.uid.as_str()),
+        (OP_REVISION, real.as_str())
+    );
+}
+
+#[test]
+fn a_rename_made_while_its_create_uploads_is_queued_for_the_landed_node() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~abc";
+    let real = uid("real").to_string();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("parent").to_string()),
+            name: Some("new.txt".to_string()),
+            blob_path: Some("/staging/sent".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    // The drain took the create; the user moves the file into a folder that
+    // is itself still queued.
+    db.rewrite_op_target(local, "local~dir", "moved.txt")
+        .unwrap();
+
+    let mut landed = landing(local, &real, &parent, "new.txt");
+    landed.landed.1 = "new (conflict).txt";
+    db.finish_create(id, Some("/staging/sent"), &landed, |_| None)
+        .unwrap();
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "the move outlives the create");
+    assert_eq!(ops[0].kind, OP_RENAME);
+    assert_eq!(ops[0].uid, real);
+    assert_eq!(ops[0].parent_uid.as_deref(), Some("local~dir"));
+    assert_eq!(ops[0].name.as_deref(), Some("moved.txt"));
+    let meta: RenameMeta = serde_json::from_str(ops[0].meta_json.as_deref().unwrap()).unwrap();
+    assert_eq!(meta.original_parent_uid, uid("parent").to_string());
+    assert_eq!(meta.original_name.as_deref(), Some("new (conflict).txt"));
+
+    // The folder lands next and the move follows it.
+    db.land_placeholder_row("local~dir", &uid("dir").to_string())
+        .unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops[0].parent_uid, Some(uid("dir").to_string()));
+}
+
+#[test]
+fn draining_a_folder_repoints_its_queued_children() {
+    let db = Db::open_in_memory().unwrap();
+    let local_dir = "local~dir";
+    let real_dir = uid("realdir").to_string();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: "local~child".to_string(),
+        parent_uid: Some(local_dir.to_string()),
+        name: Some("inside.txt".to_string()),
+        blob_path: Some("/staging/child".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 2,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    db.land_placeholder_row(local_dir, &real_dir).unwrap();
+
+    // The child was queued against a folder that did not exist yet. Once the
+    // folder is real, the child must target the server's uid — otherwise the
+    // upload would address `local~dir` and 404.
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops[0].parent_uid.as_deref(), Some(real_dir.as_str()));
+}
+
+/// B120: a child queued inside a folder that has just landed is checked
+/// against the folder's real uid before the server's copy of it arrives.
+#[test]
+fn a_landed_folder_keeps_a_row_until_the_server_copy_replaces_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    let mut child = file("child", "root", "inside.txt", 1);
+    child.parent_uid = Some(local.clone());
+    db.upsert_node(&child).unwrap();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_MKDIR.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("root").to_string()),
+            name: Some("New folder".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+    db.finish_create(
+        id,
+        None,
+        &landing(
+            &local.to_string(),
+            &uid("real").to_string(),
+            &uid("root").to_string(),
+            "New folder",
+        ),
+        |_| None,
+    )
+    .unwrap();
+
+    assert!(db.node_by_uid(&local.to_string()).unwrap().is_none());
+    let landed = db
+        .node_by_uid(&uid("real").to_string())
+        .unwrap()
+        .expect("the landed folder has a row before the server's copy is read");
+    assert_eq!(landed.uid, uid("real"));
+    assert_eq!(landed.name, "New folder");
+    assert_eq!(
+        db.effective_node_access(&uid("child")).unwrap(),
+        Some(pdfs_core::Access::Owner),
+        "the child's authority resolves without a network re-read"
+    );
+    let names: Vec<_> = db
+        .known_children(&uid("real"))
+        .unwrap()
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(names, ["inside.txt"]);
+    let found = db.search("inside", 10).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, "New folder/inside.txt");
+}
+
+/// A queued create names its folder by local id, so it is sent into the folder
+/// as soon as the folder's row has its real uid, whatever the op's own copy
+/// of the folder's uid still says.
+#[test]
+fn a_create_waits_for_its_folder_by_local_id() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    let dir = db.lid_of(&local.to_string()).unwrap().unwrap();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~child".to_string(),
+            parent_uid: Some(local.to_string()),
+            name: Some("inside.txt".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    let parent_lid: Option<i64> = db
+        .conn
+        .lock()
+        .query_row(
+            "SELECT parent_lid FROM pending_op WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent_lid, Some(dir));
+    assert!(
+        db.claim_next_due_op(1).unwrap().is_none(),
+        "nothing to send into a folder that has not landed"
+    );
+
+    db.conn
+        .lock()
+        .execute(
+            "UPDATE nodes SET uid = ?2 WHERE lid = ?1",
+            rusqlite::params![dir, uid("dir").to_string()],
+        )
+        .unwrap();
+
+    let op = db.claim_next_due_op(1).unwrap().expect("the create is due");
+    assert_eq!(op.id, id);
+    assert_eq!(op.parent_uid, Some(uid("dir").to_string()));
+}
+
+fn parent_lid(db: &Db, uid: &NodeUid) -> Option<i64> {
+    db.conn
+        .lock()
+        .query_row(
+            "SELECT parent_lid FROM nodes WHERE uid = ?1",
+            [uid.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// A node stored before its folder, as an event can bring it, is linked to
+/// the folder by local id once the folder's row arrives.
+#[test]
+fn a_node_stored_before_its_folder_is_linked_when_the_folder_arrives() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("child", "dir", "inside.txt", 1))
+        .unwrap();
+    assert_eq!(parent_lid(&db, &uid("child")), None);
+
+    db.upsert_node(&folder("dir", Some("root"), "Folder"))
+        .unwrap();
+
+    assert_eq!(
+        parent_lid(&db, &uid("child")),
+        db.lid_of(&uid("dir").to_string()).unwrap()
+    );
+    assert_eq!(
+        parent_lid(&db, &uid("dir")),
+        db.lid_of(&uid("root").to_string()).unwrap()
+    );
+}
+
+/// A restart puts a node below the folder its row links to by local id, under
+/// the uid that row has now, whatever the node's own copy of it says.
+#[test]
+fn a_restart_finds_a_node_under_its_landed_folder() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    let mut child = file("child", "root", "inside.txt", 1);
+    child.parent_uid = Some(local.clone());
+    db.upsert_node(&child).unwrap();
+    let dir = db.lid_of(&local.to_string()).unwrap().unwrap();
+    db.conn
+        .lock()
+        .execute(
+            "UPDATE nodes SET uid = ?2 WHERE lid = ?1",
+            rusqlite::params![dir, uid("dir").to_string()],
+        )
+        .unwrap();
+
+    let stored = db.load_all().unwrap();
+    let child = stored.iter().find(|s| s.node.uid == uid("child")).unwrap();
+    assert_eq!(child.node.parent_uid, Some(uid("dir")));
+}
+
+/// A rename queued against the row Drive listed for a folder still landing
+/// follows the folder when that row is merged into the landing one (B140).
+#[test]
+fn an_op_on_a_listed_twin_follows_the_folder_that_lands() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    db.upsert_node(&folder("real", Some("root"), "New folder"))
+        .unwrap();
+    let kept = db.lid_of(&local.to_string()).unwrap().unwrap();
+    let (rename, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_RENAME.to_string(),
+            uid: uid("real").to_string(),
+            parent_uid: Some(uid("root").to_string()),
+            name: Some("Renamed".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+    db.land_placeholder_row(&local.to_string(), &uid("real").to_string())
+        .unwrap();
+
+    let lid: Option<i64> = db
+        .conn
+        .lock()
+        .query_row("SELECT lid FROM pending_op WHERE id = ?1", [rename], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(lid, Some(kept));
+    assert_eq!(db.lid_of(&uid("real").to_string()).unwrap(), Some(kept));
+}
+
+/// B148: a folder pinned before it landed is still pinned once it has.
+#[test]
+fn a_folder_pinned_before_it_landed_stays_pinned() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "Keep");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    db.pin_add(&local.to_string(), "Keep", true).unwrap();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_MKDIR.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("root").to_string()),
+            name: Some("Keep".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+    db.finish_create(
+        id,
+        None,
+        &landing(
+            &local.to_string(),
+            &uid("real").to_string(),
+            &uid("root").to_string(),
+            "Keep",
+        ),
+        |_| None,
+    )
+    .unwrap();
+
+    assert!(db.is_pinned(&uid("real").to_string()).unwrap());
+    assert!(!db.is_pinned(&local.to_string()).unwrap());
+    let pins = db.pin_list().unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].uid, uid("real").to_string());
+    assert!(pins[0].recursive);
+}
+
+/// A file deleted while its create was on the wire still lands: nothing stops
+/// an upload in flight. The node it made is unwanted, so a trash of it is
+/// queued in the same transaction, already claimed by the drain that landed it
+/// (`docs/BUGS.md` B129).
+#[test]
+fn a_create_withdrawn_while_it_uploads_queues_a_trash_of_the_landed_node() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~gone";
+    let real = uid("real").to_string();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some("d".to_string()),
+            blob_path: Some("/staging/sent".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    db.claim_next_due_op(10)
+        .unwrap()
+        .expect("the drain takes the create");
+    db.delete_ops_for_uid(local).unwrap();
+
+    let retired = db
+        .finish_create(
+            id,
+            Some("/staging/sent"),
+            &landing(local, &real, &parent, "d"),
+            |_| None,
+        )
+        .unwrap();
+
+    let CreateRetired::Withdrawn { trash } = retired else {
+        panic!("a withdrawn create is not landed: {retired:?}");
+    };
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].id, trash);
+    assert_eq!(ops[0].kind, OP_TRASH);
+    assert_eq!(ops[0].uid, real);
+    assert_eq!(ops[0].name.as_deref(), Some("d"));
+    assert!(
+        db.claim_next_due_op(i64::MAX / 2).unwrap().is_none(),
+        "the trash is the landing drain's to send"
+    );
+}
+
+/// A file deleted after its create was sent and failed may still have been
+/// made: the answer can be lost after Drive made it. Its trash keeps the
+/// create's folder and blob to find that node by, and holds the name in the
+/// folder until it is done (`docs/BUGS.md` B151). A create never sent goes,
+/// blob and all.
+#[test]
+fn a_create_withdrawn_after_it_failed_queues_a_trash_that_keeps_its_blob() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("parent").to_string();
+    let create = |local: &str, blob: &str| {
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some("f.txt".to_string()),
+            blob_path: Some(blob.to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap()
+        .0
+    };
+    let sent = create("local~sent", "/staging/sent");
+    create("local~unsent", "/staging/unsent");
+    db.record_op_failure(sent, "no answer", 0).unwrap();
+
+    assert!(db.delete_ops_for_uid("local~sent").unwrap().is_empty());
+    assert_eq!(
+        db.delete_ops_for_uid("local~unsent").unwrap(),
+        vec!["/staging/unsent".to_string()]
+    );
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].kind, OP_TRASH);
+    assert_eq!(ops[0].uid, "local~sent");
+    assert_eq!(ops[0].parent_uid.as_deref(), Some(parent.as_str()));
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/sent"));
+    assert!(db.has_withdrawn_create(&parent, "f.txt").unwrap());
+    assert!(!db.has_withdrawn_create(&parent, "g.txt").unwrap());
+
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("sent"));
+    assert_eq!(
+        db.complete_trash_op(sent, &local).unwrap().as_deref(),
+        Some("/staging/sent")
+    );
+    assert!(db.pending_ops().unwrap().is_empty());
+}
+
+/// What a queued create sent, and where, stays on its row: through a newer
+/// blob, through the turn into a trash a delete makes of it, and across a
+/// reopen. The trash finds the file the create made by those bytes, after a
+/// restart too, and under a name the file had before a rename
+/// (`docs/BUGS.md` B183, B184).
+#[test]
+fn what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-create-sent-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    let parent = uid("parent").to_string();
+    let id = {
+        let db = Db::open(&path).unwrap();
+        let (id, _) = db
+            .enqueue_op(&PendingOp {
+                id: 0,
+                kind: OP_CREATE.to_string(),
+                uid: "local~sent".to_string(),
+                parent_uid: Some(parent.clone()),
+                name: Some("d".to_string()),
+                blob_path: Some("/staging/first".to_string()),
+                meta_json: Some("{}".to_string()),
+                created_at: 1,
+                attempts: 0,
+                last_error: None,
+                next_attempt_at: 0,
+            })
+            .unwrap();
+        assert!(db.create_sent(id).unwrap().is_empty());
+        assert!(db.create_targets(id).unwrap().is_empty());
+        db.note_create_target(id, &parent, "c", 10).unwrap();
+        db.note_create_target(id, &parent, "c", 20).unwrap();
+        db.note_create_sent(id, "aaaa").unwrap();
+        db.note_create_sent(id, "aaaa").unwrap();
+        db.record_op_failure(id, "no answer", 0).unwrap();
+        db.attach_blob_to_create("local~sent", "/staging/second", "{}")
+            .unwrap()
+            .expect("the create is still queued");
+        db.note_create_target(id, &parent, "d", 30).unwrap();
+        db.note_create_sent(id, "bbbb").unwrap();
+        db.record_op_failure(id, "no answer", 0).unwrap();
+        db.delete_ops_for_uid("local~sent").unwrap();
+        id
+    };
+
+    let db = Db::open(&path).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!((ops[0].id, ops[0].kind.as_str()), (id, OP_TRASH));
+    assert_eq!(db.create_sent(id).unwrap(), vec!["aaaa", "bbbb"]);
+    assert_eq!(
+        db.create_targets(id).unwrap(),
+        vec![
+            (parent.clone(), "c".to_string()),
+            (parent.clone(), "d".to_string())
+        ]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+/// A queued create knows when it first went out, which is where the window
+/// for adopting a node its lost answer left starts. Records written before
+/// the time was kept still list their targets, and one that does not parse is
+/// not replaced by the next target.
+#[test]
+fn a_create_remembers_when_it_was_first_sent() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~first".to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some("a.txt".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    assert_eq!(db.create_first_sent(id).unwrap(), None, "never sent");
+    db.note_create_target(id, &parent, "a.txt", 500).unwrap();
+    db.note_create_target(id, &parent, "a.txt", 900).unwrap();
+    db.note_create_target(id, &parent, "b.txt", 700).unwrap();
+    assert_eq!(db.create_first_sent(id).unwrap(), Some(500));
+
+    let set = |json: &str| {
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE pending_op SET sent_to = ?2 WHERE id = ?1",
+                rusqlite::params![id, json],
+            )
+            .unwrap();
+    };
+    set(&format!(r#"[["{parent}","old.txt"]]"#));
+    assert_eq!(
+        db.create_targets(id).unwrap(),
+        vec![(parent.clone(), "old.txt".to_string())]
+    );
+    assert_eq!(db.create_first_sent(id).unwrap(), None);
+    db.note_create_target(id, &parent, "a.txt", 900).unwrap();
+    assert_eq!(
+        db.create_targets(id).unwrap().len(),
+        2,
+        "the old target stays"
+    );
+    assert_eq!(db.create_first_sent(id).unwrap(), Some(900));
+
+    set("not json");
+    db.note_create_target(id, &parent, "c.txt", 1000).unwrap();
+    let raw: String = db
+        .conn
+        .lock()
+        .query_row("SELECT sent_to FROM pending_op WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        raw, "not json",
+        "an unreadable record is kept, not replaced"
+    );
+}
+
+/// A write after a create failed clears its attempts, so the next try goes
+/// out at once. The create was still sent: deleting the file then left no
+/// trash, and the file a lost answer made stayed on Drive under the name it
+/// was sent with (`docs/BUGS.md` B191).
+#[test]
+fn a_create_rewritten_after_it_failed_still_leaves_a_trash_when_deleted() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~sent".to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some("a.txt".to_string()),
+            blob_path: Some("/staging/first".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    db.note_create_target(id, &parent, "a.txt", 10).unwrap();
+    db.note_create_sent(id, "aaaa").unwrap();
+    db.record_op_failure(id, "no answer", 0).unwrap();
+    db.attach_blob_to_create("local~sent", "/staging/second", "{}")
+        .unwrap()
+        .expect("the create is still queued");
+
+    assert!(db.delete_ops_for_uid("local~sent").unwrap().is_empty());
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!((ops[0].id, ops[0].kind.as_str()), (id, OP_TRASH));
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/second"));
+    assert_eq!(
+        db.create_targets(id).unwrap(),
+        vec![(parent.clone(), "a.txt".to_string())]
+    );
+}
+
+/// A create deleted after it was sent becomes a trash in its place. The
+/// create's backoff, and the failure of an attempt still on the wire, are the
+/// create's: the trash is due at once (`docs/BUGS.md` B171).
+#[test]
+fn a_create_deleted_after_it_was_sent_leaves_a_trash_that_is_due_at_once() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("parent").to_string();
+    let create = |local: &str| {
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some(format!("{local}.txt")),
+            blob_path: Some(format!("/staging/{local}")),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap()
+        .0
+    };
+    let failed = create("local~failed");
+    db.record_attempt_failure(failed, OP_CREATE, "no answer", 50_000)
+        .unwrap();
+    let sending = create("local~sending");
+    assert_eq!(
+        db.claim_next_due_op(10).unwrap().map(|op| op.id),
+        Some(sending)
+    );
+
+    db.delete_ops_for_uid("local~failed").unwrap();
+    db.delete_ops_for_uid("local~sending").unwrap();
+    db.record_attempt_failure(sending, OP_CREATE, "No such file or directory", 50_000)
+        .unwrap();
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 2);
+    for op in &ops {
+        assert_eq!(op.kind, OP_TRASH);
+        assert_eq!((op.attempts, op.last_error.as_deref()), (0, None), "{op:?}");
+        assert_eq!(op.next_attempt_at, 0, "{op:?}");
+    }
+    db.record_attempt_failure(failed, OP_TRASH, "offline", 50_000)
+        .unwrap();
+    let trash = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .find(|op| op.id == failed);
+    assert_eq!(trash.map(|op| op.attempts), Some(1));
+}
+
+#[test]
+fn a_landed_placeholder_never_overwrites_the_server_copy() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    // The event stream reported the folder before the drain got round to it.
+    db.upsert_node(&folder("real", Some("root"), "New folder (1)"))
+        .unwrap();
+
+    db.land_placeholder_row(&local.to_string(), &uid("real").to_string())
+        .unwrap();
+
+    assert!(db.node_by_uid(&local.to_string()).unwrap().is_none());
+    assert_eq!(
+        db.node_by_uid(&uid("real").to_string())
+            .unwrap()
+            .map(|n| n.name),
+        Some("New folder (1)".to_string())
+    );
+}
+
+#[test]
+fn a_node_keeps_its_lid_across_updates_and_a_new_one_never_reuses_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("a", "root", "a.txt", 1)).unwrap();
+    db.upsert_node(&file("b", "root", "b.txt", 1)).unwrap();
+    let a = db.lid_of(&uid("a").to_string()).unwrap().unwrap();
+    let b = db.lid_of(&uid("b").to_string()).unwrap().unwrap();
+
+    db.upsert_node(&file("a", "root", "renamed.txt", 2))
+        .unwrap();
+    assert_eq!(db.lid_of(&uid("a").to_string()).unwrap(), Some(a));
+
+    db.delete_node(&uid("b")).unwrap();
+    db.upsert_node(&file("c", "root", "c.txt", 1)).unwrap();
+    let c = db.lid_of(&uid("c").to_string()).unwrap().unwrap();
+    assert!(c > b, "lid {c} reuses one a deleted row had");
+}
+
+#[test]
+fn a_lid_handed_out_before_the_node_is_stored_reads_as_no_node() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.set_share_access(&uid("root"), pdfs_core::Access::Owner)
+        .unwrap();
+    let stub = file("stub", "root", "stub.txt", 1);
+    let [lid] = db.lids_for(&[&stub]).unwrap()[..] else {
+        panic!("one lid per node");
+    };
+
+    assert_eq!(db.lid_of(&uid("stub").to_string()).unwrap(), Some(lid));
+    assert_eq!(db.lids_for(&[&stub]).unwrap(), vec![lid]);
+    assert!(db.node_by_uid(&uid("stub").to_string()).unwrap().is_none());
+    assert!(db.effective_node_access(&uid("stub")).unwrap().is_none());
+    assert!(db.node_path(&uid("stub").to_string()).unwrap().is_none());
+    assert!(!db.has_children(&uid("root")).unwrap());
+    assert!(db.search("stub", 10).unwrap().is_empty());
+    assert!(db.load_all().unwrap().iter().all(|n| n.lid != lid));
+
+    db.upsert_node(&stub).unwrap();
+    assert_eq!(db.lid_of(&uid("stub").to_string()).unwrap(), Some(lid));
+    assert!(db.has_children(&uid("root")).unwrap());
+}
+
+#[test]
+fn a_landed_placeholder_keeps_its_lid() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    for known in [false, true] {
+        let local = NodeUid::new(VolumeId::from("local"), LinkId::from(format!("{known}")));
+        let real = uid(&format!("real-{known}"));
+        let mut placeholder = folder("dir", Some("root"), "New folder");
+        placeholder.uid = local.clone();
+        db.upsert_node(&placeholder).unwrap();
+        let lid = db.lid_of(&local.to_string()).unwrap().unwrap();
+        if known {
+            // The event stream reported the folder before the drain got round
+            // to it.
+            let mut listed = folder("x", Some("root"), "New folder (1)");
+            listed.uid = real.clone();
+            db.upsert_node(&listed).unwrap();
+        }
+
+        db.land_placeholder_row(&local.to_string(), &real.to_string())
+            .unwrap();
+
+        assert_eq!(db.lid_of(&local.to_string()).unwrap(), None);
+        assert_eq!(db.lid_of(&real.to_string()).unwrap(), Some(lid));
+        assert_eq!(db.uid_of_lid(lid).unwrap(), Some(real.to_string()));
+        let name = if known {
+            "New folder (1)"
+        } else {
+            "New folder"
+        };
+        assert_eq!(
+            db.node_by_uid(&real.to_string()).unwrap().map(|n| n.name),
+            Some(name.to_string())
+        );
+        assert_eq!(db.search(name, 10).unwrap().len(), 1, "{name}");
+    }
+}
+
+/// Drive lists none of what is queued for a folder, so a listing read from
+/// it is laid over with what the queue made, moved in and moved away (B132).
+#[test]
+fn queued_children_are_what_drive_does_not_list_yet() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("dir", Some("root"), "dir")).unwrap();
+    db.upsert_node(&folder("other", Some("root"), "other"))
+        .unwrap();
+    let op = |kind: &str, uid: &str, parent: &str, name: &str| PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: uid.to_string(),
+        parent_uid: Some(parent.to_string()),
+        name: Some(name.to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let dir = uid("dir").to_string();
+    let other = uid("other").to_string();
+
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("new"));
+    let mut made = file("x", "dir", "made.txt", 3);
+    made.uid = local.clone();
+    db.upsert_node(&made).unwrap();
+    db.enqueue_op(&op(OP_CREATE, &local.to_string(), &dir, "made.txt"))
+        .unwrap();
+    db.upsert_node(&file("in", "dir", "in.txt", 3)).unwrap();
+    db.enqueue_op(&op(OP_RENAME, &uid("in").to_string(), &dir, "in.txt"))
+        .unwrap();
+    db.upsert_node(&file("out", "other", "out.txt", 3)).unwrap();
+    db.enqueue_op(&op(OP_RENAME, &uid("out").to_string(), &other, "out.txt"))
+        .unwrap();
+    db.upsert_node(&file("still", "dir", "still.txt", 3))
+        .unwrap();
+
+    let (here, gone) = db.queued_children(&uid("dir")).unwrap();
+    let mut names: Vec<_> = here.iter().map(|n| n.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["in.txt", "made.txt"]);
+    assert_eq!(
+        gone,
+        std::collections::HashSet::from([uid("out").to_string()])
+    );
+}
+
+/// A restart builds the tree from the node each row holds. A folder that
+/// landed handed its children to the real uid in the row's column only, so
+/// they came back under a parent no row has (B140).
+#[test]
+fn a_landed_folder_hands_its_children_over_in_the_stored_node_too() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("x", Some("root"), "dir");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    let mut child = file("child", "x", "a.txt", 3);
+    child.parent_uid = Some(local.clone());
+    db.upsert_node(&child).unwrap();
+
+    db.land_placeholder_row(&local.to_string(), &uid("dir").to_string())
+        .unwrap();
+
+    let stored = db.node_by_uid(&uid("child").to_string()).unwrap().unwrap();
+    assert_eq!(stored.parent_uid, Some(uid("dir")));
+    let names: Vec<_> = db
+        .known_children(&uid("dir"))
+        .unwrap()
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(names, ["a.txt"]);
+}
+
+/// A folder made here that lands takes its real uid in its own row only. What
+/// was made inside it names it by local id, and is found under the real uid.
+#[test]
+fn a_landed_folder_rewrites_no_row_or_op_below_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let root = uid("root").to_string();
+    let dir_lid = db.add_local_row(&root, "dir", true, 1).unwrap();
+    let local_dir = local_uid(dir_lid);
+    let mut dir = folder("x", Some("root"), "dir");
+    dir.uid = NodeUid::new(VolumeId::from("local"), LinkId::from(dir_lid.to_string()));
+    db.upsert_node(&dir).unwrap();
+    let child_lid = db.add_local_row(&local_dir, "a.txt", false, 1).unwrap();
+    let local_child = local_uid(child_lid);
+    let mut child = file("y", "x", "a.txt", 3);
+    child.uid = NodeUid::new(VolumeId::from("local"), LinkId::from(child_lid.to_string()));
+    child.parent_uid = Some(dir.uid.clone());
+    db.upsert_node(&child).unwrap();
+    db.enqueue_op(&op_on(OP_CREATE, &local_child, Some(&local_dir)))
+        .unwrap();
+
+    let real_dir = uid("dir").to_string();
+    db.land_placeholder_row(&local_dir, &real_dir).unwrap();
+
+    let (stored_parent, op_parent): (String, String) = {
+        let conn = db.conn.lock();
+        (
+            conn.query_row(
+                "SELECT parent_uid FROM nodes WHERE lid = ?1",
+                [child_lid],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            conn.query_row("SELECT parent_uid FROM pending_op", [], |r| r.get(0))
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        (stored_parent.as_str(), op_parent.as_str()),
+        (local_dir.as_str(), local_dir.as_str()),
+        "the child's row and op are not rewritten"
+    );
+
+    let children = db.known_children(&uid("dir")).unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].parent_uid, Some(uid("dir")));
+    assert!(db.has_children(&uid("dir")).unwrap());
+    assert_eq!(
+        db.node_path(&local_child).unwrap().as_deref(),
+        Some("dir/a.txt")
+    );
+    assert_eq!(
+        db.pending_ops().unwrap()[0].parent_uid.as_deref(),
+        Some(real_dir.as_str()),
+        "the drain sends the folder's real uid"
+    );
+
+    db.delete_ops_for_uid(&real_dir).unwrap();
+    assert!(
+        db.pending_ops().unwrap().is_empty(),
+        "removing the folder takes the create made inside it"
+    );
+}
+
+/// A node the mount still holds under its stand-in, written after it landed,
+/// updates the landed row: written under the stand-in, it brought the
+/// placeholder row back beside it.
+#[test]
+fn a_stand_in_written_after_landing_updates_the_landed_row() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let lid = db
+        .add_local_row(&uid("root").to_string(), "a.txt", false, 1)
+        .unwrap();
+    let local = local_uid(lid);
+    let mut node = file("x", "root", "a.txt", 3);
+    node.uid = NodeUid::new(VolumeId::from("local"), LinkId::from(lid.to_string()));
+    db.upsert_node(&node).unwrap();
+    db.land_placeholder_row(&local, &uid("a").to_string())
+        .unwrap();
+
+    node.name = "b.txt".into();
+    db.upsert_node(&node).unwrap();
+
+    let rows: Vec<(i64, String, String)> = {
+        let conn = db.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT lid, uid, name FROM nodes WHERE uid != ?1")
+            .unwrap();
+        stmt.query_map([uid("root").to_string()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    };
+    assert_eq!(rows, [(lid, uid("a").to_string(), "b.txt".to_string())]);
+    let landed = db.node_by_uid(&uid("a").to_string()).unwrap().unwrap();
+    assert_eq!((landed.uid, landed.name), (uid("a"), "b.txt".to_string()));
+}
+
+/// A create queued inside a folder made here is sent under the folder's real
+/// uid once it lands. Landing where it was sent is no move.
+#[test]
+fn a_create_sent_into_a_landed_folder_lands_where_it_was_queued() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let dir_lid = db
+        .add_local_row(&uid("root").to_string(), "dir", true, 1)
+        .unwrap();
+    let local_dir = local_uid(dir_lid);
+    let child_lid = db.add_local_row(&local_dir, "new.txt", false, 1).unwrap();
+    let local_child = local_uid(child_lid);
+    let (id, _) = db
+        .enqueue_op(&op_on(OP_CREATE, &local_child, Some(&local_dir)))
+        .unwrap();
+    let real_dir = uid("dir").to_string();
+    db.land_placeholder_row(&local_dir, &real_dir).unwrap();
+
+    let claimed = db.claim_next_due_op(1).unwrap().unwrap();
+    assert_eq!(claimed.parent_uid.as_deref(), Some(real_dir.as_str()));
+    let real = uid("new").to_string();
+    db.finish_create(
+        id,
+        Some("/staging/create"),
+        &landing(&local_child, &real, &real_dir, "new.txt"),
+        |_| None,
+    )
+    .unwrap();
+    assert!(
+        db.pending_ops().unwrap().is_empty(),
+        "no rename is queued for a file that landed where it was sent"
+    );
+}
+
+#[test]
+fn migration_v36_gives_every_node_its_rowid_as_lid() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v35-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    {
+        let db = Db::open(&path).unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        let mut placeholder = folder("dir", Some("root"), "Offline folder");
+        placeholder.uid = local.clone();
+        db.upsert_node(&placeholder).unwrap();
+        db.upsert_node(&file("gone", "root", "gone.txt", 1))
+            .unwrap();
+        db.upsert_node(&file("kept", "root", "kept-report.txt", 1))
+            .unwrap();
+        db.delete_node(&uid("gone")).unwrap();
+        let (id, _) = db
+            .enqueue_op(&PendingOp {
+                id: 0,
+                kind: OP_MKDIR.to_string(),
+                uid: local.to_string(),
+                parent_uid: Some(uid("root").to_string()),
+                name: Some("Offline folder".to_string()),
+                blob_path: None,
+                meta_json: None,
+                created_at: 1,
+                attempts: 0,
+                last_error: None,
+                next_attempt_at: 0,
+            })
+            .unwrap();
+        db.record_op_failure(id, "network unreachable", 5_000)
+            .unwrap();
+    }
+    {
+        // Put the file back in the state a released V35 database was in:
+        // keyed by uid, with the rowids of the rows it held.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes_v35 (
+               uid TEXT PRIMARY KEY, parent_uid TEXT, name TEXT NOT NULL,
+               is_dir INTEGER NOT NULL, size INTEGER, mtime INTEGER NOT NULL,
+               revision_hash TEXT, trashed INTEGER NOT NULL DEFAULT 0, node_json TEXT,
+               listed INTEGER NOT NULL DEFAULT 0, path TEXT
+             );
+             INSERT INTO nodes_v35 (rowid, uid, parent_uid, name, is_dir, size, mtime,
+                                    revision_hash, trashed, node_json, listed, path)
+               SELECT lid, uid, parent_uid, name, is_dir, size, mtime, revision_hash,
+                      trashed, node_json, listed, path FROM nodes;
+             DROP TABLE nodes;
+             ALTER TABLE nodes_v35 RENAME TO nodes;
+             CREATE INDEX idx_nodes_parent ON nodes(parent_uid);
+             CREATE INDEX idx_nodes_name_nocase ON nodes(name COLLATE NOCASE);
+             CREATE INDEX idx_nodes_parent_live ON nodes(parent_uid) WHERE trashed = 0;
+             DELETE FROM sqlite_sequence WHERE name = 'nodes';
+             UPDATE sync_state SET value = '35' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+    let rowids: Vec<(String, i64)> = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT uid, rowid FROM nodes ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    };
+    assert_eq!(rowids.len(), 3);
+
+    let db = Db::open(&path).unwrap();
+    // The placeholder goes by its row's stand-in from V41 on.
+    let stand_in = |uid: &str, rowid: i64| match uid == local.to_string() {
+        true => local_uid(rowid),
+        false => uid.to_string(),
+    };
+    for (uid, rowid) in &rowids {
+        let uid = stand_in(uid, *rowid);
+        assert_eq!(db.lid_of(&uid).unwrap(), Some(*rowid), "{uid}");
+    }
+    let found = db.search("report", 10).unwrap();
+    assert_eq!(found.len(), 1, "the search index still finds the node");
+    assert_eq!(found[0].node.uid, uid("kept"));
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    let (_, dir) = rowids
+        .iter()
+        .find(|(uid, _)| *uid == local.to_string())
+        .unwrap();
+    assert_eq!(ops[0].uid, local_uid(*dir));
+    assert_eq!(ops[0].attempts, 1);
+    assert_eq!(ops[0].last_error.as_deref(), Some("network unreachable"));
+
+    db.upsert_node(&file("new", "root", "new.txt", 1)).unwrap();
+    let newest = db.lid_of(&uid("new").to_string()).unwrap().unwrap();
+    assert!(newest > rowids.last().unwrap().1);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn migration_v41_gives_every_placeholder_its_rows_stand_in() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v40-fixture-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let (dir, inner) = {
+        let db = Db::open(&path).unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        let old_dir = NodeUid::new(VolumeId::from("local"), LinkId::from("1700000000000-0"));
+        let old_inner = NodeUid::new(VolumeId::from("local"), LinkId::from("1700000000000-1"));
+        let mut dir = folder("x", Some("root"), "Offline folder");
+        dir.uid = old_dir.clone();
+        db.upsert_node(&dir).unwrap();
+        let mut inner = file("x", "root", "inner.txt", 0);
+        inner.uid = old_inner.clone();
+        inner.parent_uid = Some(old_dir.clone());
+        db.upsert_node(&inner).unwrap();
+        let op = |kind: &str, uid: &NodeUid, parent: &str, meta: Option<String>| PendingOp {
+            id: 0,
+            kind: kind.to_string(),
+            uid: uid.to_string(),
+            parent_uid: Some(parent.to_string()),
+            name: Some("n".to_string()),
+            blob_path: None,
+            meta_json: meta,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+        db.enqueue_op(&op(OP_MKDIR, &old_dir, &uid("root").to_string(), None))
+            .unwrap();
+        let staged = json!({"uid": old_inner.to_string(), "len": 0}).to_string();
+        db.enqueue_op(&op(
+            OP_CREATE,
+            &old_inner,
+            &old_dir.to_string(),
+            Some(staged),
+        ))
+        .unwrap();
+        db.pin_add(&old_dir.to_string(), "/Offline folder", true)
+            .unwrap();
+        let lids = (
+            db.lid_of(&old_dir.to_string()).unwrap().unwrap(),
+            db.lid_of(&old_inner.to_string()).unwrap().unwrap(),
+        );
+        drop(db);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE sync_state SET value = '40' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        lids
+    };
+
+    let db = Db::open(&path).unwrap();
+    let (dir_uid, inner_uid) = (local_uid(dir), local_uid(inner));
+    assert_eq!(db.uid_of_lid(dir).unwrap(), Some(dir_uid.clone()));
+    assert_eq!(db.uid_of_lid(inner).unwrap(), Some(inner_uid.clone()));
+    let stored = db.node_by_uid(&inner_uid).unwrap().unwrap();
+    assert_eq!(
+        stored.uid.to_string(),
+        inner_uid,
+        "node_json follows the row"
+    );
+    assert_eq!(
+        stored.parent_uid.map(|p| p.to_string()),
+        Some(dir_uid.clone())
+    );
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops[0].uid, dir_uid);
+    assert_eq!(ops[1].uid, inner_uid);
+    assert_eq!(ops[1].parent_uid, Some(dir_uid.clone()));
+    let staged: serde_json::Value =
+        serde_json::from_str(ops[1].meta_json.as_deref().unwrap()).unwrap();
+    assert_eq!(staged["uid"], inner_uid.as_str());
+    let pins: Vec<String> = db.pin_list().unwrap().into_iter().map(|p| p.uid).collect();
+    assert_eq!(pins, vec![dir_uid]);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A database as 2.8.2 wrote it (`sqlite3 .dump`, schema 35), with queued ops
+/// in every state the drain leaves them in: due, parked, failing, deferred for
+/// access, and claimed by a worker when the daemon stopped. The creates below
+/// a folder made offline still name their parent by its `local~` placeholder.
+#[test]
+fn a_2_8_database_migrates_with_every_node_and_op_intact() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-2.8.2-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/v2.8.2.sql"))
+        .unwrap();
+    let (nodes, ops) = migrates_intact(&path);
+    assert_eq!((nodes, ops), (8, 6));
+    let db = Db::open(&path).unwrap();
+    let lid_named = |name: &str| -> i64 {
+        db.conn
+            .lock()
+            .query_row("SELECT lid FROM nodes WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let (dir, inner_lid) = (lid_named("Offline folder"), lid_named("inner.txt"));
+    let queued = db.pending_ops().unwrap();
+    let inner = queued
+        .iter()
+        .find(|op| op.uid == local_uid(inner_lid))
+        .unwrap();
+    assert_eq!(inner.parent_uid, Some(local_uid(dir)));
+    let lids: (Option<i64>, Option<i64>) = db
+        .conn
+        .lock()
+        .query_row(
+            "SELECT lid, parent_lid FROM pending_op WHERE id = ?1",
+            [inner.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        lids,
+        (Some(inner_lid), Some(dir)),
+        "the migration names the op's node and parent by local id"
+    );
+    let parent_lid: Option<i64> = db
+        .conn
+        .lock()
+        .query_row(
+            "SELECT parent_lid FROM nodes WHERE lid = ?1",
+            [inner_lid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent_lid, Some(dir));
+    let parked = db.parked_create_ops().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].name.as_deref(), Some("movie.part"));
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same migration over a copy of a database a released build wrote, which
+/// the fixtures above cannot stand in for: years of rows, every kind of op, and
+/// whatever shapes real use left behind. The copy is taken with `VACUUM INTO`
+/// over a read-only connection, so the database named is never written.
+///
+/// `PDFS_MIGRATE_DB=~/.local/state/proton-drive-linux/cache.db cargo test -p
+/// pdfs-core a_copy_of_a_real_database -- --ignored`
+#[test]
+#[ignore = "needs a real database: set PDFS_MIGRATE_DB"]
+fn a_copy_of_a_real_database_migrates_with_every_node_and_op_intact() {
+    let source = std::env::var("PDFS_MIGRATE_DB").expect("set PDFS_MIGRATE_DB");
+    let path = std::env::temp_dir().join(format!("pdfs-db-real-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    rusqlite::Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap()
+        .execute("VACUUM INTO ?1", rusqlite::params![path.to_str().unwrap()])
+        .unwrap();
+    let (nodes, ops) = migrates_intact(&path);
+    eprintln!("{nodes} nodes, {ops} queued ops");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Opens the database at `path` and checks that the migration kept every node
+/// on its row id and every queued op as it was. Returns how many of each.
+fn migrates_intact(path: &std::path::Path) -> (usize, usize) {
+    let (version, nodes, mut ops, sealed) = {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let nodes: Vec<(String, i64)> = conn
+            .prepare("SELECT uid, rowid FROM nodes")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let ops = rows(&conn, QUEUED);
+        let sealed = rows(&conn, "SELECT * FROM own_sealed_rev ORDER BY uid");
+        (version, nodes, ops, sealed)
+    };
+    // A node made on this machine goes by its row's stand-in from schema 41
+    // on, in its ops as everywhere else.
+    let stand_ins: Vec<(String, String)> = nodes
+        .iter()
+        .filter(|(uid, rowid)| uid.starts_with("local~") && *uid != local_uid(*rowid))
+        .map(|(uid, rowid)| (uid.clone(), local_uid(*rowid)))
+        .collect();
+    let nodes: Vec<(String, i64)> = nodes
+        .into_iter()
+        .map(
+            |(uid, rowid)| match stand_ins.iter().any(|(old, _)| *old == uid) {
+                true => (local_uid(rowid), rowid),
+                false => (uid, rowid),
+            },
+        )
+        .collect();
+    for value in ops.iter_mut().flatten() {
+        if let rusqlite::types::Value::Text(text) = value {
+            for (old, new) in &stand_ins {
+                if text == old {
+                    *text = new.clone();
+                } else {
+                    *text = text.replace(&format!("\"{old}\""), &format!("\"{new}\""));
+                }
+            }
+        }
+    }
+    let db = Db::open(path).unwrap();
+    {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        assert_eq!(
+            rows(&conn, QUEUED),
+            ops,
+            "every queued op survives as it was, parked, failing or deferred"
+        );
+        // A claim names a drain worker of the daemon that wrote the file.
+        let claimed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_op WHERE claimed_at <> 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed, 0, "a stopped daemon's claims are released");
+        assert_eq!(
+            rows(&conn, "SELECT * FROM own_sealed_rev ORDER BY uid"),
+            sealed
+        );
+    }
+    if version.parse::<i64>().unwrap() < 36 {
+        for (uid, rowid) in &nodes {
+            assert_eq!(db.lid_of(uid).unwrap(), Some(*rowid), "{uid}");
+        }
+    } else {
+        for (uid, _) in &nodes {
+            assert!(db.lid_of(uid).unwrap().is_some(), "{uid}");
+        }
+    }
+    drop(db);
+
+    let db = Db::open(path).unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count as usize, nodes.len(), "no node is lost or doubled");
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION.to_string());
+    drop(db);
+    (nodes.len(), ops.len())
+}
+
+/// Every column of the queue but the drain's claim.
+const QUEUED: &str = "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+                             attempts, last_error, next_attempt_at, access_deferred_since
+                      FROM pending_op ORDER BY id";
+
+/// Every row `query` returns, every column.
+fn rows(conn: &rusqlite::Connection, query: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut stmt = conn.prepare(query).unwrap();
+    let columns = stmt.column_count();
+    stmt.query_map([], |r| (0..columns).map(|i| r.get(i)).collect())
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
+#[test]
+fn a_failed_op_stays_queued_with_backoff() {
+    let db = Db::open_in_memory().unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/blob".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    let id = db.pending_ops().unwrap()[0].id;
+
+    db.record_op_failure(id, "network unreachable", 5_000)
+        .unwrap();
+
+    // The staged blob is the only copy of the user's bytes: a failure must
+    // never drop the row, only defer it.
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].attempts, 1);
+    assert_eq!(ops[0].last_error.as_deref(), Some("network unreachable"));
+    assert_eq!(ops[0].next_attempt_at, 5_000);
+
+    db.record_op_failure(id, "still down", 9_000).unwrap();
+    assert_eq!(db.pending_ops().unwrap()[0].attempts, 2);
+
+    db.delete_op(id).unwrap();
+    assert_eq!(db.pending_op_counts().unwrap().uploads, 0);
+}
+
+#[test]
+fn an_access_blocked_op_is_deferred_without_counting_an_attempt() {
+    let db = Db::open_in_memory().unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("blocked").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/blocked".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 3,
+        last_error: Some("earlier network failure".to_string()),
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    let before = db.pending_ops().unwrap();
+    let id = before[0].id;
+    let count = db.pending_op_counts().unwrap();
+
+    db.defer_op_without_attempt(id, 5_000).unwrap();
+
+    let after = db.pending_ops().unwrap();
+    assert_eq!(after.len(), 1);
+    let after_count = db.pending_op_counts().unwrap();
+    assert_eq!(after_count.uploads, count.uploads);
+    assert_eq!(after_count.changes, count.changes);
+    assert_eq!(after[0].attempts, before[0].attempts);
+    assert_eq!(after[0].last_error, before[0].last_error);
+    assert_eq!(after[0].next_attempt_at, 5_000);
+}
+
+#[test]
+fn access_deferral_does_not_unpark_a_transient_create() {
+    let db = Db::open_in_memory().unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: uid("transient").to_string(),
+        parent_uid: Some(uid("parent").to_string()),
+        name: Some(".part".to_string()),
+        blob_path: Some("/staging/transient".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: PARK_UNTIL,
+    })
+    .unwrap();
+    let op = db.pending_ops().unwrap().remove(0);
+
+    db.defer_op_without_attempt(op.id, 5_000).unwrap();
+
+    assert_eq!(db.pending_ops().unwrap()[0].next_attempt_at, PARK_UNTIL);
+}
+
+/// The drain retires the op it worked on by id. An id given out again let
+/// a rename that landed delete the trash queued over it.
+#[test]
+fn a_dropped_op_id_is_never_given_out_again() {
+    let db = Db::open_in_memory().unwrap();
+    let rename = |name: &str| PendingOp {
+        id: 0,
+        kind: OP_RENAME.to_string(),
+        uid: uid("node").to_string(),
+        parent_uid: Some(uid("root").to_string()),
+        name: Some(name.to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let (renamed, _) = db.enqueue_op(&rename("b.txt")).unwrap();
+    let in_flight = db.claim_next_due_op(10).unwrap().unwrap();
+    assert_eq!(in_flight.id, renamed);
+
+    let (trash, _) = db
+        .replace_ops_with_trash(&uid("node").to_string(), "b.txt", 2)
+        .unwrap();
+    assert_ne!(trash, renamed);
+    db.delete_op(in_flight.id).unwrap();
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].kind, OP_TRASH);
+}
+
+#[test]
+fn migrate_is_idempotent() {
+    let db = Db::open_in_memory().unwrap();
+    // Second migrate is a no-op (already at head) and must not error.
+    db.migrate().unwrap();
+}
+
+/// A queued mode switch is a promise the daemon has to keep across a restart,
+/// so it lives in the row, and reaching the mode is what retires it.
+#[test]
+fn pending_mode_is_queued_until_the_mode_is_reached() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_add("/home/me/Downloads", "v~l", "s")
+        .unwrap();
+    assert_eq!(db.sync_folder_get(id).unwrap().unwrap().pending_mode, None);
+
+    db.sync_folder_set_pending_mode(id, Some("ondemand"))
+        .unwrap();
+    assert_eq!(
+        db.sync_folder_get(id)
+            .unwrap()
+            .unwrap()
+            .pending_mode
+            .as_deref(),
+        Some("ondemand")
+    );
+    // The listing carries it too — it is what the front-ends paint from.
+    assert_eq!(
+        db.sync_folder_list().unwrap()[0].pending_mode.as_deref(),
+        Some("ondemand")
+    );
+
+    // Landing the switch satisfies the request: a `pending_mode` outliving it
+    // would have the engine try to apply the same switch on every later pass.
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    let folder = db.sync_folder_get(id).unwrap().unwrap();
+    assert_eq!(folder.mode, "ondemand");
+    assert_eq!(folder.pending_mode, None);
+
+    // And the user can withdraw a request that hasn't landed yet.
+    db.sync_folder_set_pending_mode(id, Some("mirror")).unwrap();
+    db.sync_folder_set_pending_mode(id, None).unwrap();
+    let folder = db.sync_folder_get(id).unwrap().unwrap();
+    assert_eq!(folder.mode, "ondemand");
+    assert_eq!(folder.pending_mode, None);
+}
+
+#[test]
+fn moved_sync_folder_points_at_its_new_share() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_add("/tmp/pdfs-moved-share", "vol~folder", "windows-share")
+        .unwrap();
+    let other = db
+        .sync_folder_add("/tmp/pdfs-unmoved-share", "vol~other", "windows-share")
+        .unwrap();
+
+    db.sync_folder_set_share(id, "linux-share").unwrap();
+
+    let folder = db.sync_folder_get(id).unwrap().unwrap();
+    assert_eq!(folder.remote_share_id, "linux-share");
+    // A move keeps the uid, so nothing but the share changes.
+    assert_eq!(folder.remote_uid, "vol~folder");
+    assert_eq!(
+        db.sync_folder_get(other).unwrap().unwrap().remote_share_id,
+        "windows-share"
+    );
+}
+
+#[test]
+fn mode_commit_clears_only_the_intent_it_satisfies() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_add("/tmp/pdfs-mode-intent", "vol~folder", "share")
+        .unwrap();
+
+    db.sync_folder_set_pending_mode(id, Some("ondemand"))
+        .unwrap();
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    assert_eq!(db.sync_folder_get(id).unwrap().unwrap().pending_mode, None);
+
+    db.sync_folder_set_pending_mode(id, Some("mirror")).unwrap();
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    assert_eq!(
+        db.sync_folder_get(id)
+            .unwrap()
+            .unwrap()
+            .pending_mode
+            .as_deref(),
+        Some("mirror")
+    );
+}
+
+#[test]
+fn clearing_a_stale_pending_mode_preserves_the_newer_intent() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_add("/tmp/pdfs-pending", "vol~folder", "share")
+        .unwrap();
+    db.sync_folder_set_pending_mode(id, Some("ondemand"))
+        .unwrap();
+    db.sync_folder_set_pending_mode(id, Some("mirror")).unwrap();
+
+    assert!(
+        !db.sync_folder_clear_pending_mode_if(id, "ondemand")
+            .unwrap()
+    );
+    assert_eq!(
+        db.sync_folder_get(id)
+            .unwrap()
+            .unwrap()
+            .pending_mode
+            .as_deref(),
+        Some("mirror")
+    );
+    assert!(db.sync_folder_clear_pending_mode_if(id, "mirror").unwrap());
+    assert_eq!(db.sync_folder_get(id).unwrap().unwrap().pending_mode, None);
+}
+
+fn baseline_row(rel: &str) -> StoredSyncEntry {
+    StoredSyncEntry {
+        rel_path: rel.into(),
+        remote_uid: Some(format!("vol~{rel}")),
+        local_mtime: 1_700_000_000,
+        local_mtime_ns: Some(1_700_000_000_000_000_001),
+        local_size: 7,
+        remote_rev: Some("1700000000".into()),
+        remote_hash: Some("7".into()),
+        remote_revision_id: None,
+    }
+}
+
+#[test]
+fn moving_a_baseline_subtree_takes_its_rows_and_leaves_name_prefixed_siblings() {
+    let db = Db::open_in_memory().unwrap();
+    let from = db.sync_folder_add("/home/me/A", "vol~a", "share").unwrap();
+    let to = db.sync_folder_add("/home/me/B", "vol~b", "share").unwrap();
+    for rel in [
+        "docs",
+        "docs/x.txt",
+        "docs/sub/y.txt",
+        "docsextra.txt",
+        "other",
+    ] {
+        db.sync_entry_upsert(from, &baseline_row(rel)).unwrap();
+    }
+    db.sync_entry_upsert(to, &baseline_row("inbox")).unwrap();
+
+    db.sync_entries_move(from, "docs", to, "inbox/docs")
+        .unwrap();
+
+    let left = db.sync_entries(from).unwrap();
+    let mut left: Vec<_> = left.keys().cloned().collect();
+    left.sort();
+    assert_eq!(left, ["docsextra.txt", "other"]);
+
+    let moved = db.sync_entries(to).unwrap();
+    let mut keys: Vec<_> = moved.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "inbox",
+            "inbox/docs",
+            "inbox/docs/sub/y.txt",
+            "inbox/docs/x.txt"
+        ]
+    );
+    // Only the path changes: the row still describes the same node on both sides.
+    assert_eq!(
+        moved["inbox/docs/x.txt"],
+        StoredSyncEntry {
+            rel_path: "inbox/docs/x.txt".into(),
+            ..baseline_row("docs/x.txt")
+        }
+    );
+}
+
+#[test]
+fn moving_a_baseline_subtree_within_one_folder_renames_it() {
+    let db = Db::open_in_memory().unwrap();
+    let folder = db.sync_folder_add("/home/me/A", "vol~a", "share").unwrap();
+    for rel in ["old", "old/f.txt", "new"] {
+        db.sync_entry_upsert(folder, &baseline_row(rel)).unwrap();
+    }
+
+    db.sync_entries_move(folder, "old", folder, "new/old")
+        .unwrap();
+
+    let mut keys: Vec<_> = db.sync_entries(folder).unwrap().into_keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["new", "new/old", "new/old/f.txt"]);
+}
+
+#[test]
+fn removing_a_baseline_subtree_keeps_name_prefixed_siblings() {
+    let db = Db::open_in_memory().unwrap();
+    let folder = db.sync_folder_add("/home/me/A", "vol~a", "share").unwrap();
+    for rel in ["docs", "docs/x.txt", "docsextra.txt"] {
+        db.sync_entry_upsert(folder, &baseline_row(rel)).unwrap();
+    }
+
+    db.sync_entries_remove_subtree(folder, "docs").unwrap();
+
+    let keys: Vec<_> = db.sync_entries(folder).unwrap().into_keys().collect();
+    assert_eq!(keys, ["docsextra.txt"]);
+}
+
+#[test]
+fn mirror_uid_lookup_covers_the_root_and_synced_descendants_only() {
+    let db = Db::open_in_memory().unwrap();
+    let mirror = db
+        .sync_folder_add("/home/me/Mirror", "vol~mirror-root", "share")
+        .unwrap();
+    db.sync_entry_upsert(
+        mirror,
+        &StoredSyncEntry {
+            rel_path: "nested/file.txt".into(),
+            remote_uid: Some("vol~mirror-file".into()),
+            local_mtime: 1,
+            local_size: 2,
+            remote_rev: Some("3".into()),
+            remote_hash: Some("2".into()),
+            remote_revision_id: None,
+            local_mtime_ns: None,
+        },
+    )
+    .unwrap();
+    let ondemand = db
+        .sync_folder_add("/home/me/OnDemand", "vol~ondemand-root", "share")
+        .unwrap();
+    db.sync_folder_set_mode(ondemand, "ondemand").unwrap();
+    db.sync_entry_upsert(
+        ondemand,
+        &StoredSyncEntry {
+            rel_path: "stale.txt".into(),
+            remote_uid: Some("vol~ondemand-stale".into()),
+            local_mtime: 1,
+            local_size: 2,
+            remote_rev: Some("3".into()),
+            remote_hash: Some("2".into()),
+            remote_revision_id: None,
+            local_mtime_ns: None,
+        },
+    )
+    .unwrap();
+
+    assert!(db.mirror_contains_uid("vol~mirror-root").unwrap());
+    assert!(db.mirror_contains_uid("vol~mirror-file").unwrap());
+    assert!(!db.mirror_contains_uid("vol~ondemand-root").unwrap());
+    assert!(!db.mirror_contains_uid("vol~ondemand-stale").unwrap());
+    assert!(!db.mirror_contains_uid("vol~missing").unwrap());
+}
+
+#[test]
+fn node_path_resolves_relative_to_a_sync_root_uid() {
+    let db = Db::open_in_memory().unwrap();
+    let root = node_from(serde_json::Value::Null, "root", "My Files", json!("Folder"));
+    let videos = node_from(json!(uid("root")), "videos", "Videos", json!("Folder"));
+    let anime = node_from(json!(uid("videos")), "anime", "anime", json!("Folder"));
+    let show = node_from(json!(uid("anime")), "show", "Oshi no Ko", json!("Folder"));
+    let episode = node_from(
+        json!(uid("show")),
+        "episode",
+        "episode 01.mkv",
+        json!({"File": {
+            "media_type": "video/x-matroska",
+            "total_size_on_storage": 42,
+            "claimed_size": 42,
+            "claimed_modification_time": null
+        }}),
+    );
+    db.upsert_nodes(&[root, videos, anime, show, episode])
+        .unwrap();
+
+    assert_eq!(
+        db.path_relative_to(&uid("videos").to_string(), &uid("episode").to_string())
+            .unwrap()
+            .as_deref(),
+        Some("anime/Oshi no Ko/episode 01.mkv")
+    );
+    assert_eq!(
+        db.path_relative_to(&uid("videos").to_string(), &uid("videos").to_string())
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        db.path_relative_to(&uid("anime").to_string(), &uid("episode").to_string())
+            .unwrap()
+            .as_deref(),
+        Some("Oshi no Ko/episode 01.mkv")
+    );
+}
+
+#[test]
+fn node_path_rejects_unrelated_missing_and_broken_ancestor_chains() {
+    let db = Db::open_in_memory().unwrap();
+    let root = node_from(serde_json::Value::Null, "root", "My Files", json!("Folder"));
+    let videos = node_from(json!(uid("root")), "videos", "Videos", json!("Folder"));
+    let episode = node_from(
+        json!(uid("videos")),
+        "episode",
+        "episode.mkv",
+        json!({"File": {
+            "media_type": "video/x-matroska",
+            "total_size_on_storage": 42,
+            "claimed_size": 42,
+            "claimed_modification_time": null
+        }}),
+    );
+    let unrelated = node_from(
+        json!(uid("root")),
+        "documents",
+        "Documents",
+        json!("Folder"),
+    );
+    let orphan = node_from(
+        json!(uid("missing-parent")),
+        "orphan",
+        "orphan.mkv",
+        json!({"File": {
+            "media_type": "video/x-matroska",
+            "total_size_on_storage": 42,
+            "claimed_size": 42,
+            "claimed_modification_time": null
+        }}),
+    );
+    db.upsert_nodes(&[root, videos, episode, unrelated, orphan])
+        .unwrap();
+
+    for (ancestor, descendant) in [
+        ("documents", "episode"),
+        ("videos", "missing-node"),
+        ("videos", "orphan"),
+    ] {
+        assert_eq!(
+            db.path_relative_to(&uid(ancestor).to_string(), &uid(descendant).to_string())
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn cache_index_touch_access_and_lru_order() {
+    let db = Db::open_in_memory().unwrap();
+    db.cache_touch("k1", "blob", 100, 10).unwrap();
+    db.cache_touch("k2", "blob", 200, 20).unwrap();
+    // LRU-first: k1 (older access) before k2.
+    let rows = db.cache_entries_by_kind("blob").unwrap();
+    assert_eq!(rows, vec![("k1".into(), 100), ("k2".into(), 200)]);
+
+    // Accessing k1 moves it to the back (most recent).
+    db.cache_accessed("k1", 30).unwrap();
+    let rows = db.cache_entries_by_kind("blob").unwrap();
+    assert_eq!(rows[0].0, "k2");
+    assert_eq!(rows[1].0, "k1");
+
+    // Re-touch updates size, not just time.
+    db.cache_touch("k1", "blob", 150, 40).unwrap();
+    let rows = db.cache_entries_by_kind("blob").unwrap();
+    assert_eq!(rows.iter().find(|(k, _)| k == "k1").unwrap().1, 150);
+}
+
+#[test]
+fn cache_index_kinds_are_separate() {
+    let db = Db::open_in_memory().unwrap();
+    db.cache_touch("blob1", "blob", 100, 1).unwrap();
+    db.cache_touch("blk1.b0", "block", 50, 1).unwrap();
+    assert_eq!(db.cache_entries_by_kind("blob").unwrap().len(), 1);
+    assert_eq!(db.cache_entries_by_kind("block").unwrap().len(), 1);
+}
+
+#[test]
+fn cache_index_remove_and_remove_all() {
+    let db = Db::open_in_memory().unwrap();
+    // A blob plus two of its blocks (key prefix shared).
+    db.cache_touch("abc", "blob", 1, 1).unwrap();
+    db.cache_touch("abc.b0", "block", 1, 1).unwrap();
+    db.cache_touch("abc.b1", "block", 1, 1).unwrap();
+    // An unrelated entry that must survive.
+    db.cache_touch("xyz", "blob", 1, 1).unwrap();
+
+    db.cache_remove("abc.b0").unwrap();
+    assert_eq!(db.cache_entries_by_kind("block").unwrap().len(), 1);
+
+    // remove_all drops the blob row and every remaining block of that uid.
+    db.cache_remove_all("abc").unwrap();
+    assert!(db.cache_entries_by_kind("block").unwrap().is_empty());
+    let blobs = db.cache_entries_by_kind("blob").unwrap();
+    assert_eq!(blobs, vec![("xyz".into(), 1)]);
+}
+
+/// A rebuild is a replacement, not a merge: whatever the index said before
+/// is what a stale or externally-deleted cache file would leave behind.
+#[test]
+fn cache_index_rebuild_replaces_every_row() {
+    let db = Db::open_in_memory().unwrap();
+    db.cache_touch("gone", "blob", 1, 1).unwrap();
+    db.cache_touch("also-gone", "block", 1, 1).unwrap();
+
+    db.cache_rebuild(&[CacheEntryInput {
+        key: "kept",
+        kind: "blob",
+        size: 7,
+        last_accessed: 42,
+    }])
+    .unwrap();
+
+    assert_eq!(
+        db.cache_entries_by_kind("blob").unwrap(),
+        vec![("kept".to_string(), 7)]
+    );
+    assert!(db.cache_entries_by_kind("block").unwrap().is_empty());
+
+    // An empty rebuild is how a cache directory that vanished reports itself.
+    db.cache_rebuild(&[]).unwrap();
+    assert!(db.cache_entries_by_kind("blob").unwrap().is_empty());
+}
+
+#[test]
+fn pin_add_list_remove_roundtrip() {
+    let db = Db::open_in_memory().unwrap();
+    db.pin_add("vol~a", "docs/a.txt", false).unwrap();
+    db.pin_add("vol~d", "docs", true).unwrap();
+    let list = db.pin_list().unwrap();
+    assert_eq!(list.len(), 2);
+    // No `nodes` row for either pin, so the kind is unknown rather than guessed
+    // from the recursive flag.
+    assert_eq!(
+        list[0],
+        PinRow {
+            uid: "vol~a".into(),
+            path: "docs/a.txt".into(),
+            recursive: false,
+            is_dir: None,
+        }
+    );
+    assert_eq!(
+        list[1],
+        PinRow {
+            uid: "vol~d".into(),
+            path: "docs".into(),
+            recursive: true,
+            is_dir: None,
+        }
+    );
+
+    // Once the node is cached, the pin reports the real kind — a folder pinned
+    // non-recursively must not look like a file.
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("d", Some("root"), "docs")).unwrap();
+    db.pin_add("vol~d", "docs", false).unwrap();
+    let list = db.pin_list().unwrap();
+    assert!(!list[1].recursive, "pin policy stays non-recursive");
+    assert_eq!(list[1].is_dir, Some(true), "but the node is still a folder");
+
+    // Re-pin refreshes path/flag, not a duplicate row.
+    db.pin_add("vol~a", "moved/a.txt", false).unwrap();
+    let list = db.pin_list().unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].path, "moved/a.txt");
+
+    assert!(db.pin_remove("vol~a").unwrap());
+    assert!(!db.pin_remove("vol~a").unwrap());
+    assert_eq!(db.pin_list().unwrap().len(), 1);
+}
+
+#[test]
+fn is_pinned_direct_without_node_row() {
+    // A direct pin counts even when the node was never hydrated into `nodes`.
+    let db = Db::open_in_memory().unwrap();
+    db.pin_add("vol~a", "a.txt", false).unwrap();
+    assert!(db.is_pinned("vol~a").unwrap());
+    assert!(!db.is_pinned("vol~b").unwrap());
+}
+
+#[test]
+fn recursive_folder_pin_covers_subtree() {
+    let db = Db::open_in_memory().unwrap();
+    // root/docs/{report.pdf, sub/deep.txt}, root/loose.txt
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("docs", Some("root"), "Documents"))
+        .unwrap();
+    db.upsert_node(&file("rep", "docs", "report.pdf", 1))
+        .unwrap();
+    db.upsert_node(&folder("sub", Some("docs"), "Sub")).unwrap();
+    db.upsert_node(&file("deep", "sub", "deep.txt", 1)).unwrap();
+    db.upsert_node(&file("loose", "root", "loose.txt", 1))
+        .unwrap();
+
+    // Pin the Documents folder recursively (uids are `vol~link` display form).
+    let du = |l: &str| uid(l).to_string();
+    db.pin_add(&du("docs"), "Documents", true).unwrap();
+
+    // Everything under docs (any depth) is pinned; loose.txt is not.
+    assert!(db.is_pinned(&du("docs")).unwrap());
+    assert!(db.is_pinned(&du("rep")).unwrap());
+    assert!(db.is_pinned(&du("deep")).unwrap());
+    assert!(!db.is_pinned(&du("loose")).unwrap());
+
+    // pinned_uids expands the subtree (folder + descendants), no loose.txt.
+    let mut got = db.pinned_uids().unwrap();
+    got.sort();
+    assert_eq!(got, vec![du("deep"), du("docs"), du("rep"), du("sub")]);
+
+    // descendants() lists the subtree of a folder (excludes the folder).
+    let mut desc = db.descendants(&du("docs")).unwrap();
+    desc.sort();
+    assert_eq!(desc, vec![du("deep"), du("rep"), du("sub")]);
+}
+
+#[test]
+fn non_recursive_folder_pin_does_not_cover_children() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("docs", Some("root"), "Documents"))
+        .unwrap();
+    db.upsert_node(&file("rep", "docs", "report.pdf", 1))
+        .unwrap();
+    // A non-recursive pin on the folder covers only the folder itself.
+    let du = |l: &str| uid(l).to_string();
+    db.pin_add(&du("docs"), "Documents", false).unwrap();
+    assert!(db.is_pinned(&du("docs")).unwrap());
+    assert!(!db.is_pinned(&du("rep")).unwrap());
+}
+
+/// A `parent_uid` cycle is corrupt data the API can hand us, and `is_pinned`'s
+/// ancestor walk is `UNION ALL` — uncapped it never terminates, while holding
+/// the daemon's only SQLite connection, on a path that runs per cached read.
+/// The answer here matters less than the fact that there is one.
+#[test]
+fn is_pinned_terminates_on_a_parent_cycle() {
+    let db = Db::open_in_memory().unwrap();
+    let du = |l: &str| uid(l).to_string();
+    // a -> b -> a, with nothing pinned above either.
+    db.upsert_node(&folder("a", Some("b"), "A")).unwrap();
+    db.upsert_node(&folder("b", Some("a"), "B")).unwrap();
+    db.upsert_node(&file("leaf", "a", "leaf.txt", 1)).unwrap();
+
+    assert!(!db.is_pinned(&du("leaf")).unwrap());
+
+    // And a pin *inside* the cycle is still found rather than walked past.
+    db.pin_add(&du("a"), "A", true).unwrap();
+    assert!(db.is_pinned(&du("leaf")).unwrap());
+}
+
+#[test]
+fn schema_objects_exist() {
+    let db = Db::open_in_memory().unwrap();
+    let count: i64 = db
+        .with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM sqlite_master
+                     WHERE name IN ('nodes', 'nodes_fts', 'cache_entries')",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(count, 3);
+}
+
+/// A queued op carrying a realistically-sized `meta_json`, which is what made
+/// the old scan expensive: the drain read and parsed every op's sidecar to pick
+/// one.
+fn bulk_op(i: usize, parent: &str) -> PendingOp {
+    PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: format!("vol~link{i}"),
+        parent_uid: Some(parent.to_string()),
+        name: Some(format!("file-{i}.bin")),
+        blob_path: Some(format!("/staging/vol~link{i}-{i}")),
+        // A StagedWrite sidecar, roughly the shape and size of a real one.
+        meta_json: Some(format!(
+            r#"{{"uid":"vol~link{i}","len":8388608,"base_size":8388608,
+                 "base_mtime":1700000000,"authored":[[0,8388608]],"complete":true,
+                 "based_on":{{"mtime":1700000000,"size":8388608}}}}"#
+        )),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    }
+}
+
+/// **The B3 measurement.** The drain picks one op per iteration. Doing that by
+/// reading the whole queue is quadratic in queue length; doing it in SQL with
+/// `LIMIT 1` is flat. Asserts the shape of the difference, not a wall-clock
+/// number — the point is that one grows with the queue and the other does not.
+#[test]
+fn next_due_op_does_not_scale_with_queue_length() {
+    use std::time::Instant;
+
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    const N: usize = 2000;
+    for i in 0..N {
+        db.enqueue_op(&bulk_op(i, &root)).unwrap();
+    }
+
+    // Both must agree on which op is next.
+    let scanned = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.next_attempt_at <= 10);
+    let queried = db.next_due_op(10).unwrap();
+    assert_eq!(
+        scanned.as_ref().map(|o| o.id),
+        queried.as_ref().map(|o| o.id),
+        "the new query must pick the op the old scan picked"
+    );
+    assert_eq!(scanned.map(|o| o.uid), queried.map(|o| o.uid));
+
+    // Simulate a drain pass: pick the next op, retire it, repeat.
+    let rounds = 200;
+
+    let t0 = Instant::now();
+    for _ in 0..rounds {
+        let _ = db
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.next_attempt_at <= 10);
+    }
+    let scan = t0.elapsed();
+
+    let t1 = Instant::now();
+    for _ in 0..rounds {
+        let _ = db.next_due_op(10).unwrap();
+    }
+    let query = t1.elapsed();
+
+    println!("B3: {rounds} picks over a {N}-op queue — scan {scan:?}, query {query:?}");
+    assert!(
+        query * 20 < scan,
+        "expected the LIMIT 1 query to be far cheaper than a full scan; \
+         scan={scan:?} query={query:?}"
+    );
+}
+
+/// The readiness filter moved into SQL, so it needs its own coverage there: an
+/// op whose parent was itself created offline is not yet sendable and must be
+/// skipped in favour of a later one that is.
+#[test]
+fn next_due_op_skips_ops_blocked_on_a_local_parent() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+
+    db.enqueue_op(&bulk_op(1, "local~dir")).unwrap();
+    db.enqueue_op(&bulk_op(2, &root)).unwrap();
+
+    let next = db.next_due_op(10).unwrap().expect("an op is due");
+    assert_eq!(next.uid, "vol~link2", "skipped the local-parent op");
+
+    // A NULL parent is not blocked.
+    let mut orphan = bulk_op(3, &root);
+    orphan.parent_uid = None;
+    db.enqueue_op(&orphan).unwrap();
+    db.delete_op(next.id).unwrap();
+    assert_eq!(db.next_due_op(10).unwrap().unwrap().uid, "vol~link3");
+}
+
+/// B70: a transient file's create is parked so its bytes never upload while it
+/// wears that name, the park survives a write attaching its blob, and the
+/// finalize rename (un-park) is what finally makes the completed file due.
+#[test]
+fn a_parked_transient_create_stays_off_the_drain_until_finalized() {
+    let db = Db::open_in_memory().unwrap();
+    let node = uid("dl").to_string();
+    let parent = uid("root").to_string();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: node.clone(),
+        parent_uid: Some(parent),
+        name: Some("movie.mkv.part".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: PARK_UNTIL,
+    })
+    .unwrap();
+
+    // Parked: never selected, however far the clock advances.
+    assert!(
+        db.next_due_op(PARK_UNTIL - 1).unwrap().is_none(),
+        "a parked create is never due"
+    );
+
+    // A write attaches its blob to the create but must not wake it.
+    let attached = db
+        .attach_blob_to_create(&node, "/staging/blob1", "{}")
+        .unwrap();
+    assert!(attached.is_some(), "the blob attached to the create");
+    assert!(
+        db.next_due_op(PARK_UNTIL - 1).unwrap().is_none(),
+        "still parked after a write attaches"
+    );
+
+    // Finalize: un-park, and the completed file is due to upload with its bytes.
+    assert!(
+        db.set_create_hold(&node, false).unwrap(),
+        "a create row was un-parked"
+    );
+    let due = db
+        .next_due_op(1_000)
+        .unwrap()
+        .expect("the un-parked create is due");
+    assert_eq!(due.uid, node);
+    assert_eq!(due.blob_path.as_deref(), Some("/staging/blob1"));
+}
+
+/// The park sweep's query: parked creates are the rows nothing else in the drain
+/// can see, so it has to find them by the sentinel and report how long each has
+/// been parked. Ordinary queued work is not its business.
+#[test]
+fn parked_creates_are_listed_with_the_age_the_sweep_judges_them_by() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("root").to_string();
+    let parked = uid("swap").to_string();
+    let due = uid("ordinary").to_string();
+    for (node, name, next_attempt_at, created_at) in [
+        (&parked, ".notes.txt.swp", PARK_UNTIL, 1_000),
+        (&due, "notes.txt", 0, 2_000),
+    ] {
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: node.clone(),
+            parent_uid: Some(parent.clone()),
+            name: Some(name.to_string()),
+            blob_path: Some(format!("/staging/{name}")),
+            meta_json: None,
+            created_at,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at,
+        })
+        .unwrap();
+    }
+
+    let rows = db.parked_create_ops().unwrap();
+    assert_eq!(rows.len(), 1, "only the parked create is swept");
+    assert_eq!(rows[0].uid, parked);
+    assert_eq!(rows[0].created_at, 1_000, "the park's age is readable");
+    assert_eq!(
+        rows[0].blob_path.as_deref(),
+        Some("/staging/.notes.txt.swp")
+    );
+
+    // What the sweep does with an expired park: un-park it, and it drains like
+    // any other create rather than waiting for a rename that is not coming.
+    assert!(db.set_create_hold(&parked, false).unwrap());
+    assert!(
+        db.parked_create_ops().unwrap().is_empty(),
+        "an un-parked create is no longer the sweep's business"
+    );
+    assert_eq!(
+        db.next_due_op(1_000 + PARK_EXPIRY_MS).unwrap().unwrap().uid,
+        parked
+    );
+}
+
+/// Backoff still gates: nothing is returned before an op is due.
+#[test]
+fn next_due_op_respects_backoff() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    let id = db.enqueue_op(&bulk_op(1, &root)).unwrap().0;
+    db.record_op_failure(id, "boom", 5_000).unwrap();
+
+    assert!(
+        db.next_due_op(4_999).unwrap().is_none(),
+        "still backing off"
+    );
+    assert!(db.next_due_op(5_000).unwrap().is_some(), "due now");
+}
+
+/// **The B4 measurement.** `enforce_block_budget` runs on *every* `store_block`,
+/// i.e. once per 4 MiB of every cold read. The old path read and sorted every
+/// row of the cache index to answer a question that is almost always "no, we are
+/// under budget" — under the shared connection lock, so it also stalled FUSE
+/// metadata calls.
+///
+/// Asserts correctness — the aggregate must agree with summing the rows, and
+/// must count the kinds apart — and *reports* the timing without asserting on
+/// it. See the note at the measurement for why.
+#[test]
+fn cache_total_bytes_agrees_with_summing_the_rows() {
+    use std::time::Instant;
+
+    let db = Db::open_in_memory().unwrap();
+    // A 20 GB block cache at 4 MiB a block is ~5000 rows.
+    const N: usize = 5000;
+    const BLOCK: u64 = 4 << 20;
+    for i in 0..N {
+        db.cache_touch(&format!("k{i}.b0"), "block", BLOCK, i as i64)
+            .unwrap();
+    }
+
+    // The aggregate must agree with summing the rows.
+    let summed: u64 = db
+        .cache_entries_by_kind("block")
+        .unwrap()
+        .iter()
+        .map(|(_, s)| s)
+        .sum();
+    assert_eq!(db.cache_total_bytes("block").unwrap(), summed);
+    assert_eq!(summed, N as u64 * BLOCK);
+    // Kinds are counted apart.
+    assert_eq!(db.cache_total_bytes("blob").unwrap(), 0);
+
+    let rounds = 500;
+
+    let t0 = Instant::now();
+    for _ in 0..rounds {
+        let entries = db.cache_entries_by_kind("block").unwrap();
+        let _: u64 = entries.iter().map(|(_, s)| *s).sum();
+    }
+    let scan = t0.elapsed();
+
+    let t1 = Instant::now();
+    for _ in 0..rounds {
+        let _ = db.cache_total_bytes("block").unwrap();
+    }
+    let aggregate = t1.elapsed();
+
+    // Reported, not asserted. The SUM is cheaper than reading every row — no
+    // materialization, no allocation, no sort — but it is still O(rows), so this
+    // is a constant factor, and an assertion on a constant factor measured
+    // alongside the rest of the suite tests the machine's load as much as the
+    // query. The claim that matters — that the *common* path does not touch the
+    // database at all — is pinned by `budget_check_is_free_when_under_budget`,
+    // which compares against itself and so is load-independent.
+    println!(
+        "B4: {rounds} budget checks over {N} entries — scan {scan:?}, aggregate {aggregate:?}"
+    );
+}
+
+/// Victims still come out least-recently-accessed first, now in bounded batches
+/// rather than one unbounded read of the table.
+#[test]
+fn cache_eviction_candidates_are_lru_ordered_and_limited() {
+    let db = Db::open_in_memory().unwrap();
+    for i in 0..10u64 {
+        // Insert newest-first so insertion order cannot be mistaken for LRU order.
+        db.cache_touch(&format!("k{i}"), "blob", 100, (10 - i) as i64)
+            .unwrap();
+    }
+    db.cache_touch("other", "block", 100, 0).unwrap();
+
+    let batch = db.cache_eviction_candidates("blob", 3, 0).unwrap();
+    assert_eq!(batch.len(), 3, "honours the limit");
+    let keys: Vec<&str> = batch.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["k9", "k8", "k7"], "least-recently-accessed first");
+    assert!(
+        batch.iter().all(|(k, _)| k != "other"),
+        "a different kind is never a candidate"
+    );
+}
+
+/// **The B5 checkpoint.** A performance plan proposed concurrent SQLite
+/// reads, on the premise that the single `Mutex<Connection>` serializes the FUSE
+/// workers. This measures what the connection is actually asked to do now that
+/// B3 and B4 have landed, so the proposal is decided on evidence.
+///
+/// Note what is *not* here: `lookup`/`getattr`/`readdir` do not read this
+/// database in the steady state — they serve from `State::entries` in memory and
+/// only write through on a cold fill. The per-read DB operation is
+/// `cache_accessed`, one `UPDATE` per cache hit, which is what this drives.
+#[test]
+fn db_contention_under_fuse_worker_load() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    for i in 0..5000u64 {
+        db.cache_touch(&format!("k{i}.b0"), "block", 4 << 20, i as i64)
+            .unwrap();
+    }
+
+    // Eight workers, matching FUSE_WORKERS, each doing what a served block read
+    // does to the database: one LRU touch.
+    const WORKERS: usize = 8;
+    const PER_WORKER: usize = 2000;
+
+    let t = Instant::now();
+    let mut handles = Vec::new();
+    for w in 0..WORKERS {
+        let db = db.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..PER_WORKER {
+                db.cache_accessed(&format!("k{}.b0", (w * PER_WORKER + i) % 5000), i as i64)
+                    .unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let concurrent = t.elapsed();
+
+    // The same work on one thread, for the serialization baseline.
+    let t = Instant::now();
+    for i in 0..(WORKERS * PER_WORKER) {
+        db.cache_accessed(&format!("k{}.b0", i % 5000), i as i64)
+            .unwrap();
+    }
+    let serial = t.elapsed();
+
+    let total = WORKERS * PER_WORKER;
+    println!(
+        "B5: {total} LRU touches — {WORKERS} threads {concurrent:?}, 1 thread {serial:?} \
+         (per-op {:?} vs {:?})",
+        concurrent / total as u32,
+        serial / total as u32
+    );
+}
+
+#[test]
+fn test_db_has_children_and_trashed_filtering() {
+    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+    let db = Db::open_in_memory().unwrap();
+    let parent_uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("parent"));
+    let child_uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("child"));
+
+    assert!(
+        !db.has_children(&parent_uid).unwrap(),
+        "no children initially"
+    );
+
+    let parent_node = Node {
+        uid: parent_uid.clone(),
+        parent_uid: None,
+        name: "parent".into(),
+        kind: NodeKind::Folder,
+        creation_time: 100,
+        modification_time: 100,
+        trashed: false,
+        is_shared: false,
+        is_shared_publicly: false,
+        signature_email: None,
+        membership: None,
+        photo: None,
+        album: None,
+        verification: Default::default(),
+        direct_role: None,
+        share_id: None,
+    };
+    db.upsert_node(&parent_node).unwrap();
+
+    let mut child_node = Node {
+        uid: child_uid.clone(),
+        parent_uid: Some(parent_uid.clone()),
+        name: "child.txt".into(),
+        kind: NodeKind::File {
+            media_type: "text/plain".into(),
+            total_size_on_storage: 10,
+            active_revision_state: None,
+            active_revision_id: None,
+            content_sha1: None,
+            claimed_size: Some(10),
+            claimed_modification_time: None,
+        },
+        creation_time: 100,
+        modification_time: 100,
+        trashed: false,
+        is_shared: false,
+        is_shared_publicly: false,
+        signature_email: None,
+        membership: None,
+        photo: None,
+        album: None,
+        verification: Default::default(),
+        direct_role: None,
+        share_id: None,
+    };
+    db.upsert_node(&child_node).unwrap();
+
+    assert!(db.has_children(&parent_uid).unwrap(), "child node present");
+
+    // Trashing child removes it from active children
+    child_node.trashed = true;
+    db.upsert_node(&child_node).unwrap();
+
+    assert!(
+        !db.has_children(&parent_uid).unwrap(),
+        "trashed child ignored"
+    );
+}
+
+#[test]
+fn test_db_has_create_op() {
+    let db = Db::open_in_memory().unwrap();
+    let local_uid = "local~testnode12345678901234567890";
+
+    assert!(!db.has_create_op(local_uid).unwrap(), "no op initially");
+
+    let op = ops::PendingOp {
+        id: 0,
+        kind: ops::OP_CREATE.to_string(),
+        uid: local_uid.to_string(),
+        parent_uid: Some("vol~parent".to_string()),
+        name: Some("test.txt".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1000,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op).unwrap();
+
+    assert!(db.has_create_op(local_uid).unwrap(), "create op present");
+
+    db.delete_ops_for_uid(local_uid).unwrap();
+    assert!(!db.has_create_op(local_uid).unwrap(), "op deleted");
+}
+
+/// The album listing is a wholesale replacement, and an album that leaves the
+/// listing must take its contents with it — nothing else ever deletes those rows.
+#[test]
+fn albums_replace_drops_the_contents_of_an_album_that_left() {
+    let db = Db::open_in_memory().unwrap();
+    let album = |uid: &str, name: &str, activity: Option<i64>| StoredAlbum {
+        uid: uid.into(),
+        name: name.into(),
+        photo_count: 2,
+        cover_uid: Some("cover".into()),
+        last_activity: activity,
+        shared: false,
+    };
+    db.albums_replace(&[
+        album("a1", "Trip", Some(500)),
+        album("a2", "Cats", Some(400)),
+    ])
+    .unwrap();
+    db.album_photos_replace("a1", &[("p1".into(), 300, None, None)])
+        .unwrap();
+    db.album_photos_replace("a2", &[("p2".into(), 200, None, None)])
+        .unwrap();
+
+    // The next refresh no longer has a2 — it was deleted, or unshared.
+    db.albums_replace(&[album("a1", "Trip", Some(600))])
+        .unwrap();
+
+    assert_eq!(db.albums_count().unwrap(), 1);
+    assert_eq!(db.album_photos_count("a1").unwrap(), 1);
+    assert_eq!(
+        db.album_photos_count("a2").unwrap(),
+        0,
+        "a departed album's photos go with it"
+    );
+}
+
+/// An album's contents are replaced like the timeline: server order is kept, and
+/// what a thumbnail attempt cost a download to learn survives the refresh.
+#[test]
+fn album_photos_replace_keeps_what_was_learned() {
+    let db = Db::open_in_memory().unwrap();
+    db.albums_replace(&[StoredAlbum {
+        uid: "a1".into(),
+        name: "Trip".into(),
+        photo_count: 3,
+        cover_uid: None,
+        last_activity: None,
+        shared: true,
+    }])
+    .unwrap();
+    db.album_photos_replace(
+        "a1",
+        &[
+            ("p1".into(), 300, None, Some("video/mp4".into())),
+            ("p2".into(), 200, None, None),
+        ],
+    )
+    .unwrap();
+
+    db.album_photo_set_thumb("p1", THUMB_HAVE, Some(1.5))
+        .unwrap();
+    db.album_photo_set_thumb("p2", THUMB_NONE, None).unwrap();
+
+    db.album_photos_replace(
+        "a1",
+        &[
+            ("p0".into(), 400, Some("new.jpg".into()), None),
+            ("p1".into(), 300, None, None),
+            ("p2".into(), 200, None, None),
+        ],
+    )
+    .unwrap();
+
+    let page = db.album_photos_page("a1", 0, 10).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p0", "p1", "p2"],
+        "the album's own order is preserved"
+    );
+    assert_eq!(page[1].ratio, Some(1.5));
+    assert_eq!(page[1].thumb_state, THUMB_HAVE);
+    assert_eq!(page[2].thumb_state, THUMB_NONE);
+    // The media type is learned-and-kept, so p1 stays classified as a video even
+    // though the second refresh carried none.
+    assert_eq!(page[1].kind, pdfs_core::control::PhotoKind::Video);
+    assert_eq!(page[0].thumb_state, THUMB_UNKNOWN);
+
+    // Paging is relative to the album, and the shared flag round-trips.
+    let second = db.album_photos_page("a1", 1, 1).unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].uid, "p1");
+    assert!(db.albums_list().unwrap()[0].shared);
+}
+
+/// A photo held only by an album — everything in an album shared with us — is
+/// still resolvable for its capture time, which is what tags its cached
+/// thumbnail. One row per uid, even when the photo is in several albums.
+#[test]
+fn album_photos_by_uid_resolves_a_photo_outside_the_timeline() {
+    let db = Db::open_in_memory().unwrap();
+    db.album_photos_replace("a1", &[("p1".into(), 300, None, None)])
+        .unwrap();
+    db.album_photos_replace("a2", &[("p1".into(), 300, None, None)])
+        .unwrap();
+
+    let found = db
+        .album_photos_by_uid(&["p1".into(), "absent".into()])
+        .unwrap();
+    assert_eq!(found.len(), 1, "a photo in two albums resolves once");
+    assert_eq!(found[0].capture_time, 300);
+    assert!(db.album_photos_by_uid(&[]).unwrap().is_empty());
+}
+
+/// Per-album freshness stamps are keyed by uid, so invalidating them all is a
+/// prefix sweep — and it must not take unrelated keys with it.
+#[test]
+fn clear_state_prefix_takes_only_the_prefixed_keys() {
+    let db = Db::open_in_memory().unwrap();
+    db.set_state_i64("album_synced_ms:vol~a1", 1).unwrap();
+    db.set_state_i64("album_synced_ms:vol~a2", 2).unwrap();
+    db.set_state_i64("albums_synced_ms", 3).unwrap();
+
+    db.clear_state_prefix("album_synced_ms:").unwrap();
+
+    assert_eq!(db.state_i64("album_synced_ms:vol~a1").unwrap(), None);
+    assert_eq!(db.state_i64("album_synced_ms:vol~a2").unwrap(), None);
+    assert_eq!(
+        db.state_i64("albums_synced_ms").unwrap(),
+        Some(3),
+        "the listing's own stamp is not a per-album one"
+    );
+}
+
+// --- `nodes.path`, and the subtree work it replaces (DB3) -------------------
+
+/// Read the stored path column directly: the point of these tests is that the
+/// column itself is right, not that `path_of` can still fall back to a walk.
+fn stored_path(db: &Db, link: &str) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    db.with_conn(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT path FROM nodes WHERE uid = ?1",
+                [uid(link).to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_node_stores_its_path_when_it_is_written() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("docs", Some("root"), "Documents"))
+        .unwrap();
+    db.upsert_node(&file("f1", "docs", "report.pdf", 1))
+        .unwrap();
+
+    // The root's name is the mount, so it contributes nothing.
+    assert_eq!(stored_path(&db, "root").as_deref(), Some(""));
+    assert_eq!(stored_path(&db, "docs").as_deref(), Some("Documents"));
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("Documents/report.pdf")
+    );
+}
+
+#[test]
+fn a_node_below_an_uncached_parent_starts_its_own_path() {
+    // A device folder's root lives in `device`/`sync_folder` and never gets a
+    // `nodes` row, so its children are the top of the cached chain.
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("orphan", Some("never-cached"), "Work"))
+        .unwrap();
+    db.upsert_node(&file("f1", "orphan", "notes.txt", 1))
+        .unwrap();
+
+    assert_eq!(stored_path(&db, "orphan").as_deref(), Some("Work"));
+    assert_eq!(stored_path(&db, "f1").as_deref(), Some("Work/notes.txt"));
+}
+
+#[test]
+fn renaming_a_folder_rewrites_every_descendant_path() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("a", Some("root"), "Before"))
+        .unwrap();
+    db.upsert_node(&folder("b", Some("a"), "Inner")).unwrap();
+    db.upsert_node(&file("f1", "b", "deep.txt", 1)).unwrap();
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("Before/Inner/deep.txt")
+    );
+
+    db.upsert_node(&folder("a", Some("root"), "After")).unwrap();
+
+    assert_eq!(stored_path(&db, "a").as_deref(), Some("After"));
+    assert_eq!(stored_path(&db, "b").as_deref(), Some("After/Inner"));
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("After/Inner/deep.txt")
+    );
+    let hit = &db.search("deep.txt", 10).unwrap()[0];
+    assert_eq!(
+        hit.path, "After/Inner/deep.txt",
+        "the search index must carry the rewritten path too"
+    );
+}
+
+#[test]
+fn moving_a_folder_rewrites_every_descendant_path() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("old", Some("root"), "Old")).unwrap();
+    db.upsert_node(&folder("new", Some("root"), "New")).unwrap();
+    db.upsert_node(&folder("moved", Some("old"), "Moved"))
+        .unwrap();
+    db.upsert_node(&file("f1", "moved", "deep.txt", 1)).unwrap();
+
+    db.upsert_node(&folder("moved", Some("new"), "Moved"))
+        .unwrap();
+
+    assert_eq!(stored_path(&db, "moved").as_deref(), Some("New/Moved"));
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("New/Moved/deep.txt")
+    );
+}
+
+#[test]
+fn trashing_a_folder_drops_its_subtree_from_the_index() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("a", Some("root"), "Holder"))
+        .unwrap();
+    db.upsert_node(&file("f1", "a", "hidden.txt", 1)).unwrap();
+    assert_eq!(db.search("hidden", 10).unwrap().len(), 1);
+
+    let mut trashed = folder("a", Some("root"), "Holder");
+    trashed.trashed = true;
+    db.upsert_node(&trashed).unwrap();
+
+    assert_eq!(
+        db.search("hidden", 10).unwrap().len(),
+        0,
+        "a file under a trashed folder is not reachable and must not be findable"
+    );
+
+    // …and comes back when the folder does.
+    db.upsert_node(&folder("a", Some("root"), "Holder"))
+        .unwrap();
+    assert_eq!(db.search("hidden", 10).unwrap().len(), 1);
+}
+
+/// The re-listing case, which is most of what the write path actually does: a
+/// folder upserted with the same name and parent must not touch its subtree.
+///
+/// Written as a ratio between two subtree sizes, so it fails on the scaling
+/// regression rather than on a slow machine. Before this, every re-listing paid
+/// a `path_of` walk plus an ancestor walk per descendant.
+#[test]
+fn re_listing_a_folder_does_not_scale_with_its_subtree() {
+    fn elapsed_for(children: usize) -> std::time::Duration {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        db.upsert_node(&folder("big", Some("root"), "Big")).unwrap();
+        let kids: Vec<Node> = (0..children)
+            .map(|i| file(&format!("k{i}"), "big", &format!("child-{i}.txt"), 1))
+            .collect();
+        db.upsert_nodes(&kids).unwrap();
+
+        let unchanged = folder("big", Some("root"), "Big");
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            db.upsert_node(&unchanged).unwrap();
+        }
+        start.elapsed()
+    }
+
+    let small = elapsed_for(100);
+    let large = elapsed_for(2_000);
+    assert!(
+        large < small * 8,
+        "re-listing a folder scaled with its subtree: {small:?} for 100 children, \
+         {large:?} for 2000 (20x the descendants)"
+    );
+}
+
+#[test]
+fn migration_v25_backfills_paths_for_an_existing_tree() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v24-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        db.upsert_node(&folder("docs", Some("root"), "Documents"))
+            .unwrap();
+        db.upsert_node(&file("f1", "docs", "report.pdf", 1))
+            .unwrap();
+        db.upsert_node(&folder("orphan", Some("never-cached"), "Work"))
+            .unwrap();
+        db.upsert_node(&file("f2", "orphan", "notes.txt", 1))
+            .unwrap();
+    }
+    {
+        // Put the file back in the state a released V24 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE nodes DROP COLUMN path;
+             UPDATE sync_state SET value = '24' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(stored_path(&db, "root").as_deref(), Some(""));
+    assert_eq!(stored_path(&db, "docs").as_deref(), Some("Documents"));
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("Documents/report.pdf"),
+        "an existing tree must come out of the migration with the same paths \
+         the walk used to produce"
+    );
+    // A subtree whose top has an uncached parent is ordinary data, not an error.
+    assert_eq!(stored_path(&db, "orphan").as_deref(), Some("Work"));
+    assert_eq!(stored_path(&db, "f2").as_deref(), Some("Work/notes.txt"));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
+
+/// A queue carried over from V26 keeps its rows, and every one of them starts
+/// out not access-deferred — a migration must not invent a deferral window that
+/// would report an ordinary queued upload as blocked.
+#[test]
+fn migration_v27_adds_the_access_deferral_column_to_a_v26_queue() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v26-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.enqueue_op(&crate::db::PendingOp {
+            id: 0,
+            kind: crate::db::OP_REVISION.to_string(),
+            uid: "v~l".to_string(),
+            parent_uid: None,
+            name: None,
+            blob_path: Some("/tmp/blob".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    }
+    {
+        // Put the file back in the state a released V26 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE pending_op DROP COLUMN access_deferred_since;
+             UPDATE sync_state SET value = '26' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "the migration keeps the queued write");
+    let now = 5_000i64;
+    assert_eq!(
+        db.defer_op_for_access(ops[0].id, now, now + 5_000).unwrap(),
+        now,
+        "a carried-over op is not already deferred"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
+
+/// V44 adds the remote revision a baseline row was synced at. A row carried
+/// over from V43 has none, and the mirror then compares the modification time
+/// and size as before, so upgrading changes nothing about what is in step
+/// (`docs/BUGS.md` B249).
+#[test]
+fn migration_v44_adds_the_synced_revision_without_disturbing_a_v43_baseline() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v43-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let row = StoredSyncEntry {
+        rel_path: "notes.txt".into(),
+        remote_uid: Some("vol~notes".into()),
+        local_mtime: 1_700_000_000,
+        local_mtime_ns: Some(1_700_000_000_123_456_789),
+        local_size: 42,
+        remote_rev: Some("1700000000".into()),
+        remote_hash: Some("42".into()),
+        remote_revision_id: Some("rev-1".into()),
+    };
+    {
+        let db = Db::open(&path).unwrap();
+        let folder = db
+            .sync_folder_add("/home/me/Mirror", "vol~root", "share")
+            .unwrap();
+        db.sync_entry_upsert(folder, &row).unwrap();
+    }
+    {
+        // Put the file back in the state a released V43 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sync_entry DROP COLUMN remote_revision_id;
+             UPDATE sync_state SET value = '43' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let entries = db.sync_entries(1).unwrap();
+    let entry = entries.get("notes.txt").expect("the baseline row survives");
+    assert_eq!(
+        entry,
+        &StoredSyncEntry {
+            remote_revision_id: None,
+            ..row.clone()
+        }
+    );
+
+    // And the column is live, including through a move of the row.
+    db.sync_entry_upsert(1, &row).unwrap();
+    db.sync_entries_move(1, "notes.txt", 1, "moved.txt")
+        .unwrap();
+    let entries = db.sync_entries(1).unwrap();
+    assert_eq!(
+        entries["moved.txt"].remote_revision_id.as_deref(),
+        Some("rev-1")
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A mirror baseline carried over from V27 keeps its rows, and each one reads
+/// back with no nanosecond time. That `None` is the whole point: it makes the
+/// comparison fall back to whole seconds for rows written before the column
+/// existed, instead of asserting a sub-second time of zero and re-uploading
+/// every already-synced file in the folder (`docs/BUGS.md` B25).
+#[test]
+fn migration_v28_adds_sub_second_local_times_without_disturbing_a_v27_baseline() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v27-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        let folder = db
+            .sync_folder_add("/home/me/Mirror", "vol~root", "share")
+            .unwrap();
+        db.sync_entry_upsert(
+            folder,
+            &StoredSyncEntry {
+                rel_path: "notes.txt".into(),
+                remote_uid: Some("vol~notes".into()),
+                local_mtime: 1_700_000_000,
+                local_mtime_ns: Some(1_700_000_000_123_456_789),
+                local_size: 42,
+                remote_rev: Some("1700000000".into()),
+                remote_hash: Some("42".into()),
+                remote_revision_id: None,
+            },
+        )
+        .unwrap();
+    }
+    {
+        // Put the file back in the state a released V27 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sync_entry DROP COLUMN local_mtime_ns;
+             UPDATE sync_state SET value = '27' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let entries = db.sync_entries(1).unwrap();
+    let entry = entries.get("notes.txt").expect("the baseline row survives");
+    assert_eq!(entry.local_mtime, 1_700_000_000);
+    assert_eq!(entry.local_size, 42);
+    assert_eq!(
+        entry.local_mtime_ns, None,
+        "a carried-over row must not claim a sub-second time it never recorded"
+    );
+
+    // And the column is live: a refreshed row keeps the precision it is given.
+    db.sync_entry_upsert(
+        1,
+        &StoredSyncEntry {
+            local_mtime_ns: Some(1_700_000_001_000_000_500),
+            ..entry.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        db.sync_entries(1).unwrap()["notes.txt"].local_mtime_ns,
+        Some(1_700_000_001_000_000_500)
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
+
+// --- read-only connection pool (DB2) ---------------------------------------
+
+/// A read must not queue behind whatever happens to be writing.
+///
+/// The write connection is held for the whole measurement — which is what a
+/// large listing's commit does to it — while a reader asks for a search. Before
+/// the pool this was the same mutex, so the read waited for the writer;
+/// `busy_timeout` never entered into it, because the contention was this
+/// process's own lock rather than SQLite's.
+#[test]
+fn a_read_does_not_wait_for_the_write_connection() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-readpool-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db = std::sync::Arc::new(Db::open(&path).unwrap());
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "findme.txt", 1))
+        .unwrap();
+
+    let held = std::time::Duration::from_millis(500);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            db.with_conn(|_conn| {
+                tx.send(()).unwrap();
+                std::thread::sleep(held);
+                Ok(())
+            })
+            .unwrap();
+        })
+    };
+    rx.recv().unwrap();
+
+    let start = std::time::Instant::now();
+    let hits = db.search("findme", 10).unwrap();
+    let waited = start.elapsed();
+    writer.join().unwrap();
+
+    assert_eq!(hits.len(), 1, "the read must still see committed data");
+    assert!(
+        waited < held / 2,
+        "the read waited {waited:?} for a write connection held {held:?}"
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
+
+/// §5: the drain is several workers over one queue, and the claim column is the
+/// only thing keeping them off each other's work. Two properties matter — no
+/// row is ever handed to two workers, and no *node* is ever worked by two
+/// workers even though its ops are separate rows.
+#[test]
+fn a_claimed_op_is_invisible_to_every_other_worker() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    for i in 0..3 {
+        db.enqueue_op(&bulk_op(i, &root)).unwrap();
+    }
+
+    let first = db.claim_next_due_op(10).unwrap().expect("an op is due");
+    let second = db
+        .claim_next_due_op(10)
+        .unwrap()
+        .expect("another op is due");
+    let third = db
+        .claim_next_due_op(10)
+        .unwrap()
+        .expect("a third op is due");
+    assert!(
+        db.claim_next_due_op(10).unwrap().is_none(),
+        "a fourth claim must find nothing left: every queued op is taken"
+    );
+
+    let mut ids = [first.id, second.id, third.id];
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [1, 2, 3],
+        "each worker must get a distinct row, oldest first"
+    );
+
+    // Releasing puts one back, and it is the one that comes out next.
+    db.release_op_claim(second.id).unwrap();
+    let again = db.claim_next_due_op(10).unwrap().expect("the released op");
+    assert_eq!(again.id, second.id);
+}
+
+#[test]
+fn two_workers_never_share_a_node() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    // Two ops of different kinds against one node — a queued rename and a
+    // queued revision, which is an ordinary `mv` plus a save.
+    let mut revision = bulk_op(0, &root);
+    revision.parent_uid = None;
+    db.enqueue_op(&revision).unwrap();
+    let rename = PendingOp {
+        kind: OP_RENAME.to_string(),
+        parent_uid: Some(root.clone()),
+        blob_path: None,
+        meta_json: None,
+        ..bulk_op(0, &root)
+    };
+    db.enqueue_op(&rename).unwrap();
+
+    let claimed = db.claim_next_due_op(10).unwrap().expect("an op is due");
+    assert_eq!(claimed.kind, OP_REVISION, "the older op goes first");
+    assert!(
+        db.claim_next_due_op(10).unwrap().is_none(),
+        "the second op targets the same node, so it must wait for the first: \
+         two workers on one uid would race over its staged blob and land its \
+         changes out of order"
+    );
+
+    db.release_op_claim(claimed.id).unwrap();
+    db.delete_op(claimed.id).unwrap();
+    assert_eq!(
+        db.claim_next_due_op(10).unwrap().map(|o| o.kind),
+        Some(OP_RENAME.to_string()),
+        "once the revision retires, the rename is claimable"
+    );
+}
+
+#[test]
+fn trashing_a_folder_waits_for_moves_out_of_its_subtree() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        folder("source", Some("root"), "source"),
+        folder("nested", Some("source"), "nested"),
+        folder("destination", Some("root"), "destination"),
+        file("photo", "destination", "photo.jpg", 1),
+    ])
+    .unwrap();
+    let source = uid("source").to_string();
+    let destination = uid("destination").to_string();
+    let (move_id, _) = db
+        .enqueue_op(&PendingOp {
+            kind: OP_RENAME.to_string(),
+            uid: uid("photo").to_string(),
+            parent_uid: Some(destination.clone()),
+            name: Some("photo.jpg".into()),
+            blob_path: None,
+            meta_json: Some(
+                serde_json::to_string(&RenameMeta {
+                    original_parent_uid: uid("nested").to_string(),
+                    original_name: Some("photo.jpg".into()),
+                })
+                .unwrap(),
+            ),
+            next_attempt_at: 20,
+            ..bulk_op(0, &destination)
+        })
+        .unwrap();
+    assert!(db.has_pending_moves_out_of(&source).unwrap());
+    assert!(!db.has_pending_moves_out_of(&destination).unwrap());
+    assert!(
+        !db.has_pending_moves_out_of(&uid("root").to_string())
+            .unwrap()
+    );
+    let (trash_id, _) = db.replace_ops_with_trash(&source, "source", 2).unwrap();
+
+    assert!(db.claim_next_due_op(10).unwrap().is_none());
+    assert_eq!(db.earliest_due_at().unwrap(), Some(20));
+    assert_eq!(db.claim_next_due_op(20).unwrap().unwrap().id, move_id);
+    assert!(db.claim_next_due_op(20).unwrap().is_none());
+    assert_eq!(db.earliest_due_at().unwrap(), None);
+    db.delete_op(move_id).unwrap();
+    assert_eq!(db.claim_next_due_op(20).unwrap().unwrap().id, trash_id);
+}
+
+#[test]
+fn claims_do_not_survive_the_process_that_took_them() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    for i in 0..2 {
+        db.enqueue_op(&bulk_op(i, &root)).unwrap();
+    }
+    db.claim_next_due_op(10).unwrap().unwrap();
+    db.claim_next_due_op(10).unwrap().unwrap();
+    assert!(db.claim_next_due_op(10).unwrap().is_none());
+
+    // What `Db::open` does after the single-writer lock says the previous run
+    // is gone. Without it those ops are invisible to every worker forever.
+    assert_eq!(db.clear_op_claims().unwrap(), 2);
+    assert!(
+        db.claim_next_due_op(10).unwrap().is_some(),
+        "a crashed run's claims must not park its queue"
+    );
+}
+
+#[test]
+fn an_idle_worker_does_not_wait_on_an_op_another_worker_has() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    db.enqueue_op(&bulk_op(0, &root)).unwrap();
+
+    assert_eq!(db.earliest_due_at().unwrap(), Some(0));
+    db.claim_next_due_op(10).unwrap().unwrap();
+    assert_eq!(
+        db.earliest_due_at().unwrap(),
+        None,
+        "an op somebody else is draining is not work this worker is waiting for"
+    );
+}
+
+/// B200: a rename queued behind a long upload of the same node is due, but no
+/// worker may claim it until the upload retires. Counted as due, it had every
+/// idle worker wake at once, find nothing, and go round again.
+#[test]
+fn earliest_due_at_skips_an_op_held_behind_a_claimed_one() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    let mut revision = bulk_op(0, &root);
+    revision.parent_uid = None;
+    db.enqueue_op(&revision).unwrap();
+    db.enqueue_op(&PendingOp {
+        kind: OP_RENAME.to_string(),
+        parent_uid: Some(root.clone()),
+        blob_path: None,
+        meta_json: None,
+        ..bulk_op(0, &root)
+    })
+    .unwrap();
+
+    db.claim_next_due_op(10)
+        .unwrap()
+        .expect("the revision is due");
+    assert!(db.claim_next_due_op(10).unwrap().is_none());
+    assert_eq!(
+        db.earliest_due_at().unwrap(),
+        None,
+        "a row no worker can claim is not work an idle worker is waiting for"
+    );
+}
+
+/// Trashing a photo from the gallery must not leave it behind on an album page:
+/// the row goes, its album membership goes with it, and nothing else moves.
+#[test]
+fn photos_delete_removes_the_photo_and_its_album_membership() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow::new("p1", 300),
+        TimelineRow::new("p2", 200),
+        TimelineRow::new("p3", 100),
+    ])
+    .unwrap();
+    db.albums_replace(&[StoredAlbum {
+        uid: "a1".into(),
+        name: "Trip".into(),
+        photo_count: 3,
+        cover_uid: Some("p1".into()),
+        last_activity: Some(500),
+        shared: false,
+    }])
+    .unwrap();
+    db.album_photos_replace(
+        "a1",
+        &[
+            ("p1".into(), 300, None, None),
+            ("p2".into(), 200, None, None),
+            ("p3".into(), 100, None, None),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(db.photos_delete(&["p2".into()]).unwrap(), 1);
+
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p1", "p3"],
+        "only the trashed photo leaves the timeline"
+    );
+    assert_eq!(db.album_photos_count("a1").unwrap(), 2);
+    let album = db.album_photos_page("a1", 0, 10).unwrap();
+    assert_eq!(
+        album.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p1", "p3"]
+    );
+
+    // A uid we no longer hold is not an error: the event poller and the trash
+    // reply can both report the same deletion.
+    assert_eq!(db.photos_delete(&["p2".into()]).unwrap(), 0);
+    assert_eq!(db.photos_delete(&[]).unwrap(), 0);
+}
+
+/// A shot taken as RAW+JPEG is one photo to the person who took it: the grid
+/// shows the JPEG once, and the Raw tab still lists the raw file.
+#[test]
+fn a_raw_and_its_jpeg_are_one_entry_in_the_grid() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            ..TimelineRow::new("jpeg", 300)
+        },
+        TimelineRow {
+            name: Some("img_1234.cr2".into()),
+            ..TimelineRow::new("raw", 300)
+        },
+        TimelineRow {
+            name: Some("IMG_9999.JPG".into()),
+            ..TimelineRow::new("alone", 200)
+        },
+    ])
+    .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["jpeg", "alone"],
+        "the pair shows once, as the member that can be displayed"
+    );
+    assert_eq!(page[0].group_size, 2);
+    assert!(page[0].has_raw, "the tile can say the raw is there");
+    assert_eq!(page[1].group_size, 1);
+    assert!(!page[1].has_raw);
+
+    // The Raw tab answers "which raws do I have", so it lists files.
+    let raws = db
+        .photos_page(
+            0,
+            10,
+            Some(pdfs_core::control::PhotoKind::Raw),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        raws.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["raw"]
+    );
+    assert_eq!(db.photos_counts().unwrap(), (2, 0, 1));
+
+    // Both members are reachable from either uid: the lightbox switches between
+    // them, and deleting the tile has to trash both.
+    let group = db.photos_group("raw").unwrap();
+    assert_eq!(
+        group.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["jpeg", "raw"]
+    );
+    assert_eq!(db.photos_group("alone").unwrap().len(), 1);
+
+    let hidden = db
+        .photo_group_members_for(&["raw".to_owned()].into_iter().collect())
+        .unwrap();
+    assert_eq!(
+        hidden,
+        ["raw".to_owned(), "jpeg".to_owned()].into_iter().collect()
+    );
+    let excluded = serde_json::to_string(&hidden).unwrap();
+    assert_eq!(db.photos_counts_visible(&excluded).unwrap(), (1, 0, 0));
+    let months = db.photos_months_visible(None, &excluded).unwrap();
+    assert_eq!(months.len(), 1);
+    assert_eq!(months[0].2, 1);
+    let public = db
+        .photos_page_visible(0, 1, None, None, false, false, &excluded)
+        .unwrap();
+    assert_eq!(
+        public
+            .iter()
+            .map(|photo| photo.uid.as_str())
+            .collect::<Vec<_>>(),
+        ["alone"]
+    );
+}
+
+/// Pixel names the two files of one raw capture after the role each plays, so
+/// their stems differ. The shot is still one shot, and the grid shows the cover
+/// JPEG.
+#[test]
+fn a_pixel_raw_capture_groups_with_its_cover_jpeg() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("PXL_20260919_000625670.RAW-01.COVER.jpg".into()),
+            ..TimelineRow::new("cover", 1_789_776_385)
+        },
+        TimelineRow {
+            name: Some("PXL_20260919_000625670.RAW-02.ORIGINAL.dng".into()),
+            ..TimelineRow::new("original", 1_789_776_385)
+        },
+        // A name that merely contains the marker's opening is not a marker.
+        TimelineRow {
+            name: Some("scan.raw-notes.jpg".into()),
+            ..TimelineRow::new("notes", 1_789_776_385)
+        },
+        TimelineRow {
+            name: Some("scan.raw-other.dng".into()),
+            ..TimelineRow::new("other", 1_789_776_385)
+        },
+    ])
+    .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["cover", "notes", "other"],
+        "the capture shows once, as the cover JPEG"
+    );
+    assert_eq!(page[0].group_size, 2);
+    assert!(page[0].has_raw);
+    assert_eq!(
+        db.photos_group("original")
+            .unwrap()
+            .iter()
+            .map(|p| p.uid.as_str())
+            .collect::<Vec<_>>(),
+        ["cover", "original"]
+    );
+}
+
+/// Two files that merely share a name are not one shot: the same stem on
+/// different days, or two files of the same kind, stay apart.
+#[test]
+fn a_shared_name_alone_does_not_group_photos() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            ..TimelineRow::new("today", 1_700_000_000)
+        },
+        TimelineRow {
+            name: Some("IMG_1234.CR2".into()),
+            ..TimelineRow::new("last-year", 1_600_000_000)
+        },
+        TimelineRow {
+            name: Some("IMG_1234.PNG".into()),
+            ..TimelineRow::new("same-kind", 1_700_000_000)
+        },
+    ])
+    .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(page.len(), 3, "three shots, three tiles");
+    assert!(page.iter().all(|p| p.group_size == 1));
+}
+
+/// The server knows about live photos and bursts, so its own relation groups
+/// files this client would never pair by name.
+#[test]
+fn the_servers_photo_relation_groups_a_live_photo() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_0001.HEIC".into()),
+            ..TimelineRow::new("main", 300)
+        },
+        TimelineRow {
+            name: Some("clip.mov".into()),
+            main_uid: Some("main".into()),
+            ..TimelineRow::new("related", 299)
+        },
+    ])
+    .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["main"]
+    );
+    assert_eq!(page[0].group_size, 2);
+    assert!(!page[0].has_raw, "a live photo's video is not a raw file");
+
+    // The relation is learned-and-kept: a refresh that could not resolve the
+    // nodes must not break the group up.
+    db.photos_replace(&[
+        TimelineRow::new("main", 300),
+        TimelineRow::new("related", 299),
+    ])
+    .unwrap();
+    assert_eq!(db.photos_group("related").unwrap().len(), 2);
+}
+
+/// A database written before grouping existed opens, keeps its timeline, and
+/// shows every photo — a row with no `group_key` is its own group, which is how
+/// the gallery behaved before the column.
+#[test]
+fn migration_v32_retries_videos_written_off_as_unthumbnailable() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v31-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.photos_replace(&[
+            TimelineRow {
+                name: Some("VID-20260804-WA0023.mp4".into()),
+                ..TimelineRow::new("video", 300)
+            },
+            TimelineRow {
+                name: Some("broken.jpg".into()),
+                ..TimelineRow::new("photo", 200)
+            },
+        ])
+        .unwrap();
+        db.photo_set_thumb("video", THUMB_NONE, None).unwrap();
+        db.photo_set_thumb("photo", THUMB_NONE, None).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("UPDATE sync_state SET value = '31' WHERE key = 'schema_version';")
+            .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let state = |uid: &str| db.photos_by_uid(&[uid.into()]).unwrap()[0].thumb_state;
+    assert_eq!(state("video"), THUMB_UNKNOWN, "the video is tried again");
+    assert_eq!(
+        state("photo"),
+        THUMB_NONE,
+        "an undecodable photo stays written off"
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn migration_v30_leaves_a_v29_timeline_intact() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v29-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.photos_replace(&[
+            TimelineRow {
+                name: Some("IMG_1234.JPG".into()),
+                ..TimelineRow::new("jpeg", 300)
+            },
+            TimelineRow {
+                name: Some("IMG_1234.CR2".into()),
+                ..TimelineRow::new("raw", 300)
+            },
+        ])
+        .unwrap();
+        db.photo_set_thumb("jpeg", THUMB_HAVE, Some(1.5)).unwrap();
+    }
+    {
+        // Put the file back in the state a released V29 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_photos_group;
+             ALTER TABLE photos DROP COLUMN group_key;
+             ALTER TABLE photos DROP COLUMN main_uid;
+             ALTER TABLE photos DROP COLUMN content_hash;
+             UPDATE sync_state SET value = '29' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["jpeg", "raw"],
+        "no photo goes missing before the next refresh groups them"
+    );
+    assert!(page.iter().all(|p| p.group_size == 1));
+    assert_eq!(page[0].ratio, Some(1.5), "what was learned is still there");
+
+    // The next refresh fills the column in and the pair collapses.
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            ..TimelineRow::new("jpeg", 300)
+        },
+        TimelineRow {
+            name: Some("IMG_1234.CR2".into()),
+            ..TimelineRow::new("raw", 300)
+        },
+    ])
+    .unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].uid, "jpeg");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
+
+/// A refresh that skips an already-resolved photo sends a row carrying only the
+/// uid and capture time. The name must survive that, because the tab split and
+/// the grouping are both derived from it.
+#[test]
+fn photos_replace_keeps_a_skipped_photos_name() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            media_type: Some("image/jpeg".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("jpeg", 300)
+        },
+        TimelineRow {
+            name: Some("IMG_1234.CR2".into()),
+            media_type: Some("application/octet-stream".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("raw", 300)
+        },
+    ])
+    .unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(page.len(), 1, "one shot, two files");
+    assert!(page[0].has_raw);
+
+    // The next refresh resolves neither, because both are already resolved.
+    db.photos_replace(&[TimelineRow::new("jpeg", 300), TimelineRow::new("raw", 300)])
+        .unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(page.len(), 1, "the group survives a skipped refresh");
+    assert_eq!(page[0].name.as_deref(), Some("IMG_1234.JPG"));
+    assert!(page[0].has_raw, "the raw file is still a raw file");
+    assert_eq!(page[0].group_size, 2);
+}
+
+/// Only the photos a refresh actually read are marked resolved; the rest stay
+/// eligible, so the next refresh tries them again.
+#[test]
+fn photos_replace_marks_only_the_rows_it_resolved() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("ok.jpg".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("ok", 300)
+        },
+        // The chunk holding this one failed.
+        TimelineRow::new("failed", 200),
+    ])
+    .unwrap();
+    assert_eq!(db.photos_resolved().unwrap(), ["ok"]);
+
+    // A resolved photo stays resolved across a refresh that skips it.
+    db.photos_replace(&[
+        TimelineRow::new("ok", 300),
+        TimelineRow {
+            name: Some("late.jpg".into()),
+            resolved_at: Some(2),
+            ..TimelineRow::new("failed", 200)
+        },
+    ])
+    .unwrap();
+    let mut resolved = db.photos_resolved().unwrap();
+    resolved.sort();
+    assert_eq!(resolved, ["failed", "ok"]);
+}
+
+/// What a refresh read is the truth, including what it no longer reports: a
+/// photo unlinked from its main on another device leaves the group.
+#[test]
+fn a_resolved_replace_clears_a_relation_the_server_dropped() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_0001.HEIC".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("main", 300)
+        },
+        TimelineRow {
+            name: Some("clip.mov".into()),
+            main_uid: Some("main".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("related", 299)
+        },
+    ])
+    .unwrap();
+    assert_eq!(db.photos_group("related").unwrap().len(), 2);
+
+    // Both are read again and the server no longer reports the relation.
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_0001.HEIC".into()),
+            resolved_at: Some(2),
+            ..TimelineRow::new("main", 300)
+        },
+        TimelineRow {
+            name: Some("clip.mov".into()),
+            resolved_at: Some(2),
+            ..TimelineRow::new("related", 299)
+        },
+    ])
+    .unwrap();
+    assert_eq!(
+        db.photos_group("related").unwrap().len(),
+        1,
+        "an unlinked photo stands on its own"
+    );
+}
+
+/// A refresh that did *not* read the nodes must not break the group up, which is
+/// the older behaviour and still the one a failed resolve gets.
+#[test]
+fn an_unresolved_replace_keeps_a_relation() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_0001.HEIC".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("main", 300)
+        },
+        TimelineRow {
+            name: Some("clip.mov".into()),
+            main_uid: Some("main".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("related", 299)
+        },
+    ])
+    .unwrap();
+
+    db.photos_replace(&[
+        TimelineRow::new("main", 300),
+        TimelineRow::new("related", 299),
+    ])
+    .unwrap();
+    assert_eq!(db.photos_group("related").unwrap().len(), 2);
+}
+
+/// A remote event names the photo it changed, and that is all it takes to have
+/// the next refresh read that one node again.
+#[test]
+fn marking_a_photo_unresolved_makes_it_eligible_again() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("a.jpg".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("a", 300)
+        },
+        TimelineRow {
+            name: Some("b.jpg".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("b", 200)
+        },
+    ])
+    .unwrap();
+
+    assert_eq!(db.photos_mark_unresolved(&["a".to_string()]).unwrap(), 1);
+    assert_eq!(db.photos_resolved().unwrap(), ["b"]);
+    // A uid the timeline does not hold changes nothing.
+    assert_eq!(db.photos_mark_unresolved(&["gone".to_string()]).unwrap(), 0);
+
+    assert_eq!(db.photos_mark_all_unresolved().unwrap(), 2);
+    assert!(db.photos_resolved().unwrap().is_empty());
+}
+
+/// An existing timeline opens as resolved, so upgrading does not re-read the
+/// whole library once — except for the photos nothing was ever learned about.
+#[test]
+fn migration_v31_treats_an_existing_timeline_as_resolved() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v30-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.photos_replace(&[
+            TimelineRow {
+                name: Some("IMG_1234.JPG".into()),
+                resolved_at: Some(1),
+                ..TimelineRow::new("named", 300)
+            },
+            // A photo whose resolve had failed: nothing was ever learned.
+            TimelineRow::new("nameless", 200),
+        ])
+        .unwrap();
+    }
+    {
+        // Put the file back in the state a released V30 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_photos_unresolved;
+             ALTER TABLE photos DROP COLUMN resolved_at;
+             UPDATE sync_state SET value = '30' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(
+        db.photos_resolved().unwrap(),
+        ["named"],
+        "the stored timeline is trusted, a nameless row is not"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
+
+fn queued_op(db: &Db, uid: &str, failures: i64, next_attempt_at: i64) -> i64 {
+    let (id, _) = db
+        .enqueue_op(&ops::PendingOp {
+            id: 0,
+            kind: ops::OP_REVISION.to_string(),
+            uid: uid.to_string(),
+            parent_uid: None,
+            name: None,
+            blob_path: None,
+            meta_json: None,
+            created_at: 1000,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at,
+        })
+        .unwrap();
+    for _ in 0..failures {
+        db.record_op_failure(id, "boom", next_attempt_at).unwrap();
+    }
+    id
+}
+
+/// "Retry now" must make a backed-off op due, but never un-park a transient
+/// file's op: that one waits for its finishing rename, not for time.
+#[test]
+fn retry_now_makes_a_backed_off_op_due_but_leaves_parked_ops_parked() {
+    let db = Db::open_in_memory().unwrap();
+    let backed_off = queued_op(&db, "vol~a", 3, 90_000);
+    let parked = queued_op(&db, "vol~b", 0, ops::PARK_UNTIL);
+
+    assert!(db.retry_op_now(backed_off, 5_000).unwrap());
+    assert!(!db.retry_op_now(parked, 5_000).unwrap());
+
+    let ops = db.pending_ops().unwrap();
+    let due = |id: i64| ops.iter().find(|op| op.id == id).unwrap().next_attempt_at;
+    assert_eq!(due(backed_off), 5_000);
+    assert_eq!(due(parked), ops::PARK_UNTIL);
+}
+
+/// A change Drive refused needs the user now, not after six more failures, and
+/// its refusal is the error the status leads with.
+#[test]
+fn an_op_with_an_issue_counts_as_failing_at_once() {
+    let db = Db::open_in_memory().unwrap();
+    queued_op(&db, "vol~a", 1, 90_000);
+    let refused = queued_op(&db, "vol~b", 1, 90_000);
+    assert_eq!(db.pending_op_counts().unwrap().failing, 0);
+
+    db.record_op_failure(refused, "storage quota exceeded", 90_000)
+        .unwrap();
+    db.set_op_issue(refused, Some("quota")).unwrap();
+    let counts = db.pending_op_counts().unwrap();
+    assert_eq!(counts.failing, 1);
+    assert_eq!(counts.last_error.as_deref(), Some("storage quota exceeded"));
+    assert_eq!(
+        db.op_issues().unwrap(),
+        std::collections::HashMap::from([(refused, "quota".to_string())])
+    );
+
+    // The op stays queued with its bytes; clearing the issue is all it takes.
+    db.set_op_issue(refused, None).unwrap();
+    assert_eq!(db.pending_op_counts().unwrap().failing, 0);
+    assert!(db.op_issues().unwrap().is_empty());
+    assert_eq!(db.pending_ops().unwrap().len(), 2);
+}
+
+/// The browser shows an issue on the node it is about, which it knows by
+/// local id, under either uid.
+#[test]
+fn a_refused_change_names_its_node_by_local_id() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        file("a", "root", "a.bin", 1),
+        file("b", "root", "b.bin", 1),
+    ])
+    .unwrap();
+    let refused = queued_op(&db, &uid("a").to_string(), 1, 90_000);
+    queued_op(&db, &uid("b").to_string(), 1, 90_000);
+    let gone = queued_op(&db, "vol~nowhere", 1, 90_000);
+    db.set_op_issue(refused, Some("quota")).unwrap();
+    db.set_op_issue(gone, Some("missing")).unwrap();
+
+    let lid = db.lid_of(&uid("a").to_string()).unwrap().unwrap();
+    assert_eq!(
+        db.node_issues().unwrap(),
+        std::collections::HashMap::from([(lid, "quota".to_string())])
+    );
+}
+
+/// The name checks the drain makes before each op look the name up in an
+/// index. Scanning the queue instead made a large offline batch quadratic.
+#[test]
+fn queue_name_checks_use_an_index() {
+    let db = Db::open_in_memory().unwrap();
+    let conn = db.conn.lock();
+    let plan = |sql: &str| -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    for sql in [
+        "SELECT 1 FROM pending_op WHERE kind = 'trash' AND name = 'a'",
+        "SELECT 1 FROM pending_op WHERE name = 'a' AND kind IN ('create', 'mkdir', 'rename')",
+        "SELECT 1 FROM pending_op WHERE kind = 'rename'",
+    ] {
+        let plan = plan(sql);
+        assert!(plan.contains("pending_op_kind_name"), "{sql}: {plan}");
+    }
+}
+
+/// A reconnect moves up the ops that failed for want of a link. One Drive
+/// refused, for quota or access, keeps its backoff: the link coming back
+/// changes nothing about it. "Retry all" still moves both.
+#[test]
+fn a_reconnect_leaves_refused_ops_to_their_backoff() {
+    let db = Db::open_in_memory().unwrap();
+    let offline = queued_op(&db, "vol~a", 2, 90_000);
+    let refused = queued_op(&db, "vol~b", 2, 90_000);
+    db.set_op_issue(refused, Some("quota")).unwrap();
+
+    assert_eq!(db.retry_unrefused_ops_now(5_000).unwrap(), 1);
+    let due = |id: i64| {
+        db.pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|op| op.id == id)
+            .unwrap()
+            .next_attempt_at
+    };
+    assert_eq!(due(offline), 5_000);
+    assert_eq!(due(refused), 90_000);
+
+    assert_eq!(db.retry_failed_ops_now(5_000).unwrap(), 1);
+    assert_eq!(due(refused), 5_000);
+}
+
+#[test]
+fn retry_all_touches_only_ops_that_have_failed() {
+    let db = Db::open_in_memory().unwrap();
+    let failed = queued_op(&db, "vol~a", 2, 90_000);
+    let debounced = queued_op(&db, "vol~b", 0, 7_000);
+    let parked = queued_op(&db, "vol~c", 4, ops::PARK_UNTIL);
+
+    assert_eq!(db.retry_failed_ops_now(5_000).unwrap(), 1);
+
+    let ops = db.pending_ops().unwrap();
+    let due = |id: i64| ops.iter().find(|op| op.id == id).unwrap().next_attempt_at;
+    assert_eq!(due(failed), 5_000);
+    assert_eq!(due(debounced), 7_000);
+    assert_eq!(due(parked), ops::PARK_UNTIL);
+}
+
+#[test]
+fn a_queued_op_stops_existing_once_the_node_is_deleted() {
+    let db = Db::open_in_memory().unwrap();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_REVISION.to_string(),
+            uid: uid("journal").to_string(),
+            parent_uid: None,
+            name: None,
+            blob_path: Some("/staging/journal".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    assert!(db.op_exists(id).unwrap());
+
+    let blobs = db.delete_ops_for_uid(&uid("journal").to_string()).unwrap();
+    assert_eq!(blobs, vec!["/staging/journal"]);
+    assert!(!db.op_exists(id).unwrap());
+}
+
+#[test]
+fn attachments_have_their_own_location_and_cannot_evict_local_files() {
+    use pdfs_core::mounts::MountKind;
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_attach("/work", "vol~work", "myfiles-share")
+        .unwrap();
+    let folder = db.sync_folder_get(id).unwrap().unwrap();
+    assert_eq!(folder.kind, "attached");
+    assert_eq!(folder.mode, "mirror");
+    assert_eq!(db.sync_folder_list().unwrap()[0].kind, "attached");
+    let locations = db.mount_list().unwrap();
+    assert!(
+        matches!(locations[0].kind, MountKind::Attached { sync_folder_id } if sync_folder_id == id)
+    );
+    assert_eq!(locations[0].local_path, "/work");
+    assert_eq!(locations[0].root_share_id, "myfiles-share");
+    assert!(db.sync_folder_set_mode(id, "ondemand").is_err());
+    assert!(
+        db.sync_folder_set_pending_mode(id, Some("ondemand"))
+            .is_err()
+    );
+    assert_eq!(db.sync_folder_get(id).unwrap().unwrap().mode, "mirror");
+    db.sync_folder_remove(id).unwrap();
+    assert!(db.mount_list().unwrap().is_empty());
+}
+
+#[test]
+fn migration_v45_keeps_existing_device_folders_and_location_ids() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_add("/backup", "vol~backup", "share")
+        .unwrap();
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    db.sync_folder_set_pending_mode(id, Some("mirror")).unwrap();
+    let location_id = db.mount_list().unwrap()[0].id;
+    db.conn
+        .lock()
+        .execute_batch(
+            "DROP TRIGGER sync_folder_attached_insert;
+         DROP TRIGGER sync_folder_attached_update;
+         DROP TRIGGER IF EXISTS mount_sync_folder_kind_update;
+         DROP TRIGGER mount_sync_folder_insert;
+         ALTER TABLE sync_folder DROP COLUMN kind;
+         CREATE TRIGGER mount_sync_folder_insert AFTER INSERT ON sync_folder BEGIN
+           INSERT INTO mount (kind, sync_folder_id) VALUES ('device', NEW.id); END;
+         UPDATE sync_state SET value = '44' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    db.migrate().unwrap();
+    let folder = db.sync_folder_get(id).unwrap().unwrap();
+    assert_eq!(folder.kind, "device");
+    assert_eq!(folder.mode, "ondemand");
+    assert_eq!(folder.pending_mode.as_deref(), Some("mirror"));
+    assert_eq!(db.mount_list().unwrap()[0].id, location_id);
+    let attached = db
+        .sync_folder_attach("/work", "vol~work", "myfiles")
+        .unwrap();
+    assert_eq!(
+        db.sync_folder_get(attached).unwrap().unwrap().kind,
+        "attached"
+    );
+    db.migrate().unwrap();
+    assert_eq!(db.mount_list().unwrap().len(), 2);
+}
+
+#[test]
+fn photo_feed_failure_keeps_the_cursor_and_a_stale_listing_cannot_restore_deleted_rows() {
+    let db = Db::open_in_memory().unwrap();
+    let rows = vec![TimelineRow::new("gone", 200), TimelineRow::new("keep", 100)];
+    db.photos_replace(&rows).unwrap();
+    db.albums_replace(&[StoredAlbum {
+        uid: "album".into(),
+        name: "Test album".into(),
+        photo_count: 2,
+        cover_uid: Some("gone".into()),
+        last_activity: None,
+        shared: false,
+    }])
+    .unwrap();
+    db.album_photos_replace(
+        "album",
+        &[
+            ("gone".into(), 200, None, None),
+            ("keep".into(), 100, None, None),
+        ],
+    )
+    .unwrap();
+    db.set_state_str("photos-cursor-test", "old").unwrap();
+    let stale = db.photo_projection_generation().unwrap();
+    db.conn.lock().execute_batch(
+        "CREATE TEMP TRIGGER reject_cursor BEFORE INSERT ON sync_state WHEN NEW.key='photos-cursor-test'
+         BEGIN SELECT RAISE(ABORT, 'simulated cursor failure'); END;",
+    ).unwrap();
+
+    let gone = ["gone".into()];
+    assert!(
+        db.photos_apply_events("photos-cursor-test", "next", &gone, &[], false, false)
+            .is_err()
+    );
+    assert_eq!(
+        db.state_str("photos-cursor-test").unwrap().as_deref(),
+        Some("old")
+    );
+    assert_eq!(db.photos_count().unwrap(), 2);
+    assert!(db.photos_contains("gone", Some("album")).unwrap());
+    db.conn
+        .lock()
+        .execute("DROP TRIGGER reject_cursor", [])
+        .unwrap();
+
+    db.photos_apply_events("photos-cursor-test", "next", &gone, &[], false, false)
+        .unwrap();
+    assert_eq!(
+        db.state_str("photos-cursor-test").unwrap().as_deref(),
+        Some("next")
+    );
+    assert!(!db.photos_contains("gone", None).unwrap());
+    assert_eq!(
+        db.albums_list().unwrap()[0].cover_uid.as_deref(),
+        Some("keep")
+    );
+    assert!(!db.photos_replace_at(&rows, stale, true, 1).unwrap());
+    assert!(
+        !db.album_photos_replace_at("album", &[("gone".into(), 200, None, None)], stale, 1)
+            .unwrap()
+    );
+    assert!(!db.photos_contains("gone", None).unwrap());
+
+    db.photos_apply_events("photos-cursor-test", "restore", &[], &gone, false, false)
+        .unwrap();
+    let current = db.photo_projection_generation().unwrap();
+    assert!(db.photos_replace_at(&rows, current, true, 2).unwrap());
+    assert!(db.photos_contains("gone", None).unwrap());
+}
+
+#[test]
+fn warm_photo_months_exclude_hidden_groups_with_thirteen_thousand_rows() {
+    let db = Db::open_in_memory().unwrap();
+    let mut rows: Vec<_> = (0..13_000)
+        .map(|i| TimelineRow::new(format!("volume~{i}"), 1_700_000_000 + i))
+        .collect();
+    rows[1].main_uid = Some(rows[0].uid.clone());
+    db.photos_replace(&rows).unwrap();
+    let started = std::time::Instant::now();
+    let months = db.photos_months_visible(None, r#"["volume~1"]"#).unwrap();
+    assert_eq!(months.iter().map(|month| month.2).sum::<usize>(), 12_998);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+fn revisionless_row(rel: &str, revision: Option<&str>) -> StoredSyncEntry {
+    StoredSyncEntry {
+        rel_path: rel.into(),
+        remote_uid: Some(format!("vol~{rel}")),
+        local_mtime: 5,
+        local_mtime_ns: None,
+        local_size: 6,
+        remote_rev: Some("7".into()),
+        remote_hash: Some("8".into()),
+        remote_revision_id: revision.map(Into::into),
+    }
+}
+
+/// A remote walk stores the revision ids it confirms as it goes, so a pass
+/// cut short keeps them; a row that has an id keeps its own
+/// (`docs/BUGS.md` B294).
+#[test]
+fn revision_ids_fill_only_rows_without_one() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~l", "s").unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("a", None))
+        .unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("b", Some("old")))
+        .unwrap();
+    let changed = db
+        .sync_entries_set_revision(
+            id,
+            &[
+                ("a".into(), "r1".into()),
+                ("b".into(), "r2".into()),
+                ("gone".into(), "r3".into()),
+            ],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    let rows = db.sync_entries(id).unwrap();
+    assert_eq!(rows["a"].remote_revision_id.as_deref(), Some("r1"));
+    assert_eq!(rows["b"].remote_revision_id.as_deref(), Some("old"));
+    assert_eq!(db.sync_entries_set_revision(id, &[]).unwrap(), 0);
+}
+
+#[test]
+fn baseline_rows_are_counted_per_folder() {
+    let db = Db::open_in_memory().unwrap();
+    let big = db.sync_folder_add("/home/me/Big", "v~big", "s").unwrap();
+    let small = db
+        .sync_folder_add("/home/me/Small", "v~small", "s")
+        .unwrap();
+    let empty = db
+        .sync_folder_add("/home/me/Empty", "v~empty", "s")
+        .unwrap();
+    for rel in ["a", "b", "c"] {
+        db.sync_entry_upsert(big, &revisionless_row(rel, None))
+            .unwrap();
+    }
+    db.sync_entry_upsert(small, &revisionless_row("a", None))
+        .unwrap();
+    let counts = db.sync_entry_counts().unwrap();
+    assert_eq!(counts.get(&big), Some(&3));
+    assert_eq!(counts.get(&small), Some(&1));
+    assert_eq!(counts.get(&empty), None);
+}
+
+/// A daemon killed mid-pass leaves its folder in `syncing`; the next start
+/// says `error` instead and keeps the time of the last finished pass.
+#[test]
+fn folders_left_syncing_are_reset_to_error() {
+    let db = Db::open_in_memory().unwrap();
+    let busy = db.sync_folder_add("/home/me/Busy", "v~busy", "s").unwrap();
+    let idle = db.sync_folder_add("/home/me/Idle", "v~idle", "s").unwrap();
+    db.sync_folder_set_state(busy, "syncing", 100).unwrap();
+    db.sync_folder_set_state(idle, "idle", 200).unwrap();
+    assert_eq!(db.sync_folders_reset_syncing().unwrap(), 1);
+    let busy = db.sync_folder_get(busy).unwrap().unwrap();
+    assert_eq!((busy.state.as_str(), busy.last_sync), ("error", 100));
+    let idle = db.sync_folder_get(idle).unwrap().unwrap();
+    assert_eq!((idle.state.as_str(), idle.last_sync), ("idle", 200));
+}
+
+fn walked(rel: &str, is_dir: bool) -> SavedWalkItem {
+    SavedWalkItem {
+        rel_path: rel.into(),
+        uid: Some(format!("vol~{rel}")),
+        is_dir,
+        mtime: 1,
+        size: 2,
+        revision: (!is_dir).then(|| "r".into()),
+        sha1: None,
+    }
+}
+
+/// A walk of Drive saved folder by folder comes back as it was saved: each
+/// folder found is queued to be listed, and only a recorded listing counts
+/// as listed (B294).
+#[test]
+fn a_saved_walk_resumes_where_it_stopped() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    assert_eq!(db.sync_walk_load(id).unwrap(), None);
+    db.sync_walk_begin(id, "v~root", 100).unwrap();
+    assert!(
+        db.sync_walk_record(id, "", false, &[walked("a", true), walked("f", false)], &[])
+            .unwrap()
+    );
+    assert!(
+        db.sync_walk_record(id, "a", true, &[walked("a/g", false)], &[])
+            .unwrap()
+    );
+    // A folder the walk never found is not something it can list.
+    assert!(!db.sync_walk_record(id, "nowhere", false, &[], &[]).unwrap());
+
+    let walk = db.sync_walk_load(id).unwrap().unwrap();
+    assert_eq!((walk.root_uid.as_str(), walk.started), ("v~root", 100));
+    assert!(!walk.complete);
+    let mut dirs: Vec<(String, bool, bool)> = walk
+        .dirs
+        .iter()
+        .map(|d| (d.rel_path.clone(), d.listed, d.short))
+        .collect();
+    dirs.sort();
+    assert_eq!(dirs, [("".into(), true, false), ("a".into(), true, true)]);
+    let mut items: Vec<&str> = walk.items.iter().map(|i| i.rel_path.as_str()).collect();
+    items.sort();
+    assert_eq!(items, ["a", "a/g", "f"]);
+
+    // Beginning again starts from the root, with nothing listed.
+    db.sync_walk_begin(id, "v~root", 200).unwrap();
+    let walk = db.sync_walk_load(id).unwrap().unwrap();
+    assert_eq!(walk.started, 200);
+    assert_eq!(walk.dirs.len(), 1);
+    assert!(!walk.dirs[0].listed);
+    assert!(walk.items.is_empty());
+    db.sync_walk_clear(id).unwrap();
+    assert_eq!(db.sync_walk_load(id).unwrap(), None);
+}
+
+/// A saved listing never outlives a change to the baseline it was read
+/// against: a file moved to another synced folder would read as deleted on
+/// Drive, and its local copy would go. Filling in a revision id is the one
+/// change that keeps it, since the walk itself makes it (B294).
+#[test]
+fn a_baseline_change_drops_the_saved_walk() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    let other = db
+        .sync_folder_add("/home/me/Other", "v~other", "s")
+        .unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("a", None))
+        .unwrap();
+    let saved = |db: &Db| db.sync_walk_load(id).unwrap().is_some();
+    let begin = |db: &Db| {
+        db.sync_walk_begin(id, "v~root", 1).unwrap();
+        db.sync_walk_record(id, "", false, &[walked("a", false)], &[])
+            .unwrap();
+    };
+
+    begin(&db);
+    db.sync_entries_set_revision(id, &[("a".into(), "r1".into())])
+        .unwrap();
+    assert!(saved(&db), "a revision id is filled in by the walk itself");
+    // Another folder's baseline is not this walk's business.
+    db.sync_entry_upsert(other, &revisionless_row("x", None))
+        .unwrap();
+    assert!(saved(&db));
+
+    db.sync_entry_upsert(id, &revisionless_row("b", None))
+        .unwrap();
+    assert!(!saved(&db), "insert");
+    begin(&db);
+    db.sync_entry_upsert(id, &revisionless_row("a", Some("r2")))
+        .unwrap();
+    assert!(!saved(&db), "update");
+    begin(&db);
+    db.sync_entries_move(id, "a", other, "a").unwrap();
+    assert!(!saved(&db), "moved to another folder");
+    begin(&db);
+    db.sync_entry_upsert(id, &revisionless_row("c", None))
+        .unwrap();
+    begin(&db);
+    db.sync_entry_remove(id, "c").unwrap();
+    assert!(!saved(&db), "delete");
+    begin(&db);
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    assert!(!saved(&db), "mode switch");
+    begin(&db);
+    db.sync_folder_remove(id).unwrap();
+    assert!(db.sync_walk_load(id).unwrap().is_none(), "folder removed");
+    assert!(db.sync_walk_load(other).unwrap().is_none());
+}
+
+fn dirty(db: &Db, id: i64) -> Vec<String> {
+    let mut dirs: Vec<String> = db
+        .sync_remote_dirty(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, dir)| dir)
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// A complete walk of Drive is the next pass's picture of Drive. A change to
+/// the baseline no longer drops it: it marks the folder the change is in, so
+/// the next pass lists that folder again, and only that one.
+#[test]
+fn a_complete_walk_stays_and_marks_where_the_baseline_changed() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    let other = db
+        .sync_folder_add("/home/me/Other", "v~other", "s")
+        .unwrap();
+    db.sync_remote_mark(id, &["before".into()]).unwrap();
+    db.sync_walk_begin(id, "v~root", 1).unwrap();
+    db.sync_remote_mark(id, &["during".into()]).unwrap();
+    db.sync_walk_record(id, "", false, &[walked("a", true)], &[])
+        .unwrap();
+    assert!(db.sync_walk_complete(id).unwrap());
+    assert!(db.sync_walk_load(id).unwrap().unwrap().complete);
+    assert_eq!(
+        dirty(&db, id),
+        ["during"],
+        "the walk read what was marked before it began"
+    );
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+
+    db.sync_entry_upsert(id, &revisionless_row("a/b/f", None))
+        .unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("top", None))
+        .unwrap();
+    assert!(db.sync_walk_load(id).unwrap().is_some());
+    assert_eq!(dirty(&db, id), ["", "a/b"]);
+    // Marked again, a folder takes a new seq, even through an upsert, whose
+    // conflict clause overrides the trigger's.
+    let before = db.sync_remote_dirty(id).unwrap();
+    db.sync_entry_upsert(id, &revisionless_row("a/b/f", Some("r9")))
+        .unwrap();
+    let after = db.sync_remote_dirty(id).unwrap();
+    let seq_of = |rows: &[(i64, String)]| rows.iter().find(|(_, d)| d == "a/b").unwrap().0;
+    assert!(seq_of(&after) > seq_of(&before));
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+
+    db.sync_entries_set_revision(id, &[("top".into(), "r1".into())])
+        .unwrap();
+    assert!(dirty(&db, id).is_empty(), "a revision id changes nothing");
+    db.sync_entries_move(id, "a/b/f", other, "x/f").unwrap();
+    assert_eq!(dirty(&db, id), ["a/b"]);
+    assert!(
+        dirty(&db, other).is_empty(),
+        "the other folder has no walk to mark"
+    );
+    db.sync_entry_remove(id, "top").unwrap();
+    assert_eq!(dirty(&db, id), ["", "a/b"]);
+
+    // A mark made after the pass read the marks survives their consumption.
+    let read: i64 = db
+        .sync_remote_dirty(id)
+        .unwrap()
+        .iter()
+        .map(|(seq, _)| *seq)
+        .max()
+        .unwrap();
+    db.sync_remote_mark(id, &["a/b".into()]).unwrap();
+    db.sync_remote_dirty_consume(id, read).unwrap();
+    assert_eq!(dirty(&db, id), ["a/b"]);
+
+    db.sync_folder_remove(id).unwrap();
+    assert!(dirty(&db, id).is_empty());
+    assert!(db.sync_walk_load(id).unwrap().is_none());
+}
+
+/// A listing done again replaces what the folder held: the paths it no
+/// longer holds go, with everything saved under them.
+#[test]
+fn a_listing_done_again_drops_what_the_folder_no_longer_holds() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    db.sync_walk_begin(id, "v~root", 1).unwrap();
+    db.sync_walk_record(id, "", false, &[walked("a", true), walked("f", false)], &[])
+        .unwrap();
+    db.sync_walk_record(id, "a", false, &[walked("a/g", false)], &[])
+        .unwrap();
+    db.sync_walk_record(
+        id,
+        "",
+        false,
+        &[walked("f", false)],
+        &["a".into(), "a/g".into()],
+    )
+    .unwrap();
+    let walk = db.sync_walk_load(id).unwrap().unwrap();
+    let items: Vec<&str> = walk.items.iter().map(|i| i.rel_path.as_str()).collect();
+    assert_eq!(items, ["f"]);
+    let dirs: Vec<&str> = walk.dirs.iter().map(|d| d.rel_path.as_str()).collect();
+    assert_eq!(dirs, [""]);
+}
+
+/// Drive's report of a change marks the folder the node is in now and the
+/// one a saved walk last saw it in, since a move names only its new parent.
+#[test]
+fn a_change_on_drive_marks_the_folders_it_touches() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    db.sync_walk_begin(id, "v~root", 1).unwrap();
+    db.sync_walk_record(
+        id,
+        "",
+        false,
+        &[walked("a", true), walked("b", true), walked("f", false)],
+        &[],
+    )
+    .unwrap();
+    db.sync_walk_record(id, "a", false, &[walked("a/g", false)], &[])
+        .unwrap();
+    assert!(db.sync_walk_complete(id).unwrap());
+
+    // `a/g` moved to `b`.
+    assert_eq!(
+        db.sync_remote_changed("vol~a/g", Some("vol~b")).unwrap(),
+        [id]
+    );
+    assert_eq!(dirty(&db, id), ["a", "b"]);
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+    // Something new at the root.
+    assert_eq!(
+        db.sync_remote_changed("vol~new", Some("v~root")).unwrap(),
+        [id]
+    );
+    assert_eq!(dirty(&db, id), [""]);
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+    // A deletion names only the node.
+    db.sync_remote_changed("vol~f", None).unwrap();
+    assert_eq!(dirty(&db, id), [""]);
+    db.sync_remote_dirty_consume(id, i64::MAX).unwrap();
+    // Nothing this walk knows of.
+    assert!(
+        db.sync_remote_changed("vol~elsewhere", Some("vol~far"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(dirty(&db, id).is_empty());
+
+    db.sync_walks_clear_all().unwrap();
+    assert!(db.sync_walk_load(id).unwrap().is_none());
+}
+
+/// A read that cannot get a read-only connection fails. It does not wait on
+/// the write connection, which a long transaction can hold for seconds and a
+/// wedged one forever (`docs/BUGS.md` B296).
+#[test]
+fn a_read_without_a_reader_connection_fails_instead_of_waiting_on_the_writer() {
+    let dir = std::env::temp_dir().join(format!("pdfs-db-noreader-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cache.db");
+    let db = std::sync::Arc::new(Db::open(&path).unwrap());
+    // The writer keeps its open file; a new read-only connection finds nothing.
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let writer = db.conn.lock();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::sync::Arc::clone(&db);
+    std::thread::spawn(move || {
+        let _ = tx.send(reader.pending_op_counts().is_err());
+    });
+    let failed = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(writer);
+    assert_eq!(
+        failed,
+        Ok(true),
+        "the read must fail, not queue behind the writer"
+    );
+}

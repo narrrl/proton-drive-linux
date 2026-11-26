@@ -4,7 +4,7 @@ All notable changes to the Linux client since the 1.0.0 release. Format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/); versions follow semver, and every
 release is tagged `vX.Y.Z` with `Cargo.toml` and `packaging/PKGBUILD` in agreement.
 
-`Schema:` lines record the SQLite `SCHEMA_VERSION` (`pdfs-core/src/db/migrations.rs`) a
+`Schema:` lines record the SQLite `SCHEMA_VERSION` (`pdfs-store/src/db/migrations.rs`) a
 release ships. Migrations are forward-only — a database written by a newer client is a hard
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
@@ -15,6 +15,9 @@ Schema: **49**. New tables save a mirror folder's walk of Proton Drive (48). A f
 kept, with a list of the folders that changed on Proton Drive since (49).
 
 ### Added
+- **`pdfs diagnostics` counts every call the daemon makes to Proton Drive.** Per kind of call it
+  shows how many were made since start, how many failed, and their total and longest time. The
+  JSON report has them as `drive_calls`.
 - **`pdfs diagnostics` and the journal say where a sync pass spends its time.** Each pass over a
   synced folder records how long it took to walk this computer's copy, list Proton Drive, plan
   and apply. It also records how many calls to Proton Drive it made of each kind, how long they

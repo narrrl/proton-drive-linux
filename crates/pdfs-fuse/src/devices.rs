@@ -17,10 +17,10 @@ use pdfs_core::control::{
     ActivityKind, DeviceInfo, JobItem, MountKind, MountSpec, SyncFolderInfo, SyncPhase,
     SyncProgress,
 };
-use pdfs_core::db::{StoredDevice, StoredSyncFolder};
 use pdfs_core::mounts::MountMode;
 use pdfs_core::profile::PROFILE_DIR_NAME;
 use pdfs_core::{CoreError, CoreResult};
+use pdfs_store::db::{StoredDevice, StoredSyncFolder};
 use proton_drive_rs::proton_sdk::ids::{DeviceUid, NodeUid};
 use proton_drive_rs::{DeviceType, Node};
 use std::sync::OnceLock;
@@ -1346,7 +1346,7 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
-    use pdfs_core::db::StoredSyncFolder;
+    use pdfs_store::db::StoredSyncFolder;
 
     use super::{
         ApplicableMountMode, commit_after_teardown, migrated_name, pending_intent_matches,
