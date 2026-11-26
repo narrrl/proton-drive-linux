@@ -30,6 +30,16 @@ const MOUNT_DEADLINE: Duration = Duration::from_secs(20);
 /// How long a restart may wait for the last run to let go of its database.
 const LAST_RUN_DEADLINE: Duration = Duration::from_secs(30);
 
+/// How long a stop may wait for the mount to end before it aborts the FUSE
+/// connection. A mount that stops answering otherwise hangs the test, and the
+/// whole run with it (`docs/BUGS.md` B297).
+const STOP_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one daemon may live. Past this, its FUSE connection is aborted, so
+/// a test blocked on a request the mount never answers fails with `ENOTCONN`
+/// instead of hanging the run. The whole suite takes about 15 minutes in CI.
+const LIFETIME_LIMIT: Duration = Duration::from_secs(20 * 60);
+
 pub(crate) struct Daemon {
     pub(crate) client: FakeClient,
     pub(crate) mountpoint: PathBuf,
@@ -38,6 +48,13 @@ pub(crate) struct Daemon {
     stop: SyncSender<()>,
     mount: Option<JoinHandle<io::Result<MountOutcome>>>,
     rt: Option<tokio::runtime::Runtime>,
+    /// The mount's FUSE connection, as `/sys/fs/fuse/connections` names it.
+    connection: u64,
+    /// Dropped with the daemon, which ends the thread enforcing
+    /// [`LIFETIME_LIMIT`].
+    _alive: std::sync::mpsc::Sender<()>,
+    /// Dropped after `shut_down`, so the next simulation waits for this one.
+    _turn: Turn,
 }
 
 impl Daemon {
@@ -45,6 +62,7 @@ impl Daemon {
     /// A later start on the same `dir` is a restart: it finds the queue, the
     /// cache and the database the last run left.
     pub(crate) fn start(dir: &Path, client: FakeClient) -> io::Result<Self> {
+        let turn = Turn::take();
         log_to_test_output();
         isolate_from_the_developer();
         let mountpoint = dir.join("mnt");
@@ -112,6 +130,27 @@ impl Daemon {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let connection = {
+            use std::os::unix::fs::MetadataExt;
+            u64::from(libc::minor(std::fs::metadata(&mountpoint)?.dev()))
+        };
+        let (alive, dropped) = std::sync::mpsc::channel::<()>();
+        {
+            let mountpoint = mountpoint.clone();
+            std::thread::Builder::new()
+                .name("sim-lifetime".into())
+                .spawn(move || {
+                    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        dropped.recv_timeout(LIFETIME_LIMIT)
+                    {
+                        eprintln!(
+                            "{}: the daemon outlived {LIFETIME_LIMIT:?}; aborting its FUSE connection",
+                            mountpoint.display()
+                        );
+                        abort_connection(connection);
+                    }
+                })?;
+        }
         Ok(Self {
             client,
             mountpoint,
@@ -120,6 +159,9 @@ impl Daemon {
             stop,
             mount: Some(mount),
             rt: Some(rt),
+            connection,
+            _alive: alive,
+            _turn: turn,
         })
     }
 
@@ -215,6 +257,21 @@ impl Daemon {
             return Ok(MountOutcome::Shutdown);
         };
         let _ = self.stop.try_send(());
+        if !wait_until(STOP_DEADLINE, || mount.is_finished()) {
+            abort_connection(self.connection);
+            let _ = wait_until(STOP_DEADLINE, || mount.is_finished());
+            if !mount.is_finished() {
+                // Joining would hang the run; leak the thread instead.
+                return Err(io::Error::other(format!(
+                    "{}: the mount did not end after its FUSE connection was aborted",
+                    self.mountpoint.display()
+                )));
+            }
+            return Err(io::Error::other(format!(
+                "{}: the mount did not stop within {STOP_DEADLINE:?}, so its FUSE connection was aborted",
+                self.mountpoint.display()
+            )));
+        }
         let outcome = mount
             .join()
             .unwrap_or_else(|_| Err(io::Error::other("mount thread panicked")));
@@ -228,6 +285,61 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.shut_down();
+    }
+}
+
+/// Abort FUSE connection `connection`: every request waiting on it fails with
+/// `ENOTCONN`, and the mount's session ends. The connection belongs to the
+/// user who mounted it, so this needs no privileges.
+fn abort_connection(connection: u64) {
+    let path = format!("/sys/fs/fuse/connections/{connection}/abort");
+    if let Err(error) = std::fs::write(&path, "1") {
+        eprintln!("could not abort {path}: {error}");
+    }
+}
+
+/// One simulation's turn to run daemons. The simulations share the process:
+/// its environment (see [`isolate_from_the_developer`]), its cores and its
+/// mounts. Run side by side, as plain `cargo test` does, they miss their
+/// deadlines and can hang (`docs/BUGS.md` B297). So a daemon started on one
+/// test thread waits while another test thread still has one.
+struct Turn;
+
+/// The test thread whose daemons run now, and how many it has.
+static TURN: parking_lot::Mutex<Option<(std::thread::ThreadId, usize)>> =
+    parking_lot::Mutex::new(None);
+static TURN_FREE: parking_lot::Condvar = parking_lot::Condvar::new();
+
+impl Turn {
+    fn take() -> Self {
+        let me = std::thread::current().id();
+        let mut turn = TURN.lock();
+        loop {
+            match turn.as_mut() {
+                None => {
+                    *turn = Some((me, 1));
+                    return Turn;
+                }
+                Some((owner, count)) if *owner == me => {
+                    *count += 1;
+                    return Turn;
+                }
+                Some(_) => TURN_FREE.wait(&mut turn),
+            }
+        }
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let mut turn = TURN.lock();
+        if let Some((_, count)) = turn.as_mut() {
+            *count -= 1;
+            if *count == 0 {
+                *turn = None;
+                TURN_FREE.notify_all();
+            }
+        }
     }
 }
 
@@ -368,6 +480,35 @@ mod tests {
     use crate::sim::fake_drive::{Entry, FakeDrive, Faults};
     use pdfs_core::control::{RefreshScope, SyncIssue};
     use std::collections::BTreeMap;
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_simulation_on_another_thread_waits_for_this_ones_daemons() {
+        // Side by side, the simulations missed their deadlines and could hang
+        // on a mount (B297).
+        let drive = FakeDrive::new();
+        let first = Daemon::start(&scratch("turn-first"), drive.client(1, Faults::lan())).unwrap();
+        let second_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let other = {
+            let drive = drive.clone();
+            let second_up = second_up.clone();
+            std::thread::spawn(move || {
+                let second =
+                    Daemon::start(&scratch("turn-second"), drive.client(2, Faults::lan())).unwrap();
+                second_up.store(true, std::sync::atomic::Ordering::SeqCst);
+                second.stop().unwrap();
+            })
+        };
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(!second_up.load(std::sync::atomic::Ordering::SeqCst));
+
+        // A second daemon on this thread does not wait for the first.
+        let restarted = first.restart().unwrap();
+        assert!(!second_up.load(std::sync::atomic::Ordering::SeqCst));
+        restarted.stop().unwrap();
+        other.join().unwrap();
+        assert!(second_up.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
