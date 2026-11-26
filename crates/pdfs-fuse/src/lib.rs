@@ -59,8 +59,8 @@ use pdfs_core::batch;
 use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
-    SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncIssue, SyncProgress,
-    ThumbnailBuildStatus, Topic, TransferDirection,
+    SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncIssue, SyncProgress, Topic,
+    TransferDirection,
 };
 use pdfs_core::localindex;
 use pdfs_core::search::relevance_score;
@@ -634,20 +634,9 @@ struct Core {
     /// written through the mount reads without the network (`docs/BUGS.md`
     /// B119).
     landing_uploads: Arc<AtomicU64>,
-    /// True while a background refresh of the photos timeline (resp. the trash) is
-    /// already running, so a burst of page requests against a stale listing kicks
-    /// off one refresh rather than one per request.
-    timeline_refreshing: Arc<AtomicBool>,
-    /// How far the running timeline refresh has got resolving photo metadata,
-    /// as `(done, total)` photos; `None` when no refresh is resolving any. The
-    /// Places view shows it while a library's locations are first read.
-    timeline_progress: Arc<Mutex<Option<(usize, usize)>>>,
-    /// The same, for the album listing.
-    albums_refreshing: Arc<AtomicBool>,
+    /// True while a background refresh of the trash is already running, so a
+    /// burst of requests against a stale listing starts one refresh.
     trash_refreshing: Arc<AtomicBool>,
-    /// True while the similar-photo pass hashes thumbnails (see
-    /// [`Core::photo_similar`]), so asking again doesn't start a second one.
-    similar_hashing: Arc<AtomicBool>,
     /// Fires whenever a trash refresh persists a batch or finishes, so a
     /// `ListTrash` request waiting on a first-ever refresh wakes on progress
     /// instead of polling or blocking for the whole run. See
@@ -667,35 +656,9 @@ struct Core {
     /// queued, and the drain sends it; the syscall never waits for Drive. Off,
     /// they go to Drive inline while online, as before 3.0.
     local_first: bool,
-    /// Photos whose missing thumbnail is being generated right now. A tile that is
-    /// still on screen asks for its thumbnail again every few seconds, and each of
-    /// those downloads is a full-size photo — so an in-flight uid is never started
-    /// twice.
-    thumb_gen: Arc<Mutex<HashSet<NodeUid>>>,
-    /// Global permit pool for locally generated thumbnails. The old per-request
-    /// limit multiplied when the GUI sent several batches, allowing dozens of
-    /// full-size images to download at once.
-    thumb_gen_budget: Arc<tokio::sync::Semaphore>,
-    /// Current ordinary-file listing generation and a wake-up for tasks waiting
-    /// on a permit or a download when that listing is abandoned.
-    file_thumb_generation: Arc<AtomicU64>,
-    file_thumb_cancel: Arc<tokio::sync::Notify>,
-    /// Progress of the explicit recursive build started from the Files toolbar.
-    thumbnail_build: Arc<Mutex<ThumbnailBuildStatus>>,
-    /// Cancellation for the explicit recursive build. Separate from ordinary
-    /// listing cancellation because the two jobs have independent lifetimes.
-    thumbnail_build_cancelled: Arc<AtomicBool>,
-    thumbnail_build_cancel: Arc<tokio::sync::Notify>,
-    /// Negative thumbnail knowledge, separated by whether the remote lacked a
-    /// thumbnail or local decoding proved this revision unsupported.
-    ///
-    /// Absence has to be cached or it costs a round trip every time it is asked
-    /// for, and it is asked for constantly: an `ls -l` from an xattr-aware lister
-    /// issues a `getxattr` per advertised name per entry, so a 65-file directory
-    /// of videos re-probed 130 times per listing at ~186 ms each (B5). The mtime
-    /// is the validity tag — a new revision may well have a thumbnail — matching
-    /// how [`ContentCache::read_thumbnail`] validates the positive side.
-    thumbnail_misses: Arc<Mutex<ThumbnailMissCaches>>,
+    /// What the Photos and thumbnail jobs are doing right now. See
+    /// [`photos::PhotoJobs`].
+    photo_jobs: photos::PhotoJobs,
     /// Last account quota answer and when it was learned, for `statfs(2)`.
     ///
     /// `df` and the free-space preflight of every file manager and installer ask
@@ -4467,7 +4430,12 @@ impl Core {
         // "This file has no thumbnail" is an answer worth remembering: without
         // it every listing pays a round trip per file to be told nothing (B5).
         let key = (uid.clone(), ttype.as_i32());
-        if self.thumbnail_misses.lock().remote_contains(&key, mtime) {
+        if self
+            .photo_jobs
+            .thumbnail_misses
+            .lock()
+            .remote_contains(&key, mtime)
+        {
             return Ok(None);
         }
         // A file manager asks for one per file in a folder, on the metadata
@@ -4490,7 +4458,10 @@ impl Core {
                     .store_thumbnail(&uid, ttype.as_i32(), mtime, bytes);
             }
             None => {
-                self.thumbnail_misses.lock().remember_remote(key, mtime);
+                self.photo_jobs
+                    .thumbnail_misses
+                    .lock()
+                    .remember_remote(key, mtime);
             }
         }
         Ok(bytes)
