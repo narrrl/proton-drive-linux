@@ -466,6 +466,12 @@ pub(crate) fn mount_with(
     // Start the uptime clock here rather than at the first `pdfs diagnostics`,
     // so the age it reports is the daemon's own.
     super::diagnostics::start_clock();
+    // Count every call to Drive from the first, the root lookup included.
+    let drive_calls = Arc::new(pdfs_drive::counted::CallStats::default());
+    let drive: Arc<dyn DriveApi> = Arc::new(pdfs_drive::counted::Counted::new(
+        drive,
+        drive_calls.clone(),
+    ));
     check_mountpoint(mountpoint)?;
     let (root, start) = fetch_or_recall_root(drive.as_ref(), &rt, &db)?;
     let online = start == Start::Online;
@@ -487,6 +493,7 @@ pub(crate) fn mount_with(
         gallery_session.map(|session| Arc::new(super::gallery::Gallery::new(gallery_dir, session)));
     let core = Core {
         drive,
+        drive_calls,
         client,
         gallery,
         rt: rt.clone(),

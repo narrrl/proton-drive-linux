@@ -3646,6 +3646,15 @@ fn cmd_diagnostics() -> Result<()> {
                     );
                 }
             }
+            if !d.drive_calls.is_empty() {
+                println!("calls to Drive since start:");
+                for call in &d.drive_calls {
+                    println!(
+                        "  {:<38} {:>7} calls {:>5} failed  {:>9} ms total {:>7} ms longest",
+                        call.call, call.count, call.errors, call.total_ms, call.longest_ms,
+                    );
+                }
+            }
             if d.inflight.is_empty() {
                 println!("in-flight requests: none");
             } else {

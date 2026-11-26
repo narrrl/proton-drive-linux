@@ -33,6 +33,8 @@ use proton_drive_rs::{
     NodeMoveItem, ProtonDriveClient, RevisionReader, Thumbnail, ThumbnailType, TrashedNode,
 };
 
+pub mod counted;
+
 /// One outcome per node of a batch request; see [`ProtonDriveClient::trash_nodes`].
 pub type NodeOutcomes = Vec<(NodeUid, Result<()>)>;
 

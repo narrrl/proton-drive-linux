@@ -371,6 +371,34 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn diagnostics_count_the_calls_made_to_drive() {
+        let drive = FakeDrive::new();
+        let daemon =
+            Daemon::start(&scratch("drive-calls"), drive.client(1, Faults::lan())).unwrap();
+        std::fs::write(daemon.mountpoint.join("a.txt"), b"a").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || drive
+            .tree()
+            .contains_key("a.txt")));
+
+        let Ok(Response::Diagnostics { diagnostics }) = daemon.request(&Request::Diagnostics)
+        else {
+            panic!("no diagnostics");
+        };
+        let calls: BTreeMap<_, _> = diagnostics
+            .drive_calls
+            .iter()
+            .map(|stat| (stat.call.as_str(), stat))
+            .collect();
+        assert!(calls.contains_key("get_my_files_folder"), "{calls:?}");
+        let uploads = calls
+            .get("upload_file_from")
+            .or_else(|| calls.get("upload_file_replacing_draft_from"))
+            .unwrap_or_else(|| panic!("no upload counted: {calls:?}"));
+        assert!(uploads.count >= 1);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_daemon_on_the_fake_drive_syncs_both_ways() {
         let drive = FakeDrive::new();
         let dir = scratch("smoke");
