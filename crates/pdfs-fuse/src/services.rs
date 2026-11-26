@@ -247,7 +247,10 @@ impl Service for Supervisor {
 ///
 /// Optional: without it a shutdown is not delayed, and queued changes go out
 /// on the next start.
-pub(crate) struct Inhibitor(pub(crate) Core);
+pub(crate) struct Inhibitor {
+    pub(crate) db: Arc<Db>,
+    pub(crate) shutdown: Arc<Shutdown>,
+}
 
 impl Service for Inhibitor {
     fn name(&self) -> String {
@@ -259,6 +262,6 @@ impl Service for Inhibitor {
     }
 
     fn run(self: Box<Self>) {
-        super::inhibit::run(self.0);
+        super::inhibit::run(&self.db, &self.shutdown);
     }
 }

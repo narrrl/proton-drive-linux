@@ -768,7 +768,13 @@ pub(crate) fn mount_with(
     // Hold off a shutdown while changes exist only here (B66). Only the real
     // daemon: a simulation's queue is not the user's data.
     if matches!(host, Host::Daemon) {
-        start_late(&mut workers, Box::new(services::Inhibitor(core.clone())));
+        start_late(
+            &mut workers,
+            Box::new(services::Inhibitor {
+                db: core.db.clone(),
+                shutdown: core.shutdown.clone(),
+            }),
+        );
     }
 
     // Stop signals (SIGTERM from `systemctl --user stop`, SIGINT from Ctrl-C)
