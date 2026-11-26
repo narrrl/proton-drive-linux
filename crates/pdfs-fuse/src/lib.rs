@@ -3859,6 +3859,15 @@ mod tests {
         );
     }
 
+    /// The drain's source: `drain.rs` and the modules it was split into.
+    const DRAIN_SOURCE: &str = concat!(
+        include_str!("drain/create.rs"),
+        include_str!("drain/rename.rs"),
+        include_str!("drain/revision.rs"),
+        include_str!("drain/trash.rs"),
+        include_str!("drain.rs"),
+    );
+
     /// `Core`'s source: `lib.rs` and the modules its methods were split into.
     const CORE_SOURCE: &str = concat!(
         include_str!("activity.rs"),
@@ -4147,7 +4156,7 @@ mod tests {
         for source in [
             CORE_SOURCE,
             include_str!("filesystem.rs"),
-            include_str!("drain.rs"),
+            DRAIN_SOURCE,
             include_str!("relocate.rs"),
         ] {
             assert_eq!(
@@ -4337,7 +4346,7 @@ mod tests {
 
         // A drain worker that claimed the op before it was withdrawn checks
         // again before any byte leaves.
-        let drain = function_source(include_str!("drain.rs"), "pub(crate) fn drain_revision(");
+        let drain = function_source(DRAIN_SOURCE, "pub(crate) fn drain_revision(");
         let upload = &drain[drain.find("begin_cancellable_upload").unwrap()..];
         assert_before(upload, "self.db.op_exists(op.id)", "File::open(&blob)");
     }
@@ -4358,16 +4367,15 @@ mod tests {
     fn a_paused_drain_claims_nothing() {
         // A claimed create counts as sent, so trashing its folder kept it as
         // a trash, although the paused worker only handed it back (B178).
-        let worker: String =
-            function_source(include_str!("drain.rs"), "pub(crate) fn run_pending_drain(")
-                .split_whitespace()
-                .collect();
+        let worker: String = function_source(DRAIN_SOURCE, "pub(crate) fn run_pending_drain(")
+            .split_whitespace()
+            .collect();
         assert!(worker.contains("(online&&!paused).then(||self.db.claim_next_due_op(now))"));
     }
 
     #[test]
     fn a_landed_upload_stays_pending_until_its_bytes_are_cached() {
-        let drain = function_source(include_str!("drain.rs"), "pub(crate) fn drain_revision(");
+        let drain = function_source(DRAIN_SOURCE, "pub(crate) fn drain_revision(");
         assert_before(
             drain,
             "let _landing = LandingUpload::begin(&self.drain.landing_uploads)",
