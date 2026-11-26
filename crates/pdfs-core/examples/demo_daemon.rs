@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Datelike, Local, TimeZone};
-use pdfs_core::config::{AppDirs, KEYRING_SERVICE};
+use pdfs_core::config::AppDirs;
 use pdfs_core::control::Pin;
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, DeviceInfo, DirEntry, Event, LocalHit, PhotoItem,
@@ -108,7 +108,7 @@ fn seed_keyring() -> Result<(), String> {
     let store: Arc<keyring_core::CredentialStore> =
         dbus_secret_service_keyring_store::Store::new().map_err(|e| e.to_string())?;
     keyring_core::set_default_store(store);
-    keyring_core::Entry::new(KEYRING_SERVICE, "session")
+    keyring_core::Entry::new(pdfs_core::config::keyring_service(), "session")
         .and_then(|entry| entry.set_password(&session.to_string()))
         .map_err(|e| e.to_string())
 }

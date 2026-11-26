@@ -267,6 +267,50 @@ typo it is. A release run leaves it unset.
 | `PDFS_ACCEPTANCE_MIN_MIBPS`, `PDFS_ACCEPTANCE_MIN_OPS` | Throughput floors |
 | `PDFS_ACCEPTANCE_UNIT` | The systemd unit `--durability` restarts |
 
+## A second account next to your own
+
+`PDFS_INSTANCE=<name>` runs the client as a separate instance. The name is 1 to 32 lowercase
+letters, digits or `-`. Everything that keeps an account apart gets the name as a suffix:
+
+- the config, state and cache directories (`~/.config/proton-drive-linux-<name>` and so on),
+  and with them the database, the control socket and the machine id
+- the Secret Service entry and the kernel keys
+- the default mountpoint, `~/ProtonDrive-<name>`
+
+The systemd unit runs only the default instance. With an instance set, `pdfs login` does not
+restart it; start that instance's daemon by hand:
+
+```bash
+PDFS_INSTANCE=test pdfs login
+PDFS_INSTANCE=test pdfs daemon
+```
+
+### The one-edit benchmark
+
+`scripts/live-bench.py` times a single edit in a synced folder against a real account, on its own
+instance (`bench` by default). For each tree size it attaches a new folder in My files, waits for
+the first sync, edits one file and reports:
+
+- debounce: the write until the sync pass starts
+- the pass, by stage and by call to Drive, from `pdfs diagnostics`
+- verify: the end of the pass until `pdfs versions list` shows the new revision
+
+Then it detaches the folder and moves it to the trash.
+
+```bash
+scripts/live-bench.py --account-env path/to/.env --pdfs target/debug/pdfs --sizes 20,500
+```
+
+The env file holds `username=`, `password=` and, for two-factor sign-in, `PROTON_TOTP_SECRET=`.
+The script types them into `pdfs login` and never prints them. The session stays in the
+instance's keyring entry so the next run does not sign in again; `--logout` forgets it. When
+Proton asks for a CAPTCHA, sign in once by hand with `PDFS_INSTANCE=bench pdfs login`.
+
+The script refuses a `pdfs` built without `PDFS_INSTANCE`, which would act on your own account.
+A new folder's first sync uploads about one small file every four seconds, so with a 500-file
+tree the edit is timed about 35 minutes in. A run that is cut short leaves its folder behind; the
+next run removes it.
+
 ## Before a release
 
 1. The quality gates and the simulation runs pass in CI.

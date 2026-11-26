@@ -129,7 +129,7 @@ fn cache_file(key: &str) -> Option<PathBuf> {
     let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
     Some(
         runtime
-            .join("proton-drive-linux")
+            .join(pdfs_core::config::app_dir_name())
             .join(format!("completion-{key}.json")),
     )
 }

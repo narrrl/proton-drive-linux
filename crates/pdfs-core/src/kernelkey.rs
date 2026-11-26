@@ -18,36 +18,38 @@
 //! `CONFIG_KEYS`); every operation then reports it as an error and the caller
 //! falls back to asking again, never to storing the secret somewhere weaker.
 
+use std::ffi::CString;
 use std::io;
 
 use zeroize::Zeroizing;
 
 /// One secret in the user keyring, by its description. Descriptions are
-/// namespaced so they cannot collide with another program's keys.
+/// namespaced so they cannot collide with another program's keys, and carry
+/// the [`crate::config::instance`] so a second instance keeps its own.
 pub struct Key {
-    description: &'static [u8],
+    name: &'static str,
 }
 
 /// The account's key passphrases (see the module docs).
 #[cfg(not(test))]
 pub const PASSPHRASES: Key = Key {
-    description: b"pdfs:key-passphrases\0",
+    name: "pdfs:key-passphrases",
 };
 /// Tests must never touch a real unlock.
 #[cfg(test)]
 pub const PASSPHRASES: Key = Key {
-    description: b"pdfs:key-passphrases:test\0",
+    name: "pdfs:key-passphrases:test",
 };
 
 /// Session tokens the Secret Service refused to store, until it takes them.
 /// A refresh token held only in a process's memory dies with the process.
 #[cfg(not(test))]
 pub const UNSAVED_TOKENS: Key = Key {
-    description: b"pdfs:unsaved-tokens\0",
+    name: "pdfs:unsaved-tokens",
 };
 #[cfg(test)]
 pub const UNSAVED_TOKENS: Key = Key {
-    description: b"pdfs:unsaved-tokens:test\0",
+    name: "pdfs:unsaved-tokens:test",
 };
 
 const KEY_TYPE: &[u8] = b"user\0";
@@ -73,7 +75,7 @@ fn last_error<T>() -> io::Result<T> {
     Err(io::Error::last_os_error())
 }
 
-fn find(description: &[u8]) -> io::Result<Option<libc::c_long>> {
+fn find(description: &std::ffi::CStr) -> io::Result<Option<libc::c_long>> {
     // SAFETY: both strings are NUL-terminated and outlive the call.
     let id = unsafe {
         libc::syscall(
@@ -108,15 +110,23 @@ pub fn forbid_dumps() {
 }
 
 impl Key {
+    /// The key's description: its name, suffixed with the instance when one
+    /// is set.
+    fn description(&self) -> CString {
+        CString::new(crate::config::instance_suffixed(self.name, ':'))
+            .expect("key names and instance names hold no NUL")
+    }
+
     /// Store `secret`, replacing any earlier one.
     pub fn store(&self, secret: &[u8]) -> io::Result<()> {
         // SAFETY: strings are NUL-terminated; the payload pointer/length pair
         // describes `secret`, which outlives the call.
+        let description = self.description();
         let id = unsafe {
             libc::syscall(
                 libc::SYS_add_key,
                 KEY_TYPE.as_ptr(),
-                self.description.as_ptr(),
+                description.as_ptr(),
                 secret.as_ptr(),
                 secret.len(),
                 KEY_SPEC_USER_KEYRING,
@@ -145,7 +155,7 @@ impl Key {
 
     /// Read the stored secret, or `None` when there is none.
     pub fn load(&self) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
-        let Some(id) = find(self.description)? else {
+        let Some(id) = find(&self.description())? else {
             return Ok(None);
         };
         // Size first, then read; retry if the key was replaced in between.
@@ -190,7 +200,7 @@ impl Key {
 
     /// Remove the stored secret. Succeeds when there is none.
     pub fn clear(&self) -> io::Result<()> {
-        let Some(id) = find(self.description)? else {
+        let Some(id) = find(&self.description())? else {
             return Ok(());
         };
         // SAFETY: plain integer arguments.

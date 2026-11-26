@@ -1035,7 +1035,11 @@ fn cli_error(kind: ErrorKind, message: &str) -> String {
 }
 
 fn main() -> Result<()> {
-    // First: a completion request answers on stdout and exits, so nothing may
+    // A bad `PDFS_INSTANCE` is refused before anything reads a path or the
+    // keyring; falling back to the default instance would touch the user's
+    // own account.
+    pdfs_core::config::check_instance()?;
+    // Next: a completion request answers on stdout and exits, so nothing may
     // write there before it.
     complete::handle_request();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

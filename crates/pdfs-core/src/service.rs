@@ -16,7 +16,15 @@ pub const SERVICE: &str = "proton-drive.service";
 
 /// Run one `systemctl --user <args> proton-drive.service`, returning whether it
 /// succeeded. Output is suppressed; failures are logged.
+///
+/// The unit runs the default instance. With a named
+/// [`crate::config::instance`], nothing is run and the answer is `false`, so a
+/// test account's `pdfs login` never restarts the user's own daemon.
 fn systemctl(args: &[&str]) -> bool {
+    if crate::config::instance().is_some() {
+        tracing::debug!(args = ?args, "not running systemctl for a named instance");
+        return false;
+    }
     let ok = Command::new("systemctl")
         .arg("--user")
         .args(args)
@@ -36,6 +44,9 @@ fn systemctl(args: &[&str]) -> bool {
 /// rather than a failure to log. For query verbs (`is-active`, `is-failed`)
 /// where "no" is the normal, expected result.
 fn systemctl_query(args: &[&str]) -> bool {
+    if crate::config::instance().is_some() {
+        return false;
+    }
     Command::new("systemctl")
         .arg("--user")
         .args(args)

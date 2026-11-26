@@ -15,6 +15,10 @@ Schema: **49**. New tables save a mirror folder's walk of Proton Drive (48). A f
 kept, with a list of the folders that changed on Proton Drive since (49).
 
 ### Added
+- **`PDFS_INSTANCE` runs a second client next to your own.** With a name set, the client keeps
+  its own directories, keyring entry, kernel keys and mountpoint, so a test account can run
+  alongside the account you use. `scripts/live-bench.py` uses it to time one edit, from the
+  write to the new revision on Proton Drive.
 - **`pdfs diagnostics` counts every call the daemon makes to Proton Drive.** Per kind of call it
   shows how many were made since start, how many failed, and their total and longest time. The
   JSON report has them as `drive_calls`.

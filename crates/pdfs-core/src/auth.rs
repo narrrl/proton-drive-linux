@@ -42,7 +42,7 @@ use proton_sdk::telemetry::TracingTelemetry;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::config::{APP_VERSION, AppDirs, KEYRING_SERVICE, USER_AGENT};
+use crate::config::{APP_VERSION, AppDirs, USER_AGENT};
 use crate::error::{Error, Result};
 use crate::kernelkey;
 
@@ -141,12 +141,15 @@ fn keyring() -> &'static KeyringStore {
     STORE.get_or_init(|| {
         #[cfg(not(test))]
         {
-            KeyringStore::new(KEYRING_SERVICE)
+            KeyringStore::new(crate::config::keyring_service())
         }
         #[cfg(test)]
         {
-            KeyringStore::with_connector(KEYRING_SERVICE, Arc::new(tests::connect_keyring_store))
-                .replace_items(|| tests::MOCK_STORE.lock().is_none())
+            KeyringStore::with_connector(
+                crate::config::KEYRING_SERVICE,
+                Arc::new(tests::connect_keyring_store),
+            )
+            .replace_items(|| tests::MOCK_STORE.lock().is_none())
         }
     })
 }
@@ -1273,7 +1276,7 @@ mod tests {
 
     /// The session's entry, to make its next call fail.
     fn keyring_entry() -> Entry {
-        Entry::new(KEYRING_SERVICE, KEYRING_USER).unwrap()
+        Entry::new(crate::config::KEYRING_SERVICE, KEYRING_USER).unwrap()
     }
 
     /// Make the session entry's next call fail with `error`.
@@ -1420,7 +1423,7 @@ mod tests {
                 .unwrap();
         let found = ss
             .search_items(std::collections::HashMap::from([
-                ("service", KEYRING_SERVICE),
+                ("service", crate::config::KEYRING_SERVICE),
                 ("username", KEYRING_USER),
             ]))
             .unwrap();
