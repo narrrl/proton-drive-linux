@@ -40,8 +40,8 @@ use super::{
     Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, ThumbnailMissCaches,
     WriteAuthority, link, node_size, now_ms, parse_uid,
 };
-use pdfs_core::control::DirEntry;
 use pdfs_core::control::TransferDirection;
+use pdfs_core::control::{ActivityKind, DirEntry};
 use pdfs_core::lifecycle::ServiceBoard;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::{ProtonDriveClient, ProtonPhotosClient};
@@ -139,7 +139,10 @@ const DECODE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 static DECODE_BUDGET: DecodeBudget = DecodeBudget::new(DECODE_BUDGET_BYTES);
 
 mod albums;
+pub(crate) mod redate;
+pub(crate) mod takeout;
 pub(crate) use albums::AlbumOutcome;
+pub(crate) use takeout::sha1_of;
 mod thumbs;
 mod timeline;
 mod trash;
@@ -173,6 +176,8 @@ pub(crate) trait PhotosHost: Send + Sync {
     /// Record a change this daemon made, so its echo in the event feed is not
     /// taken for a remote edit.
     fn note_self_change(&self, uid: &NodeUid);
+    /// Add an entry to the activity log.
+    fn log_activity(&self, kind: ActivityKind, target: String, detail: String, ok: bool);
 }
 
 impl PhotosHost for Core {
@@ -182,6 +187,10 @@ impl PhotosHost for Core {
 
     fn note_self_change(&self, uid: &NodeUid) {
         Core::note_self_change(self, uid)
+    }
+
+    fn log_activity(&self, kind: ActivityKind, target: String, detail: String, ok: bool) {
+        Core::log_activity(self, kind, target, detail, ok);
     }
 }
 

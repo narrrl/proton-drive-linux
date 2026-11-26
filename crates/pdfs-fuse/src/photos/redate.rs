@@ -27,7 +27,7 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata};
 use tracing::{info, warn};
 
-use super::Core;
+use super::Photos;
 use crate::parse_uid as parse_node_uid;
 use crate::transfers::CountingReader;
 
@@ -84,7 +84,7 @@ struct Candidate {
     albums: Vec<String>,
 }
 
-impl Core {
+impl Photos {
     /// Re-date mis-dated photos. Blocking; run on its own thread.
     ///
     /// `cancel` stops the run at the next photo boundary. A photo is only ever
@@ -173,7 +173,7 @@ impl Core {
             job.step();
         }
 
-        self.photos().spawn_timeline_refresh();
+        self.spawn_timeline_refresh();
         summary.cancelled = cancel.load(Ordering::Relaxed);
         Ok(summary)
     }
@@ -185,12 +185,12 @@ impl Core {
     /// as it was.
     fn redate_one(&self, candidate: &Candidate, summary: &mut RedateSummary) -> CoreResult<()> {
         let photos = self.photos_api();
-        let path = self.photos().open_photo(&candidate.uid)?;
+        let path = self.open_photo(&candidate.uid)?;
         let size = std::fs::metadata(&path)
             .map_err(|e| CoreError::internal(format!("stat {}: {e}", path.display())))?
             .len();
         let media_type = media_type_of(&candidate.name).unwrap_or("application/octet-stream");
-        let thumbnails = self.photos().upload_thumbnails(&path, &candidate.name);
+        let thumbnails = self.upload_thumbnails(&path, &candidate.name);
 
         let guard =
             self.transfers
@@ -227,7 +227,7 @@ impl Core {
             match self.rt.block_on(photos.update_photos(&[update])) {
                 // As in `set_photo_favorite`: claim our own echo, so the tag we
                 // just set does not come back as a remote change.
-                Ok(_) => self.note_self_change(&new_uid),
+                Ok(_) => self.host.note_self_change(&new_uid),
                 Err(e) => {
                     warn!(name = candidate.name, error = %e, "cannot re-favorite re-dated photo")
                 }
@@ -287,9 +287,9 @@ impl Core {
             state.last = None;
         }
 
-        let core = self.clone();
+        let this = self.clone();
         if let Err(error) = self.services.spawn_job("pdfs-redate", move || {
-            let outcome = core.redate_photos(dry_run, limit, range, cancel);
+            let outcome = this.redate_photos(dry_run, limit, range, cancel);
             let mut state = REDATE.lock();
             state.running = false;
             state.cancel = None;

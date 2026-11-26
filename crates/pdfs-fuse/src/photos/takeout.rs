@@ -47,7 +47,7 @@ use tracing::{info, warn};
 
 pub(crate) use pdfs_drive::digest::sha1_of;
 
-use super::Core;
+use super::Photos;
 use crate::photos::can_make_thumbnail;
 use crate::transfers::CountingReader;
 
@@ -468,7 +468,7 @@ fn read_entry<R>(
     Ok(sink(&mut file))
 }
 
-impl Core {
+impl Photos {
     /// Copy archive entry `entry` into the thumbnail staging folder and return
     /// its path. The caller removes it.
     fn stage_takeout_entry(
@@ -562,7 +562,7 @@ impl Core {
             report.counts(&summary);
         }
         if summary.uploaded > 0 {
-            self.photos().spawn_timeline_refresh();
+            self.spawn_timeline_refresh();
         }
         summary
     }
@@ -919,7 +919,7 @@ impl Core {
         report.step();
         match done.result {
             Ok(uid) => {
-                self.note_self_change(&uid);
+                self.host.note_self_change(&uid);
                 summary.uploaded += 1;
                 summary.bytes += done.photo.size;
                 if done.live {
@@ -930,7 +930,7 @@ impl Core {
                 }
                 planned[done.index].uid = Some(uid);
                 if summary.uploaded.is_multiple_of(TIMELINE_REFRESH_EVERY) {
-                    self.photos().spawn_timeline_refresh();
+                    self.spawn_timeline_refresh();
                 }
                 if summary.uploaded.is_multiple_of(CHECKPOINT_EVERY) {
                     report.counts(summary);
@@ -977,7 +977,7 @@ impl Core {
 
         match source {
             Source::Staged(path) => {
-                let thumbnails = self.photos().upload_thumbnails(path, &photo.name);
+                let thumbnails = self.upload_thumbnails(path, &photo.name);
                 // No sidecar date and none in the name: the photo's own EXIF,
                 // then when Google received it, before Drive files it under
                 // today.
@@ -1152,14 +1152,14 @@ impl Core {
             state.save();
         }
 
-        let core = self.clone();
+        let this = self.clone();
         if let Err(error) = self.services.spawn_job("pdfs-import", move || {
             // The job is dropped only after the final state is stored: the
             // job leaving the transfer snapshot is the front-ends' cue to ask
             // for the result, which must then be there.
-            let job = core.transfers.begin_job("Importing Google Photos");
+            let job = this.transfers.begin_job("Importing Google Photos");
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                core.import_takeout(&archives, dry_run, &cancel, &job)
+                this.import_takeout(&archives, dry_run, &cancel, &job)
             }));
             // A panic must not leave the import marked as running for the
             // life of the daemon, refusing every later one.
@@ -1179,9 +1179,9 @@ impl Core {
             }
             drop(job);
             if !dry_run {
-                core.log_activity(
+                this.host.log_activity(
                     ActivityKind::Upload,
-                    "Google Photos import",
+                    "Google Photos import".to_string(),
                     activity_line(&summary),
                     summary.complete(),
                 );

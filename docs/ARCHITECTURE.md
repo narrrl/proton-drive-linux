@@ -772,10 +772,11 @@ only the handles it calls (the client, Drive, the content cache, the transfer li
 the tree), and every one of its methods takes a node already resolved to its uid. Like the sync
 engine's `Syncer`, it can be built and tested without the rest of the daemon.
 
-`photos::Photos` is the timeline, albums and thumbnails. It holds the handles it calls and the
-`PhotoJobs` state, and reaches the filesystem through a `PhotosHost` port with two methods: list
-a folder, for the recursive thumbnail build, and note a change made here, so its echo in the event
-feed is not taken for a remote edit. `Core::photos` builds one on demand with the daemon as its
+`photos::Photos` is the timeline, albums, thumbnails, the Google Photos import and the redate
+job. It holds the handles it calls and the `PhotoJobs` state, and reaches the filesystem through a
+`PhotosHost` port with three methods: list a folder, for the recursive thumbnail build; note a
+change made here, so its echo in the event feed is not taken for a remote edit; and add an entry
+to the activity log. `Core::photos` builds one on demand with the daemon as its
 host, as `Core::syncer` does for the sync engine. Trashing photos stays on `Core`, because it
 checks write authority against the tree and drops open readers.
 

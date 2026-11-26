@@ -328,7 +328,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             }
         }
         CtlRequest::ImportStatus => {
-            let report = crate::takeout::import_status();
+            let report = crate::photos::takeout::import_status();
             CtlResponse::ImportStatus {
                 running: report.running,
                 summary: report.summary,
@@ -336,12 +336,12 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                 resumable: report.resumable,
             }
         }
-        CtlRequest::ResumeImport => match crate::takeout::resumable_archives() {
+        CtlRequest::ResumeImport => match crate::photos::takeout::resumable_archives() {
             None => CtlResponse::error(CoreError::not_found("there is no import to resume")),
             Some(paths) => start_takeout_import(core, paths, false),
         },
         CtlRequest::CancelImport => {
-            if crate::takeout::cancel_import() {
+            if crate::photos::takeout::cancel_import() {
                 CtlResponse::Ok {
                     message: "stopping the import".to_string(),
                 }
@@ -353,7 +353,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             dry_run,
             limit,
             range,
-        } => match core.spawn_redate(dry_run, limit, range) {
+        } => match core.photos().spawn_redate(dry_run, limit, range) {
             Ok(()) => CtlResponse::Ok {
                 message: if dry_run {
                     "checking photo dates".to_string()
@@ -364,11 +364,11 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             Err(e) => CtlResponse::error(e),
         },
         CtlRequest::RedateStatus => {
-            let (running, summary) = crate::redate::redate_status();
+            let (running, summary) = crate::photos::redate::redate_status();
             CtlResponse::RedateStatus { running, summary }
         }
         CtlRequest::CancelRedate => {
-            if crate::redate::cancel_redate() {
+            if crate::photos::redate::cancel_redate() {
                 CtlResponse::Ok {
                     message: "stopping the re-date".to_string(),
                 }

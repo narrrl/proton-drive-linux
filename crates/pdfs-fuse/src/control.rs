@@ -1135,7 +1135,7 @@ fn start_takeout_import(core: &Core, paths: Vec<PathBuf>, dry_run: bool) -> CtlR
         )));
     }
     let count = paths.len();
-    match core.spawn_takeout_import(paths, dry_run) {
+    match core.photos().spawn_takeout_import(paths, dry_run) {
         Ok(()) => CtlResponse::Ok {
             message: format!(
                 "{} {count} archive(s)",
