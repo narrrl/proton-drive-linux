@@ -13,9 +13,9 @@
 //! diagnostic that blocks on the hang it is diagnosing reports nothing at
 //! exactly the moment it matters.
 
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use pdfs_core::control::{Diagnostics, InflightRequest, WorkerState};
@@ -167,28 +167,51 @@ impl Core {
         }
     }
 
-    /// Queued mutations, or `0` if the database did not answer within
-    /// [`PENDING_COUNT_DEADLINE`].
-    fn pending_ops_quickly(&self) -> u64 {
+    /// Queued mutations, or `None` when the database did not answer within
+    /// [`PENDING_COUNT_DEADLINE`] or an earlier probe is still waiting on it.
+    ///
+    /// The supervisor asks for a report every tick. One thread per report
+    /// would pile up behind a database that never answers, so a second probe
+    /// is not started until the first one has returned.
+    fn pending_ops_quickly(&self) -> Option<u64> {
         let db = self.db.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        if std::thread::Builder::new()
-            .name("pdfs-diagnostics".into())
-            .spawn(move || {
-                let counts = db.pending_op_counts().unwrap_or_default();
-                let total = counts.uploads.max(0) as u64 + counts.changes.max(0) as u64;
-                let _ = tx.send(total);
-            })
-            .is_err()
-        {
-            return 0;
-        }
-        rx.recv_timeout(PENDING_COUNT_DEADLINE).unwrap_or(0)
+        probe_once(&self.pending_probe, PENDING_COUNT_DEADLINE, move || {
+            let counts = db.pending_op_counts().ok()?;
+            Some(counts.uploads.max(0) as u64 + counts.changes.max(0) as u64)
+        })
     }
 }
 
+/// Run `probe` on a thread of its own and wait up to `deadline` for it.
+///
+/// `None` when it did not answer in time, or when the previous probe sharing
+/// `busy` has not returned yet: then no new thread is started at all.
+fn probe_once<T: Send + 'static>(
+    busy: &Arc<AtomicBool>,
+    deadline: Duration,
+    probe: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    if busy.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let done = Arc::clone(busy);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("pdfs-diagnostics".into())
+        .spawn(move || {
+            let answer = probe();
+            done.store(false, Ordering::Release);
+            let _ = tx.send(answer);
+        });
+    if spawned.is_err() {
+        busy.store(false, Ordering::Release);
+        return None;
+    }
+    rx.recv_timeout(deadline).ok().flatten()
+}
+
 /// How long the report waits for the database before reporting without it.
-const PENDING_COUNT_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+const PENDING_COUNT_DEADLINE: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 mod tests {
@@ -251,5 +274,41 @@ mod tests {
             2048 * 1024
         );
         assert_eq!(parse_vm_rss("VmPeak:\t 100 kB\n"), 0);
+    }
+
+    #[test]
+    fn a_stuck_probe_is_not_started_again() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let short = Duration::from_millis(50);
+
+        let stuck = probe_once(&busy, short, move || {
+            let _ = wait.recv();
+            Some(1)
+        });
+        assert_eq!(stuck, None, "a probe that does not answer reports nothing");
+
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&started);
+        let second = probe_once(&busy, short, move || {
+            flag.store(true, Ordering::SeqCst);
+            Some(2)
+        });
+        assert_eq!(second, None);
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "no second thread while the first is out"
+        );
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while busy.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the first probe never returned");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            probe_once(&busy, Duration::from_secs(10), || Some(3)),
+            Some(3)
+        );
     }
 }

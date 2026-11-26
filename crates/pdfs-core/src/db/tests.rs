@@ -8349,3 +8349,31 @@ fn a_change_on_drive_marks_the_folders_it_touches() {
     db.sync_walks_clear_all().unwrap();
     assert!(db.sync_walk_load(id).unwrap().is_none());
 }
+
+/// A read that cannot get a read-only connection fails. It does not wait on
+/// the write connection, which a long transaction can hold for seconds and a
+/// wedged one forever (`docs/BUGS.md` B296).
+#[test]
+fn a_read_without_a_reader_connection_fails_instead_of_waiting_on_the_writer() {
+    let dir = std::env::temp_dir().join(format!("pdfs-db-noreader-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cache.db");
+    let db = std::sync::Arc::new(Db::open(&path).unwrap());
+    // The writer keeps its open file; a new read-only connection finds nothing.
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let writer = db.conn.lock();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::sync::Arc::clone(&db);
+    std::thread::spawn(move || {
+        let _ = tx.send(reader.pending_op_counts().is_err());
+    });
+    let failed = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(writer);
+    assert_eq!(
+        failed,
+        Ok(true),
+        "the read must fail, not queue behind the writer"
+    );
+}

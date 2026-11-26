@@ -16,7 +16,7 @@ impl Db {
     /// remains the restart/offline authority and every explicit role change is
     /// written through before this cache is updated.
     pub fn all_share_access(&self) -> Result<HashMap<NodeUid, Access>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare("SELECT root_uid, access FROM share_access")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -42,7 +42,7 @@ impl Db {
 
     /// Read the effective access recorded for a shared-tree root.
     pub fn share_access(&self, uid: &NodeUid) -> Result<Option<Access>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let value = conn
             .query_row(
                 "SELECT access FROM share_access WHERE root_uid = ?1",
@@ -101,7 +101,7 @@ impl Db {
     /// Drive gave it. The tree learns that uid a moment later, and a rename in
     /// between was refused (`docs/BUGS.md` B174).
     pub fn effective_node_access(&self, uid: &NodeUid) -> Result<Option<Access>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let key = uid.to_string();
         let key = match super::local_lid(&key) {
             Some(lid) => conn

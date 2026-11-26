@@ -105,7 +105,7 @@ impl Db {
 
     /// The persisted album listing, in stored order.
     pub fn albums_list(&self) -> Result<Vec<StoredAlbum>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT uid, name, photo_count, cover_uid, last_activity, shared
              FROM albums ORDER BY seq",
@@ -127,7 +127,7 @@ impl Db {
 
     /// Number of albums in the persisted listing.
     pub fn albums_count(&self) -> Result<usize> {
-        let conn = self.read();
+        let conn = self.read()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM albums", [], |r| r.get(0))?;
         Ok(n.max(0) as usize)
     }
@@ -226,7 +226,7 @@ impl Db {
         &self,
         album: &str,
     ) -> Result<HashMap<String, (String, Option<String>)>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT uid,name,media_type FROM album_photos
                WHERE album_uid=?1 AND resolved=1 AND name IS NOT NULL
@@ -255,7 +255,7 @@ impl Db {
         limit: usize,
         excluded: &str,
     ) -> Result<Vec<StoredPhoto>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT uid, capture_time, name, ratio, thumb_state, kind FROM album_photos
              WHERE album_uid = ?1 AND uid NOT IN (SELECT value FROM json_each(?4))
@@ -293,7 +293,7 @@ impl Db {
     /// which has to put the re-uploaded copy back into the albums the original
     /// was in.
     pub fn albums_of_photo(&self, uid: &str) -> Result<Vec<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt =
             conn.prepare("SELECT DISTINCT album_uid FROM album_photos WHERE uid = ?1")?;
         let rows = stmt
@@ -304,7 +304,7 @@ impl Db {
 
     /// How many photos of `album_uid` are persisted.
     pub fn album_photos_count(&self, album_uid: &str) -> Result<usize> {
-        let conn = self.read();
+        let conn = self.read()?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM album_photos WHERE album_uid = ?1",
             [album_uid],
@@ -321,7 +321,7 @@ impl Db {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.read();
+        let conn = self.read()?;
         let placeholders = vec!["?"; uids.len()].join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT uid, capture_time, name, ratio, thumb_state, kind FROM album_photos
