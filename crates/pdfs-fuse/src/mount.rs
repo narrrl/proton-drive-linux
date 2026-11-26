@@ -491,6 +491,25 @@ pub(crate) fn mount_with(
     let gallery_dir = control_socket.with_file_name("gallery-catalog");
     let gallery =
         gallery_session.map(|session| Arc::new(super::gallery::Gallery::new(gallery_dir, session)));
+    let cache = Arc::new(cache);
+    let shutdown = Arc::new(crate::shutdown::Shutdown::default());
+    let transfers = TransferRegistry::new();
+    let sync = sync::SyncParts {
+        db: db.clone(),
+        drive: drive.clone(),
+        rt: rt.clone(),
+        cache: cache.clone(),
+        transfers: transfers.clone(),
+        shutdown: shutdown.clone(),
+        primary_root_uid: root.uid.clone(),
+        progress: Arc::default(),
+        engine: Arc::default(),
+        tx: sync_tx,
+        locks: Arc::default(),
+        unscanned: Arc::default(),
+        abandon: Arc::default(),
+        events_read_at: Arc::new(AtomicI64::new(0)),
+    };
     let core = Core {
         drive,
         drive_calls,
@@ -505,7 +524,7 @@ pub(crate) fn mount_with(
             State::new(db.clone(), share_access),
         )),
         root: Arc::new(OnceLock::new()),
-        cache: Arc::new(cache),
+        cache,
         readers: Arc::new(Mutex::new(HashMap::new())),
         block_ring: Arc::new(Mutex::new(BlockRing::default())),
         block_flight: Arc::new(BlockFlight::default()),
@@ -520,7 +539,6 @@ pub(crate) fn mount_with(
         online: Arc::new(AtomicBool::new(online)),
         link: Arc::new(link::Link::starting(start == Start::SessionExpired)),
         sync_paused_until: Arc::new(AtomicI64::new(paused_until)),
-        events_read_at: Arc::new(AtomicI64::new(0)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),
         creating: Arc::new(Mutex::new(HashMap::new())),
@@ -529,7 +547,7 @@ pub(crate) fn mount_with(
         unadopted: Arc::new(Mutex::new(HashMap::new())),
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
         pin_work: Arc::new(Mutex::new(Default::default())),
-        shutdown: Arc::new(crate::shutdown::Shutdown::default()),
+        shutdown,
         upload_times: Arc::new(Mutex::new(HashMap::new())),
         upload_cancel: Arc::new(Mutex::new(HashMap::new())),
         landing_uploads: Arc::new(AtomicU64::new(0)),
@@ -559,17 +577,12 @@ pub(crate) fn mount_with(
         size_waiters: Arc::new(Default::default()),
         notifier: Arc::new(OnceLock::new()),
         session_live: Arc::new(AtomicBool::new(false)),
-        transfers: TransferRegistry::new(),
+        transfers,
+        sync,
         events: Arc::new(Default::default()),
         indexing: Arc::new(AtomicBool::new(false)),
-        sync_progress: Arc::new(Mutex::new(HashMap::new())),
-        sync_engine: Arc::default(),
         pending_probe: Arc::default(),
-        sync_tx,
         mounts: Arc::new(Mutex::new(SecondaryMountRegistry::default())),
-        sync_locks: Arc::new(Mutex::new(HashMap::new())),
-        sync_unscanned: Arc::new(Mutex::new(HashMap::new())),
-        sync_abandon: Arc::default(),
         states: Arc::new(StateRegistry::default()),
     };
     // Before anything can queue work against it: the drain thread below reaches
@@ -608,7 +621,7 @@ pub(crate) fn mount_with(
 
     // Start the folder-sync engine. It watches every mirror folder, polls the
     // remotes, and reconciles on its own thread — never in front of a FUSE call.
-    workers.extend(sync::spawn(core.clone(), sync_rx));
+    workers.extend(sync::spawn(core.syncer(), sync_rx));
     // A timed pause persisted by an earlier run still has to end on time.
     if pause::paused_at(paused_until, now_secs()) && paused_until != pause::PAUSED_INDEFINITELY {
         core.arm_pause_timer(paused_until);
@@ -991,7 +1004,7 @@ fn halt_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::Jo
         gallery.cancel();
     }
     core.wake_drain();
-    let _ = core.sync_tx.send(sync::SyncMsg::Stop);
+    let _ = core.sync.tx.send(sync::SyncMsg::Stop);
     // Connect while the socket still exists — that is the whole point of the
     // poke — then unlink it so nothing else can arrive behind us. The listener
     // re-checks the flag after every accept, so even a connection that races the

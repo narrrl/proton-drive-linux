@@ -453,7 +453,7 @@ impl Core {
                 Err(e) => {
                     // The folders restored before this one still need their
                     // watches.
-                    let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
+                    let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
                     return Err(CoreError::internal(format!("db: {e:?}")));
                 }
             };
@@ -463,11 +463,11 @@ impl Core {
             if mode == MountMode::OnDemand {
                 let _ = self.request_sync_folder_mode(id, "ondemand");
             }
-            let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+            let _ = self.sync.tx.send(sync::SyncMsg::Reconcile(id));
             roots.push(local);
             restored += 1;
         }
-        let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
+        let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
 
         // The reply is gone once the app has shown it; the log keeps why.
         for reason in &skipped {

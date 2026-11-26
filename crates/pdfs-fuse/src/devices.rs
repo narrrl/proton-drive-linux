@@ -17,7 +17,6 @@ use pdfs_core::control::{
     ActivityKind, DeviceInfo, JobItem, MountKind, MountSpec, SyncFolderInfo, SyncPhase,
     SyncProgress,
 };
-use pdfs_core::lockrank::{Rank, Ranked};
 use pdfs_core::mounts::MountMode;
 use pdfs_core::profile::PROFILE_DIR_NAME;
 use pdfs_core::{CoreError, CoreResult};
@@ -154,7 +153,7 @@ impl Core {
 
     /// Unified local-location listing for the control protocol.
     pub(crate) fn list_locations(&self) -> CoreResult<Vec<MountSpec>> {
-        let progress = self.sync_progress.lock();
+        let progress = self.sync.progress.lock();
         let mut locations = self
             .db
             .mount_list()
@@ -602,8 +601,8 @@ impl Core {
         // Hand the initial upload to the sync engine: an empty baseline against a
         // full local tree reconciles as "upload everything", and the folder is
         // added to the filesystem watch set in the same pass.
-        let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
-        let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+        let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
+        let _ = self.sync.tx.send(sync::SyncMsg::Reconcile(id));
 
         info!(local = %local.display(), id, "added sync folder");
         self.db
@@ -617,7 +616,7 @@ impl Core {
     pub(crate) fn list_sync_folders(&self) -> CoreResult<Vec<SyncFolderInfo>> {
         // Copied out rather than held: the pass takes this lock for every
         // entry it scans, and the queries below need not stall it.
-        let progress = self.sync_progress.lock().clone();
+        let progress = self.sync.progress.lock().clone();
         Ok(self
             .db
             .sync_folder_list()
@@ -643,7 +642,8 @@ impl Core {
     pub(crate) fn jobs_snapshot(&self) -> Vec<JobItem> {
         let mut jobs = self.transfers.jobs_snapshot();
         let mut passes: Vec<(i64, SyncProgress)> = self
-            .sync_progress
+            .sync
+            .progress
             .lock()
             .iter()
             .map(|(id, p)| (*id, p.clone()))
@@ -698,30 +698,21 @@ impl Core {
         jobs
     }
 
-    /// The lock guarding sync-folder `id` against concurrent reconcile/mode-switch.
-    pub(crate) fn sync_lock(&self, id: i64) -> Arc<Ranked<()>> {
-        self.sync_locks
-            .lock()
-            .entry(id)
-            .or_insert_with(|| Arc::new(Ranked::new(Rank::SyncFolder, ())))
-            .clone()
-    }
-
     /// Remove a synced folder from the sync set. `delete_remote` also deletes its
     /// folder under the device root; otherwise the cloud copy is left in place.
     pub(crate) fn remove_sync_folder(&self, id: i64, delete_remote: bool) -> CoreResult<()> {
-        let lock = self.sync_lock(id);
+        let lock = self.sync.lock(id);
         // A pass holds the lock for as long as it runs, hours on a large
         // folder. Ask it to stop at its next checkpoint rather than wait it
         // out on a control handler (B294).
-        self.sync_abandon.lock().insert(id);
+        self.sync.abandon.lock().insert(id);
         let guard = lock.try_lock_for(REMOVE_LOCK_WAIT);
         let Some(_guard) = guard else {
             return Err(CoreError::conflict(
                 "the folder is in the middle of a sync step; try again in a minute",
             ));
         };
-        self.sync_abandon.lock().remove(&id);
+        self.sync.abandon.lock().remove(&id);
         let folder = self
             .db
             .sync_folder_get(id)
@@ -764,7 +755,7 @@ impl Core {
         drop(_guard);
         self.clear_sync_folder_paused(id);
         // Stop watching the folder we just dropped.
-        let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
+        let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
         if delete_remote
             && let Some(uid) = parse_uid(&folder.remote_uid)
             && let Err(e) = self
@@ -780,8 +771,8 @@ impl Core {
     /// Trigger a reconcile: one folder by id, or every folder when `id` is `None`.
     pub(crate) fn sync_now(&self, id: Option<i64>) {
         let _ = match id {
-            Some(id) => self.sync_tx.send(sync::SyncMsg::Reconcile(id)),
-            None => self.sync_tx.send(sync::SyncMsg::ReconcileAll),
+            Some(id) => self.sync.tx.send(sync::SyncMsg::Reconcile(id)),
+            None => self.sync.tx.send(sync::SyncMsg::ReconcileAll),
         };
     }
 
@@ -834,7 +825,7 @@ impl Core {
         }
         if current_mode == target_mode {
             let mode_str = target_mode.as_str();
-            let lock = self.sync_lock(id);
+            let lock = self.sync.lock(id);
             match lock.try_lock() {
                 Some(_guard) => {
                     let current = self
@@ -852,7 +843,7 @@ impl Core {
                         self.db
                             .sync_folder_set_pending_mode(id, None)
                             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
-                        let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
+                        let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
                         return Ok(if current.pending_mode.is_some() {
                             format!("staying {mode_str}")
                         } else {
@@ -869,7 +860,7 @@ impl Core {
                     self.db
                         .sync_folder_set_pending_mode(id, Some(mode_str))
                         .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
-                    let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+                    let _ = self.sync.tx.send(sync::SyncMsg::Reconcile(id));
                     return Ok(format!("staying {mode_str}"));
                 }
             }
@@ -885,7 +876,7 @@ impl Core {
                 self.db
                     .sync_folder_set_pending_mode(id, Some(mode_str))
                     .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
-                let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+                let _ = self.sync.tx.send(sync::SyncMsg::Reconcile(id));
                 Ok(match mode {
                     ApplicableMountMode::OnDemand => format!(
                         "{} will go on-demand once its local changes are uploaded",
@@ -987,7 +978,7 @@ impl Core {
         // failing is exactly "still syncing" — and it is the only reliable signal:
         // the `state` column is still `idle` in the window between `add_sync_folder`
         // inserting the row and the engine picking it up.
-        let lock = self.sync_lock(id);
+        let lock = self.sync.lock(id);
         let Some(_guard) = lock.try_lock() else {
             return Err(SwitchBlocked::NotNow);
         };
@@ -1032,7 +1023,7 @@ impl Core {
                     .db
                     .sync_entries(id)
                     .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?;
-                let rules = self.ignore_rules(&local);
+                let rules = self.syncer().ignore_rules(&local);
                 // Emptied before any pass saw it, the folder is still `idle`, and
                 // the check below would refuse the switch for good. The push pass
                 // of a queued switch forgets those paths instead (`docs/BUGS.md`
@@ -1091,7 +1082,7 @@ impl Core {
                 })?;
                 self.publish_secondary_mount(id, mount)
                     .map_err(SwitchBlocked::Failed)?;
-                let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
+                let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
                 self.db.sync_folder_set_state(id, "idle", now_secs()).ok();
                 info!(id, path = %local.display(), "mounted sync folder on-demand");
                 Ok(format!("{} is now on-demand", local.display()))
@@ -1118,8 +1109,8 @@ impl Core {
                 self.db
                     .sync_folder_set_mode(id, "mirror")
                     .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?;
-                let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
-                let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+                let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
+                let _ = self.sync.tx.send(sync::SyncMsg::Reconcile(id));
                 info!(id, path = %local.display(), "restored sync folder to mirror");
                 Ok(format!(
                     "{} is mirroring again; downloading",
@@ -1141,7 +1132,7 @@ impl Core {
     /// that switch runs reads an unrecorded local file as new and would upload
     /// a second copy of every file Drive already has.
     pub(crate) fn reset_sync_folder(&self, id: i64) -> CoreResult<String> {
-        let lock = self.sync_lock(id);
+        let lock = self.sync.lock(id);
         let Some(_guard) = lock.try_lock() else {
             return Err(CoreError::conflict(
                 "this folder is syncing; try again when the pass ends",
@@ -1165,7 +1156,7 @@ impl Core {
                 .sync_folder_set_pending_mode(id, None)
                 .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
         }
-        let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+        let _ = self.sync.tx.send(sync::SyncMsg::Reconcile(id));
         info!(id, path = %folder.local_path, "sync folder reset");
         Ok(format!(
             "{} will sync from scratch",
@@ -1213,7 +1204,7 @@ impl Core {
     }
 
     fn mark_restore_error_if_current(&self, snapshot: &StoredSyncFolder) {
-        let lock = self.sync_lock(snapshot.id);
+        let lock = self.sync.lock(snapshot.id);
         let _guard = lock.lock();
         if self
             .db
@@ -1268,7 +1259,7 @@ impl Core {
                     continue;
                 }
             };
-            let lock = self.sync_lock(folder.id);
+            let lock = self.sync.lock(folder.id);
             let _guard = lock.lock();
             let current = match self.db.sync_folder_get(folder.id) {
                 Ok(Some(current)) if restore_snapshot_matches(&folder, &current) => current,

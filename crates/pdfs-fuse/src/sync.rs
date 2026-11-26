@@ -39,13 +39,14 @@ use sha1::{Digest as _, Sha1};
 use tracing::{debug, info, warn};
 
 use crate::transfers::{CountingWriter, OwnedCountingReader};
-use crate::{Core, now_secs, parse_uid};
+use crate::{now_secs, parse_uid};
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::syncignore::IgnoreRules;
 use pdfs_store::db::{SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 
 mod engine;
+mod host;
 mod local_scan;
 pub(crate) use engine::SYNC_CONCURRENCY;
 pub(crate) use engine::{EngineHealth, SyncMsg, spawn};
@@ -53,6 +54,7 @@ pub(crate) use engine::{EngineHealth, SyncMsg, spawn};
 use engine::{Running, burst_order, keep_wanted, smallest_first};
 #[cfg(test)]
 use engine::{classify, event_target, settle_with};
+pub(crate) use host::{SyncParts, Syncer};
 #[cfg(test)]
 use local_scan::is_write_mode;
 use local_scan::open_for_write_set;
@@ -78,7 +80,7 @@ use trace::{Call, Count, Phase};
 /// nothing, so the journal says where a slow engine spends its time.
 const SLOW_PASS: Duration = Duration::from_secs(30);
 
-impl Core {
+impl Syncer {
     /// Reconcile one synced folder, then apply any mode switch queued while it was
     /// busy. Both halves live here because the switch has to happen with the pass
     /// finished and its lock released, and the engine thread is the only place that
@@ -107,7 +109,7 @@ impl Core {
         }
         // Hold the folder's lock for the whole pass so a mode switch can't evict the
         // local tree (and mount FUSE over it) while we walk and upload it.
-        let lock = self.sync_lock(folder.id);
+        let lock = self.lock(folder.id);
         let waited = Instant::now();
         let _guard = lock.lock();
         self.trace_phase(Phase::LockWait, waited.elapsed());
@@ -195,7 +197,7 @@ impl Core {
                 result => result,
             }
         };
-        let progress = self.sync_progress.lock().get(&folder.id).cloned();
+        let progress = self.progress.lock().get(&folder.id).cloned();
         self.progress_end(folder.id);
         self.log_trace(folder, &result, started.elapsed());
         match result {
@@ -311,7 +313,7 @@ impl Core {
         }
         // A removal that gave up waiting leaves its request behind; the next
         // pass runs whole unless the removal is asked for again.
-        self.sync_abandon.lock().remove(&folder.id);
+        self.abandon.lock().remove(&folder.id);
     }
 
     /// End the running pass's trace and put it in the journal: at info for
@@ -329,7 +331,7 @@ impl Core {
             Err(PassAbort::Abandoned) => "abandoned",
             Err(PassAbort::Failed(_)) => "failed",
         };
-        let Some(trace) = self.sync_engine.end_trace(how) else {
+        let Some(trace) = self.engine.end_trace(how) else {
             return;
         };
         if how != "finished" || folder.last_sync == 0 || elapsed >= SLOW_PASS {
@@ -341,17 +343,17 @@ impl Core {
 
     /// Add `took` to a stage of the running pass's trace.
     fn trace_phase(&self, phase: Phase, took: Duration) {
-        self.sync_engine.trace(|t| t.phase(phase, took));
+        self.engine.trace(|t| t.phase(phase, took));
     }
 
     /// Add one call that took `took` to the running pass's trace.
     fn trace_call(&self, call: Call, took: Duration) {
-        self.sync_engine.trace(|t| t.call(call, took));
+        self.engine.trace(|t| t.call(call, took));
     }
 
     /// Add `n` to a counter of the running pass's trace.
     fn trace_count(&self, count: Count, n: usize) {
-        self.sync_engine.trace(|t| t.count(count, n));
+        self.engine.trace(|t| t.count(count, n));
     }
 
     /// Tell the activity feed what a pass over this folder had to leave out
@@ -362,7 +364,7 @@ impl Core {
     /// (B196).
     fn report_unscanned(&self, folder_id: i64, name: &str, unscanned: &[String]) {
         let previous = {
-            let mut last = self.sync_unscanned.lock();
+            let mut last = self.unscanned.lock();
             if unscanned.is_empty() {
                 last.remove(&folder_id)
             } else {
@@ -1671,8 +1673,7 @@ impl Core {
         let stale: HashSet<String> = stale.iter().map(|u| u.to_string()).collect();
         self.record_revisions(folder_id, prefix, &nodes, &sized, baseline);
         self.trace_count(Count::Nodes, nodes.len());
-        self.sync_engine
-            .trace(|t| t.listing(prefix, listing.elapsed()));
+        self.engine.trace(|t| t.listing(prefix, listing.elapsed()));
 
         for node in nodes {
             if node.trashed {
@@ -1852,7 +1853,7 @@ impl Core {
 
     /// Whether a removal of `folder_id` is waiting for its running pass.
     fn pass_abandoned(&self, folder_id: i64) -> bool {
-        self.sync_abandon.lock().contains(&folder_id)
+        self.abandon.lock().contains(&folder_id)
     }
 
     /// Apply one [`Pending`] op (async, so it can run concurrently in a batch),
@@ -2030,9 +2031,8 @@ impl Core {
         // Taken from the descriptor being streamed, so it names the content that
         // actually goes up rather than whatever is at the path when we finish.
         let streamed = LocalSig::from(&meta);
-        let thumbnails = self
-            .upload_thumbnails_async(path.clone(), name.to_string())
-            .await;
+        let thumbnails =
+            crate::photos::thumbnails_for_upload(&self.cache, path.clone(), name.to_string()).await;
         // Count the bytes as they are read, so this upload shows up in
         // `GetQueueStatus` next to a manual one. The uid isn't known until the
         // draft is sealed, so the transfer registers without one.
@@ -2114,9 +2114,12 @@ impl Core {
         let meta = file.metadata().map_err(|e| format!("stat {rel}: {e}"))?;
         let mtime = system_mtime(&meta);
         let streamed = LocalSig::from(&meta);
-        let thumbnails = self
-            .upload_thumbnails_async(path.clone(), base_name(rel).to_string())
-            .await;
+        let thumbnails = crate::photos::thumbnails_for_upload(
+            &self.cache,
+            path.clone(),
+            base_name(rel).to_string(),
+        )
+        .await;
         let (reader, sent) = Sha1Tap::new(OwnedCountingReader::new(
             file,
             self.transfers.begin(

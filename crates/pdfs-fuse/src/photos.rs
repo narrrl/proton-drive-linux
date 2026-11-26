@@ -1157,10 +1157,7 @@ impl Core {
         path: PathBuf,
         name: String,
     ) -> Vec<Thumbnail> {
-        let staging_dir = self.cache.raw_thumbnail_staging_dir().to_path_buf();
-        tokio::task::spawn_blocking(move || upload_thumbnails(&path, &name, &staging_dir))
-            .await
-            .unwrap_or_default()
+        thumbnails_for_upload(&self.cache, path, name).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3644,4 +3641,17 @@ mod thumb_tests {
             assert_eq!(cover_rank(name), None, "{name}");
         }
     }
+}
+
+/// The thumbnails to upload with the file at `path`, made off the async
+/// runtime. Empty when the file is not an image or a video.
+pub(crate) async fn thumbnails_for_upload(
+    cache: &pdfs_store::cache::ContentCache,
+    path: PathBuf,
+    name: String,
+) -> Vec<Thumbnail> {
+    let staging_dir = cache.raw_thumbnail_staging_dir().to_path_buf();
+    tokio::task::spawn_blocking(move || upload_thumbnails(&path, &name, &staging_dir))
+        .await
+        .unwrap_or_default()
 }

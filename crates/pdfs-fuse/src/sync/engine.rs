@@ -51,8 +51,8 @@ pub(crate) enum SyncMsg {
 
 /// Start the sync engine: a control thread that owns the filesystem watcher and
 /// serialises reconcile passes, plus a periodic poll thread. The engine receives
-/// on `rx`; senders live in [`Core::sync_tx`].
-pub(crate) fn spawn(core: Core, rx: Receiver<SyncMsg>) -> Option<std::thread::JoinHandle<()>> {
+/// on `rx`; senders live in [`SyncParts::tx`].
+pub(crate) fn spawn(core: Syncer, rx: Receiver<SyncMsg>) -> Option<std::thread::JoinHandle<()>> {
     match std::thread::Builder::new()
         .name("pdfs-sync".into())
         .spawn(move || engine_loop(core, rx))
@@ -204,9 +204,9 @@ impl Drop for Running<'_> {
 
 /// One folder's pass, contained: a panic in it sets the folder to `error` and
 /// leaves the engine running for the next one.
-fn run_pass(core: &Core, folder: &StoredSyncFolder) {
+fn run_pass(core: &Syncer, folder: &StoredSyncFolder) {
     if core
-        .sync_engine
+        .engine
         .contain(folder.id, || core.reconcile_folder(folder))
     {
         return;
@@ -230,7 +230,7 @@ fn run_pass(core: &Core, folder: &StoredSyncFolder) {
 
 /// The pass a `Reconcile(id)` asked for. A folder removed since, or one the
 /// database cannot read, is said so rather than dropped in silence.
-fn run_pass_by_id(core: &Core, id: i64) {
+fn run_pass_by_id(core: &Syncer, id: i64) {
     match core.db.sync_folder_get(id) {
         Ok(Some(folder)) => run_pass(core, &folder),
         Ok(None) => debug!(id, "sync: folder removed before its pass; skipping"),
@@ -239,8 +239,8 @@ fn run_pass_by_id(core: &Core, id: i64) {
 }
 
 /// The engine control loop. Single-threaded so reconcile passes never overlap.
-fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
-    let health = core.sync_engine.clone();
+fn engine_loop(core: Syncer, rx: Receiver<SyncMsg>) {
+    let health = core.engine.clone();
     let _running = Running::start(&health);
     // No pass runs before this thread starts one, so a folder in `syncing` was
     // left there by a daemon that was killed mid-pass. It would read as busy
@@ -257,7 +257,7 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
     // path can be resolved back to the folder it belongs to.
     let watched: Arc<Mutex<Vec<(PathBuf, i64)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let tx_events = core.sync_tx.clone();
+    let tx_events = core.tx.clone();
     let watched_events = watched.clone();
     let handler = move |res: notify::Result<notify::Event>| {
         let event = match res {
@@ -291,7 +291,7 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
 
     // Periodic remote poll.
     {
-        let tx = core.sync_tx.clone();
+        let tx = core.tx.clone();
         let shutdown = core.shutdown.clone();
         std::thread::Builder::new()
             .name("pdfs-sync-poll".into())
@@ -334,9 +334,9 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
 }
 
 /// Fallback loop when no filesystem watcher could be created: poll + SyncNow only.
-fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
+fn poll_only_loop(core: &Syncer, rx: Receiver<SyncMsg>) {
     {
-        let tx = core.sync_tx.clone();
+        let tx = core.tx.clone();
         let shutdown = core.shutdown.clone();
         std::thread::spawn(move || {
             while shutdown.sleep(POLL_INTERVAL) {
@@ -371,7 +371,7 @@ fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
 /// Skipped while sync is paused, and cut short when a pause lands between
 /// passes: the resume sends a fresh [`SyncMsg::ReconcileAll`], which walks
 /// everything the watcher reported meanwhile.
-fn run_burst(core: &Core, ids: &HashSet<i64>, all: bool) {
+fn run_burst(core: &Syncer, ids: &HashSet<i64>, all: bool) {
     if core.sync_paused() {
         debug!("sync: paused, skipping reconcile");
         return;
@@ -534,7 +534,7 @@ pub(super) fn event_target(watched: &[(PathBuf, i64)], paths: &[PathBuf]) -> Syn
 /// callback takes the same lock, and a backend that hands a watch request to
 /// its event thread and waits for the answer would deadlock against it.
 fn rewatch(
-    core: &Core,
+    core: &Syncer,
     watcher: &mut notify::RecommendedWatcher,
     watched: &Mutex<Vec<(PathBuf, i64)>>,
 ) -> bool {

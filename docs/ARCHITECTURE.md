@@ -47,8 +47,11 @@ graph TD
 
 | Crate | Holds |
 |---|---|
-| [`pdfs-core`](../crates/pdfs-core) | Authentication and keyring (`auth`), configuration and directories (`config`), the SQLite schema and queries (`db/`), the content cache (`cache`), the control protocol (`control`), search scoring, ignore rules, Google Takeout parsing, the machine profile |
-| [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), the tree (`state`), reads (`reads`), the queue and the drain (`queue`, `drain`, `upload`), the link state (`link`), remote events (`background`), the sync engine (`sync`, `sync/`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
+| [`pdfs-core`](../crates/pdfs-core) | Authentication and keyring (`auth`), configuration and directories (`config`), the control protocol (`control`), search scoring, ignore rules, Google Takeout parsing, the machine profile |
+| [`pdfs-store`](../crates/pdfs-store) | The SQLite schema and queries (`db/`), the content cache (`cache`) |
+| [`pdfs-drive`](../crates/pdfs-drive) | The `DriveApi` seam over the SDK, the call counter (`counted`), and `FakeDrive` for the simulations |
+| [`pdfs-sync`](../crates/pdfs-sync) | The sync planner, the pass model and the pass trace: the parts of the sync engine with no I/O |
+| [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), the tree (`state`), reads (`reads`), the queue and the drain (`queue`, `drain`, `upload`), the link state (`link`), remote events (`background`), the sync engine (`sync`, `sync/`; its own state in `SyncParts`, its calls into the daemon through `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
 | [`pdfs-cli`](../crates/pdfs-cli) | The `pdfs` binary. `pdfs daemon` runs the daemon in-process; every other command is a control-socket client |
 | [`pdfs-gui`](../crates/pdfs-gui) | `pdfs-app`, `pdfs-tray` and `pdfs-prompt`. Pages in `src/app/pages/`, widgets in `src/app/widgets/`, CSS and icons in `resources/` |
 
