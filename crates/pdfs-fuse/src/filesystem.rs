@@ -325,7 +325,7 @@ impl Filesystem for ProtonFs {
                     };
                     let is_video =
                         PhotoKind::classify(Some(&e.node.name), media_type) == PhotoKind::Video;
-                    let queued = self.core.pending.lock().get(&e.uid).map(|p| p.meta.len);
+                    let queued = self.core.writes.queued_len(&e.uid);
                     // Still the cheap enumeration's ciphertext size (B12).
                     let provisional = queued.is_none()
                         && matches!(
@@ -1413,7 +1413,7 @@ impl ProtonFs {
                         }
                     }
                 }
-                let pending_base = self.core.pending.lock().get(&uid).cloned();
+                let pending_base = self.core.writes.queued(&uid);
                 let (file, path) = match self.core.cache.create_scratch() {
                     Ok(x) => x,
                     Err(e) => {
@@ -2402,7 +2402,7 @@ impl ProtonFs {
         }
         // Only remove the namespace entry after Drive accepted the mutation.
         // Otherwise an EIO response still made the path disappear locally.
-        self.core.hidden.lock().insert(uid.clone());
+        self.core.writes.hide(&uid);
         self.core.state().forget_or_unlink(&uid);
         if open_now {
             // The open handle keeps the staged bytes; the drain must not send

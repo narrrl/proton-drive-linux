@@ -19,7 +19,7 @@ impl Core {
         if is_local_uid_str(&op.uid) {
             match self.withdrawn_twin(op)? {
                 Some(twin) => {
-                    self.hidden.lock().insert(twin.clone());
+                    self.writes.hide(&twin);
                     match self
                         .block_on_bounded(self.drive.trash_nodes(std::slice::from_ref(&twin)))
                         .and_then(batch::into_unit)
@@ -131,7 +131,7 @@ impl Core {
         // mount trashed is not one, and a node in the tree was answered for.
         // A file of the user's renamed to the name the create was sent under
         // was taken for it, and trashed (`docs/BUGS.md` B193).
-        let hidden = self.hidden.lock().clone();
+        let hidden = self.writes.hidden();
         let Some(twin) = children
             .into_iter()
             .find(|node| node.name == name && !node.trashed && !hidden.contains(&node.uid))
@@ -191,7 +191,7 @@ impl Core {
         real: &NodeUid,
         name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.hidden.lock().insert(real.clone());
+        self.writes.hide(real);
         self.note_self_change(real);
         let trash = PendingOp {
             id: trash,

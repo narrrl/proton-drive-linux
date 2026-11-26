@@ -108,6 +108,7 @@ mod inhibit;
 mod keeper;
 mod link;
 mod listing;
+mod writes;
 pub use filesystem::ProtonFs;
 mod maintenance;
 mod mount;
@@ -568,17 +569,14 @@ struct Core {
     /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
     /// Persisted, so a pause survives a restart (see [`Core::sync_paused`]).
     sync_paused_until: Arc<AtomicI64>,
-    /// Writes accepted from the kernel but not yet uploaded, keyed by node.
-    /// The in-memory face of the `pending_op` table, from
-    /// which it is rebuilt on mount.
+    /// The write-back's state: writes accepted from the kernel and not yet sent,
+    /// nodes removed here that a stale listing may still return, and the changes
+    /// this daemon made that Drive's event feed will echo back.
     ///
-    /// Two things read it: [`Core::read_range`], because until the op drains the
-    /// staged blob *is* the file's content and the remote still holds the old
-    /// revision; and the drain worker, which performs the uploads.
-    pending: Arc<Mutex<HashMap<NodeUid, PendingRevision>>>,
-    /// Nodes removed through this daemon which a briefly stale remote listing
-    /// may still return. Uids are not reused; an explicit restore clears one.
-    hidden: Arc<Mutex<HashSet<NodeUid>>>,
+    /// The drain, the queue and recovery own it. Everything else, the read path,
+    /// listings, the pin keeper and the event feed, asks through the methods
+    /// below instead of taking its locks.
+    writes: writes::WriteState,
     /// The drain's own bookkeeping: its wake-up, the creates and uploads on
     /// the wire, and what they left behind. See [`drain::DrainState`].
     drain: drain::DrainState,
@@ -653,26 +651,6 @@ struct Core {
     /// FUSE connection id and the fork's exact liveness flag so teardown first
     /// makes that mount unroutable.
     mounts: Arc<Mutex<mount::SecondaryMountRegistry<SecondaryMount>>>,
-    /// Nodes this daemon changed on the remote itself, and how many echoes of
-    /// those changes the event feed still owes us.
-    ///
-    /// The feed replays our own writes back at us seconds later, and a
-    /// `NodeUpdated` carries no revision id — nothing in it distinguishes "another
-    /// device changed this file" from "you changed this file". Treating the echo
-    /// as foreign is not free: it evicts the content blob we just uploaded, so the
-    /// next read re-downloads a revision the API may not be serving yet. That is
-    /// how a SQLite database written on the mount came back `malformed`, and how a
-    /// mount doing bulk uploads spent its time re-fetching its own bytes.
-    ///
-    /// So the first event for a node we changed ourselves, within
-    /// [`SELF_CHANGE_TTL_MS`], is consumed rather than applied: the tree already
-    /// holds what that event describes, because [`Core::refresh_after_upload`] put
-    /// it there. Anything beyond that applies normally, which bounds the staleness
-    /// a genuine remote change can suffer to one event.
-    ///
-    /// Shared across forks like `pending`: the drain that records the change and
-    /// the event task that consumes the echo are both per-daemon.
-    self_changes: Arc<Mutex<HashMap<NodeUid, echoes::SelfChange>>>,
     /// Every live mount: the primary and one per on-demand fork
     /// ([`Core::fork_state`]), with its mountpoint, root and kernel channel.
     /// Shared by every fork.
@@ -1398,7 +1376,7 @@ impl Core {
     /// swaps the map entry to point at it, so an unchanged path means the base a
     /// caller sampled earlier is still the base now (`docs/BUGS.md` B32).
     fn pending_blob(&self, uid: &NodeUid) -> Option<PathBuf> {
-        self.pending.lock().get(uid).map(|p| p.path.clone())
+        self.writes.queued(uid).map(|queued| queued.path)
     }
 
     /// Nudge the drain worker to re-examine the queue now.
@@ -3924,7 +3902,7 @@ mod tests {
         assert_before(revision, "preserve_on_access_denied", "fill_gaps");
 
         let staged = function_source(source, "fn enqueue_staged_write(");
-        assert_before(staged, "preserve_on_access_denied", "self.pending.lock()");
+        assert_before(staged, "preserve_on_access_denied", "self.writes.queued(");
         assert_before(
             staged,
             "preserve_on_access_denied",
@@ -3932,7 +3910,7 @@ mod tests {
         );
 
         let truncate = function_source(source, "fn queue_truncate(");
-        assert_before(truncate, "require_uid_writable", "self.pending.lock()");
+        assert_before(truncate, "require_uid_writable", "self.writes.queued(");
         assert_before(truncate, "require_uid_writable", "create_scratch");
 
         for (signature, first_side_effect) in [
@@ -4081,7 +4059,7 @@ mod tests {
         assert_before(
             restore,
             "self.drive.restore_nodes(",
-            "self.hidden.lock().remove(uid)",
+            "self.writes.unhide(uid)",
         );
         assert!(restore.contains("st.invalidate_listing(ino)"));
         assert!(restore.contains("notify.inval_entry(ino, name.to_string())"));
@@ -4328,7 +4306,7 @@ mod tests {
         // once; the bytes the handle reads go with the last close.
         let withdraw = function_source(CORE_SOURCE, "fn withdraw_queued_ops(");
         assert_before(withdraw, "self.pending_blob(uid)", "release_dropped_below");
-        assert!(!withdraw.contains("self.pending.lock().remove(uid)"));
+        assert!(!withdraw.contains("self.writes.pending.lock().remove(uid)"));
 
         let filesystem = include_str!("filesystem.rs");
         let trash = function_source(filesystem, "fn trash_child(");

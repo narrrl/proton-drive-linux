@@ -773,7 +773,7 @@ impl Core {
     /// is disarmed, letting a gap-fill read from a revision that no longer
     /// describes the file.
     pub(crate) fn release_pending(&self, uid: &NodeUid, blob: &Path) {
-        let mut pending = self.pending.lock();
+        let mut pending = self.writes.pending.lock();
         if let Some(current) = pending.get(uid)
             && current.path == blob
         {

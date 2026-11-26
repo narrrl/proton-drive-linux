@@ -172,7 +172,7 @@ impl Core {
                 CoreError::conflict(format!("{path} is being sent right now; try again"))
             })?;
         self.release_dropped_ops(uid, blobs);
-        self.hidden.lock().remove(uid);
+        self.writes.unhide(uid);
         match node {
             Some(node) => self.for_each_mount(|st, notify| {
                 put_back(st, notify, node);

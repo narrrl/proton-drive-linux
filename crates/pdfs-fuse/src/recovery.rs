@@ -28,17 +28,11 @@ impl Core {
         // lying about the size reads as data loss. `hydrate_pending` ran before
         // us, so the pending map is populated; snapshot it here rather than hold
         // both locks at once.
-        let pending_sizes: HashMap<NodeUid, u64> = {
-            let pending = self.pending.lock();
-            pending
-                .iter()
-                .map(|(uid, pr)| (uid.clone(), pr.meta.len))
-                .collect()
-        };
+        let pending_sizes = self.writes.queued_sizes();
         // `hydrate_pending` runs first and restores queued-trash tombstones.
         // Their node rows remain persisted as drain-time access authority, but
         // must not reappear in the mounted namespace after a restart.
-        let hidden = self.hidden.lock().clone();
+        let hidden = self.writes.hidden();
         let mut st = self.state();
 
         // Pass 1: give every uid its inode from its local id (the root is
@@ -123,7 +117,7 @@ impl Core {
                 return;
             }
         };
-        let mut map = self.pending.lock();
+        let mut map = self.writes.pending.lock();
         let mut restored = 0usize;
         for op in ops {
             let Some(uid) = parse_node_uid(&op.uid) else {
@@ -132,7 +126,7 @@ impl Core {
                 continue;
             };
             if op.kind == OP_TRASH {
-                self.hidden.lock().insert(uid.clone());
+                self.writes.hide(&uid);
             }
             restored += 1;
             // Only a revision must have a blob. A create carries none until
@@ -225,7 +219,7 @@ impl Core {
                 example.get_or_insert_with(|| blob.clone());
                 continue;
             };
-            if self.pending.lock().contains_key(&uid) {
+            if self.writes.is_queued(&uid) {
                 // A newer write for the same node is queued and carries its own
                 // blob. These bytes are older; keeping them is right, uploading
                 // them over the newer ones is not.
@@ -266,7 +260,7 @@ impl Core {
                     if let Some(old) = superseded {
                         self.cache.discard_staged(Path::new(&old));
                     }
-                    self.pending.lock().insert(
+                    self.writes.pending.lock().insert(
                         uid.clone(),
                         PendingRevision {
                             path: blob.clone(),
@@ -336,7 +330,7 @@ impl Core {
             // now would use the wrong remote base. enqueue_staged_write would abandon it
             // to staging; keep it in recovery instead so the drain loop can queue it
             // once the queue clears.
-            if !meta.complete && self.pending.lock().contains_key(&uid) {
+            if !meta.complete && self.writes.is_queued(&uid) {
                 continue;
             }
 

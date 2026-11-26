@@ -58,16 +58,10 @@ impl Core {
     /// lock: no site in the daemon holds `pending` and `state` at once, and this
     /// is not the place to become the first.
     pub(super) fn stamp_pending_sizes(&self, nodes: &mut [Node]) {
-        let sizes: HashMap<NodeUid, u64> = {
-            let pending = self.pending.lock();
-            if pending.is_empty() {
-                return;
-            }
-            pending
-                .iter()
-                .map(|(uid, pr)| (uid.clone(), pr.meta.len))
-                .collect()
-        };
+        let sizes = self.writes.queued_sizes();
+        if sizes.is_empty() {
+            return;
+        }
         apply_pending_sizes(nodes, &sizes);
     }
 
@@ -167,7 +161,7 @@ impl Core {
         // Before the lock: a DB row carries the size the server last
         // sealed, which a queued write is ahead of (B11).
         self.stamp_pending_sizes(&mut nodes);
-        let hidden = self.hidden.lock().clone();
+        let hidden = self.writes.hidden();
         let mut st = self.state();
         if st.children.contains_key(&ino) {
             return Ok(());
@@ -334,7 +328,7 @@ impl Core {
         // Same as the DB path above: the remote's size for a file with a write
         // still queued is the pre-write one (B11).
         self.stamp_pending_sizes(&mut nodes);
-        let hidden = self.hidden.lock().clone();
+        let hidden = self.writes.hidden();
         let mut filtered_nodes: Vec<Node> = nodes
             .into_iter()
             .filter(|node| node_visible(node, &folder_uid, &hidden))

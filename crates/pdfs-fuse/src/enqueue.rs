@@ -204,7 +204,7 @@ impl Core {
         if is_local_uid(uid) {
             return None;
         }
-        match self.pending.lock().get(uid) {
+        match self.writes.pending.lock().get(uid) {
             Some(p) => p.meta.based_on.clone(),
             None => Some(Baseline {
                 mtime: base_mtime,
@@ -247,7 +247,7 @@ impl Core {
         // of exactly the ranges this write did not touch, and what neither wrote
         // is still the remote content that the earlier write was based on, which
         // is why the baseline is inherited along with them.
-        let previous = self.pending.lock().get(uid).cloned();
+        let previous = self.writes.queued(uid);
         if !meta.complete
             && let Some(previous) = previous
             && let Err(error) = merge_over_pending(&mut meta, src, &previous)
@@ -302,7 +302,7 @@ impl Core {
                 // carries it over, or has already finished and this write
                 // queues against the real uid below (`Core::retire_create`).
                 let meta_json = serde_json::to_string(&meta).unwrap_or_default();
-                let mut pending = self.pending.lock();
+                let mut pending = self.writes.pending.lock();
                 let attached = self
                     .db
                     .attach_blob_to_create(&uid.to_string(), &path.to_string_lossy(), &meta_json)
@@ -325,7 +325,7 @@ impl Core {
                 debug!(local = %uid, %real, "create landed under an open write; queueing a revision");
                 uid = real;
                 meta.uid = uid.to_string();
-                let previous = self.pending.lock().get(&uid).cloned();
+                let previous = self.writes.queued(&uid);
                 meta.based_on = previous.as_ref().and_then(|p| p.meta.based_on.clone());
                 if !meta.complete
                     && let Some(previous) = previous
@@ -353,7 +353,8 @@ impl Core {
                 error!(%uid, error = %e, "queueing upload failed");
                 Errno::EIO
             })?;
-            self.pending
+            self.writes
+                .pending
                 .lock()
                 .insert(uid.clone(), PendingRevision { path, meta });
             superseded
@@ -436,7 +437,7 @@ impl Core {
         // case the remote is *not* our base: the complete staged revision is.
         // Compose from those local bytes so the truncate can supersede the
         // queued upload without fetching stale remote content or returning EIO.
-        let pending_base = self.pending.lock().get(&uid).cloned();
+        let pending_base = self.writes.queued(&uid);
         if pending_base
             .as_ref()
             .is_some_and(|pending| !pending.meta.complete)
@@ -726,7 +727,7 @@ impl Core {
         } else {
             self.release_dropped_ops(uid, blobs);
         }
-        self.hidden.lock().insert(uid.clone());
+        self.writes.hide(uid);
         // Withdrawn from the tree, which every mount serves from, so no other
         // mount goes on serving a file the user just trashed (`docs/BUGS.md`
         // B74).
@@ -786,7 +787,7 @@ impl Core {
     /// (`docs/BUGS.md` B102), so the entries to forget are found by blob, not
     /// only by `uid`.
     pub(super) fn release_dropped_ops(&self, uid: &NodeUid, blobs: Vec<String>) {
-        self.pending.lock().remove(uid);
+        self.writes.pending.lock().remove(uid);
         self.release_dropped_below(blobs);
     }
 
@@ -794,7 +795,7 @@ impl Core {
     /// entry.
     pub(super) fn release_dropped_below(&self, blobs: Vec<String>) {
         let below: Vec<NodeUid> = {
-            let mut pending = self.pending.lock();
+            let mut pending = self.writes.pending.lock();
             let below: Vec<NodeUid> = pending
                 .iter()
                 .filter(|(_, p)| blobs.iter().any(|b| p.path == Path::new(b)))

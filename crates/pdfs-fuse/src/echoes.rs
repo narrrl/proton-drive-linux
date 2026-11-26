@@ -7,22 +7,22 @@ impl Core {
     /// Record that this daemon just changed `uid` on the remote, so the event
     /// feed's echo of that change is recognised instead of re-applied. Called
     /// from the drain once the remote has actually accepted the change and the
-    /// tree has been brought level with it. See [`Core::self_changes`].
+    /// tree has been brought level with it. See [`writes::WriteState`].
     pub(crate) fn note_self_change(&self, uid: &NodeUid) {
-        note_self_change(&mut self.self_changes.lock(), uid, now_millis());
+        self.writes.note_echo(uid, now_millis());
     }
 
     /// Claim one outstanding echo for `uid`, reporting whether this event is one
     /// this daemon caused. Consuming rather than merely testing is what bounds
     /// the suppression: the next event for the node applies normally.
     pub(super) fn take_self_change(&self, uid: &NodeUid) -> bool {
-        take_self_change(&mut self.self_changes.lock(), uid, now_millis())
+        self.writes.take_echo(uid, now_millis())
     }
 }
 
 /// How long a change this daemon made stays recognisable as its own. Generous
 /// against a feed that can lag, but finite: past it, an event for the node is
-/// applied like any other. See [`Core::self_changes`].
+/// applied like any other. See [`writes::WriteState`].
 pub(super) const SELF_CHANGE_TTL_MS: i64 = 120_000;
 
 /// A remote change this daemon made, awaiting its echo from the event feed.

@@ -233,7 +233,7 @@ impl Core {
                 .insert(real.clone(), local.clone());
         }
         // The feed will report this create back to us; the tree already has it
-        // under its real uid, so that event is ours to ignore (`Core::self_changes`).
+        // under its real uid, so that event is ours to ignore (`WriteState::note_echo`).
         self.note_self_change(&real);
         // The uploaded blob is done with either way: a write that replaced it
         // while it was on the wire already discarded it when it attached.
@@ -358,7 +358,7 @@ impl Core {
         // while its trash is on the wire or a listing still shows it. Taking a
         // folder removed and made again put the new one's contents into the
         // old one, and its trash took them along (docs/BUGS.md B162).
-        let hidden = self.hidden.lock().clone();
+        let hidden = self.writes.hidden();
         let Some(twin) = children
             .into_iter()
             .find(|node| node.name == name && !node.trashed && !hidden.contains(&node.uid))
@@ -514,7 +514,7 @@ impl Core {
         real: &NodeUid,
     ) -> Result<CreateRetired, Box<dyn std::error::Error>> {
         let retired = {
-            let mut pending = self.pending.lock();
+            let mut pending = self.writes.pending.lock();
             let retired = self.db.finish_create(op.id, uploaded, landing, |json| {
                 let mut meta: StagedWrite = serde_json::from_str(json).ok()?;
                 meta.uid = landing.real.to_string();

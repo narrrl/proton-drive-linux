@@ -176,7 +176,7 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
             // even for a trash, so an echo we no longer care about does not
             // linger to suppress a later foreign change.
             let echo = core.take_self_change(node_uid);
-            let ours = !*is_trashed && (echo || core.pending.lock().contains_key(node_uid));
+            let ours = !*is_trashed && (echo || core.writes.is_queued(node_uid));
             if ours {
                 debug!(uid = %node_uid, "ignoring remote event for a node with a queued write");
             }
