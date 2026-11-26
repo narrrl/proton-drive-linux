@@ -544,15 +544,15 @@ pub fn plan_file(
             (false, false) => FilePlan::Unchanged,
             (true, false) => FilePlan::UploadRevision,
             (false, true) => FilePlan::Download,
-            // With a baseline, both-changed is a genuine concurrent edit and must
-            // be preserved as a conflict. Without one, "both changed" only means
-            // this is the first sync and there was nothing to compare to: when the
-            // sizes match and Drive has a digest to compare against, the apply
-            // step hashes the local file before adopting it. Divergent sizes, or
-            // no digest, stay a real conflict: a missing digest proves nothing.
-            (true, true) if baseline.is_none() && l.size == r.size && r.sha1.is_some() => {
-                FilePlan::AdoptBaseline
-            }
+            // Both sides changed. When the sizes match and Drive has a digest,
+            // the apply step hashes the local file first, and records a
+            // baseline without a transfer if they are the same bytes. Without
+            // a baseline that is a first sync of a file already on both sides.
+            // With one, it is an upload whose reply was lost: Drive holds this
+            // computer's own edit, and a conflict copy of it would be a copy of
+            // itself. Different bytes, divergent sizes, or no digest stay a
+            // real conflict: a missing digest proves nothing.
+            (true, true) if l.size == r.size && r.sha1.is_some() => FilePlan::AdoptBaseline,
             (true, true) => FilePlan::Conflict,
         },
         (Some(_), None) if baseline.is_none() || local_changed => FilePlan::UploadNew,
@@ -789,6 +789,17 @@ mod file_plan_tests {
         assert_eq!(
             plan_file(Some(&edited), Some(&newer), Some(&base)),
             FilePlan::Conflict
+        );
+        // The same size with a digest is hashed first: it may be this
+        // computer's own upload whose reply was lost.
+        let digested = RemoteItem {
+            revision: Some("r2".into()),
+            sha1: Some("da39a3ee".into()),
+            ..remote(30, 40)
+        };
+        assert_eq!(
+            plan_file(Some(&local(11, 40)), Some(&digested), Some(&base)),
+            FilePlan::AdoptBaseline
         );
 
         // A row from before schema 44 has no id to compare, and a node read

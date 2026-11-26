@@ -2112,6 +2112,46 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_mirror_edit_whose_reply_was_lost_is_not_kept_as_a_conflict() {
+        // Drive made the revision, but the answer never came back. The next
+        // pass saw both sides changed since the baseline and kept a conflict
+        // copy of this computer's own edit.
+        let drive = FakeDrive::new();
+        let dir = scratch("mirror-lost-revision-reply");
+        let (daemon, folder, client) = start_mirror(&drive, &dir, &[("a.txt", b"one")]);
+        let local = dir.join("local");
+        assert!(wait_until(Duration::from_secs(30), || drive
+            .lookup("mirrored/a.txt")
+            .is_some()));
+        assert!(wait_for_pass(&daemon, folder, 0));
+
+        client.lose_reply_to_next_revision();
+        std::fs::write(local.join("a.txt"), b"two").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            on_drive(&drive, "mirrored/a.txt").is_some_and(|bytes| bytes == b"two")
+        }));
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+        assert!(wait_for_pass(&daemon, folder, 0));
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+        assert!(wait_for_pass(&daemon, folder, 0));
+
+        assert!(conflict_copies(&local, "a").is_empty());
+        assert!(
+            !drive.tree().keys().any(|k| k.contains("sync-conflict")),
+            "{:?}",
+            drive.tree()
+        );
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"two");
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_revision_made_during_a_mirror_download_still_arrives() {
         // The baseline after a download read the node again, and recorded a
         // revision another computer made while the download ran as synced.

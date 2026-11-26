@@ -50,6 +50,9 @@ kept, with a list of the folders that changed on Proton Drive since (49).
   first pass, and whenever the change feed lost track (#53).
 
 ### Fixed
+- **An edit in a synced folder whose upload lost its answer is no longer kept as a conflict copy
+  of itself.** When the file on Drive has the same size and content as the local one, the
+  next sync records it as in step instead (B298).
 - **A busy database no longer stalls reads or piles up threads.** A read that cannot get its own
   connection fails instead of waiting behind a long write. `pdfs diagnostics` reports the
   number of queued operations as unknown when the database does not answer in time, and no
