@@ -795,6 +795,10 @@ and migrating them, and registering this computer. Its `DevicesHost` port moves 
 sync pass and re-enumerates a folder, which is what migrating a device's folders needs. Synced
 folders and on-demand mounts are still methods on `Core`.
 
+`profile::ProfileBackup` writes this machine's profile to its device and reads the profiles other
+machines wrote, to offer their folders for restore. It needs nothing from the filesystem, so it
+has no host. Turning the offered folders into synced folders stays on `Core`.
+
 The control socket answers each area's requests in a module of its own under `control/`:
 sharing, Photos, synced folders and devices, revisions, and the trash and cache. Each module
 exports a pattern macro naming its requests, and the main match hands them over in one arm, so

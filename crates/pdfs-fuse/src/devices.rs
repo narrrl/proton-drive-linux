@@ -152,6 +152,7 @@ fn migrated_name(name: &str, device: &str, taken: &[String]) -> Option<String> {
 ///
 /// It reaches the rest of the daemon through [`DevicesHost`]. [`Core::devices`]
 /// builds one on demand with the daemon as its host.
+#[derive(Clone)]
 pub(crate) struct Devices {
     client: proton_drive_rs::ProtonDriveClient,
     drive: std::sync::Arc<dyn crate::drive::DriveApi>,

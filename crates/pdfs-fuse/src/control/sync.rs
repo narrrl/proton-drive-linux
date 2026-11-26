@@ -84,7 +84,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                     let started = Instant::now();
                     match core.add_sync_folder(&path) {
                         Ok(folder) => {
-                            core.touch_profile();
+                            core.profile().touch_profile();
                             let name = Path::new(&folder.local_path)
                                 .file_name()
                                 .and_then(|n| n.to_str())
@@ -131,7 +131,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
         CtlRequest::RemoveSyncFolder { id, delete_remote } => {
             match core.remove_sync_folder(id, delete_remote) {
                 Ok(()) => {
-                    core.touch_profile();
+                    core.profile().touch_profile();
                     CtlResponse::Ok {
                         message: "removed synced folder".to_string(),
                     }
@@ -142,7 +142,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
         CtlRequest::SetSyncFolderMode { id, mode } => {
             match core.request_sync_folder_mode(id, &mode) {
                 Ok(message) => {
-                    core.touch_profile();
+                    core.profile().touch_profile();
                     core.log_activity(ActivityKind::Upload, &message, "", true);
                     CtlResponse::Ok { message }
                 }
@@ -225,12 +225,12 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::ListRestorableFolders => match core.list_restorable_folders(None) {
+        CtlRequest::ListRestorableFolders => match core.profile().list_restorable_folders(None) {
             Ok(items) => CtlResponse::RestorableFolders { items },
             Err(e) => CtlResponse::error(e),
         },
         CtlRequest::ListDeviceRestorableFolders { device } => {
-            match core.list_restorable_folders(Some(&device)) {
+            match core.profile().list_restorable_folders(Some(&device)) {
                 Ok(items) => CtlResponse::RestorableFolders { items },
                 Err(e) => CtlResponse::error(e),
             }
@@ -251,7 +251,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                     .spawn_job("pdfs-restore-sync-folders", move || {
                         match core.restore_sync_folders(&items, device.as_deref()) {
                             Ok(outcome) => {
-                                core.touch_profile();
+                                core.profile().touch_profile();
                                 if !outcome.complete() {
                                     warn!(skipped = ?outcome.skipped, "restore skipped folders");
                                 }

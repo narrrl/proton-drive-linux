@@ -120,7 +120,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                 .map(|dirs| dirs.update_config(|cfg| cfg.cache_budget = Some(bytes)))
             {
                 Ok(Ok(())) => {
-                    core.touch_profile();
+                    core.profile().touch_profile();
                     CtlResponse::Ok {
                         message: format!("cache budget set to {bytes} bytes"),
                     }

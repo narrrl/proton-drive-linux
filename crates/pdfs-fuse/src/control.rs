@@ -638,7 +638,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::Pin { path }) => match route_keep(core, mountpoint, &path) {
             Ok((routed, rel)) => match routed.pin(&rel, &pin_record(&routed, &rel, &path)) {
                 Ok(name) => {
-                    core.touch_profile();
+                    core.profile().touch_profile();
                     CtlResponse::Ok {
                         message: format!("pinned {name}"),
                     }
@@ -650,7 +650,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::Unpin { path }) => match route_keep(core, mountpoint, &path) {
             Ok((routed, rel)) => match routed.unpin(&rel) {
                 Ok(name) => {
-                    core.touch_profile();
+                    core.profile().touch_profile();
                     CtlResponse::Ok {
                         message: format!("unpinned {name}"),
                     }
