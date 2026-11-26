@@ -4,7 +4,7 @@
 //! The engine used to be a set of methods on the daemon's `Core`, the struct
 //! every subsystem shares, so any part of a pass could read or lock anything in the
 //! daemon. Its own state now lives in [`SyncParts`], next to the handles it
-//! borrows (the database, Drive, the content cache), and everything else it
+//! borrows (its tables through [`SyncStore`], Drive, the content cache), and everything else it
 //! needs from the daemon goes through [`SyncHost`]. A [`Syncer`] is the two
 //! together: the value the engine's methods run on.
 //!
@@ -24,12 +24,12 @@ use pdfs_core::shutdown::Shutdown;
 use pdfs_core::transfers::TransferRegistry;
 use pdfs_drive::DriveApi;
 use pdfs_store::cache::ContentCache;
-use pdfs_store::db::Db;
 use proton_drive_rs::Thumbnail;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::info;
 
 use super::{EngineHealth, SyncMsg};
+use crate::store::SyncStore;
 
 /// What the sync engine needs from the daemon that it does not own.
 pub trait SyncHost: Send + Sync {
@@ -53,7 +53,8 @@ pub trait SyncHost: Send + Sync {
 /// The sync engine's state, and the daemon handles it uses.
 #[derive(Clone)]
 pub struct SyncParts {
-    pub db: Arc<Db>,
+    /// The engine's tables: synced folders, baselines and saved walks.
+    pub store: Arc<dyn SyncStore>,
     pub drive: Arc<dyn DriveApi>,
     pub rt: tokio::runtime::Handle,
     pub cache: Arc<ContentCache>,

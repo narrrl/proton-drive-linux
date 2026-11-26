@@ -495,7 +495,7 @@ pub(crate) fn mount_with(
     let shutdown = Arc::new(crate::shutdown::Shutdown::default());
     let transfers = TransferRegistry::new();
     let sync = sync::SyncParts {
-        db: db.clone(),
+        store: db.clone(),
         drive: drive.clone(),
         rt: rt.clone(),
         cache: cache.clone(),

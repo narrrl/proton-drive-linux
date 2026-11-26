@@ -2,7 +2,8 @@
 //!
 //! [`mirror`] runs the passes. It walks both sides, applies the plan and runs
 //! the engine thread; it owns its state and reaches the rest of the daemon only
-//! through [`mirror::SyncHost`]. The rest is the engine's decisions, apart from
+//! through [`mirror::SyncHost`], and its database tables only through
+//! [`store::SyncStore`]. The rest is the engine's decisions, apart from
 //! the I/O that feeds and applies them: [`model`] is what a pass knows about
 //! each path, [`planner`] decides what to do with it and refuses what looks
 //! like a wipe, [`trace`] records where a pass spent its time, and [`naming`]
@@ -23,6 +24,7 @@ pub mod mirror;
 pub mod model;
 pub mod naming;
 pub mod planner;
+pub mod store;
 pub mod trace;
 
 use model::{LocalItem, LocalSig, RemoteItem};
