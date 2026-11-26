@@ -130,7 +130,13 @@ impl Core {
             SizeUpgradeClaim::Start(slot, uids) => {
                 let core = self.clone();
                 let worker = slot.clone();
-                std::thread::spawn(move || core.run_size_upgrade(key, uids, worker));
+                if let Err(error) = self.services.spawn_job("pdfs-size-upgrade", move || {
+                    core.run_size_upgrade(key, uids, worker)
+                }) {
+                    // The waiters give up on the slot at their deadline and
+                    // answer with the size they have.
+                    warn!(%error, "could not start a size upgrade");
+                }
                 Some(slot)
             }
         }

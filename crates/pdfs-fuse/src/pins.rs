@@ -42,9 +42,10 @@ impl Core {
                 .map_err(|e| CoreError::from_api(&e, "pin"))?;
             let core = self.clone();
             let folder = name.clone();
-            std::thread::Builder::new()
-                .name("pin-folder".into())
-                .spawn(move || core.pin_subtree(ino, &uid, &folder))
+            self.services
+                .spawn_job("pdfs-pin-folder", move || {
+                    core.pin_subtree(ino, &uid, &folder)
+                })
                 .map_err(|e| CoreError::internal(format!("spawn pin: {e}")))?;
             return Ok(format!("{name}: downloading its files in the background"));
         }

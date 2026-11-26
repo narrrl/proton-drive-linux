@@ -1153,7 +1153,7 @@ impl Core {
         }
 
         let core = self.clone();
-        std::thread::spawn(move || {
+        if let Err(error) = self.services.spawn_job("pdfs-import", move || {
             // The job is dropped only after the final state is stored: the
             // job leaving the transfer snapshot is the front-ends' cue to ask
             // for the result, which must then be there.
@@ -1186,7 +1186,9 @@ impl Core {
                     summary.complete(),
                 );
             }
-        });
+        }) {
+            tracing::warn!(%error, "could not start pdfs-import");
+        }
         Ok(())
     }
 }

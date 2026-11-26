@@ -17,7 +17,9 @@ kept, with a list of the folders that changed on Proton Drive since (49).
 ### Added
 - **`pdfs diagnostics` says which of the daemon's background services are running.** If one
   ends while the drive is mounted, for example the sync engine after a crash, the journal says
-  so once, by name, instead of saying nothing until a restart.
+  so once, by name, instead of saying nothing until a restart. It also lists the jobs running
+  in the background, such as a cache check, an import or a folder being pinned, and how long
+  each has run.
 - **`PDFS_INSTANCE` runs a second client next to your own.** With a name set, the client keeps
   its own directories, keyring entry, kernel keys and mountpoint, so a test account can run
   alongside the account you use. `scripts/live-bench.py` uses it to time one edit, from the

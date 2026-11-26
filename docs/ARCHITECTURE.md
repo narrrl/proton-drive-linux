@@ -485,6 +485,11 @@ order, up to one 10-second deadline, and names any that are still running at the
 `pdfs diagnostics` reports what each worker is doing and which services are still running. The
 supervisor warns once about a service that ended while the mount runs.
 
+Work a request starts and does not wait for (a cache check, `VACUUM`, an import, a folder pin, a
+re-date, a profile backup, a size upgrade) runs as a one-shot job:
+`ServiceBoard::spawn_job` starts it on a named thread and lists it until it ends. `pdfs
+diagnostics` shows the jobs running and how long each has run. Jobs are not joined on stop.
+
 ---
 
 ## 10. Threat model: what this client writes to disk in plaintext

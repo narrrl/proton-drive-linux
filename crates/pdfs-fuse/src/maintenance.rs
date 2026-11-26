@@ -22,7 +22,7 @@ impl Core {
             m.running = true;
         }
         let core = self.clone();
-        std::thread::spawn(move || {
+        if let Err(error) = self.services.spawn_job("pdfs-vacuum", move || {
             let job = core.transfers.begin_job("Compacting the cache database");
             job.detail("Rewriting the database file");
             let started = Instant::now();
@@ -38,7 +38,9 @@ impl Core {
                 Err(e) => warn!(error = %e, "vacuum failed"),
             }
             core.maintenance.lock().running = false;
-        });
+        }) {
+            tracing::warn!(%error, "could not start pdfs-vacuum");
+        }
         Ok(())
     }
 
@@ -61,7 +63,7 @@ impl Core {
         drop(m);
 
         let core = self.clone();
-        std::thread::spawn(move || {
+        if let Err(error) = self.services.spawn_job("pdfs-integrity-check", move || {
             let job = core
                 .transfers
                 .begin_background_job("Checking the cache database");
@@ -78,7 +80,9 @@ impl Core {
             let mut m = core.maintenance.lock();
             m.integrity = Some(problems);
             m.running = false;
-        });
+        }) {
+            tracing::warn!(%error, "could not start pdfs-integrity-check");
+        }
         (Vec::new(), false, true)
     }
 }

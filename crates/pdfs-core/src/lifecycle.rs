@@ -12,9 +12,13 @@
 //! reverse start order: it signals [`Shutdown`], wakes each one, and joins each
 //! one up to a shared deadline, naming any that is still running then.
 //! [`ServiceBoard`] is the live view of the same threads, for diagnostics.
+//!
+//! Work a request starts and does not wait for runs as a one-shot job
+//! ([`ServiceBoard::spawn_job`]): a named thread, listed on the board while
+//! it runs, and not joined on stop.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -35,10 +39,18 @@ pub struct ServiceHealth {
     pub age: Duration,
 }
 
-/// The live view of the service threads: which ones were started, and which
-/// are still running. Cheap to clone and to read; never blocks on a service.
+/// The live view of the service threads, which were started and which are
+/// still running, and of the one-shot jobs running now. Cheap to clone and to
+/// read; never blocks on a service or a job.
 #[derive(Clone, Default)]
-pub struct ServiceBoard(Arc<Mutex<Vec<Entry>>>);
+pub struct ServiceBoard(Arc<Board>);
+
+#[derive(Default)]
+struct Board {
+    services: Mutex<Vec<Entry>>,
+    jobs: Mutex<Vec<Job>>,
+    next_job: AtomicU64,
+}
 
 struct Entry {
     name: String,
@@ -46,10 +58,17 @@ struct Entry {
     running: Arc<AtomicBool>,
 }
 
+struct Job {
+    id: u64,
+    name: String,
+    started: Instant,
+}
+
 impl ServiceBoard {
     /// Every service thread started so far, in start order.
     pub fn health(&self) -> Vec<ServiceHealth> {
         self.0
+            .services
             .lock()
             .iter()
             .map(|entry| ServiceHealth {
@@ -60,14 +79,73 @@ impl ServiceBoard {
             .collect()
     }
 
+    /// The one-shot jobs running now, oldest first. A job leaves the list
+    /// when its thread ends.
+    pub fn jobs(&self) -> Vec<ServiceHealth> {
+        self.0
+            .jobs
+            .lock()
+            .iter()
+            .map(|job| ServiceHealth {
+                name: job.name.clone(),
+                running: true,
+                age: job.started.elapsed(),
+            })
+            .collect()
+    }
+
+    /// Start `run` on a thread named `name`, as a one-shot job: a request's
+    /// work that outlasts the request, such as a cache check, an import or a
+    /// folder pin. It shows in [`jobs`](Self::jobs) until it ends, by return
+    /// or by panic.
+    ///
+    /// Not joined on stop. A job's work is either safe to cut short (the
+    /// process exits) or bounded by the deadlines of the calls it makes.
+    pub fn spawn_job<F>(&self, name: &str, run: F) -> std::io::Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let id = self.0.next_job.fetch_add(1, Ordering::Relaxed);
+        self.0.jobs.lock().push(Job {
+            id,
+            name: name.to_owned(),
+            started: Instant::now(),
+        });
+        let guard = JobGuard {
+            board: self.0.clone(),
+            id,
+        };
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let _guard = guard;
+                run();
+            })
+            // On an error the closure, and the guard in it, are already
+            // dropped, so the job is off the list.
+            .map(|_| ())
+    }
+
     fn add(&self, name: &str) -> Arc<AtomicBool> {
         let running = Arc::new(AtomicBool::new(true));
-        self.0.lock().push(Entry {
+        self.0.services.lock().push(Entry {
             name: name.to_owned(),
             started: Instant::now(),
             running: running.clone(),
         });
         running
+    }
+}
+
+/// Takes a job off the board when its thread ends, by return or by panic.
+struct JobGuard {
+    board: Arc<Board>,
+    id: u64,
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        self.board.jobs.lock().retain(|job| job.id != self.id);
     }
 }
 
@@ -259,5 +337,41 @@ mod tests {
         );
         assert!(left.is_empty());
         assert!(!board.health()[0].running);
+    }
+
+    #[test]
+    fn a_job_shows_while_it_runs_and_leaves_when_it_ends() {
+        let board = ServiceBoard::default();
+        let (release, wait) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        board
+            .spawn_job("pdfs-test-job", move || {
+                let _ = wait.recv();
+                let _done = done_tx;
+            })
+            .unwrap();
+        let jobs = board.jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "pdfs-test-job");
+        assert!(board.health().is_empty(), "a job is not a service");
+
+        release.send(()).unwrap();
+        let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !board.jobs().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(board.jobs().is_empty());
+    }
+
+    #[test]
+    fn a_job_that_panics_leaves_the_list() {
+        let board = ServiceBoard::default();
+        board.spawn_job("doomed-job", || panic!("boom")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !board.jobs().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(board.jobs().is_empty());
     }
 }

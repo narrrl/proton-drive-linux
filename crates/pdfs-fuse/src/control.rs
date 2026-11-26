@@ -1291,7 +1291,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     let core = core.clone();
                     let paths: Vec<PathBuf> = sources.into_iter().map(PathBuf::from).collect();
                     let n = paths.len();
-                    std::thread::spawn(move || {
+                    if let Err(error) = core.services.clone().spawn_job("pdfs-upload", move || {
                         let started = Instant::now();
                         match core.upload_paths(&parent_rel, &paths) {
                             Ok(stats) => {
@@ -1327,7 +1327,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                                 core.log_activity(ActivityKind::Upload, "bulk upload", &e, false);
                             }
                         }
-                    });
+                    }) {
+                        tracing::warn!(%error, "could not start pdfs-upload");
+                    }
                     CtlResponse::Ok {
                         message: format!("uploading {n} item(s)"),
                     }
@@ -1514,29 +1516,35 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             // completion (and any failures) go to the activity log.
             let core = core.clone();
             let path = PathBuf::from(&local_path);
-            std::thread::spawn(move || {
-                let started = Instant::now();
-                match core.add_sync_folder(&path) {
-                    Ok(folder) => {
-                        core.touch_profile();
-                        let name = Path::new(&folder.local_path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(&folder.local_path)
-                            .to_string();
-                        core.log_activity(
-                            ActivityKind::Upload,
-                            format!("synced {name}"),
-                            human_duration(started.elapsed()),
-                            folder.state != "error",
-                        );
+            if let Err(error) = core
+                .services
+                .clone()
+                .spawn_job("pdfs-add-sync-folder", move || {
+                    let started = Instant::now();
+                    match core.add_sync_folder(&path) {
+                        Ok(folder) => {
+                            core.touch_profile();
+                            let name = Path::new(&folder.local_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(&folder.local_path)
+                                .to_string();
+                            core.log_activity(
+                                ActivityKind::Upload,
+                                format!("synced {name}"),
+                                human_duration(started.elapsed()),
+                                folder.state != "error",
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "add sync folder failed");
+                            core.log_activity(ActivityKind::Upload, "add sync folder", &e, false);
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "add sync folder failed");
-                        core.log_activity(ActivityKind::Upload, "add sync folder", &e, false);
-                    }
-                }
-            });
+                })
+            {
+                tracing::warn!(%error, "could not start pdfs-add-sync-folder");
+            }
             CtlResponse::Ok {
                 message: format!("adding {local_path}"),
             }
@@ -1682,26 +1690,37 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             // Like AddSyncFolder: each restored folder downloads a whole tree,
             // which outlasts the socket timeout. Ack, then work.
             let core = core.clone();
-            std::thread::spawn(move || {
-                match core.restore_sync_folders(&items, device.as_deref()) {
-                    Ok(outcome) => {
-                        core.touch_profile();
-                        if !outcome.complete() {
-                            warn!(skipped = ?outcome.skipped, "restore skipped folders");
+            if let Err(error) =
+                core.services
+                    .clone()
+                    .spawn_job("pdfs-restore-sync-folders", move || {
+                        match core.restore_sync_folders(&items, device.as_deref()) {
+                            Ok(outcome) => {
+                                core.touch_profile();
+                                if !outcome.complete() {
+                                    warn!(skipped = ?outcome.skipped, "restore skipped folders");
+                                }
+                                core.log_activity(
+                                    ActivityKind::Download,
+                                    outcome.summary(),
+                                    outcome.skipped.join("; "),
+                                    outcome.complete(),
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "restore failed");
+                                core.log_activity(
+                                    ActivityKind::Download,
+                                    "restore folders",
+                                    &e,
+                                    false,
+                                );
+                            }
                         }
-                        core.log_activity(
-                            ActivityKind::Download,
-                            outcome.summary(),
-                            outcome.skipped.join("; "),
-                            outcome.complete(),
-                        );
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "restore failed");
-                        core.log_activity(ActivityKind::Download, "restore folders", &e, false);
-                    }
-                }
-            });
+                    })
+            {
+                tracing::warn!(%error, "could not start pdfs-restore-sync-folders");
+            }
             CtlResponse::Ok {
                 message: "restoring folders".to_string(),
             }
