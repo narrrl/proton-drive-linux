@@ -608,7 +608,7 @@ struct Core {
     /// that needs the database — so the handler acknowledges the request and a
     /// thread does the work, exactly as the other long control requests already
     /// do. See [`Maintenance`].
-    maintenance: Arc<Mutex<maintenance::Maintenance>>,
+    maintenance: maintenance::Maintenance,
     /// The size upgrades running now, and the replies parked on them. Shared
     /// by every mount: the bound that matters is per daemon.
     sizes: sizes::SizeState,

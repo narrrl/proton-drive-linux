@@ -88,7 +88,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                 // problems found" and "never looked" are both an empty list;
                 // `integrity_running` says a fresh answer is on its way.
                 let (integrity_problems, integrity_checked, integrity_running) = if deep {
-                    core.start_or_read_integrity_check()
+                    core.maintenance.start_or_read_integrity_check()
                 } else {
                     (Vec::new(), false, false)
                 };
@@ -106,7 +106,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             }
             Err(e) => CtlResponse::error(CoreError::internal(format!("read db stats: {e:?}"))),
         },
-        CtlRequest::CacheVacuum => match core.start_vacuum() {
+        CtlRequest::CacheVacuum => match core.maintenance.start_vacuum() {
             Ok(()) => CtlResponse::Ok {
                 message: "compacting the cache database in the background".into(),
             },

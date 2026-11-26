@@ -496,6 +496,7 @@ pub(crate) fn mount_with(
     let cache = Arc::new(cache);
     let shutdown = Arc::new(crate::shutdown::Shutdown::default());
     let transfers = TransferRegistry::new();
+    let services = ServiceBoard::default();
     let sync = sync::SyncParts {
         store: db.clone(),
         drive: drive.clone(),
@@ -530,7 +531,11 @@ pub(crate) fn mount_with(
         client,
         gallery,
         rt: rt.clone(),
-        maintenance: Arc::new(Mutex::new(Default::default())),
+        maintenance: super::maintenance::Maintenance::new(
+            db.clone(),
+            transfers.clone(),
+            services.clone(),
+        ),
         primary_root_uid: root.uid.clone(),
         state: state.clone(),
         cache,
@@ -550,7 +555,7 @@ pub(crate) fn mount_with(
         writes: super::writes::WriteState::new(),
         session: super::session::SessionCells::new(),
         shutdown,
-        services: ServiceBoard::default(),
+        services: services.clone(),
         photo_jobs: super::photos::PhotoJobs::new(),
         local_first,
         transfers,
