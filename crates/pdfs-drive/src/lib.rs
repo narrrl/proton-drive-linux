@@ -27,13 +27,14 @@ use futures::stream::BoxStream;
 use proton_drive_rs::proton_sdk::account::Quota;
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::{ProtonError, Result};
-use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid, ShareId};
+use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
 use proton_drive_rs::{
     AvailableNameTarget, Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeKind,
     NodeMoveItem, ProtonDriveClient, RevisionReader, Thumbnail, ThumbnailType, TrashedNode,
 };
 
 pub mod counted;
+pub mod digest;
 
 /// One outcome per node of a batch request; see [`ProtonDriveClient::trash_nodes`].
 pub type NodeOutcomes = Vec<(NodeUid, Result<()>)>;
@@ -606,6 +607,58 @@ pub fn node_revision_id(node: &Node) -> Option<String> {
         NodeKind::File {
             active_revision_id, ..
         } => active_revision_id.clone(),
+    }
+}
+
+/// The plaintext content SHA-1 of a file node, if its active revision carried one.
+/// A download-free content fingerprint the conflict sweep uses to prove two files
+/// hold identical bytes before it removes one.
+pub fn node_content_sha1(node: &Node) -> Option<String> {
+    match &node.kind {
+        NodeKind::Folder => None,
+        NodeKind::File { content_sha1, .. } => content_sha1.clone(),
+    }
+}
+
+/// Parse a `volume~link` uid display string back into a [`NodeUid`]. Front-ends
+/// receive uids as strings over the control socket and pass them back verbatim.
+pub fn parse_uid(s: &str) -> Option<NodeUid> {
+    let (vol, link) = s.split_once('~')?;
+    if vol.is_empty() || link.is_empty() || link.contains('~') {
+        return None;
+    }
+    Some(NodeUid::new(VolumeId::from(vol), LinkId::from(link)))
+}
+
+/// Whether a decrypted remote name can stand as one local path component.
+///
+/// Drive checks names only when a client creates or renames a node, and only
+/// for length, so a name made by another client, or by a server that should
+/// not be trusted, can hold anything. Joined onto a local path, a `/` or a `..`
+/// in it walks out of the folder it belongs to, and the mirror engine would
+/// then write or delete outside the sync root. In the mount, the kernel fails
+/// the whole listing with EIO on a single such name (`docs/BUGS.md` B215).
+pub fn remote_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= 255
+        && !name.contains(['/', '\0'])
+}
+
+/// A coarse MIME type guessed from a file name's extension; Proton stores this
+/// on the node but an exact value is not required for correctness.
+pub fn media_type_for(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("txt" | "md" | "log") => "text/plain",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("pdf") => "application/pdf",
+        Some("json") => "application/json",
+        Some("html" | "htm") => "text/html",
+        _ => "application/octet-stream",
     }
 }
 

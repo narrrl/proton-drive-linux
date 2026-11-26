@@ -1,6 +1,16 @@
-//! Convert the client's stored epoch seconds at the SDK boundary.
+//! Epoch seconds: the clock, and the conversion at the SDK boundary.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use proton_drive_rs::ModificationTime;
+
+/// Current wall-clock time as epoch seconds (0 if the clock is before the epoch).
+pub fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// A UTC modification time, or `None` when outside the SDK's supported range.
 pub fn modification_time(seconds: i64) -> Option<ModificationTime> {

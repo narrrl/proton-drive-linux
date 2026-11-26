@@ -43,8 +43,9 @@ use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{PhotoLocation, PhotoTag, PhotoTagsUpdate, PhotoUploadMetadata};
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 use tracing::{info, warn};
+
+pub(crate) use pdfs_drive::digest::{hex_lower, sha1_of};
 
 use super::Core;
 use crate::photos::can_make_thumbnail;
@@ -1232,31 +1233,6 @@ fn open_archive(
         .map_err(|e| CoreError::invalid(format!("cannot open {}: {e}", path.display())))?;
     zip::ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|e| CoreError::invalid(format!("{} is not a readable zip: {e}", path.display())))
-}
-
-/// The lowercase-hex SHA-1 of everything `reader` yields — the digest Proton's
-/// photo duplicate detection is keyed on.
-pub(crate) fn sha1_of(reader: &mut (dyn Read + Send)) -> CoreResult<String> {
-    let mut hasher = Sha1::new();
-    let mut buffer = vec![0u8; 256 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|e| CoreError::invalid(format!("read failed: {e}")))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex_lower(&hasher.finalize()))
-}
-
-pub(crate) fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
 }
 
 #[cfg(test)]
