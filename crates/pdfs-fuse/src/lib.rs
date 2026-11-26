@@ -59,7 +59,7 @@ use pdfs_core::batch;
 use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
-    SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncIssue, SyncPhase, SyncProgress,
+    SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncIssue, SyncProgress,
     ThumbnailBuildStatus, Topic, TransferDirection,
 };
 use pdfs_core::localindex;
@@ -576,10 +576,6 @@ struct Core {
     /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
     /// Persisted, so a pause survives a restart (see [`Core::sync_paused`]).
     sync_paused_until: Arc<AtomicI64>,
-    /// When Drive's event stream was last read to the end of a batch, in Unix
-    /// seconds; `0` until the first time. A mirror pass relies on the dirty
-    /// marks the stream makes only while this is recent (see `docs/SYNC_ENGINE.md`).
-    events_read_at: Arc<AtomicI64>,
     /// Writes accepted from the kernel but not yet uploaded, keyed by node.
     /// The in-memory face of the `pending_op` table, from
     /// which it is rebuilt on mount.
@@ -741,24 +737,18 @@ struct Core {
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
+    /// The folder-sync engine's own state, and the handles it shares with the
+    /// rest of the daemon.
+    sync: sync::SyncParts,
     /// Open [`Request::Subscribe`](pdfs_core::control::Request::Subscribe)
     /// connections, which every change a front-end shows is published to.
     events: Arc<events::EventHub>,
     /// True while the background scanner is rebuilding the local-file index, so
     /// `SearchLocal` can tell a front-end "still indexing" apart from "no match".
     indexing: Arc<AtomicBool>,
-    /// Live per-folder sync progress, keyed by sync-folder id, so `ListSyncFolders`
-    /// can say what a pass is doing rather than just "syncing". An entry exists
-    /// only while that folder's reconcile pass is running.
-    sync_progress: Arc<Mutex<HashMap<i64, SyncProgress>>>,
-    /// Whether the folder-sync engine is alive, and which pass it is on.
-    sync_engine: Arc<sync::EngineHealth>,
     /// Set while a diagnostics report's database probe is still out, so a
     /// database that does not answer costs one stuck thread, not one per report.
     pending_probe: Arc<AtomicBool>,
-    /// Channel to the folder-sync engine: nudges it to
-    /// reconcile a folder, reconcile everything, or re-scan its watch set.
-    sync_tx: std::sync::mpsc::Sender<sync::SyncMsg>,
     /// Secondary FUSE sessions for `ondemand` sync folders, keyed by sync-folder
     /// id. Each is a `ProtonFs` rooted at the folder's remote
     /// node, mounted over its local path, sharing this Core's client/cache/db and
@@ -767,20 +757,6 @@ struct Core {
     /// FUSE connection id and the fork's exact liveness flag so teardown first
     /// makes that mount unroutable.
     mounts: Arc<Mutex<mount::SecondaryMountRegistry<SecondaryMount>>>,
-    /// Per-sync-folder locks, held for a whole reconcile pass and for a whole
-    /// mode switch. A `mirror→ondemand` flip evicts the local tree and mounts
-    /// FUSE over it, so it must never overlap a pass that is walking and
-    /// uploading that same tree — the engine would upload files as they vanish
-    /// and then walk the FUSE mount as if it were local.
-    sync_locks: Arc<Mutex<HashMap<i64, Arc<Ranked<()>>>>>,
-    /// Per-sync-folder paths the last pass could not read, so the activity feed
-    /// says so when the set changes rather than on every poll (B196).
-    sync_unscanned: Arc<Mutex<HashMap<i64, Vec<String>>>>,
-    /// Sync folders whose running pass should stop at its next checkpoint,
-    /// because a removal is waiting for the folder's lock. A pass over a large
-    /// folder holds that lock for hours, and a removal that waited for it
-    /// held a control handler just as long (B294).
-    sync_abandon: Arc<Mutex<HashSet<i64>>>,
     /// Nodes this daemon changed on the remote itself, and how many echoes of
     /// those changes the event feed still owes us.
     ///
@@ -6171,100 +6147,6 @@ impl Core {
                 Vec::new()
             }
         }
-    }
-
-    // ---- live sync progress -----------------------------------------------
-
-    /// Start tracking a reconcile pass over `folder_id`, in [`SyncPhase::Scanning`].
-    pub(crate) fn progress_begin(&self, folder_id: i64) {
-        self.sync_progress.lock().insert(
-            folder_id,
-            SyncProgress {
-                phase: SyncPhase::Scanning,
-                done: 0,
-                total: 0,
-                current: String::new(),
-            },
-        );
-    }
-
-    /// Apply `f` to a folder's live progress, if a pass is running for it.
-    fn progress_update(&self, folder_id: i64, f: impl FnOnce(&mut SyncProgress)) {
-        let now = self.sync_progress.lock().get_mut(&folder_id).map(|p| {
-            f(p);
-            (p.phase, p.done, p.total)
-        });
-        if let Some((folder, age)) = self.sync_engine.moved()
-            && let Some((phase, done, total)) = now
-            && folder == folder_id
-        {
-            info!(
-                id = folder,
-                ?phase,
-                done,
-                total,
-                elapsed_s = age.as_secs(),
-                "sync: pass still running"
-            );
-        }
-    }
-
-    /// Set the number of items the scan expects to check, from the size of the
-    /// last pass's baseline. Only an estimate — the folder may have grown since —
-    /// but it turns the scan from an indeterminate pulse into a bar that moves,
-    /// which is the difference between "it's stuck" and "it's working" on a folder
-    /// whose walk takes minutes.
-    pub(crate) fn progress_scan_total(&self, folder_id: i64, n: usize) {
-        self.progress_update(folder_id, |p| p.total = n);
-    }
-
-    /// Note that the scan has checked one more item, named `name`.
-    pub(crate) fn progress_scanned(&self, folder_id: i64, name: &str) {
-        self.progress_update(folder_id, |p| {
-            p.done += 1;
-            p.current = name.to_string();
-        });
-    }
-
-    /// Note that the scan has checked `n` more items at once, read back from
-    /// a walk an earlier pass saved.
-    pub(crate) fn progress_scanned_many(&self, folder_id: i64, n: usize) {
-        self.progress_update(folder_id, |p| p.done += n);
-    }
-
-    /// Note that `n` more items have been queued for this pass, and that it has
-    /// moved on from scanning to applying the diff. The scan's counts are dropped:
-    /// they measured a different quantity (items checked, not items to apply), so
-    /// carrying them over would start the applying bar at a meaningless fraction.
-    pub(crate) fn progress_queued(&self, folder_id: i64, n: usize) {
-        self.progress_update(folder_id, |p| {
-            if p.phase == SyncPhase::Scanning {
-                p.phase = SyncPhase::Applying;
-                p.done = 0;
-                p.total = 0;
-                p.current.clear();
-            }
-            p.total += n;
-        });
-    }
-
-    /// Note that work has started on `name` (shown as the pass's current item).
-    pub(crate) fn progress_started(&self, folder_id: i64, name: &str) {
-        self.progress_update(folder_id, |p| p.current = name.to_string());
-    }
-
-    /// Note that one queued item finished, whether it succeeded or not.
-    pub(crate) fn progress_finished(&self, folder_id: i64) {
-        self.progress_update(folder_id, |p| {
-            p.done += 1;
-            p.current.clear();
-        });
-    }
-
-    /// Stop tracking a pass — no progress is reported for the folder until the
-    /// next [`progress_begin`](Self::progress_begin).
-    pub(crate) fn progress_end(&self, folder_id: i64) {
-        self.sync_progress.lock().remove(&folder_id);
     }
 }
 

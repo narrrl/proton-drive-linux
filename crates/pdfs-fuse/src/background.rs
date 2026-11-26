@@ -502,7 +502,9 @@ pub(super) async fn run_event_sync(
             }
         };
         if events.is_empty() {
-            core.events_read_at.store(now_secs(), Ordering::Relaxed);
+            core.sync
+                .events_read_at
+                .store(now_secs(), Ordering::Relaxed);
             continue;
         }
         debug!(count = events.len(), "applying remote events");
@@ -550,10 +552,12 @@ pub(super) async fn run_event_sync(
             core.recheck_pinned(uid);
         }
         for &id in &dirty.synced {
-            let _ = core.sync_tx.send(crate::sync::SyncMsg::Reconcile(id));
+            let _ = core.sync.tx.send(crate::sync::SyncMsg::Reconcile(id));
         }
         if whole {
-            core.events_read_at.store(now_secs(), Ordering::Relaxed);
+            core.sync
+                .events_read_at
+                .store(now_secs(), Ordering::Relaxed);
         }
         // Another device changed the tree: whatever a front-end lists may have
         // moved, including what is shared and what is in the trash.

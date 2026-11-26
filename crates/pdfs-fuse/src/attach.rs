@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 impl Core {
     /// A bounded, server-verified ancestry walk. Do not decide ownership or
     /// remote-root overlap from a possibly incomplete cached folder listing.
-    pub(super) fn attach_ancestors(&self, start: &NodeUid) -> CoreResult<Vec<NodeUid>> {
+    pub(crate) fn attach_ancestors(&self, start: &NodeUid) -> CoreResult<Vec<NodeUid>> {
         self.remote_ancestry(start, false)
     }
 
@@ -140,8 +140,8 @@ impl Core {
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
         // An empty baseline makes one-sided files new, never deletions. The
         // engine hashes matching-size files and preserves divergent versions.
-        let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
-        let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+        let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
+        let _ = self.sync.tx.send(sync::SyncMsg::Reconcile(id));
         self.db
             .sync_folder_get(id)
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?

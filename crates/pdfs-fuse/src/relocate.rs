@@ -200,7 +200,7 @@ impl Core {
         ids.sort_unstable();
         ids.dedup();
         let locks: Vec<Arc<pdfs_core::lockrank::Ranked<()>>> =
-            ids.iter().map(|&id| self.sync_lock(id)).collect();
+            ids.iter().map(|&id| self.sync.lock(id)).collect();
         let mut guards = Vec::with_capacity(locks.len());
         for lock in &locks {
             guards.push(lock.try_lock_for(MIRROR_LOCK_WAIT).ok_or_else(|| {
