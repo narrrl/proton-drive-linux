@@ -97,7 +97,7 @@ impl Db {
     /// waited that long behind it (`docs/BUGS.md` B218). WAL lets it read a
     /// consistent snapshot while the writer goes on.
     pub fn integrity_check(&self) -> Result<Vec<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare("PRAGMA integrity_check")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut problems = Vec::new();
@@ -116,7 +116,7 @@ impl Db {
     /// connection, for the reason [`integrity_check`](Self::integrity_check)
     /// gives: counting the rows of every table reads most of the file.
     pub fn stats(&self) -> Result<DbStats> {
-        let conn = self.read();
+        let conn = self.read()?;
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
         let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;

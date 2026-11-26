@@ -3606,7 +3606,8 @@ fn cmd_diagnostics() -> Result<()> {
                 "uptime {}  rss {}  pending ops {}",
                 human_secs(d.uptime_secs),
                 human_bytes(d.rss_bytes),
-                d.pending_ops,
+                d.pending_ops
+                    .map_or_else(|| "unknown (database busy)".to_owned(), |n| n.to_string()),
             );
             println!(
                 "control handlers {}/{}",

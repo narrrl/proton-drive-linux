@@ -503,7 +503,7 @@ impl Db {
     /// A folder can look empty locally while Drive still holds the queued
     /// moves' source files. A trash has to go through the drain in that case.
     pub fn has_pending_moves_out_of(&self, uid: &str) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         Ok(conn
             .prepare_cached(&format!(
                 "SELECT EXISTS (SELECT 1 FROM (SELECT ?1 AS uid) AS source
@@ -520,7 +520,7 @@ impl Db {
     /// wait for the trash rather than land under a conflict name. Older rows
     /// whose node and parent are unknown are matched by name alone.
     pub fn has_pending_trash_named(&self, name: &str, parent_uid: Option<&str>) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT EXISTS(
                     SELECT 1 FROM pending_op AS p
@@ -546,7 +546,7 @@ impl Db {
     /// and name, so a create of that name there waits for the trash: sent
     /// first, it made a node the trash took for the withdrawn one.
     pub fn has_withdrawn_create(&self, parent_uid: &str, name: &str) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         conn.query_row(
             &format!(
                 "SELECT EXISTS(
@@ -567,7 +567,7 @@ impl Db {
     /// once it lands, so an op that wants the name can wait for it. A create
     /// renamed while it was on the wire queues one (`Db::finish_create`).
     pub fn has_pending_move_from(&self, name: &str) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         conn.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM pending_op WHERE {MOVES_FROM})"),
             params![OP_RENAME, name],
@@ -589,7 +589,7 @@ impl Db {
 
     /// Whether a specific desired-state operation is still queued for a node.
     pub fn has_pending_op(&self, uid: &str, kind: &str) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         let lid = node_lid(&conn, uid)?;
         conn.query_row(
             &format!(
@@ -604,7 +604,7 @@ impl Db {
 
     /// Read an existing operation's metadata before a superseding enqueue.
     pub fn pending_op_meta(&self, uid: &str, kind: &str) -> Result<Option<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let lid = node_lid(&conn, uid)?;
         conn.query_row(
             &format!(
@@ -1099,7 +1099,7 @@ impl Db {
 
     /// Check if a queued create or mkdir op exists for `uid`.
     pub fn has_create_op(&self, uid: &str) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         let lid = node_lid(&conn, uid)?;
         let count: i64 = conn.query_row(
             &format!(
@@ -1119,7 +1119,7 @@ impl Db {
     /// bytes are still owed an upload, and dropping it would discard the staged
     /// blob that holds them (`docs/BUGS.md` B71).
     pub fn has_any_op(&self, uid: &str) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         let lid = node_lid(&conn, uid)?;
         let count: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM pending_op WHERE {}", on_node(2)),
@@ -1227,7 +1227,7 @@ impl Db {
     /// sort, and no separate index to maintain. The common case (something is
     /// due) exits on the first row.
     pub fn next_due_op(&self, now: i64) -> Result<Option<PendingOp>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT id, kind, {UID_NOW}, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
@@ -1368,7 +1368,7 @@ impl Db {
     /// is not work this worker is waiting for, and counting it would have an
     /// idle worker spin on a row it cannot have.
     pub fn earliest_due_at(&self) -> Result<Option<i64>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let ts: Option<i64> = conn
             .query_row(
                 &format!(
@@ -1386,7 +1386,7 @@ impl Db {
     /// Every queued op, oldest first. For status read-outs and the CLI — the
     /// drain wants [`next_due_op`](Self::next_due_op) instead.
     pub fn pending_ops(&self) -> Result<Vec<PendingOp>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT id, kind, {UID_NOW}, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
@@ -1418,7 +1418,7 @@ impl Db {
     /// construction, so nothing else in the drain ever looks at them. This is
     /// the one query that does.
     pub fn parked_create_ops(&self) -> Result<Vec<PendingOp>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT id, kind, {UID_NOW}, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
@@ -1453,7 +1453,7 @@ impl Db {
     /// mount owes the server, but it carries no bytes and reporting it as an
     /// upload is simply untrue.
     pub fn pending_op_counts(&self) -> Result<PendingCounts> {
-        let conn = self.read();
+        let conn = self.read()?;
         let uploads = conn.query_row(
             "SELECT COUNT(*) FROM pending_op WHERE kind IN (?1, ?2)",
             params![OP_REVISION, OP_CREATE],
@@ -1501,7 +1501,7 @@ impl Db {
     /// it gone: the node was deleted, or a newer write superseded it, while the
     /// worker was talking to the server.
     pub fn op_exists(&self, id: i64) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pending_op WHERE id = ?1",
             params![id],
@@ -1617,7 +1617,7 @@ impl Db {
 
     /// The issue of every op Drive refused, by op id.
     pub fn op_issues(&self) -> Result<HashMap<i64, String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare("SELECT id, issue FROM pending_op WHERE issue IS NOT NULL")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1628,7 +1628,7 @@ impl Db {
     /// The issue each node with a refused change has, by local id: what the
     /// file browser shows on the node itself.
     pub fn node_issues(&self) -> Result<HashMap<i64, String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT COALESCE(o.lid, n.lid), o.issue FROM pending_op o
              LEFT JOIN nodes n ON o.lid IS NULL AND n.uid = o.uid
@@ -1753,7 +1753,7 @@ impl Db {
     /// `staging/`: the difference is bytes the kernel was told were written and
     /// that nothing is going to upload.
     pub fn op_blob_paths(&self) -> Result<std::collections::HashSet<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt =
             conn.prepare("SELECT blob_path FROM pending_op WHERE blob_path IS NOT NULL")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -1794,7 +1794,7 @@ impl Db {
     /// supersedes rather than forking a `(sync-conflict)` copy (docs/BUGS.md
     /// B70 layer B).
     pub fn own_sealed_rev(&self, uid: &str, now_ms: i64) -> Result<Option<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         Ok(conn
             .query_row(
                 "SELECT revision_id FROM own_sealed_rev

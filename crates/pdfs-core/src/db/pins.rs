@@ -40,7 +40,7 @@ impl Db {
 
     /// Every directly-pinned entry, ordered by uid.
     pub fn pin_list(&self) -> Result<Vec<PinRow>> {
-        let conn = self.read();
+        let conn = self.read()?;
         // `recursive` is pin policy; the node's kind comes from `nodes`, and is
         // NULL for a pin whose node was never cached.
         let mut stmt = conn.prepare(
@@ -73,7 +73,7 @@ impl Db {
     /// terminates — while holding the daemon's only SQLite connection, on a path
     /// that runs per cached read.
     pub fn is_pinned(&self, uid: &str) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         let direct: Option<i64> = conn
             .query_row("SELECT 1 FROM pins WHERE uid = ?1", params![uid], |r| {
                 r.get(0)
@@ -107,7 +107,7 @@ impl Db {
     /// every descendant of a recursively-pinned folder. Used to build the
     /// eviction-exempt set (the budget enforcer hashes these into cache keys).
     pub fn pinned_uids(&self) -> Result<Vec<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "WITH RECURSIVE sub(uid, lid) AS (
                SELECT p.uid, n.lid FROM pins p LEFT JOIN nodes n ON n.uid = p.uid
@@ -130,7 +130,7 @@ impl Db {
     /// Every descendant uid of `folder` (all depths), via a `parent_lid` CTE.
     /// Used to evict a recursively-pinned subtree's cached blobs on unpin.
     pub fn descendants(&self, folder: &str) -> Result<Vec<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "WITH RECURSIVE sub(uid, lid) AS (
                SELECT c.uid, c.lid FROM nodes c JOIN nodes f ON c.parent_lid = f.lid

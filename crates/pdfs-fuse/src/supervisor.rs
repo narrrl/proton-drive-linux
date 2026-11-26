@@ -73,7 +73,7 @@ pub(crate) fn run(core: Core, control_socket: PathBuf) {
         if last_rss.elapsed() >= RSS_EVERY {
             info!(
                 rss_bytes = report.rss_bytes,
-                pending_ops = report.pending_ops,
+                pending_ops = ?report.pending_ops,
                 meta_queued = report.meta_queued,
                 transfer_queued = report.transfer_queued,
                 stalled,

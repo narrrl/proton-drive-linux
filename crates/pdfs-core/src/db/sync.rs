@@ -141,7 +141,7 @@ impl Db {
 
     /// Every synced folder, oldest first.
     pub fn sync_folder_list(&self) -> Result<Vec<StoredSyncFolder>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync, kind
              FROM sync_folder ORDER BY id",
@@ -168,7 +168,7 @@ impl Db {
 
     /// Look up one synced folder by id.
     pub fn sync_folder_get(&self, id: i64) -> Result<Option<StoredSyncFolder>> {
-        let conn = self.read();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync, kind
              FROM sync_folder WHERE id = ?1",
@@ -263,7 +263,7 @@ impl Db {
 
     /// The whole per-file sync baseline for a folder, keyed by relative path.
     pub fn sync_entries(&self, folder_id: i64) -> Result<HashMap<String, StoredSyncEntry>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash,
                     local_mtime_ns, remote_revision_id
@@ -296,7 +296,7 @@ impl Db {
     /// `sync_folder` and descendants come from the last successful
     /// `sync_entry` baseline.
     pub fn mirror_contains_uid(&self, uid: &str) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT EXISTS(
                  SELECT 1
@@ -345,7 +345,7 @@ impl Db {
     /// How many baseline rows each synced folder has, by folder id. A folder
     /// with none is absent.
     pub fn sync_entry_counts(&self) -> Result<HashMap<i64, usize>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt =
             conn.prepare("SELECT folder_id, COUNT(*) FROM sync_entry GROUP BY folder_id")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
@@ -564,7 +564,7 @@ impl Db {
     /// device or by a pass. [`Db::sync_remote_changed`] and the baseline's
     /// triggers mark them.
     pub fn sync_remote_dirty(&self, folder_id: i64) -> Result<Vec<(i64, String)>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt =
             conn.prepare("SELECT seq, dir FROM sync_remote_dirty WHERE folder_id = ?1")?;
         let rows = stmt
@@ -612,7 +612,7 @@ impl Db {
         // Looked up on a reader: most events are about nodes no walk holds,
         // and those must not queue behind the writer.
         let marked: Vec<(i64, String)> = {
-            let conn = self.read();
+            let conn = self.read()?;
             let mut marked: Vec<(i64, String)> = conn
                 .prepare_cached(
                     "SELECT folder_id, rtrim(rtrim(rel_path, replace(rel_path, '/', '')), '/')

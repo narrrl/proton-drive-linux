@@ -744,6 +744,9 @@ struct Core {
     sync_progress: Arc<Mutex<HashMap<i64, SyncProgress>>>,
     /// Whether the folder-sync engine is alive, and which pass it is on.
     sync_engine: Arc<sync::EngineHealth>,
+    /// Set while a diagnostics report's database probe is still out, so a
+    /// database that does not answer costs one stuck thread, not one per report.
+    pending_probe: Arc<AtomicBool>,
     /// Channel to the folder-sync engine: nudges it to
     /// reconcile a folder, reconcile everything, or re-scan its watch set.
     sync_tx: std::sync::mpsc::Sender<sync::SyncMsg>,

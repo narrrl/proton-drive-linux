@@ -126,19 +126,16 @@ struct ReadPool {
 const MAX_IDLE_READERS: usize = 4;
 
 impl ReadPool {
-    fn take(&self) -> Option<Connection> {
+    /// An idle connection, or a new one. An error when none can be opened:
+    /// the caller's read fails rather than queueing behind the writer, which
+    /// can hold its lock for as long as a large transaction takes.
+    fn take(&self) -> Result<Connection> {
         if let Some(conn) = self.idle.lock().pop() {
-            return Some(conn);
+            return Ok(conn);
         }
-        match open_read_only(&self.path) {
-            Ok(conn) => Some(conn),
-            Err(error) => {
-                // Falling back to the write connection is correct, just slower,
-                // so this is a warning and not a failed read.
-                tracing::warn!(%error, "could not open a read-only connection");
-                None
-            }
-        }
+        open_read_only(&self.path).inspect_err(|error| {
+            tracing::warn!(%error, "could not open a read-only connection");
+        })
     }
 
     fn put(&self, conn: Connection) {
@@ -150,10 +147,10 @@ impl ReadPool {
 }
 
 /// A connection to read through: one borrowed from [`ReadPool`], or the write
-/// connection when there is no pool (in-memory) or opening one failed.
+/// connection for an in-memory database, which has no pool.
 ///
 /// Derefs to `Connection`, so a method converts by swapping `self.conn.lock()`
-/// for `self.read()` and nothing else.
+/// for `self.read()?` and nothing else.
 pub(super) struct Reader<'a> {
     pooled: Option<Connection>,
     writer: Option<parking_lot::MutexGuard<'a, Connection>>,
@@ -320,21 +317,19 @@ impl Db {
     /// Reads see the last committed state, which is the same thing they saw
     /// through the write connection: every method here commits before it
     /// returns, and nothing holds a transaction open across calls.
-    pub(super) fn read(&self) -> Reader<'_> {
-        if let Some(pool) = &self.readers
-            && let Some(conn) = pool.take()
-        {
-            return Reader {
-                pooled: Some(conn),
-                writer: None,
-                pool: Some(pool),
-            };
-        }
-        Reader {
-            pooled: None,
-            writer: Some(self.conn.lock()),
-            pool: None,
-        }
+    pub(super) fn read(&self) -> Result<Reader<'_>> {
+        let Some(pool) = &self.readers else {
+            return Ok(Reader {
+                pooled: None,
+                writer: Some(self.conn.lock()),
+                pool: None,
+            });
+        };
+        Ok(Reader {
+            pooled: Some(pool.take()?),
+            writer: None,
+            pool: Some(pool),
+        })
     }
 
     /// Open the file, apply every PRAGMA, and migrate. Split out of

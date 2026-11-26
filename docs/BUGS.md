@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B296](#b296--a-busy-database-stalls-reads-and-piles-up-diagnostics-threads) | A busy database stalls reads, and piles up diagnostics threads |
 | [B294](#b294--a-mirror-folder-too-large-to-finish-in-one-run-never-syncs-and-holds-back-the-others) | A mirror folder too large to finish in one run never syncs, and holds back the others |
 | [B66](#b66--local-only-pending-data-is-not-protected-at-shutdown-high-21) | Local-only pending data is not protected at shutdown (HIGH-21) |
 | [B291](#b291--on-fedora-45s-oo7-every-saved-sign-in-is-lost-at-the-next-reboot) | On Fedora 45's oo7, every saved sign-in is lost at the next reboot |
@@ -434,6 +435,36 @@ once, serially ([run](https://github.com/narrrl/proton-drive-linux/actions/runs/
 the assert at `daemon.rs:2209` found an empty list. It has not failed since.
 
 ---
+### B296 — A busy database stalls reads, and piles up diagnostics threads
+
+**Status:** Fixed (unverified)
+
+**Found:** 2026-11-25, while hunting a hang in the remote-dirty simulation (B294). The stuck
+process held one `pdfs-diagnostics` thread per supervisor tick, every one of them waiting on the
+database.
+
+**Where:** `crates/pdfs-core/src/db/mod.rs` `Db::read`; `crates/pdfs-fuse/src/diagnostics.rs`
+`Core::pending_ops_quickly`
+
+**Repro:** Hold the write connection, for example with a long transaction, and make opening a
+read-only connection fail (too many open files, or the file gone). Every `SELECT`-only method
+waits for the writer. Ask for diagnostics while the database does not answer: each report
+starts a new thread, and none of them ends.
+
+**Cause:** `Db::read` used the write connection whenever it could not open a read-only one, so
+a read waited behind whatever transaction the writer was in. The diagnostics report counted the
+queued operations on a new thread each time and stopped waiting after half a second, but left
+the thread behind. The supervisor asks for a report every tick, so a database that never
+answered gained a thread per tick. The report also showed `0` queued operations when the count
+did not come back, which reads as "nothing to upload".
+
+**Fix:** `Db::read` returns an error when it cannot open a read-only connection. Only an
+in-memory database, which has no read-only connections, still reads through the writer. The
+diagnostics report starts a probe only when the previous one has returned, and reports the count
+as unknown (`null` in JSON, `unknown (database busy)` in `pdfs diagnostics`) when it has none.
+
+**Verified:** `a_read_without_a_reader_connection_fails_instead_of_waiting_on_the_writer` and
+`a_stuck_probe_is_not_started_again`.
 
 ---
 

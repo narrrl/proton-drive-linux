@@ -2335,8 +2335,10 @@ pub struct Diagnostics {
     /// from the CLI.
     pub control_handlers: usize,
     pub control_handler_limit: usize,
-    /// Queued mutations not yet drained.
-    pub pending_ops: u64,
+    /// Queued mutations not yet drained. `None` when the database did not
+    /// answer in time, which is itself the thing to look at.
+    #[serde(default)]
+    pub pending_ops: Option<u64>,
     /// The folder-sync engine. `None` from a daemon that predates the field.
     #[serde(default)]
     pub sync: Option<SyncEngineState>,

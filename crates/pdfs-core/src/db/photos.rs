@@ -209,7 +209,7 @@ fn photos_delete_tx(tx: &Transaction<'_>, uids: &[String]) -> Result<usize> {
 
 impl Db {
     pub fn photo_projection_generation(&self) -> Result<i64> {
-        Ok(photos_generation(&self.read())?)
+        Ok(photos_generation(&*self.read()?)?)
     }
 
     /// One transaction records the deletion, stale metadata, listing work and feed position.
@@ -265,7 +265,7 @@ impl Db {
     }
 
     pub fn photos_need_work(&self) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         Ok(conn.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM sync_state WHERE key=?1)
              OR EXISTS(SELECT 1 FROM photos WHERE resolved_at IS NULL)",
@@ -275,7 +275,7 @@ impl Db {
     }
 
     pub fn photos_pending(&self) -> Result<Vec<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt =
             conn.prepare("SELECT uid FROM photos WHERE resolved_at IS NULL ORDER BY seq")?;
         Ok(stmt
@@ -284,7 +284,7 @@ impl Db {
     }
 
     pub fn photo_removed(&self, uid: &str) -> Result<bool> {
-        Ok(self.read().query_row(
+        Ok(self.read()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM photo_tombstones WHERE uid=?1)",
             [uid],
             |r| r.get(0),
@@ -292,7 +292,7 @@ impl Db {
     }
 
     pub fn photos_contains(&self, uid: &str, album: Option<&str>) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         Ok(match album {
             Some(album) => conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM album_photos WHERE album_uid=?1 AND uid=?2)",
@@ -572,7 +572,7 @@ impl Db {
     /// one a remote event marked stale — is resolved. That is what keeps a
     /// 12k-photo library off 63 round-trips of `enumerate_nodes` every refresh.
     pub fn photos_resolved(&self) -> Result<Vec<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare("SELECT uid FROM photos WHERE resolved_at IS NOT NULL")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut uids = Vec::new();
@@ -671,7 +671,7 @@ impl Db {
         not_in_album: bool,
         excluded: &str,
     ) -> Result<Vec<StoredPhoto>> {
-        let conn = self.read();
+        let conn = self.read()?;
         // Built up so any combination of the optional filters is one indexed
         // query rather than a statement per case.
         let mut sql = String::from(PHOTO_SELECT);
@@ -729,7 +729,7 @@ impl Db {
     /// of a shot, or just the photo itself when it stands alone. The lightbox
     /// switches between these, and deleting a tile trashes all of them.
     pub fn photos_group(&self, uid: &str) -> Result<Vec<StoredPhoto>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let sql = format!(
             "{PHOTO_SELECT} WHERE COALESCE(p.group_key, p.uid) = \
              (SELECT COALESCE(group_key, uid) FROM photos WHERE uid = ?1) ORDER BY p.seq"
@@ -748,7 +748,7 @@ impl Db {
             return Ok(HashSet::new());
         }
         let ids = serde_json::to_string(uids).expect("file identifiers serialize");
-        let conn = self.read();
+        let conn = self.read()?;
         let mut query = conn.prepare(
             "SELECT uid FROM photos WHERE COALESCE(group_key, uid) IN (
                SELECT COALESCE(group_key, uid) FROM photos
@@ -764,7 +764,7 @@ impl Db {
     /// per group. Only for whole-library passes (the photo re-date); the gallery
     /// pages with [`Db::photos_page`].
     pub fn photos_all(&self) -> Result<Vec<StoredPhoto>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let sql = format!("{PHOTO_SELECT} ORDER BY p.seq");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
@@ -790,7 +790,7 @@ impl Db {
         kind: Option<crate::control::PhotoKind>,
         excluded: &str,
     ) -> Result<Vec<(i32, i32, usize)>> {
-        let conn = self.read();
+        let conn = self.read()?;
         // The scrubber has to agree with the page it scrubs, so it counts what
         // the page shows: groups everywhere except on the Raw tab.
         let filter = match kind {
@@ -837,7 +837,7 @@ impl Db {
         limit: usize,
         excluded: &str,
     ) -> Result<Vec<StoredPhoto>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let sql = format!(
             "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) \
              AND strftime('%m-%d', p.capture_time, 'unixepoch', 'localtime') \
@@ -863,7 +863,7 @@ impl Db {
 
     pub fn photo_places_visible(&self, excluded: &str) -> Result<Vec<StoredPlace>> {
         let rows: Vec<(u32, usize, String)> = {
-            let conn = self.read();
+            let conn = self.read()?;
             // SQLite fills the bare `uid` from the row `MIN(seq)` picked, which
             // is the newest photo of the place.
             let mut stmt = conn.prepare(
@@ -912,7 +912,7 @@ impl Db {
         limit: usize,
         excluded: &str,
     ) -> Result<Vec<StoredPhoto>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let sql = format!(
             "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) AND p.place_id = ?1
              AND p.uid NOT IN (SELECT value FROM json_each(?4))
@@ -934,7 +934,7 @@ impl Db {
     pub fn photo_locations_at_place(&self, id: u32) -> Result<Vec<(StoredPhoto, (f64, f64))>> {
         let photos = self.photos_at_place(id, 0, usize::MAX >> 1)?;
         let located: HashMap<String, (f64, f64)> = {
-            let conn = self.read();
+            let conn = self.read()?;
             let mut stmt = conn.prepare(
                 "SELECT uid, latitude, longitude FROM photos \
                  WHERE place_id = ?1 AND latitude IS NOT NULL AND longitude IS NOT NULL",
@@ -961,7 +961,7 @@ impl Db {
     /// set left with one member is no set.
     pub fn photo_duplicates(&self) -> Result<Vec<Vec<StoredPhoto>>> {
         let rows: Vec<(String, String, String)> = {
-            let conn = self.read();
+            let conn = self.read()?;
             let mut stmt = conn.prepare(
                 "SELECT p.uid, p.content_hash, COALESCE(p.group_key, p.uid) AS k FROM photos p \
                  WHERE p.content_hash IN (SELECT content_hash FROM photos \
@@ -1008,7 +1008,7 @@ impl Db {
     /// any of its files is, since they all show one picture.
     pub fn photos_unhashed(&self, limit: usize) -> Result<Vec<StoredPhoto>> {
         let uids: Vec<String> = {
-            let conn = self.read();
+            let conn = self.read()?;
             let mut stmt = conn.prepare(
                 "SELECT COALESCE(group_key, uid) AS k FROM photos \
                  GROUP BY k \
@@ -1042,7 +1042,7 @@ impl Db {
 
     /// How many shots have been hashed, out of how many could be.
     pub fn similar_progress(&self) -> Result<(usize, usize)> {
-        let conn = self.read();
+        let conn = self.read()?;
         let (hashed, total): (i64, i64) = conn.query_row(
             "SELECT COUNT(*) FILTER (WHERE hashed), COUNT(*) FROM \
                (SELECT MAX(similar_hash) IS NOT NULL AS hashed FROM photos \
@@ -1060,7 +1060,7 @@ impl Db {
     /// are all byte-identical copies is left to [`Self::photo_duplicates`].
     pub fn photo_similar(&self) -> Result<Vec<Vec<StoredPhoto>>> {
         let rows: Vec<(String, u64, Option<String>)> = {
-            let conn = self.read();
+            let conn = self.read()?;
             let mut stmt = conn.prepare(
                 "SELECT COALESCE(group_key, uid) AS k, MAX(similar_hash), \
                         MAX(content_hash) FILTER (WHERE uid = COALESCE(group_key, uid)) \
@@ -1109,7 +1109,7 @@ impl Db {
 
     pub fn photos_counts_visible(&self, excluded: &str) -> Result<(usize, usize, usize)> {
         use crate::control::PhotoKind;
-        let conn = self.read();
+        let conn = self.read()?;
         // Photos and Videos count groups — one shot is one entry, however many
         // files it was stored as. Raw counts files, because the Raw tab lists
         // them individually.
@@ -1140,7 +1140,7 @@ impl Db {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.read();
+        let conn = self.read()?;
         let placeholders = vec!["?"; uids.len()].join(",");
         let sql = format!("{PHOTO_SELECT} WHERE p.uid IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
@@ -1178,7 +1178,7 @@ impl Db {
 
     /// Number of photos in the persisted timeline.
     pub fn photos_count(&self) -> Result<usize> {
-        let conn = self.read();
+        let conn = self.read()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))?;
         Ok(n.max(0) as usize)
     }
