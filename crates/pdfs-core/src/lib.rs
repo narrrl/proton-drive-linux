@@ -11,6 +11,7 @@ pub mod error;
 pub mod kernelkey;
 pub mod keycheck;
 pub mod localindex;
+pub mod lockrank;
 pub mod menu;
 pub mod mountfail;
 pub mod mountpoint;
