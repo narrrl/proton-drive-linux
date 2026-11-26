@@ -3712,6 +3712,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    #[ignore = "mounts FUSE: run explicitly on an isolated fake Drive"]
+    fn a_synced_folder_trashed_on_drive_does_not_block_attaching_another() {
+        let drive = FakeDrive::new();
+        let dir = scratch("attach-past-trash");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        for folder in ["Gone", "Next", "Parent", "Parent/Old"] {
+            std::fs::create_dir(daemon.mountpoint.join(folder)).unwrap();
+        }
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.lookup("Parent/Old").is_some()
+                && drive.lookup("Next").is_some()
+        }));
+        let attach = |local: &str, remote: &str| {
+            let path = dir.join(local);
+            std::fs::create_dir_all(&path).unwrap();
+            daemon.request(&Request::AttachSyncFolder {
+                local_path: path.to_str().unwrap().into(),
+                remote_path: remote.into(),
+            })
+        };
+        attach("gone", "Gone").unwrap();
+        attach("old", "Parent/Old").unwrap();
+        drive.device().trash("Gone");
+        drive.device().trash("Parent/Old");
+        // Reads lag the server: wait until this client sees both in the trash.
+        assert!(wait_until(Duration::from_secs(60), || {
+            !daemon.mountpoint.join("Gone").exists()
+                && !daemon.mountpoint.join("Parent/Old").exists()
+        }));
+
+        // B299: the first synced folder in the trash failed every later attach
+        // with "remote sync folder is in the trash".
+        attach("next", "Next").expect("a trashed synced folder blocked an unrelated attach");
+        // Its place on Drive still counts: the folder above it overlaps it.
+        assert!(
+            attach("parent", "Parent").is_err(),
+            "attached a folder above a synced folder in the trash"
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn attached_my_files(daemon: &Daemon, drive: &FakeDrive, local: &Path) -> i64 {
         std::fs::create_dir(daemon.mountpoint.join("Work")).unwrap();
         assert!(wait_until(Duration::from_secs(30), || {

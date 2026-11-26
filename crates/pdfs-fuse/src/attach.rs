@@ -14,6 +14,13 @@ impl Core {
     /// A bounded, server-verified ancestry walk. Do not decide ownership or
     /// remote-root overlap from a possibly incomplete cached folder listing.
     pub(super) fn attach_ancestors(&self, start: &NodeUid) -> CoreResult<Vec<NodeUid>> {
+        self.remote_ancestry(start, false)
+    }
+
+    /// The ancestry walk behind [`attach_ancestors`](Self::attach_ancestors).
+    /// With `through_trash`, a folder in the trash is walked like any other
+    /// instead of failing the walk.
+    fn remote_ancestry(&self, start: &NodeUid, through_trash: bool) -> CoreResult<Vec<NodeUid>> {
         let mut ancestors = Vec::new();
         let mut seen = HashSet::new();
         let mut next = Some(start.clone());
@@ -35,7 +42,7 @@ impl Core {
                 .into_iter()
                 .next()
                 .ok_or_else(|| CoreError::not_found("remote sync folder is missing"))?;
-            if node.trashed {
+            if node.trashed && !through_trash {
                 return Err(CoreError::invalid("remote sync folder is in the trash"));
             }
             next = node.parent_uid;
@@ -103,10 +110,17 @@ impl Core {
         for other in existing.iter().filter(|f| f.kind == "attached") {
             let uid = parse_uid(&other.remote_uid)
                 .ok_or_else(|| CoreError::internal("invalid existing remote sync root"))?;
-            if uid == remote_uid
-                || ancestors.contains(&uid)
-                || self.attach_ancestors(&uid)?.contains(&remote_uid)
-            {
+            // Another synced folder whose Drive folder is in the trash, or gone
+            // for good, must not block every attach: its own walk fails, but
+            // the question is only whether it lies below the new one. A
+            // trashed folder keeps its parent, so the walk goes through the
+            // trash; one that no longer exists lies below nothing.
+            let theirs = match self.remote_ancestry(&uid, true) {
+                Ok(theirs) => theirs,
+                Err(e) if e.kind == pdfs_core::control::ErrorKind::NotFound => Vec::new(),
+                Err(e) => return Err(e),
+            };
+            if uid == remote_uid || ancestors.contains(&uid) || theirs.contains(&remote_uid) {
                 return Err(CoreError::invalid(
                     "remote folder overlaps an existing synced folder",
                 ));
