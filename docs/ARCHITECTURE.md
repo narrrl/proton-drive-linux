@@ -841,8 +841,11 @@ exports a pattern macro naming its requests, and the main match hands them over 
 the compiler still checks that every request has an answer. A module turns a path or a uid into a
 node once, then asks the service.
 
-What is left in `Core` is the tree, the database, the cache and the Drive client, which most
-owners use, plus single fields that belong to one module each.
+What is left in `Core` is the mounted-files side: the tree and its per-mount state, reads,
+queued writes and the drain, listings and sizes, path requests, and the registry of on-demand
+mounts. Step 5 turns that into the `pdfs-vfs` service. `Core` also implements the services'
+host ports and builds each service on demand, which moves to `pdfs-daemon` once the services no
+longer need the tree.
 
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and
