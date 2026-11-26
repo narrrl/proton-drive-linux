@@ -116,7 +116,7 @@ impl Syncer {
         self.trace_phase(Phase::LockWait, waited.elapsed());
         // `folder` was read before the lock; a switch may have landed in between, so
         // re-read and re-check the mode rather than trusting the snapshot.
-        let current = match self.db.sync_folder_get(folder.id) {
+        let current = match self.store.sync_folder_get(folder.id) {
             Ok(Some(current)) if current.mode == "mirror" => current,
             Ok(Some(_)) => return,
             Ok(None) => return,
@@ -137,13 +137,13 @@ impl Syncer {
         if !local_root.is_dir() {
             warn!(id = folder.id, path = %local_root.display(), "sync: local root missing");
             let _ = self
-                .db
+                .store
                 .sync_folder_set_state(folder.id, "error", now_secs());
             return;
         }
 
         let _ = self
-            .db
+            .store
             .sync_folder_set_state(folder.id, "syncing", folder.last_sync);
         let name = base_name(&folder.local_path);
         // Rebuilt per pass rather than cached on `Core`, so editing `.pdfsignore`
@@ -218,7 +218,9 @@ impl Syncer {
                 } else {
                     "idle"
                 };
-                let _ = self.db.sync_folder_set_state(folder.id, state, now_secs());
+                let _ = self
+                    .store
+                    .sync_folder_set_state(folder.id, state, now_secs());
                 let elapsed = started.elapsed();
                 if let Some(first_error) = &outcome.first_error {
                     warn!(
@@ -283,9 +285,9 @@ impl Syncer {
                     total = progress.as_ref().map_or(0, |p| p.total),
                     "sync: pass cut short by the stop"
                 );
-                let _ = self
-                    .db
-                    .sync_folder_set_state(folder.id, &current.state, current.last_sync);
+                let _ =
+                    self.store
+                        .sync_folder_set_state(folder.id, &current.state, current.last_sync);
             }
             Err(PassAbort::Abandoned) => {
                 info!(
@@ -293,14 +295,14 @@ impl Syncer {
                     elapsed_s = started.elapsed().as_secs(),
                     "sync: pass stopped for the folder's removal"
                 );
-                let _ = self
-                    .db
-                    .sync_folder_set_state(folder.id, &current.state, current.last_sync);
+                let _ =
+                    self.store
+                        .sync_folder_set_state(folder.id, &current.state, current.last_sync);
             }
             Err(PassAbort::Failed(e)) => {
                 warn!(id = folder.id, error = %e, "sync: reconcile failed");
                 let _ = self
-                    .db
+                    .store
                     .sync_folder_set_state(folder.id, "error", now_secs());
                 if folder.state != "error" {
                     self.log_activity(
@@ -416,7 +418,7 @@ impl Syncer {
     /// both agree on.
     fn ondemand_queued(&self, folder_id: i64) -> bool {
         matches!(
-            self.db.sync_folder_get(folder_id),
+            self.store.sync_folder_get(folder_id),
             Ok(Some(f)) if f.pending_mode.as_deref() == Some("ondemand")
         )
     }
@@ -452,12 +454,12 @@ impl Syncer {
     ) -> Result<Outcome, PassAbort> {
         // This pass uploads without walking Drive, so a walk saved by an
         // earlier pass would not know what it sent; see `do_reconcile`.
-        self.db
+        self.store
             .sync_walk_clear(folder_id)
             .map_err(|e| format!("drop the saved walk: {e:?}"))?;
         let step = Instant::now();
         let baseline = self
-            .db
+            .store
             .sync_entries(folder_id)
             .map_err(|e| format!("load baseline: {e:?}"))?;
         self.trace_phase(Phase::Baseline, step.elapsed());
@@ -720,7 +722,7 @@ impl Syncer {
                     parent = parent_rel(parent);
                 }
                 if parent.is_empty() {
-                    let _ = self.db.sync_entries_remove_subtree(folder_id, rel);
+                    let _ = self.store.sync_entries_remove_subtree(folder_id, rel);
                     forgotten.insert(rel);
                 }
             }
@@ -732,11 +734,11 @@ impl Syncer {
                 .iter()
                 .any(|dir| rel.starts_with(&format!("{dir}/")))
             {
-                let _ = self.db.sync_entry_remove(folder_id, rel);
+                let _ = self.store.sync_entry_remove(folder_id, rel);
                 continue;
             }
             let Some(uid) = baseline[rel].remote_uid.as_deref().and_then(parse_uid) else {
-                let _ = self.db.sync_entry_remove(folder_id, rel);
+                let _ = self.store.sync_entry_remove(folder_id, rel);
                 continue;
             };
             if let Err(e) = self
@@ -753,7 +755,7 @@ impl Syncer {
             if let Some(parent) = parent_uid_of(rel, &remote_dirs, &baseline) {
                 self.invalidate_children_of(&parent);
             }
-            let _ = self.db.sync_entry_remove(folder_id, rel);
+            let _ = self.store.sync_entry_remove(folder_id, rel);
             self.log_activity(
                 ActivityKind::Trash,
                 base_name(rel),
@@ -786,7 +788,7 @@ impl Syncer {
         // discover the real figure only by finishing.
         let step = Instant::now();
         let baseline = self
-            .db
+            .store
             .sync_entries(folder_id)
             .map_err(|e| format!("load baseline: {e:?}"))?;
         self.trace_phase(Phase::Baseline, step.elapsed());
@@ -939,7 +941,7 @@ impl Syncer {
                         delete_remote_dirs.push((rel.clone(), remote[rel].uid.clone()));
                     }
                     (false, false) => {
-                        let _ = self.db.sync_entry_remove(folder_id, rel);
+                        let _ = self.store.sync_entry_remove(folder_id, rel);
                     }
                 }
                 continue;
@@ -958,7 +960,7 @@ impl Syncer {
                             remote_revision_id: Some(revision.clone()),
                             ..base.clone()
                         };
-                        if let Err(e) = self.db.sync_entry_upsert(folder_id, &row) {
+                        if let Err(e) = self.store.sync_entry_upsert(folder_id, &row) {
                             debug!(rel, error = ?e, "sync: cannot record the revision id");
                         }
                     }
@@ -1047,7 +1049,7 @@ impl Syncer {
                         outcome.failed(&format!("{rel}: {e}"));
                         continue;
                     }
-                    let _ = self.db.sync_entry_remove(folder_id, rel);
+                    let _ = self.store.sync_entry_remove(folder_id, rel);
                     self.log_activity(ActivityKind::Trash, base_name(rel), "removed locally", true);
                     outcome.deleted += 1;
                 }
@@ -1073,7 +1075,7 @@ impl Syncer {
                     if let Some(parent) = parent_uid_of(rel, &remote_dirs, &baseline) {
                         self.invalidate_children_of(&parent);
                     }
-                    let _ = self.db.sync_entry_remove(folder_id, rel);
+                    let _ = self.store.sync_entry_remove(folder_id, rel);
                     self.log_activity(
                         ActivityKind::Trash,
                         base_name(rel),
@@ -1083,7 +1085,7 @@ impl Syncer {
                     outcome.deleted += 1;
                 }
                 FilePlan::ForgetBaseline => {
-                    let _ = self.db.sync_entry_remove(folder_id, rel);
+                    let _ = self.store.sync_entry_remove(folder_id, rel);
                 }
             }
         }
@@ -1103,13 +1105,13 @@ impl Syncer {
         // creates it on Drive again and uploads what it holds (B211).
         if !delete_local_dirs.is_empty() {
             let mut current = self
-                .db
+                .store
                 .sync_entries(folder_id)
                 .map_err(|e| format!("reload baseline: {e:?}"))?;
             for removal in remove_local_dirs(local_root, delete_local_dirs, &mut current) {
                 match removal {
                     DirRemoval::Removed(rel) => {
-                        let _ = self.db.sync_entry_remove(folder_id, &rel);
+                        let _ = self.store.sync_entry_remove(folder_id, &rel);
                         self.log_activity(
                             ActivityKind::Trash,
                             base_name(&rel),
@@ -1123,7 +1125,7 @@ impl Syncer {
                             rel,
                             reason, "sync: deleted on Drive, but holds unsynced data; keeping it"
                         );
-                        let _ = self.db.sync_entry_remove(folder_id, &rel);
+                        let _ = self.store.sync_entry_remove(folder_id, &rel);
                         self.log_activity(
                             ActivityKind::Trash,
                             base_name(&rel),
@@ -1177,7 +1179,7 @@ impl Syncer {
             if let Some(parent) = parent_uid_of(&rel, &remote_dirs, &baseline) {
                 self.invalidate_children_of(&parent);
             }
-            let _ = self.db.sync_entry_remove(folder_id, &rel);
+            let _ = self.store.sync_entry_remove(folder_id, &rel);
             self.log_activity(
                 ActivityKind::Trash,
                 base_name(&rel),
@@ -1396,7 +1398,7 @@ impl Syncer {
             // A walk that cannot be saved still runs; it just starts over if
             // it is cut short.
             if let Err(e) =
-                self.db
+                self.store
                     .sync_walk_record(folder_id, &prefix, listing.short, &saved, &removed)
             {
                 debug!(folder = prefix, error = ?e, "sync: cannot save the walk's progress");
@@ -1423,12 +1425,12 @@ impl Syncer {
         again: &[String],
     ) -> pdfs_core::Result<()> {
         if !again.is_empty() {
-            self.db.sync_remote_mark(folder_id, again)?;
+            self.store.sync_remote_mark(folder_id, again)?;
         }
         match dirty_upto {
-            Some(seq) => self.db.sync_remote_dirty_consume(folder_id, seq),
+            Some(seq) => self.store.sync_remote_dirty_consume(folder_id, seq),
             None => {
-                if !self.db.sync_walk_complete(folder_id)? {
+                if !self.store.sync_walk_complete(folder_id)? {
                     debug!(
                         id = folder_id,
                         "sync: the walk of Drive was dropped before its end"
@@ -1448,7 +1450,7 @@ impl Syncer {
     /// - Otherwise a new walk starts at the root.
     fn start_walk(&self, folder_id: i64, root: &NodeUid, walk: &mut RemoteWalk<'_>) -> WalkStart {
         let root_uid = root.to_string();
-        let saved = match self.db.sync_walk_load(folder_id) {
+        let saved = match self.store.sync_walk_load(folder_id) {
             Ok(saved) => saved,
             Err(e) => {
                 warn!(id = folder_id, error = ?e, "sync: cannot read the saved walk; starting over");
@@ -1490,7 +1492,7 @@ impl Syncer {
             walk.dirs.retain(|rel, _| rel.is_empty());
             *walk.gaps = RemoteGaps::default();
         }
-        if let Err(e) = self.db.sync_walk_begin(folder_id, &root_uid, now_secs()) {
+        if let Err(e) = self.store.sync_walk_begin(folder_id, &root_uid, now_secs()) {
             debug!(id = folder_id, error = ?e, "sync: cannot save the walk's progress");
         }
         WalkStart {
@@ -1512,7 +1514,7 @@ impl Syncer {
         saved: &SavedWalk,
         walk: &mut RemoteWalk<'_>,
     ) -> Option<WalkStart> {
-        let dirty = match self.db.sync_remote_dirty(folder_id) {
+        let dirty = match self.store.sync_remote_dirty(folder_id) {
             Ok(dirty) => dirty,
             Err(e) => {
                 warn!(id = folder_id, error = ?e, "sync: cannot read what changed on Drive");
@@ -1752,7 +1754,7 @@ impl Syncer {
         if rows.is_empty() {
             return;
         }
-        match self.db.sync_entries_set_revision(folder_id, &rows) {
+        match self.store.sync_entries_set_revision(folder_id, &rows) {
             Ok(n) => self.trace_count(Count::Revisions, n),
             Err(e) => debug!(folder = prefix, error = ?e, "sync: cannot record revision ids"),
         }
@@ -1760,7 +1762,7 @@ impl Syncer {
 
     /// Record a folder's baseline row (folders carry no content signature).
     fn baseline_dir(&self, folder_id: i64, rel: &str, uid: &NodeUid) -> Result<(), String> {
-        self.db
+        self.store
             .sync_entry_upsert(folder_id, &dir_row(rel, uid))
             .map_err(|e| format!("baseline dir {rel}: {e:?}"))
     }
@@ -1946,7 +1948,7 @@ impl Syncer {
                         .take_remote_keeping_local(folder_id, local_root, rel, uid, remote)
                         .await;
                 }
-                self.db
+                self.store
                     .sync_entry_upsert(
                         folder_id,
                         &StoredSyncEntry {
@@ -2310,7 +2312,7 @@ impl Syncer {
         let Some(local) = local else {
             return Err(format!("stat {rel}: no local identity to baseline"));
         };
-        self.db
+        self.store
             .sync_entry_upsert(
                 folder_id,
                 &StoredSyncEntry {

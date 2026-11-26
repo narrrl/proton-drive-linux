@@ -213,7 +213,7 @@ fn run_pass(core: &Syncer, folder: &StoredSyncFolder) {
     }
     core.progress_end(folder.id);
     let _ = core
-        .db
+        .store
         .sync_folder_set_state(folder.id, "error", folder.last_sync);
     error!(
         id = folder.id,
@@ -231,7 +231,7 @@ fn run_pass(core: &Syncer, folder: &StoredSyncFolder) {
 /// The pass a `Reconcile(id)` asked for. A folder removed since, or one the
 /// database cannot read, is said so rather than dropped in silence.
 fn run_pass_by_id(core: &Syncer, id: i64) {
-    match core.db.sync_folder_get(id) {
+    match core.store.sync_folder_get(id) {
         Ok(Some(folder)) => run_pass(core, &folder),
         Ok(None) => debug!(id, "sync: folder removed before its pass; skipping"),
         Err(e) => warn!(id, error = ?e, "sync: cannot read folder; skipping its pass"),
@@ -245,7 +245,7 @@ fn engine_loop(core: Syncer, rx: Receiver<SyncMsg>) {
     // No pass runs before this thread starts one, so a folder in `syncing` was
     // left there by a daemon that was killed mid-pass. It would read as busy
     // until its next pass ends, which on a large folder is hours away.
-    match core.db.sync_folders_reset_syncing() {
+    match core.store.sync_folders_reset_syncing() {
         Ok(0) => {}
         Ok(n) => info!(
             folders = n,
@@ -377,7 +377,7 @@ fn run_burst(core: &Syncer, ids: &HashSet<i64>, all: bool) {
         return;
     }
     let folders = if all {
-        match core.db.sync_folder_list() {
+        match core.store.sync_folder_list() {
             Ok(folders) => folders,
             Err(e) => {
                 warn!(error = ?e, "sync: cannot list folders");
@@ -389,7 +389,7 @@ fn run_burst(core: &Syncer, ids: &HashSet<i64>, all: bool) {
     };
     let listed: Vec<i64> = folders.iter().map(|f| f.id).collect();
     let listed = if listed.len() > 1 {
-        match core.db.sync_entry_counts() {
+        match core.store.sync_entry_counts() {
             Ok(counts) => smallest_first(&listed, &counts),
             Err(e) => {
                 warn!(error = ?e, "sync: cannot count baseline rows; keeping the folder order");
@@ -538,7 +538,7 @@ fn rewatch(
     watcher: &mut notify::RecommendedWatcher,
     watched: &Mutex<Vec<(PathBuf, i64)>>,
 ) -> bool {
-    let want: Vec<(PathBuf, i64)> = match core.db.sync_folder_list() {
+    let want: Vec<(PathBuf, i64)> = match core.store.sync_folder_list() {
         Ok(f) => f
             .into_iter()
             .filter(|f| f.mode == "mirror")
