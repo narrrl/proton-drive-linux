@@ -109,7 +109,7 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
     let foreign_delete = is_foreign_node_delete(event, &core.primary_root_uid.volume_id);
     let serializes_shared_publication =
         event_serializes_shared_publication(event, &core.primary_root_uid.volume_id);
-    let _publication = serializes_shared_publication.then(|| core.shared_publication.lock());
+    let _publication = serializes_shared_publication.then(|| core.shared.shared_publication.lock());
     if serializes_shared_publication {
         core.invalidate_shared_refreshes();
     }

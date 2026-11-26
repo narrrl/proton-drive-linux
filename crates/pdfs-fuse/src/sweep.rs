@@ -18,7 +18,10 @@
 //! copy whose sibling has no recorded SHA-1 is treated as divergent — the sweep
 //! never removes a file it cannot prove is a duplicate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use pdfs_core::batch;
@@ -28,6 +31,31 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{debug, info, warn};
 
 use super::{Core, node_content_sha1, node_revision_id, node_size};
+
+/// What the conflict sweep may do, and the copies it already checked this
+/// run.
+#[derive(Clone)]
+pub(crate) struct SweepState {
+    /// Whether the conflict sweep may actually trash the duplicates it finds, or
+    /// only report them. Resolved once at mount from config + environment
+    /// ([`AppConfig::resolved_conflict_sweep`]); [`SweepMode::Off`] means the
+    /// sweep thread is never spawned at all. See `docs/BUGS.md` B71.
+    pub(crate) sweep_mode: SweepMode,
+    /// Conflict copies the sweep has already checked against the activity log
+    /// this run, so each pass does not ask the database again. The log itself
+    /// is what keeps a copy from being flagged again after a restart. See
+    /// [`Core::run_conflict_sweep_loop`] and `docs/BUGS.md` B99.
+    pub(crate) conflict_notified: Arc<Mutex<HashSet<NodeUid>>>,
+}
+
+impl SweepState {
+    pub(crate) fn new(sweep_mode: SweepMode) -> Self {
+        Self {
+            sweep_mode,
+            conflict_notified: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+}
 
 /// Time between sweeps. Conflicts are rare and non-urgent; a slow cadence keeps
 /// the sweep off the hot path while still cleaning up within a few minutes.
@@ -141,7 +169,7 @@ impl Core {
                 .unwrap_or_default();
             let sibling = by_parent_name.get(&(parent, base.as_str())).copied();
 
-            match decide(node, sibling, &base, self.sweep_mode) {
+            match decide(node, sibling, &base, self.sweep.sweep_mode) {
                 SweepAction::Remove => {
                     // Only while online — the remote trash is the point. Offline,
                     // it waits for a later pass.
@@ -210,7 +238,7 @@ impl Core {
             warn!(%uid, error = ?e, "conflict sweep: db delete after trash failed");
         }
         self.invalidate_trash();
-        self.conflict_notified.lock().remove(uid);
+        self.sweep.conflict_notified.lock().remove(uid);
         self.log_activity(
             ActivityKind::Trash,
             name,
@@ -303,7 +331,7 @@ impl Core {
     /// what keeps a restart from logging the same copy again (`docs/BUGS.md`
     /// B99). A copy's name carries its own timestamp, so the name identifies it.
     fn flag_conflict(&self, uid: &NodeUid, name: &str, detail: String) {
-        if !self.conflict_notified.lock().insert(uid.clone()) {
+        if !self.sweep.conflict_notified.lock().insert(uid.clone()) {
             return;
         }
         match self.db.activity_has(ActivityKind::Conflict, name) {

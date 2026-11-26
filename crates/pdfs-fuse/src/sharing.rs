@@ -7,6 +7,10 @@
 //! shape the control socket expects.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use parking_lot::Mutex;
 
 use pdfs_core::control::{
     BookmarkInfo, DirEntry, InvitationInfo, LinkChange, PublicLinkInfo, ShareEntry, ShareEntryKind,
@@ -23,6 +27,32 @@ use proton_drive_rs::{MemberRole, NodeKind};
 use proton_drive_rs::Node;
 
 use super::{Core, node_size, parse_uid, public_link_info, role_from_str, role_to_str};
+
+/// The last account quota answer, for `statfs(2)`, and whether a refresh
+/// of it is running.
+#[derive(Clone)]
+pub(crate) struct QuotaCache {
+    /// Last account quota answer and when it was learned, for `statfs(2)`.
+    ///
+    /// `df` and the free-space preflight of every file manager and installer ask
+    /// for this, and the answer costs a round trip — so it is served from here
+    /// for [`QUOTA_TTL`] and refreshed on a worker afterwards. Total account
+    /// storage moves slowly enough that a minute-old number is a better answer
+    /// than either a stall or the zeroes the default implementation returns.
+    pub(crate) quota: Arc<Mutex<Option<(std::time::Instant, i64, i64)>>>,
+    /// Set while a `statfs` is refreshing [`Core::quota`], so the others serve
+    /// the last figures instead of each holding a worker on the same request.
+    pub(crate) quota_refreshing: Arc<AtomicBool>,
+}
+
+impl QuotaCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            quota: Arc::new(Mutex::new(None)),
+            quota_refreshing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
 
 /// A node from a *shared* listing as a [`DirEntry`].
 ///
@@ -701,7 +731,8 @@ impl Core {
             self.lost_link(&e, "account quota");
             CoreError::from_api(&e, "account quota")
         })?;
-        *self.quota.lock() = Some((std::time::Instant::now(), q.max_space, q.used_space));
+        *self.quota_cache.quota.lock() =
+            Some((std::time::Instant::now(), q.max_space, q.used_space));
         Ok((q.max_space, q.used_space))
     }
 
@@ -714,21 +745,28 @@ impl Core {
     /// stale byte count is worth more to them than a stalled syscall. Offline,
     /// the last known figures keep being served rather than degrading to zero.
     pub(crate) fn account_quota_cached(&self) -> Option<(i64, i64)> {
-        if let Some((at, max_space, used_space)) = *self.quota.lock()
+        if let Some((at, max_space, used_space)) = *self.quota_cache.quota.lock()
             && at.elapsed() < QUOTA_TTL
         {
             return Some((max_space, used_space));
         }
-        let last = || self.quota.lock().map(|(_, max, used)| (max, used));
+        let last = || {
+            self.quota_cache
+                .quota
+                .lock()
+                .map(|(_, max, used)| (max, used))
+        };
         if !self.is_online()
             || self
+                .quota_cache
                 .quota_refreshing
                 .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
             return last();
         }
         let refreshed = self.account_quota();
-        self.quota_refreshing
+        self.quota_cache
+            .quota_refreshing
             .store(false, std::sync::atomic::Ordering::Release);
         match refreshed {
             Ok(q) => Some(q),

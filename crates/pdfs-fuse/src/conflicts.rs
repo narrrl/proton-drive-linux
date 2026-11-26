@@ -151,7 +151,7 @@ impl Core {
                 rel.display()
             )));
         }
-        self.conflict_notified.lock().remove(&uid);
+        self.sweep.conflict_notified.lock().remove(&uid);
         Ok(())
     }
 }
