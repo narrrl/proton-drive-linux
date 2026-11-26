@@ -4801,6 +4801,12 @@ which survives the landing, and queues the write against the real uid when the n
 **Test:** the unit tests `a_landed_placeholder_keeps_its_lid` and
 `an_inode_gives_back_the_lid_it_was_made_from`. Seed 1 of three-clients passes.
 
+**Seen again:** 2026-11-26, once in a full local sim run, in
+`a_move_blocked_by_trash_can_be_retried_after_restore`. Its first write, of a new file in a new
+folder, logged "access changed before the write could be queued" for `local~14`, and the file
+read back empty. The next five runs of that test passed, and so did five on main. The race left
+is somewhere other than the lookup by local id that the fix added.
+
 ---
 
 ### B138 — A file created where another is leaving lands as a conflict copy
