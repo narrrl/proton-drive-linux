@@ -105,6 +105,7 @@ mod inhibit;
 mod keeper;
 mod link;
 pub use filesystem::ProtonFs;
+mod maintenance;
 mod mount;
 mod pause;
 mod photos;
@@ -582,16 +583,9 @@ struct Core {
     /// Whether a trash refresh is running, and the wake-up for requests waiting
     /// on its progress.
     trash: trash::TrashState,
-    /// Conflict copies the sweep has already checked against the activity log
-    /// this run, so each pass does not ask the database again. The log itself
-    /// is what keeps a copy from being flagged again after a restart. See
-    /// [`Core::run_conflict_sweep_loop`] and `docs/BUGS.md` B99.
-    conflict_notified: Arc<Mutex<HashSet<NodeUid>>>,
-    /// Whether the conflict sweep may actually trash the duplicates it finds, or
-    /// only report them. Resolved once at mount from config + environment
-    /// ([`AppConfig::resolved_conflict_sweep`]); [`SweepMode::Off`] means the
-    /// sweep thread is never spawned at all. See `docs/BUGS.md` B71.
-    sweep_mode: SweepMode,
+    /// What the conflict sweep may do, and the copies it already checked this
+    /// run.
+    sweep: sweep::SweepState,
     /// A mkdir, create, rename or delete through the mount is recorded and
     /// queued, and the drain sends it; the syscall never waits for Drive. Off,
     /// they go to Drive inline while online, as before 3.0.
@@ -599,17 +593,9 @@ struct Core {
     /// What the Photos and thumbnail jobs are doing right now. See
     /// [`photos::PhotoJobs`].
     photo_jobs: photos::PhotoJobs,
-    /// Last account quota answer and when it was learned, for `statfs(2)`.
-    ///
-    /// `df` and the free-space preflight of every file manager and installer ask
-    /// for this, and the answer costs a round trip — so it is served from here
-    /// for [`QUOTA_TTL`] and refreshed on a worker afterwards. Total account
-    /// storage moves slowly enough that a minute-old number is a better answer
-    /// than either a stall or the zeroes the default implementation returns.
-    quota: Arc<Mutex<Option<(std::time::Instant, i64, i64)>>>,
-    /// Set while a `statfs` is refreshing [`Core::quota`], so the others serve
-    /// the last figures instead of each holding a worker on the same request.
-    quota_refreshing: Arc<AtomicBool>,
+    /// The last account quota answer, for `statfs(2)`, and whether a refresh
+    /// of it is running.
+    quota_cache: sharing::QuotaCache,
     /// Database maintenance that has been moved off the request thread.
     ///
     /// `VACUUM` and a deep `integrity_check` both hold the single connection for
@@ -617,7 +603,7 @@ struct Core {
     /// that needs the database — so the handler acknowledges the request and a
     /// thread does the work, exactly as the other long control requests already
     /// do. See [`Maintenance`].
-    maintenance: Arc<Mutex<Maintenance>>,
+    maintenance: Arc<Mutex<maintenance::Maintenance>>,
     /// The size upgrades running now, and the replies parked on them. Shared
     /// by every mount: the bound that matters is per daemon.
     sizes: sizes::SizeState,
@@ -690,21 +676,6 @@ struct Core {
     ///
     /// `Weak`, so an unmounted fork is dropped rather than pinned here.
     states: Arc<StateRegistry>,
-}
-
-/// Background database maintenance: what is running, and what the last deep
-/// integrity check found.
-///
-/// One at a time — both operations are whole-database and there is nothing to
-/// gain from overlapping them — and the result of a check outlives the request
-/// that asked for it, because the request is answered before the check finishes.
-#[derive(Default)]
-struct Maintenance {
-    /// A vacuum or integrity check is running right now.
-    running: bool,
-    /// Findings of the most recent completed deep check. `None` means none has
-    /// finished this run, which is *not* the same as "found nothing".
-    integrity: Option<Vec<String>>,
 }
 
 /// How long a change this daemon made stays recognisable as its own. Generous
@@ -886,84 +857,6 @@ enum SwitchBlocked {
 }
 
 impl Core {
-    /// Start a background `VACUUM`, or refuse because maintenance is already
-    /// running.
-    ///
-    /// Returns as soon as the thread is spawned; the caller acknowledges the
-    /// request. The outcome is a log line and a job that disappears from
-    /// `GetQueueStatus` when it is done — a vacuum has nothing to report that a
-    /// follow-up `CacheInspect` cannot show.
-    fn start_vacuum(&self) -> CoreResult<()> {
-        {
-            let mut m = self.maintenance.lock();
-            if m.running {
-                return Err(CoreError::conflict(
-                    "database maintenance is already running",
-                ));
-            }
-            m.running = true;
-        }
-        let core = self.clone();
-        std::thread::spawn(move || {
-            let job = core.transfers.begin_job("Compacting the cache database");
-            job.detail("Rewriting the database file");
-            let started = Instant::now();
-            match core.db.vacuum() {
-                Ok(outcome) => info!(
-                    freed_bytes = outcome.freed_bytes(),
-                    before_bytes = outcome.before_bytes,
-                    after_bytes = outcome.after_bytes,
-                    wal_frames = outcome.wal_frames_checkpointed,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "cache database vacuumed"
-                ),
-                Err(e) => warn!(error = %e, "vacuum failed"),
-            }
-            core.maintenance.lock().running = false;
-        });
-        Ok(())
-    }
-
-    /// Answer a deep `CacheInspect`: hand back the last completed integrity
-    /// check, and start one if none is running.
-    ///
-    /// Returns `(problems, checked, running)`. A first request gets
-    /// `(_, false, true)` and the answer lands on a later one — the check reads
-    /// every page of the database under the connection mutex, so the choice is
-    /// between answering late and freezing the mount until it finishes.
-    fn start_or_read_integrity_check(&self) -> (Vec<String>, bool, bool) {
-        let mut m = self.maintenance.lock();
-        if let Some(problems) = m.integrity.clone() {
-            return (problems, true, m.running);
-        }
-        if m.running {
-            return (Vec::new(), false, true);
-        }
-        m.running = true;
-        drop(m);
-
-        let core = self.clone();
-        std::thread::spawn(move || {
-            let job = core
-                .transfers
-                .begin_background_job("Checking the cache database");
-            job.detail("Verifying every page");
-            let problems = match core.db.integrity_check() {
-                Ok(problems) => problems,
-                Err(e) => vec![format!("integrity check failed: {e:?}")],
-            };
-            if problems.is_empty() {
-                info!("cache database integrity check found no problems");
-            } else {
-                warn!(problems = problems.len(), "cache database integrity check");
-            }
-            let mut m = core.maintenance.lock();
-            m.integrity = Some(problems);
-            m.running = false;
-        });
-        (Vec::new(), false, true)
-    }
-
     /// Register a mount so background work can reach its session. Called once
     /// for the primary mount and once per on-demand fork.
     fn register_state(&self, mountpoint: &Path) {
@@ -7550,7 +7443,7 @@ mod tests {
     fn a_size_upgrade_leaves_the_page_cache_alone() {
         // Reads resolve provisional sizes inline, while the kernel holds the
         // page lock of that read; dropping pages here waited on it forever.
-        let upgrade = function_source(include_str!("lib.rs"), "fn apply_size_upgrade(");
+        let upgrade = function_source(include_str!("sizes.rs"), "fn apply_size_upgrade(");
         assert!(upgrade.contains("notifier.inval_attrs(ino)"));
         assert!(!upgrade.contains("notifier.inval_inode("));
         let read = function_source(include_str!("filesystem.rs"), "    fn read(");
@@ -7707,9 +7600,9 @@ mod tests {
         let thumbnail = function_source(lib, "fn thumbnail(");
         assert_before(thumbnail, "if !self.is_online()", "download_thumbnail");
         assert!(thumbnail.contains(".block_on_bounded(self.client.download_thumbnail("));
-        let upgrade = function_source(lib, "fn run_size_upgrade(");
+        let upgrade = function_source(include_str!("sizes.rs"), "fn run_size_upgrade(");
         assert!(upgrade.contains("block_on_within(BATCH_CALL_TIMEOUT"));
-        let shared = function_source(lib, "fn ensure_shared_children(");
+        let shared = function_source(include_str!("shared.rs"), "fn ensure_shared_children(");
         assert!(shared.contains("block_on_within(BATCH_CALL_TIMEOUT"));
         assert!(!shared.contains("self.rt"));
     }
