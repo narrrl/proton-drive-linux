@@ -658,7 +658,7 @@ pub(crate) fn mount_with(
     // the walk is I/O-heavy and must never sit in front of a FUSE callback.
     if matches!(host, Host::Daemon) {
         if let Some(gallery) = &core.gallery {
-            rt.spawn(gallery.clone().poll(core.clone()));
+            workers.spawn_task(&rt, "pdfs-gallery", gallery.clone().poll(core.clone()));
         }
         let db = core.db.clone();
         let indexing = core.indexing.clone();
@@ -798,19 +798,28 @@ pub(crate) fn mount_with(
             }
         }
     };
-    rt.spawn(run_event_sync(core.drive.clone(), scope, core.clone()));
+    // Services rather than bare tasks: a stop aborts them. Before, they ran
+    // until the runtime went away, which on a stop is when the process exits.
+    workers.spawn_task(
+        &rt,
+        "pdfs-event-sync",
+        run_event_sync(core.drive.clone(), scope, core.clone()),
+    );
     // The photos volume has its own event stream; without it the gallery only
     // learns about a phone-side deletion when the timeline goes stale.
-    rt.spawn(run_photos_event_sync(core.clone()));
+    workers.spawn_task(
+        &rt,
+        "pdfs-photo-events",
+        run_photos_event_sync(core.clone()),
+    );
     // Not in a simulation: `client` there reaches no API, and the thread, still
     // waiting on it after the stop, held the database a test opens next.
     if online && matches!(host, Host::Daemon) {
         let repair_core = core.clone();
         let root_uid = core.primary_root_uid.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("pdfs-share-id".into())
-            .spawn(move || repair_core.repair_primary_share_id(&root_uid))
-        {
+        if let Err(error) = core.services.spawn_job("pdfs-share-id", move || {
+            repair_core.repair_primary_share_id(&root_uid)
+        }) {
             warn!(%error, "start My Files share-id repair failed");
         }
     }

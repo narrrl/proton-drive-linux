@@ -18,8 +18,8 @@ kept, with a list of the folders that changed on Proton Drive since (49).
 - **`pdfs diagnostics` says which of the daemon's background services are running.** If one
   ends while the drive is mounted, for example the sync engine after a crash, the journal says
   so once, by name, instead of saying nothing until a restart. It also lists the jobs running
-  in the background, such as a cache check, an import or a folder being pinned, and how long
-  each has run.
+  in the background, such as a cache check, an import, a folder being pinned or a refresh of
+  the trash or the photo timeline, and how long each has run.
 - **`PDFS_INSTANCE` runs a second client next to your own.** With a name set, the client keeps
   its own directories, keyring entry, kernel keys and mountpoint, so a test account can run
   alongside the account you use. `scripts/live-bench.py` uses it to time one edit, from the
@@ -59,6 +59,10 @@ kept, with a list of the folders that changed on Proton Drive since (49).
   first pass, and whenever the change feed lost track (#53).
 
 ### Fixed
+- **A stop ends the loops that follow Proton Drive's change feed before the daemon exits.**
+  The loops that read the Drive and photos event streams, and the gallery refresh, kept
+  running after every other service had stopped, and could still write to the database while
+  the process exited.
 - **A synced folder whose folder on Drive is in the trash no longer blocks attaching another.**
   Until it was removed, every `pdfs sync attach` failed with "remote sync folder is in the trash",
   whatever folder it named (B299).

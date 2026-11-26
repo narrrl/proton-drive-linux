@@ -140,6 +140,14 @@ pub(crate) fn run(seed: u64, profile: &'static Profile) -> Result<(), String> {
         }
     }
     run.logged.extend(take_logged());
+    // Every stop, the restarts' included, ends all the services a mount
+    // started; one left running is a second generation beside the next mount's.
+    let outcome = outcome.and_then(
+        |()| match run.logged.iter().find(|line| left_running(line)) {
+            Some(line) => Err(format!("shutdown: a stop left services running: {line}")),
+            None => Ok(()),
+        },
+    );
     match outcome {
         Ok(()) => {
             let _ = std::fs::remove_dir_all(&dir);
@@ -606,6 +614,12 @@ fn outcome(actual: &Result<Result<(), i32>, String>) -> String {
         Ok(result) => errno(*result),
         Err(check) => check.clone(),
     }
+}
+
+/// Whether `line` is the mount's report of services still running at its
+/// stop deadline (`mount::halt_workers`).
+fn left_running(line: &str) -> bool {
+    line.starts_with("background workers did not finish in time")
 }
 
 /// Run `profile` over the seeds the environment asks for: `PDFS_SIM_SEED`

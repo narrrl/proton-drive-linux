@@ -266,16 +266,17 @@ impl Core {
             return;
         }
         let core = self.clone();
-        self.rt.spawn(async move {
-            let refreshed = core.refresh_trash().await;
-            core.trash.trash_refreshing.store(false, Ordering::SeqCst);
-            match refreshed {
-                Ok(_) => core.events.publish(&[Topic::Trash]),
-                Err(e) => warn!(error = %e, "background trash refresh failed"),
-            }
-            // After the flag, so a waiter that wakes on this sees it cleared.
-            core.trash.trash_progress.notify_waiters();
-        });
+        self.services
+            .spawn_task_job(&self.rt, "pdfs-trash-refresh", async move {
+                let refreshed = core.refresh_trash().await;
+                core.trash.trash_refreshing.store(false, Ordering::SeqCst);
+                match refreshed {
+                    Ok(_) => core.events.publish(&[Topic::Trash]),
+                    Err(e) => warn!(error = %e, "background trash refresh failed"),
+                }
+                // After the flag, so a waiter that wakes on this sees it cleared.
+                core.trash.trash_progress.notify_waiters();
+            });
     }
 
     /// Wait for the in-flight trash refresh to make progress, for at most

@@ -582,18 +582,19 @@ impl Core {
             return;
         }
         let core = self.clone();
-        self.rt.spawn(async move {
-            let refreshed = core.refresh_timeline().await;
-            core.photo_jobs
-                .timeline_refreshing
-                .store(false, Ordering::SeqCst);
-            // Only a refresh that landed: a front-end re-reading after a failed
-            // one would find the timeline still stale and start another.
-            match refreshed {
-                Ok(_) => core.events.publish(&[Topic::Photos]),
-                Err(e) => warn!(error = %e, "background timeline refresh failed"),
-            }
-        });
+        self.services
+            .spawn_task_job(&self.rt, "pdfs-timeline-refresh", async move {
+                let refreshed = core.refresh_timeline().await;
+                core.photo_jobs
+                    .timeline_refreshing
+                    .store(false, Ordering::SeqCst);
+                // Only a refresh that landed: a front-end re-reading after a failed
+                // one would find the timeline still stale and start another.
+                match refreshed {
+                    Ok(_) => core.events.publish(&[Topic::Photos]),
+                    Err(e) => warn!(error = %e, "background timeline refresh failed"),
+                }
+            });
     }
 
     /// How far the running timeline refresh has got reading photo metadata, or

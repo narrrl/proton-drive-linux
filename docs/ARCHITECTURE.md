@@ -469,7 +469,9 @@ both with `pdfs_core::search::relevance_score`, so the prompt can merge them int
 | `pdfs-control` | Accepts control connections; at most 64 handlers |
 | `pdfs-events` | Publishes status, transfer and topic changes to subscribers |
 | `pdfs-sync`, `pdfs-sync-poll` | Mirror passes and the remote poll (§7) |
-| Tokio runtime | Remote calls, and the Drive and photos event streams (§6) |
+| `pdfs-event-sync`, `pdfs-photo-events` | Async tasks on the Tokio runtime that follow the Drive and photos event streams (§6) |
+| `pdfs-gallery` | Async task. Refreshes the gallery's visibility every minute and on request |
+| Tokio runtime | Remote calls |
 | `pdfs-online-probe` | Probes Drive while offline |
 | `pdfs-pin-keeper` | Checks pins once a second for work: every pin at startup, when the link returns and after the event feed loses continuity, and the pins a batch of remote events changed. Downloads files kept offline that are missing or stale; failures retry with a backoff of 30 s to 30 min (`docs/BUGS.md` B282) |
 | `pdfs-supervisor` | Logs workers that hold one job for minutes, a queue that stops draining, and control requests that never return; samples memory; pings the systemd watchdog only after a round trip over the control socket succeeds (`WatchdogSec=120`) |
@@ -481,14 +483,20 @@ instead of leaving them behind (`docs/BUGS.md` B44). The mount starts its long-l
 through `pdfs_core::lifecycle::Services`. Each one is started with its name and, if it blocks where
 the signal does not reach, the call that wakes it: the drain's condvar, the sync engine's `Stop`
 message, a connection to the control socket. A stop signals, wakes and joins them in reverse start
-order, up to one 10-second deadline, and names any that are still running at the end.
+order, up to one 10-second deadline, and names any that are still running at the end. A
+service can also be an async task on the runtime (`Services::spawn_task`): the event streams and
+the gallery refresh. A stop aborts such a task at its next `.await` and waits for it to end. These
+tasks used to run until the runtime went away, which on a stop is when the process exits.
+The sims fail a run whose stops leave a service running.
 `pdfs diagnostics` reports what each worker is doing and which services are still running. The
 supervisor warns once about a service that ended while the mount runs.
 
 Work a request starts and does not wait for (a cache check, `VACUUM`, an import, a folder pin, a
 re-date, a profile backup, a size upgrade) runs as a one-shot job:
 `ServiceBoard::spawn_job` starts it on a named thread and lists it until it ends. `pdfs
-diagnostics` shows the jobs running and how long each has run. Jobs are not joined on stop.
+diagnostics` shows the jobs running and how long each has run. Async work of the same kind (the
+trash, timeline and album refreshes a listing starts) goes through `ServiceBoard::spawn_task_job`
+and is listed the same way. Jobs are not joined on stop.
 
 ---
 
@@ -738,7 +746,8 @@ The work goes in steps. Each ships the same behaviour with the simulation tests 
 | 5 | `pdfs-vfs`: open files, then directories and renames, behind the FUSE adapter |
 | 6 | One admission policy for mirrors, reads and writeback |
 
-Step 3 so far: the daemon's long-lived threads start and stop through one `Services` set (§9).
+Step 3 so far: the daemon's long-lived threads and async loops start and stop through one
+`Services` set (§9).
 `Core`'s fields are grouped by owner, each group a struct in the module that owns it:
 `photos::PhotoJobs`, `drain::DrainState`, `reads::ReadState`, `sizes::SizeState`,
 `trash::TrashState`, `shared::SharedState`, `sharing::QuotaCache` and `sweep::SweepState`.
