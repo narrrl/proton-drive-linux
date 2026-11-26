@@ -18,7 +18,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use pdfs_core::control::{Diagnostics, InflightRequest, WorkerState};
+use pdfs_core::control::{Diagnostics, DriveCallStat, InflightRequest, WorkerState};
 
 use super::Core;
 
@@ -164,6 +164,18 @@ impl Core {
             control_handler_limit: super::control::handler_limit(),
             pending_ops: self.pending_ops_quickly(),
             sync: Some(self.sync_engine.report()),
+            drive_calls: self
+                .drive_calls
+                .snapshot()
+                .into_iter()
+                .map(|stat| DriveCallStat {
+                    call: stat.call.name().to_owned(),
+                    count: stat.count,
+                    errors: stat.errors,
+                    total_ms: u64::try_from(stat.total.as_millis()).unwrap_or(u64::MAX),
+                    longest_ms: u64::try_from(stat.longest.as_millis()).unwrap_or(u64::MAX),
+                })
+                .collect(),
         }
     }
 

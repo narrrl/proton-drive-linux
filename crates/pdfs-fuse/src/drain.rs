@@ -30,9 +30,9 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use pdfs_core::batch;
-use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, SyncIssue, TransferDirection};
-use pdfs_core::db::{
+use pdfs_store::cache::{Baseline, StagedWrite};
+use pdfs_store::db::{
     CreateLanding, CreateRetired, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH,
     PARK_EXPIRY_MS, PendingOp, RenameMeta,
 };
@@ -93,8 +93,8 @@ const DRAIN_ACCESS_RECHECK: Duration = Duration::from_secs(5);
 /// recheck records a failure, so the op enters the ordinary backoff and, at
 /// [`FAILING_ATTEMPTS`], is counted and named by `Response::Status`.
 ///
-/// [`Db::effective_node_access`]: pdfs_core::db::Db::effective_node_access
-/// [`FAILING_ATTEMPTS`]: pdfs_core::db::FAILING_ATTEMPTS
+/// [`Db::effective_node_access`]: pdfs_store::db::Db::effective_node_access
+/// [`FAILING_ATTEMPTS`]: pdfs_store::db::FAILING_ATTEMPTS
 const DRAIN_ACCESS_DEFER_LIMIT: Duration = Duration::from_secs(300);
 
 /// A registered cancellation flag for one in-flight upload, deregistered when
@@ -315,7 +315,7 @@ impl Core {
     /// worker would just multiply them.
     ///
     /// [`DRAIN_WORKERS`]: super::DRAIN_WORKERS
-    /// [`Db::claim_next_due_op`]: pdfs_core::db::Db::claim_next_due_op
+    /// [`Db::claim_next_due_op`]: pdfs_store::db::Db::claim_next_due_op
     pub(crate) fn run_pending_drain(&self, primary: bool) {
         loop {
             // Between ops, never inside one: an op that has started is either
@@ -476,8 +476,8 @@ impl Core {
     /// where they are either way; this changes only whether the user can see
     /// them.
     ///
-    /// [`Db::record_op_failure`]: pdfs_core::db::Db::record_op_failure
-    /// [`FAILING_ATTEMPTS`]: pdfs_core::db::FAILING_ATTEMPTS
+    /// [`Db::record_op_failure`]: pdfs_store::db::Db::record_op_failure
+    /// [`FAILING_ATTEMPTS`]: pdfs_store::db::FAILING_ATTEMPTS
     fn defer_for_access(&self, op: &PendingOp, reason: AccessDeferral) {
         let now = now_millis();
         let next_attempt_at = now + DRAIN_ACCESS_RECHECK.as_millis() as i64;
@@ -2968,7 +2968,7 @@ mod tests {
     use super::*;
     use crate::state::WriteHandle;
     use pdfs_core::Access;
-    use pdfs_core::db::Db;
+    use pdfs_store::db::Db;
     use proton_drive_rs::NodeKind;
     use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
     use std::cell::Cell;

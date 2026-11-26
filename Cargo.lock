@@ -3641,6 +3641,7 @@ dependencies = [
  "clap_complete",
  "pdfs-core",
  "pdfs-fuse",
+ "pdfs-store",
  "rpassword",
  "serde_json",
  "tokio",
@@ -3680,6 +3681,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdfs-drive"
+version = "3.10.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "parking_lot 0.13.0",
+ "pdfs-core",
+ "pdfs-store",
+ "proton-drive-rs",
+ "sha1 0.11.0",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pdfs-fuse"
 version = "3.10.0"
 dependencies = [
@@ -3697,6 +3713,9 @@ dependencies = [
  "notify",
  "parking_lot 0.13.0",
  "pdfs-core",
+ "pdfs-drive",
+ "pdfs-store",
+ "pdfs-sync",
  "proton-drive-rs",
  "proton-gallery-app-rs",
  "proton-gallery-rs",
@@ -3735,6 +3754,33 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webkit6",
+]
+
+[[package]]
+name = "pdfs-store"
+version = "3.10.0"
+dependencies = [
+ "libc",
+ "parking_lot 0.13.0",
+ "pdfs-core",
+ "proton-drive-rs",
+ "proton-gallery-rs",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tracing",
+]
+
+[[package]]
+name = "pdfs-sync"
+version = "3.10.0"
+dependencies = [
+ "pdfs-core",
+ "pdfs-drive",
+ "pdfs-store",
+ "proton-drive-rs",
+ "tracing",
 ]
 
 [[package]]

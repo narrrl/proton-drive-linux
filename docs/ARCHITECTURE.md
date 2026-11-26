@@ -625,7 +625,7 @@ Features whose code is shaped by a constraint that the code alone does not expla
 
 ### Photos
 
-`pdfs-fuse/src/photos.rs`, `pdfs-core/src/db/photos.rs`, `pdfs-gui/src/app/pages/photos.rs`.
+`pdfs-fuse/src/photos.rs`, `pdfs-store/src/db/photos.rs`, `pdfs-gui/src/app/pages/photos.rs`.
 
 - **Favorites** use the SDK's photo tags. Favoriting a photo that is not on the account's own
   photos volume (shared, or only in an album) is refused: it would need re-encryption the SDK does

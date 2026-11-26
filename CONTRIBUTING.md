@@ -48,7 +48,7 @@ runs are destructive: use a dedicated test account, never one holding data you c
 - **Keep shared logic in `pdfs-core`.** The CLI and GUI never touch the database or the network;
   they speak the control protocol to the daemon.
 - **The SQLite schema is forward-only.** Never edit a shipped migration — add a new one and bump
-  `SCHEMA_VERSION` in `crates/pdfs-core/src/db/migrations.rs`.
+  `SCHEMA_VERSION` in `crates/pdfs-store/src/db/migrations.rs`.
 - **Typed errors and `?` over panics** on runtime paths. Blocking filesystem, keyring, or
   control-socket work stays off GTK's main thread.
 - **`staging/` and `recovery/` may hold the only copy of user data.** Nothing may clear or purge

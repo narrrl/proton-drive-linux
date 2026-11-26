@@ -12,9 +12,36 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cache::Pin;
 use crate::error::Result;
 pub use crate::mounts::{MountAccess, MountKind, MountMode, MountSpec};
+
+/// One pin, as carried over the control socket and listed in `status`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Pin {
+    /// Node uid in `volume~link` display form.
+    pub uid: String,
+    /// Last path the node was pinned under, for display in `status`. Advisory
+    /// only — the uid is the identity.
+    pub path: String,
+    /// A folder pin whose whole subtree is kept on disk. `false` for a single
+    /// file. Defaulted so a legacy `pins.json` (file pins only) still parses.
+    #[serde(default)]
+    pub recursive: bool,
+    /// Whether the pinned node is a folder, when the node cache knows.
+    ///
+    /// `recursive` is pin *policy*, not node kind: a folder pinned
+    /// non-recursively has `recursive: false`, and a front-end reading it as
+    /// "this is a file" draws a file icon and sends an invalid `OpenFile`. This
+    /// is resolved from the `nodes` row at list time, so it is `None` for a pin
+    /// whose node is not cached — and absent from an older daemon's reply,
+    /// which is why it is defaulted.
+    #[serde(default)]
+    pub is_dir: Option<bool>,
+    /// A pinned file whose content is on disk right now. The daemon fills it
+    /// in when it answers `ListPins`; folders and older daemons say `false`.
+    #[serde(default)]
+    pub cached: bool,
+}
 
 /// Cap on the *write* half of a round-trip. A crashed daemon can leave its
 /// listening socket in the kernel (e.g. as a `<defunct>` zombie): `connect`
@@ -2342,6 +2369,22 @@ pub struct Diagnostics {
     /// The folder-sync engine. `None` from a daemon that predates the field.
     #[serde(default)]
     pub sync: Option<SyncEngineState>,
+    /// Every kind of call made to Drive since start: how many, how many
+    /// failed, and how long they took. Empty from a daemon that predates the
+    /// field.
+    #[serde(default)]
+    pub drive_calls: Vec<DriveCallStat>,
+}
+
+/// One kind of call to Drive, in [`Diagnostics::drive_calls`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct DriveCallStat {
+    /// The client method, such as `enumerate_folder_children_node_uids`.
+    pub call: String,
+    pub count: u64,
+    pub errors: u64,
+    pub total_ms: u64,
+    pub longest_ms: u64,
 }
 
 /// What the folder-sync engine is doing, for [`Diagnostics`].
@@ -2479,7 +2522,7 @@ pub enum Response {
         username: String,
         mountpoint: String,
         pinned: usize,
-        /// Bytes of cached content blobs (see [`crate::cache::ContentCache::usage`]).
+        /// Bytes of cached content blobs (see `pdfs_store::cache::ContentCache::usage`).
         used: u64,
         /// Configured soft byte cap (`0` = unlimited).
         budget: u64,

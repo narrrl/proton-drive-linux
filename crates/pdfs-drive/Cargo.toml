@@ -1,0 +1,28 @@
+[package]
+name = "pdfs-drive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The Proton Drive calls the Linux client makes, behind a trait"
+
+[features]
+# FakeDrive and the simulation RNG, for tests in this and other crates.
+sim = ["dep:parking_lot", "dep:sha1", "dep:tokio", "dep:pdfs-store"]
+
+[dependencies]
+pdfs-core.workspace = true
+proton-drive-rs.workspace = true
+tracing.workspace = true
+pdfs-store = { workspace = true, optional = true }
+async-trait.workspace = true
+futures.workspace = true
+parking_lot = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
