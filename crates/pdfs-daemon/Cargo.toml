@@ -1,0 +1,18 @@
+[package]
+name = "pdfs-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The Proton Drive Linux daemon's composition root: session, mount and restart loop"
+
+[dependencies]
+pdfs-core.workspace = true
+pdfs-store.workspace = true
+pdfs-fuse.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

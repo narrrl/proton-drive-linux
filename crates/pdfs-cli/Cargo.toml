@@ -17,6 +17,7 @@ path = "src/main.rs"
 pdfs-core.workspace = true
 pdfs-store.workspace = true
 pdfs-fuse.workspace = true
+pdfs-daemon.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
