@@ -490,9 +490,17 @@ pub(crate) fn mount_with(
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<sync::SyncMsg>();
 
     let pause = pause::SyncPause::load(db.clone());
+    let events: Arc<events::EventHub> = Arc::default();
     let gallery_dir = control_socket.with_file_name("gallery-catalog");
-    let gallery =
-        gallery_session.map(|session| Arc::new(super::gallery::Gallery::new(gallery_dir, session)));
+    let gallery = gallery_session.map(|session| {
+        Arc::new(super::gallery::Gallery::new(
+            gallery_dir,
+            session,
+            client.clone(),
+            events.clone(),
+            db.clone(),
+        ))
+    });
     let cache = Arc::new(cache);
     let shutdown = Arc::new(crate::shutdown::Shutdown::default());
     let transfers = TransferRegistry::new();
@@ -560,7 +568,7 @@ pub(crate) fn mount_with(
         local_first,
         transfers,
         sync,
-        events: Arc::new(Default::default()),
+        events,
         indexing: Arc::new(AtomicBool::new(false)),
         pending_probe: Arc::default(),
         mounts: Arc::new(Mutex::new(SecondaryMountRegistry::default())),
@@ -630,7 +638,7 @@ pub(crate) fn mount_with(
     if matches!(host, Host::Daemon)
         && let Some(gallery) = &core.gallery
     {
-        workers.spawn_task(&rt, "pdfs-gallery", gallery.clone().poll(core.clone()));
+        workers.spawn_task(&rt, "pdfs-gallery", gallery.clone().poll());
     }
     // A timed pause persisted by an earlier run still has to end on time.
     if let Some(until) = core.pause.deadline() {

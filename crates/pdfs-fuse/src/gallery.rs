@@ -14,6 +14,8 @@ use pdfs_core::control::{
     GalleryAction, GalleryAlbum, GalleryFolder, GalleryPlace, PhotoItem, PhotoKind, Response,
 };
 use pdfs_core::{CoreError, CoreResult};
+use pdfs_store::db::Db;
+use proton_drive_rs::ProtonDriveClient;
 use proton_drive_rs::proton_sdk::session::ProtonApiSession;
 use proton_gallery_app_rs::{App, View};
 use proton_gallery_rs::CancellationToken;
@@ -32,6 +34,9 @@ pub(super) struct Gallery {
     refresh: Notify,
     access: AtomicU64,
     video: video::Server,
+    client: ProtonDriveClient,
+    events: Arc<super::events::EventHub>,
+    db: Arc<Db>,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -50,8 +55,17 @@ impl Visibility {
 }
 
 impl Gallery {
-    pub(super) fn new(root: PathBuf, session: ProtonApiSession) -> Self {
+    pub(super) fn new(
+        root: PathBuf,
+        session: ProtonApiSession,
+        client: ProtonDriveClient,
+        events: Arc<super::events::EventHub>,
+        db: Arc<Db>,
+    ) -> Self {
         Self {
+            client,
+            events,
+            db,
             root,
             session,
             cancel: CancellationToken::new(),
@@ -69,13 +83,13 @@ impl Gallery {
         self.video.close_all();
     }
 
-    async fn app(&self, core: &Core) -> CoreResult<&App> {
+    async fn app(&self) -> CoreResult<&App> {
         self.app
             .get_or_try_init(|| async {
                 App::open_hosted(
                     self.root.clone(),
                     self.session.clone(),
-                    core.client.clone(),
+                    self.client.clone(),
                     self.cancel.child_token(),
                 )
                 .await
@@ -84,12 +98,7 @@ impl Gallery {
             .await
     }
 
-    async fn ensure_visibility(
-        &self,
-        core: &Core,
-        app: &App,
-        force: bool,
-    ) -> CoreResult<Arc<Visibility>> {
+    async fn ensure_visibility(&self, app: &App, force: bool) -> CoreResult<Arc<Visibility>> {
         if self.cancel.is_cancelled() {
             return Err(CoreError::remote("The Gallery session expired"));
         }
@@ -111,7 +120,7 @@ impl Gallery {
                 .await
                 .map_err(gallery_error)?
         {
-            self.publish_visibility(core, self.read_visibility(core, app).await?);
+            self.publish_visibility(self.read_visibility(app).await?);
         }
         let started = Instant::now();
         let result = tokio::select! {
@@ -119,7 +128,7 @@ impl Gallery {
             _ = self.cancel.cancelled() => Err(CoreError::remote("The Gallery session expired")),
             result = tokio::time::timeout(Duration::from_secs(20), async {
                 app.refresh_gallery_configuration(false).await.map_err(gallery_error)?;
-                self.read_visibility(core, app).await
+                self.read_visibility(app).await
             }) => result.unwrap_or_else(|_| Err(CoreError::remote("Gallery visibility check timed out"))),
         };
         tracing::debug!(
@@ -129,7 +138,7 @@ impl Gallery {
         );
         *checked = Some(Instant::now());
         if let Ok(visibility) = result {
-            self.publish_visibility(core, visibility.clone());
+            self.publish_visibility(visibility.clone());
             return Ok(visibility);
         }
         if !force && let Some(visibility) = self.snapshot() {
@@ -145,18 +154,18 @@ impl Gallery {
             .clone()
     }
 
-    fn publish_visibility(&self, core: &Core, visibility: Arc<Visibility>) {
+    fn publish_visibility(&self, visibility: Arc<Visibility>) {
         let mut snapshot = self.visibility.write().unwrap_or_else(|e| e.into_inner());
         if snapshot.as_ref() != Some(&visibility) {
             *snapshot = Some(visibility);
             drop(snapshot);
             self.video.close_all();
-            core.events
+            self.events
                 .publish(&[pdfs_core::control::Topic::GalleryVisibilitySynced]);
         }
     }
 
-    async fn read_visibility(&self, core: &Core, app: &App) -> CoreResult<Arc<Visibility>> {
+    async fn read_visibility(&self, app: &App) -> CoreResult<Arc<Visibility>> {
         let account = self.account()?;
         let mut visibility = Visibility::default();
         for (volume, node) in app
@@ -170,7 +179,7 @@ impl Gallery {
                 .insert(NodeUid::new(volume.into(), node.into()).to_string());
         }
         visibility.media.extend(
-            core.db
+            self.db
                 .photo_group_members_for(&visibility.media)
                 .map_err(CoreError::from)?,
         );
@@ -328,7 +337,7 @@ impl Gallery {
         Ok(())
     }
 
-    pub(super) async fn poll(self: Arc<Self>, core: Core) {
+    pub(super) async fn poll(self: Arc<Self>) {
         loop {
             tokio::select! {
                 biased;
@@ -336,9 +345,8 @@ impl Gallery {
                 _ = self.refresh.notified() => {},
                 _ = tokio::time::sleep(Duration::from_secs(60)) => {}
             }
-            if let Ok(Ok(app)) = tokio::time::timeout(Duration::from_secs(5), self.app(&core)).await
-            {
-                let _ = self.ensure_visibility(&core, app, false).await;
+            if let Ok(Ok(app)) = tokio::time::timeout(Duration::from_secs(5), self.app()).await {
+                let _ = self.ensure_visibility(app, false).await;
             }
         }
     }
@@ -422,8 +430,8 @@ impl Core {
         }
         let gallery = self.gallery_host()?;
         self.rt.block_on(async {
-            let app = gallery.app(self).await?;
-            gallery.ensure_visibility(self, app, false).await
+            let app = gallery.app().await?;
+            gallery.ensure_visibility(app, false).await
         })
     }
 
@@ -475,9 +483,9 @@ impl Core {
             other => other,
         };
         self.rt.block_on(async {
-            let app = gallery.app(self).await?;
+            let app = gallery.app().await?;
             gallery
-                .ensure_visibility(self, app, matches!(action, GalleryAction::Refresh))
+                .ensure_visibility(app, matches!(action, GalleryAction::Refresh))
                 .await?;
             match action {
                 GalleryAction::AuthenticateHidden | GalleryAction::Lock => unreachable!(),
@@ -517,14 +525,14 @@ impl Core {
                     app.add_drive_folder(uid(&node)?)
                         .await
                         .map_err(gallery_error)?;
-                    gallery.ensure_visibility(self, app, true).await?;
+                    gallery.ensure_visibility(app, true).await?;
                     Ok(done())
                 }
                 GalleryAction::Remove { gallery: id } => {
                     app.forget_drive_gallery(SourceId::new(id).map_err(gallery_error)?)
                         .await
                         .map_err(gallery_error)?;
-                    gallery.ensure_visibility(self, app, true).await?;
+                    gallery.ensure_visibility(app, true).await?;
                     Ok(done())
                 }
                 GalleryAction::Refresh => {
@@ -535,7 +543,7 @@ impl Core {
                         );
                         app.scan_drive_folder(root).await.map_err(gallery_error)?;
                     }
-                    gallery.ensure_visibility(self, app, true).await?;
+                    gallery.ensure_visibility(app, true).await?;
                     Ok(done())
                 }
                 GalleryAction::Cover { album, uid: node } => {
@@ -565,7 +573,7 @@ impl Core {
                         .set_album_settings_at(Some(root), id, settings)
                         .await
                         .map_err(gallery_error)?;
-                    gallery.ensure_visibility(self, app, true).await?;
+                    gallery.ensure_visibility(app, true).await?;
                     Ok(done())
                 }
             }
@@ -576,8 +584,8 @@ impl Core {
         let gallery = self.gallery_host()?;
         let uid = uid(node)?;
         self.rt.block_on(async {
-            let app = gallery.app(self).await?;
-            let visibility = gallery.ensure_visibility(self, app, false).await?;
+            let app = gallery.app().await?;
+            let visibility = gallery.ensure_visibility(app, false).await?;
             let access = if private {
                 Some(gallery.private_access()?)
             } else {
@@ -605,7 +613,7 @@ impl Core {
         let access = gallery.private_access()?;
         let asset = gallery.asset(&uid(node)?)?;
         self.rt.block_on(async {
-            let app = gallery.app(self).await?;
+            let app = gallery.app().await?;
             let bytes = tokio::time::timeout(Duration::from_secs(30), async {
                 if let Some(bytes) = app.preview(&asset).await? {
                     Ok(bytes)
@@ -633,8 +641,8 @@ impl Core {
         let gallery = self.gallery_host()?;
         let asset = gallery.asset(&uid(node)?)?;
         self.rt.block_on(async {
-            let app = gallery.app(self).await?;
-            let visibility = gallery.ensure_visibility(self, app, false).await?;
+            let app = gallery.app().await?;
+            let visibility = gallery.ensure_visibility(app, false).await?;
             let access = if private {
                 Some(gallery.private_access()?)
             } else {
