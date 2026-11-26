@@ -573,14 +573,14 @@ pub(crate) fn mount_with(
 
     // Writes queued by a previous run (or left behind by a crash) are still owed
     // an upload, and reads must be served from their staged blobs until they land.
-    core.hydrate_pending();
+    core.recovery().hydrate_pending();
     // Then the writes that were fsynced but never closed, which the cache moved
     // aside at open. After `hydrate_pending`, so a recovered partial write can
     // see an already-queued write to the same node.
-    core.recover_fsynced_writes();
+    core.recovery().recover_fsynced_writes();
     // And finally the staged blobs neither of those accounts for: bytes a
     // failed release left behind with nothing pointing at them.
-    core.reconcile_staging();
+    core.recovery().reconcile_staging();
     // Several drain workers over one queue. One thread meant a single large
     // upload held every queued rename, trash and small write behind it for as
     // long as it ran; the claim column (`Db::claim_next_due_op`) keeps the
