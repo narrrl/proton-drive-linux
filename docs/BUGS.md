@@ -308,6 +308,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B295](#b295--a-resize-the-scratch-file-refused-still-succeeded) | A resize the scratch file refused still succeeded |
 | [B293](#b293--a-large-trash-never-lists-and-empty-trash-never-empties-it) | A large trash never lists, and Empty Trash never empties it |
 | [B292](#b292--two-programs-changing-settings-at-once-lose-one-of-the-changes) | Two programs changing settings at once lose one of the changes |
 | [B290](#b290--reopening-the-database-right-after-closing-it-can-be-refused-as-another-daemon) | Reopening the database right after closing it can be refused as another daemon |
