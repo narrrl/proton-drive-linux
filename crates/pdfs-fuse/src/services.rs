@@ -109,7 +109,7 @@ impl Service for OnlineProbe {
 /// Keeps pinned files on this computer through changes made elsewhere, and
 /// fetches the ones a failed or missed download left out (`docs/BUGS.md`
 /// B282). A check lists folders and downloads files.
-pub(crate) struct PinKeeper(pub(crate) Core);
+pub(crate) struct PinKeeper(pub(crate) super::keeper::PinKeeper);
 
 impl Service for PinKeeper {
     fn name(&self) -> String {
@@ -117,7 +117,7 @@ impl Service for PinKeeper {
     }
 
     fn run(self: Box<Self>) {
-        self.0.run_pin_keeper();
+        self.0.run();
     }
 }
 

@@ -22,6 +22,16 @@ use proton_drive_rs::NodeKind;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{debug, info, warn};
 
+use std::sync::Arc;
+
+use fuser::Errno;
+use parking_lot::Mutex;
+use pdfs_core::CoreResult;
+use pdfs_core::shutdown::Shutdown;
+use pdfs_store::cache::ContentCache;
+
+use super::link::Link;
+use super::transfers::TransferRegistry;
 use super::{Core, is_local_uid, node_size, parse_uid};
 
 /// How often the keeper looks for work.
@@ -59,32 +69,76 @@ pub(crate) struct KeptFile {
     pub(crate) size: u64,
 }
 
-impl Core {
-    /// Have the keeper check every pin.
-    pub(crate) fn recheck_all_pins(&self) {
-        self.pin_work.lock().all = true;
+/// What the pin keeper needs from the tree.
+pub(crate) trait KeeperHost: Send + Sync {
+    /// Where `uid` is in the tree: its inode, its parent's, and whether it is
+    /// a folder.
+    fn locate(&self, uid: &NodeUid) -> Option<(u64, u64, bool)>;
+    /// Every file under the folder at `ino`, listing what is not listed yet.
+    fn pin_subtree_files(&self, ino: u64) -> CoreResult<Vec<u64>>;
+    /// List the folder at `ino` again if its listing was dropped.
+    fn ensure_children(&self, ino: u64) -> Result<(), Errno>;
+    /// The file at `ino`, as a pin keeps it. See [`Core::kept_file`].
+    fn kept_file(&self, ino: u64) -> Option<KeptFile>;
+    /// Download a pinned file and keep it.
+    fn fetch_pinned(&self, uid: &NodeUid, name: &str, mtime: i64, size: u64) -> CoreResult<()>;
+}
+
+impl KeeperHost for Core {
+    fn locate(&self, uid: &NodeUid) -> Option<(u64, u64, bool)> {
+        let st = self.state();
+        st.by_uid.get(uid).and_then(|&ino| {
+            let e = st.entries.get(&ino)?;
+            Some((ino, e.parent, e.node.is_folder()))
+        })
     }
 
-    /// Have the keeper check the pinned file or folder `uid`.
-    pub(crate) fn recheck_pinned(&self, uid: &NodeUid) {
-        self.pin_work.lock().nodes.insert(uid.clone());
+    fn pin_subtree_files(&self, ino: u64) -> CoreResult<Vec<u64>> {
+        Core::pin_subtree_files(self, ino)
     }
 
+    fn ensure_children(&self, ino: u64) -> Result<(), Errno> {
+        Core::ensure_children(self, ino)
+    }
+
+    fn kept_file(&self, ino: u64) -> Option<KeptFile> {
+        Core::kept_file(self, ino)
+    }
+
+    fn fetch_pinned(&self, uid: &NodeUid, name: &str, mtime: i64, size: u64) -> CoreResult<()> {
+        Core::fetch_pinned(self, uid, name, mtime, size)
+    }
+}
+
+/// Checks pins again and downloads what is missing or stale (the module
+/// documentation says when). Holds the content cache, the transfer list, the
+/// link, the stop signal and the queue of work; it reaches the tree through
+/// [`KeeperHost`].
+pub(crate) struct PinKeeper {
+    cache: Arc<ContentCache>,
+    transfers: Arc<TransferRegistry>,
+    link: Arc<Link>,
+    shutdown: Arc<Shutdown>,
+    work: Arc<Mutex<PinWork>>,
+    host: Arc<dyn KeeperHost>,
+}
+
+impl PinKeeper {
     /// The keeper's loop, until the daemon stops. Starts with a check of every
     /// pin, which catches up on whatever changed while the daemon was down.
     ///
     /// Work that failed waits out a backoff of its own. New work does not wait
     /// for it, so a file that keeps failing does not hold up the next change.
-    pub(crate) fn run_pin_keeper(&self) {
-        self.recheck_all_pins();
+    pub(crate) fn run(&self) {
+        self.work.lock().all = true;
         let mut backlog = PinWork::default();
         let mut backlog_due = Instant::now();
         let mut retry = RETRY_FIRST;
         while self.shutdown.sleep(KEEPER_TICK) {
-            if !self.is_online() {
+            if !self.link.is_online() {
                 continue;
             }
-            let mut work = std::mem::take(&mut *self.pin_work.lock());
+            let mut work = std::mem::take(&mut *self.work.lock());
             let retrying = !backlog.is_empty() && Instant::now() >= backlog_due;
             if retrying {
                 work.merge(std::mem::take(&mut backlog));
@@ -128,19 +182,13 @@ impl Core {
             if !self.cache.is_pinned(&uid) {
                 continue;
             }
-            let found = {
-                let st = self.state();
-                st.by_uid.get(&uid).and_then(|&ino| {
-                    let e = st.entries.get(&ino)?;
-                    Some((ino, e.parent, e.node.is_folder()))
-                })
-            };
+            let found = self.host.locate(&uid);
             let Some((ino, parent, is_folder)) = found else {
                 debug!(%uid, "pin keeper: pinned node is not in the tree");
                 continue;
             };
             if is_folder {
-                match self.pin_subtree_files(ino) {
+                match self.host.pin_subtree_files(ino) {
                     Ok(inos) => files.extend(inos.into_iter().filter(|i| seen.insert(*i))),
                     Err(e) => {
                         warn!(%uid, error = %e, "pin keeper: listing a kept folder failed");
@@ -154,7 +202,7 @@ impl Core {
             // now, which is what the cached copy is checked against.
             if !work.all
                 && parent != ino
-                && let Err(e) = self.ensure_children(parent)
+                && let Err(e) = self.host.ensure_children(parent)
             {
                 warn!(%uid, error = ?e, "pin keeper: listing a kept file's folder failed");
                 failed.nodes.insert(uid);
@@ -167,7 +215,7 @@ impl Core {
 
         let stale: Vec<KeptFile> = files
             .into_iter()
-            .filter_map(|ino| self.kept_file(ino))
+            .filter_map(|ino| self.host.kept_file(ino))
             .filter(|f| !self.cache.is_cached(&f.uid, f.mtime, f.size))
             .collect();
         if stale.is_empty() {
@@ -186,7 +234,10 @@ impl Core {
                 continue;
             }
             job.detail(file.name.clone());
-            match self.fetch_pinned(&file.uid, &file.name, file.mtime, file.size) {
+            match self
+                .host
+                .fetch_pinned(&file.uid, &file.name, file.mtime, file.size)
+            {
                 Ok(()) => fetched += 1,
                 Err(e) => {
                     warn!(uid = %file.uid, error = %e, "pin keeper: download failed");
@@ -202,6 +253,30 @@ impl Core {
             "pin keeper: brought files kept offline up to date"
         );
         failed
+    }
+}
+
+impl Core {
+    /// The pin keeper, with this daemon as its host.
+    pub(crate) fn pin_keeper(&self) -> PinKeeper {
+        PinKeeper {
+            cache: self.cache.clone(),
+            transfers: self.transfers.clone(),
+            link: self.link.clone(),
+            shutdown: self.shutdown.clone(),
+            work: self.pin_work.clone(),
+            host: Arc::new(self.clone()),
+        }
+    }
+
+    /// Have the keeper check every pin.
+    pub(crate) fn recheck_all_pins(&self) {
+        self.pin_work.lock().all = true;
+    }
+
+    /// Have the keeper check the pinned file or folder `uid`.
+    pub(crate) fn recheck_pinned(&self, uid: &NodeUid) {
+        self.pin_work.lock().nodes.insert(uid.clone());
     }
 
     /// The file at `ino`, as a pin keeps it. `None` for a folder, a file this

@@ -613,7 +613,7 @@ pub(crate) fn mount_with(
         list.push(Box::new(services::ConflictSweep(core.sweeper())));
     }
     list.push(Box::new(services::OnlineProbe(core.online_probe())));
-    list.push(Box::new(services::PinKeeper(core.clone())));
+    list.push(Box::new(services::PinKeeper(core.pin_keeper())));
     if matches!(host, Host::Daemon) {
         list.push(Box::new(services::LocalIndex {
             db: core.db.clone(),
