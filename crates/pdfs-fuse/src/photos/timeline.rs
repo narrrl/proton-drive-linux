@@ -159,16 +159,14 @@ impl Core {
             return;
         }
         let core = self.clone();
-        let spawned = std::thread::Builder::new()
-            .name("pdfs-similar".into())
-            .spawn(move || {
-                if let Err(e) = core.hash_similar() {
-                    warn!(error = %e, "similar-photo hashing failed");
-                }
-                core.photo_jobs
-                    .similar_hashing
-                    .store(false, Ordering::SeqCst);
-            });
+        let spawned = self.services.spawn_job("pdfs-similar", move || {
+            if let Err(e) = core.hash_similar() {
+                warn!(error = %e, "similar-photo hashing failed");
+            }
+            core.photo_jobs
+                .similar_hashing
+                .store(false, Ordering::SeqCst);
+        });
         if let Err(e) = spawned {
             warn!(error = %e, "could not start similar-photo hashing");
             self.photo_jobs

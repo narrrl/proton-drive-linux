@@ -182,24 +182,22 @@ impl Core {
     pub(crate) fn arm_pause_timer(&self, until: i64) {
         let core = self.clone();
         let wait = Duration::from_secs(until.saturating_sub(now_secs()).max(0) as u64);
-        let spawned = std::thread::Builder::new()
-            .name("pdfs-pause".into())
-            .spawn(move || {
-                if !core.shutdown.sleep(wait) {
-                    return;
+        let spawned = self.services.spawn_job("pdfs-pause", move || {
+            if !core.shutdown.sleep(wait) {
+                return;
+            }
+            if core
+                .sync_paused_until
+                .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                if let Err(error) = core.db.clear_state(PAUSED_UNTIL_KEY) {
+                    warn!(%error, "clearing an expired sync pause failed");
                 }
-                if core
-                    .sync_paused_until
-                    .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    if let Err(error) = core.db.clear_state(PAUSED_UNTIL_KEY) {
-                        warn!(%error, "clearing an expired sync pause failed");
-                    }
-                    info!("sync pause ended");
-                    core.resume_sync_work();
-                }
-            });
+                info!("sync pause ended");
+                core.resume_sync_work();
+            }
+        });
         if let Err(error) = spawned {
             // The drain and the reconcile still read the clock, so the pause
             // still ends — just at the next idle poll instead of on time.

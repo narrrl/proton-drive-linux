@@ -288,7 +288,7 @@ impl Core {
         }
 
         let core = self.clone();
-        std::thread::spawn(move || {
+        if let Err(error) = self.services.spawn_job("pdfs-redate", move || {
             let outcome = core.redate_photos(dry_run, limit, range, cancel);
             let mut state = REDATE.lock();
             state.running = false;
@@ -310,7 +310,9 @@ impl Core {
                 ),
                 Err(e) => warn!(error = %e, "photo re-date failed"),
             }
-        });
+        }) {
+            tracing::warn!(%error, "could not start pdfs-redate");
+        }
         Ok(())
     }
 }

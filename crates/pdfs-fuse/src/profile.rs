@@ -55,7 +55,7 @@ impl Core {
             return;
         }
         let core = self.clone();
-        std::thread::spawn(move || {
+        if let Err(error) = self.services.spawn_job("pdfs-profile-backup", move || {
             let (saving, dirty) = save_state();
             while dirty.swap(false, Ordering::SeqCst) {
                 if let Err(e) = core.save_profile() {
@@ -64,7 +64,9 @@ impl Core {
                 }
             }
             saving.store(false, Ordering::SeqCst);
-        });
+        }) {
+            tracing::warn!(%error, "could not start pdfs-profile-backup");
+        }
     }
 
     /// Serialize this machine's arrangement and upload it to its own

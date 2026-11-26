@@ -323,6 +323,14 @@ pub(super) fn cmd_diagnostics() -> Result<()> {
                     );
                 }
             }
+            if !d.jobs.is_empty() {
+                let jobs: Vec<String> = d
+                    .jobs
+                    .iter()
+                    .map(|job| format!("{} ({})", job.name, human_secs(job.age_secs)))
+                    .collect();
+                println!("jobs: {}", jobs.join(", "));
+            }
             if let Some(sync) = &d.sync {
                 println!("sync engine: {}", sync_engine_line(sync));
                 for trace in &sync.traces {

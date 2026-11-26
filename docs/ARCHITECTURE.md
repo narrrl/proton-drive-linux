@@ -50,7 +50,7 @@ graph TD
 | [`pdfs-core`](../crates/pdfs-core) | Authentication and keyring (`auth`), configuration and directories (`config`), the control protocol (`control`), search scoring, ignore rules, Google Takeout parsing, the machine profile, the transfer registry (`transfers`) and the shutdown signal (`shutdown`) |
 | [`pdfs-store`](../crates/pdfs-store) | The SQLite schema and queries (`db/`), the content cache (`cache`) |
 | [`pdfs-drive`](../crates/pdfs-drive) | The `DriveApi` seam over the SDK, the call counter (`counted`), and `FakeDrive` for the simulations |
-| [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes and engine thread (`mirror`), with its reads and writes of the local disk in one module (`mirror::local`), and the parts with no I/O: planner, pass model and pass trace. It owns its state (`SyncParts`), reads and writes its tables only through `SyncStore`, and reaches the daemon only through `SyncHost` |
+| [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes (`mirror`), split into the walks (`mirror::walk`), applying a plan (`mirror::apply`) and the push pass (`mirror::push`), its engine thread (`mirror::engine`), its reads and writes of the local disk in one module (`mirror::local`), and the parts with no I/O: planner, pass model and pass trace. It owns its state (`SyncParts`), reads and writes its tables only through `SyncStore`, and reaches the daemon only through `SyncHost` |
 | [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), the tree (`state`), finding nodes (`resolve`), folder listings and file sizes (`listing`, `sizes`), reads (`reads`), queueing and the drain (`enqueue`, `queue`, `drain`, `upload`), calls sent straight to Drive (`remote`), requests by path (`requests`), startup recovery (`recovery`), pins, search, trash, the shared tree (`shared`), the link state (`link`), remote events (`background`), the daemon's side of the sync engine (`sync`, which implements `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
 | [`pdfs-daemon`](../crates/pdfs-daemon) | The daemon's composition root: waits for a session, opens the database and the content cache, resumes the session and mounts, then remounts or retries with a backoff and records each failure |
 | [`pdfs-cli`](../crates/pdfs-cli) | The `pdfs` binary. `pdfs daemon` runs `pdfs_daemon::run` in-process; every other command is a control-socket client |
@@ -484,6 +484,11 @@ message, a connection to the control socket. A stop signals, wakes and joins the
 order, up to one 10-second deadline, and names any that are still running at the end.
 `pdfs diagnostics` reports what each worker is doing and which services are still running. The
 supervisor warns once about a service that ended while the mount runs.
+
+Work a request starts and does not wait for (a cache check, `VACUUM`, an import, a folder pin, a
+re-date, a profile backup, a size upgrade) runs as a one-shot job:
+`ServiceBoard::spawn_job` starts it on a named thread and lists it until it ends. `pdfs
+diagnostics` shows the jobs running and how long each has run. Jobs are not joined on stop.
 
 ---
 

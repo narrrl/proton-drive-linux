@@ -2378,9 +2378,14 @@ pub struct Diagnostics {
     /// still running. Empty from a daemon that predates the field.
     #[serde(default)]
     pub services: Vec<ServiceState>,
+    /// The one-shot jobs running now, such as a cache check, an import or a
+    /// folder pin, oldest first. Empty from a daemon that predates the field.
+    #[serde(default)]
+    pub jobs: Vec<ServiceState>,
 }
 
-/// One long-lived daemon thread, in [`Diagnostics::services`].
+/// One long-lived daemon thread, in [`Diagnostics::services`], or one
+/// one-shot job, in [`Diagnostics::jobs`].
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServiceState {
     /// The thread's name, such as `pdfs-sync`.

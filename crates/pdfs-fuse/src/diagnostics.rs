@@ -174,6 +174,16 @@ impl Core {
                     age_secs: service.age.as_secs(),
                 })
                 .collect(),
+            jobs: self
+                .services
+                .jobs()
+                .into_iter()
+                .map(|job| ServiceState {
+                    name: job.name,
+                    running: job.running,
+                    age_secs: job.age.as_secs(),
+                })
+                .collect(),
             drive_calls: self
                 .drive_calls
                 .snapshot()
