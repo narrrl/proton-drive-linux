@@ -15,3 +15,7 @@ pdfs-drive.workspace = true
 pdfs-store.workspace = true
 proton-drive-rs.workspace = true
 tracing.workspace = true
+notify = "8"
+parking_lot.workspace = true
+sha1.workspace = true
+tokio.workspace = true

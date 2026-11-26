@@ -17,7 +17,7 @@
 //! transfer moves is charged to its direction's [`RateLimit`], and the thread
 //! moving it sleeps off whatever the charge puts it over the cap.
 //!
-//! [`Request::GetQueueStatus`]: pdfs_core::control::Request::GetQueueStatus
+//! [`Request::GetQueueStatus`]: crate::control::Request::GetQueueStatus
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use pdfs_core::control::{JobItem, TransferDirection, TransferItem};
+use crate::control::{JobItem, TransferDirection, TransferItem};
 
 /// One registered transfer. `done` is bumped from the I/O wrapper without the
 /// registry lock; the rest is immutable for the transfer's lifetime.
@@ -198,7 +198,7 @@ impl TransferRegistry {
     /// Snapshot every in-flight job for [`Response::Transfers`], oldest first, so
     /// a front-end's rows keep their order across polls.
     ///
-    /// [`Response::Transfers`]: pdfs_core::control::Response::Transfers
+    /// [`Response::Transfers`]: crate::control::Response::Transfers
     pub fn jobs_snapshot(&self) -> Vec<JobItem> {
         let map = self.jobs.lock();
         let mut ids: Vec<_> = map.keys().copied().collect();
@@ -222,7 +222,7 @@ impl TransferRegistry {
     /// running average since the transfer began — simple, and stable enough for a
     /// progress widget without per-tick sampling state.
     ///
-    /// [`Response::Transfers`]: pdfs_core::control::Response::Transfers
+    /// [`Response::Transfers`]: crate::control::Response::Transfers
     pub fn snapshot(&self) -> Vec<TransferItem> {
         let map = self.inner.lock();
         let mut ids: Vec<_> = map.keys().copied().collect();

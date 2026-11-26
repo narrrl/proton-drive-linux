@@ -31,13 +31,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(120);
 /// per-item work is a network round-trip, so a folder with thousands of files is
 /// unusable done one-at-a-time; this bounds concurrency like the bulk-upload
 /// engine does.
-pub(crate) const SYNC_CONCURRENCY: usize = 8;
+pub const SYNC_CONCURRENCY: usize = 8;
 /// How long after a failed watch the engine tries the watches again. Each try
 /// walks the folder's whole tree, so not on every burst.
 const REWATCH_RETRY: Duration = Duration::from_secs(600);
 
 /// A message to the sync engine's control thread.
-pub(crate) enum SyncMsg {
+pub enum SyncMsg {
     /// Reconcile one folder by id (a local change, or a targeted `SyncNow`).
     Reconcile(i64),
     /// Reconcile every mirror folder (periodic poll, or startup).
@@ -52,7 +52,7 @@ pub(crate) enum SyncMsg {
 /// Start the sync engine: a control thread that owns the filesystem watcher and
 /// serialises reconcile passes, plus a periodic poll thread. The engine receives
 /// on `rx`; senders live in [`SyncParts::tx`].
-pub(crate) fn spawn(core: Syncer, rx: Receiver<SyncMsg>) -> Option<std::thread::JoinHandle<()>> {
+pub fn spawn(core: Syncer, rx: Receiver<SyncMsg>) -> Option<std::thread::JoinHandle<()>> {
     match std::thread::Builder::new()
         .name("pdfs-sync".into())
         .spawn(move || engine_loop(core, rx))
@@ -72,7 +72,7 @@ pub(crate) fn spawn(core: Syncer, rx: Receiver<SyncMsg>) -> Option<std::thread::
 /// file event and poll then went into a channel nobody read, the folder stayed
 /// `syncing`, and nothing said so until a restart (`docs/BUGS.md` B259).
 #[derive(Default)]
-pub(crate) struct EngineHealth {
+pub struct EngineHealth {
     running: AtomicBool,
     pass: Mutex<Option<PassClock>>,
     panics: AtomicU64,
@@ -100,7 +100,7 @@ const PASS_HEARTBEAT: Duration = Duration::from_secs(300);
 impl EngineHealth {
     /// Note that the running pass reported progress. Returns the pass's folder
     /// and age once every [`PASS_HEARTBEAT`], when it is time to log it.
-    pub(crate) fn moved(&self) -> Option<(i64, Duration)> {
+    pub fn moved(&self) -> Option<(i64, Duration)> {
         let mut pass = self.pass.lock();
         let pass = pass.as_mut()?;
         let now = Instant::now();
@@ -114,7 +114,7 @@ impl EngineHealth {
 
     /// The engine's state now. `try_lock`, like the rest of the diagnostics:
     /// a report must not wait on the thing it reports about.
-    pub(crate) fn report(&self) -> SyncEngineState {
+    pub fn report(&self) -> SyncEngineState {
         let pass = self.pass.try_lock().and_then(|pass| *pass);
         let mut traces: Vec<_> = self
             .traces
@@ -167,7 +167,7 @@ impl EngineHealth {
     }
 
     /// Apply `f` to the running pass's trace. Does nothing outside a pass.
-    pub(crate) fn trace(&self, f: impl FnOnce(&mut PassTrace)) {
+    pub fn trace(&self, f: impl FnOnce(&mut PassTrace)) {
         if let Some(trace) = self.trace.lock().as_mut() {
             f(trace);
         }
@@ -175,7 +175,7 @@ impl EngineHealth {
 
     /// Note that the running pass ended, `how`, and return its trace for the
     /// journal.
-    pub(crate) fn end_trace(&self, how: &'static str) -> Option<PassTrace> {
+    pub fn end_trace(&self, how: &'static str) -> Option<PassTrace> {
         let mut trace = self.trace.lock();
         let trace = trace.as_mut()?;
         trace.end(how);
