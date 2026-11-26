@@ -489,7 +489,7 @@ pub(crate) fn mount_with(
     // handlers can trigger reconciles.
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<sync::SyncMsg>();
 
-    let paused_until = pause::load_paused_until(&db);
+    let pause = pause::SyncPause::load(db.clone());
     let gallery_dir = control_socket.with_file_name("gallery-catalog");
     let gallery =
         gallery_session.map(|session| Arc::new(super::gallery::Gallery::new(gallery_dir, session)));
@@ -512,6 +512,18 @@ pub(crate) fn mount_with(
         abandon: Arc::default(),
         events_read_at: Arc::new(AtomicI64::new(0)),
     };
+    let state = Arc::new(Ranked::new(
+        Rank::State,
+        State::new(db.clone(), share_access),
+    ));
+    let sharing = super::sharing::Sharing::new(
+        client.clone(),
+        drive.clone(),
+        rt.clone(),
+        cache.clone(),
+        transfers.clone(),
+        state.clone(),
+    );
     let core = Core {
         drive,
         drive_calls,
@@ -520,22 +532,20 @@ pub(crate) fn mount_with(
         rt: rt.clone(),
         maintenance: Arc::new(Mutex::new(Default::default())),
         primary_root_uid: root.uid.clone(),
-        state: Arc::new(Ranked::new(
-            Rank::State,
-            State::new(db.clone(), share_access),
-        )),
+        state: state.clone(),
         cache,
         reads: super::reads::ReadState::new(),
         workers: Arc::new(Workers::new(FUSE_WORKERS)?),
         db,
         link: Arc::new(link::Link::starting(online, start == Start::SessionExpired)),
-        sync_paused_until: Arc::new(AtomicI64::new(paused_until)),
+        pause,
         drain: super::drain::DrainState::new(),
         pin_work: Arc::new(Mutex::new(Default::default())),
         sizes: super::sizes::SizeState::new(),
         trash: super::trash::TrashState::new(),
         shared: super::shared::SharedState::new(),
-        quota_cache: super::sharing::QuotaCache::new(),
+        quota: super::quota::QuotaCache::new(),
+        sharing,
         sweep: super::sweep::SweepState::new(sweep_mode),
         writes: super::writes::WriteState::new(),
         session: super::session::SessionCells::new(),
@@ -607,8 +617,8 @@ pub(crate) fn mount_with(
         }
     }
     // A timed pause persisted by an earlier run still has to end on time.
-    if pause::paused_at(paused_until, now_secs()) && paused_until != pause::PAUSED_INDEFINITELY {
-        core.arm_pause_timer(paused_until);
+    if let Some(until) = core.pause.deadline() {
+        core.arm_pause_timer(until);
     }
 
     // Reconcile leftover `(sync-conflict …)` copies: drop the ones that turned

@@ -750,7 +750,8 @@ Step 3 so far: the daemon's long-lived threads and async loops start and stop th
 `Services` set (§9).
 `Core`'s fields are grouped by owner, each group a struct in the module that owns it:
 `photos::PhotoJobs`, `drain::DrainState`, `reads::ReadState`, `sizes::SizeState`,
-`trash::TrashState`, `shared::SharedState`, `sharing::QuotaCache` and `sweep::SweepState`.
+`trash::TrashState`, `shared::SharedState`, `quota::QuotaCache`, `pause::SyncPause` and
+`sweep::SweepState`.
 `Core`'s methods are split by area out of `lib.rs` into their own modules. The daemon's run loop
 moved out of `pdfs-cli` into `pdfs-daemon`, which is where the services will be built.
 
@@ -765,6 +766,17 @@ State that several owners share sits behind a narrow interface of its own:
   fresh cells from `SessionCells::fork`, and shares the rest of `Core`.
 - `link::Link` holds whether Drive answers, next to when the link went down. Code reads it through
   `Core::is_online`.
+
+Some areas are services of their own rather than methods on `Core`. `sharing::Sharing` holds
+only the handles it calls (the client, Drive, the content cache, the transfer list and a read of
+the tree), and every one of its methods takes a node already resolved to its uid. Like the sync
+engine's `Syncer`, it can be built and tested without the rest of the daemon.
+
+The control socket answers each area's requests in a module of its own under `control/`:
+sharing, Photos, synced folders and devices, revisions, and the trash and cache. Each module
+exports a pattern macro naming its requests, and the main match hands them over in one arm, so
+the compiler still checks that every request has an answer. A module turns a path or a uid into a
+node once, then asks the service.
 
 What is left in `Core` is the tree, the database, the cache and the Drive client, which most
 owners use, plus single fields that belong to one module each.
