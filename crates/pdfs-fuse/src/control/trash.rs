@@ -24,15 +24,15 @@ pub(super) use request;
 pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
     let Ask { core, .. } = *ask;
     match request {
-        CtlRequest::ListTrash => match core.list_trash() {
+        CtlRequest::ListTrash => match core.trash().list_trash() {
             Ok(entries) => CtlResponse::Entries { entries },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::ListTrashedFolder { uid } => match core.list_trashed_folder(&uid) {
+        CtlRequest::ListTrashedFolder { uid } => match core.trash().list_trashed_folder(&uid) {
             Ok(entries) => CtlResponse::Entries { entries },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::Restore { uids } => match core.restore(&uids) {
+        CtlRequest::Restore { uids } => match core.trash().restore(&uids) {
             Ok(n) => {
                 core.log_activity(ActivityKind::Restore, format!("{n} item(s)"), "", true);
                 CtlResponse::Ok {
@@ -41,7 +41,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             }
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::DeleteForever { uids } => match core.delete_forever(&uids) {
+        CtlRequest::DeleteForever { uids } => match core.trash().delete_forever(&uids) {
             Ok(n) => {
                 core.log_activity(
                     ActivityKind::DeleteForever,
@@ -55,7 +55,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             }
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::EmptyTrash => match core.empty_trash() {
+        CtlRequest::EmptyTrash => match core.trash().empty_trash() {
             Ok(n) => {
                 let items = if n == 1 {
                     "1 item".to_string()

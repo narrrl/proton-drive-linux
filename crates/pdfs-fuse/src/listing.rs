@@ -434,11 +434,17 @@ impl Core {
     ///
     /// Metadata only: a thumbnail path is attached for photos whose thumbnail is
     /// already cached, and nothing is downloaded here — the front-end pulls the
-    /// thumbnails it actually paints via [`Core::photo_thumbs`].
+    /// thumbnails it actually paints via [`Photos::photo_thumbs`](crate::photos::Photos::photo_thumbs).
     pub(super) fn listing_stale(&self, key: &str, ttl: Duration) -> bool {
-        match self.db.state_i64(key).ok().flatten() {
-            Some(ms) => now_ms().saturating_sub(ms) >= ttl.as_millis() as i64,
-            None => true,
-        }
+        listing_stale(&self.db, key, ttl)
+    }
+}
+
+/// Whether the listing stamped under `key` is older than `ttl`, or was never
+/// stamped.
+pub(crate) fn listing_stale(db: &Db, key: &str, ttl: Duration) -> bool {
+    match db.state_i64(key).ok().flatten() {
+        Some(ms) => now_ms().saturating_sub(ms) >= ttl.as_millis() as i64,
+        None => true,
     }
 }

@@ -38,7 +38,7 @@ impl SyncHost for Core {
     }
 
     fn upload_thumbnails(&self, path: &Path, name: &str) -> Vec<Thumbnail> {
-        Core::upload_thumbnails(self, path, name)
+        self.photos().upload_thumbnails(path, name)
     }
 }
 

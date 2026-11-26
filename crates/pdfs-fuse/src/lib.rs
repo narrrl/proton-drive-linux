@@ -82,7 +82,6 @@ use proton_drive_rs::{
 };
 
 mod activity;
-mod albums;
 mod attach;
 mod background;
 mod conflicts;
@@ -121,7 +120,6 @@ mod queue;
 mod quota;
 mod reads;
 mod recovery;
-mod redate;
 mod relocate;
 mod remote;
 mod requests;
@@ -140,7 +138,6 @@ mod supervisor;
 mod sweep;
 mod sync;
 mod systemd;
-mod takeout;
 use pdfs_core::transfers;
 mod upload;
 mod r#virtual;
@@ -587,7 +584,7 @@ struct Core {
     services: pdfs_core::lifecycle::ServiceBoard,
     /// Whether a trash refresh is running, and the wake-up for requests waiting
     /// on its progress.
-    trash: trash::TrashState,
+    trash_jobs: trash::TrashState,
     /// What the conflict sweep may do, and the copies it already checked this
     /// run.
     sweep: sweep::SweepState,
@@ -1397,26 +1394,6 @@ impl Core {
         Ok(out.into_inner())
     }
 
-    /// Like [`download_file_tracked_to`] for a photo, streaming through the
-    /// photos client's [`download_photo_to`].
-    ///
-    /// [`download_file_tracked_to`]: Core::download_file_tracked_to
-    /// [`download_photo_to`]: ProtonPhotosClient::download_photo_to
-    fn download_photo_tracked(
-        &self,
-        photos: &ProtonPhotosClient,
-        uid: &NodeUid,
-        name: &str,
-        total: u64,
-    ) -> std::result::Result<Vec<u8>, ProtonError> {
-        let guard = self
-            .transfers
-            .begin(name, uid.to_string(), TransferDirection::Download, total);
-        let mut out = CountingWriter::new(Vec::with_capacity(total as usize), &guard);
-        self.rt.block_on(photos.download_photo_to(uid, &mut out))?;
-        Ok(out.into_inner())
-    }
-
     /// Fetch a thumbnail of `ttype` for the file at `ino`, served from the cache
     /// when fresh and otherwise downloaded from the remote and cached. Returns
     /// `Ok(None)` when the node is not a file or has no thumbnail of that type.
@@ -1476,7 +1453,7 @@ impl Core {
     /// reuses the daemon's single authenticated session rather than logging in
     /// again (Proton refresh tokens are single-use). Cheap — the Drive client
     /// is `Clone` over `Arc`-backed state.
-    fn photos(&self) -> ProtonPhotosClient {
+    fn photos_api(&self) -> ProtonPhotosClient {
         ProtonPhotosClient::from_drive_client(self.client.clone())
     }
 

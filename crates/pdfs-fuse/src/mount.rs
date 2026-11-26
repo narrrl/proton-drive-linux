@@ -542,7 +542,7 @@ pub(crate) fn mount_with(
         drain: super::drain::DrainState::new(),
         pin_work: Arc::new(Mutex::new(Default::default())),
         sizes: super::sizes::SizeState::new(),
-        trash: super::trash::TrashState::new(),
+        trash_jobs: super::trash::TrashState::new(),
         shared: super::shared::SharedState::new(),
         quota: super::quota::QuotaCache::new(),
         sharing,

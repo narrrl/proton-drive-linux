@@ -47,7 +47,7 @@ use tracing::{info, warn};
 
 pub(crate) use pdfs_drive::digest::sha1_of;
 
-use super::Core;
+use super::Photos;
 use crate::photos::can_make_thumbnail;
 use crate::transfers::CountingReader;
 
@@ -468,7 +468,7 @@ fn read_entry<R>(
     Ok(sink(&mut file))
 }
 
-impl Core {
+impl Photos {
     /// Copy archive entry `entry` into the thumbnail staging folder and return
     /// its path. The caller removes it.
     fn stage_takeout_entry(
@@ -611,7 +611,7 @@ impl Core {
             ));
         }
 
-        let photos = self.photos();
+        let photos = self.photos_api();
         if self
             .rt
             .block_on(photos.get_photos_root())
@@ -668,7 +668,7 @@ impl Core {
         report: &Reporter,
     ) -> CoreResult<()> {
         report.phase(ImportPhase::Checking, 0);
-        let photos = self.photos();
+        let photos = self.photos_api();
         let names: Vec<String> = planned.iter().map(|p| p.photo.name.clone()).collect();
         let collisions = self
             .rt
@@ -919,7 +919,7 @@ impl Core {
         report.step();
         match done.result {
             Ok(uid) => {
-                self.note_self_change(&uid);
+                self.host.note_self_change(&uid);
                 summary.uploaded += 1;
                 summary.bytes += done.photo.size;
                 if done.live {
@@ -954,7 +954,7 @@ impl Core {
         tags: Vec<PhotoTag>,
         main_uid: Option<NodeUid>,
     ) -> CoreResult<NodeUid> {
-        let photos = self.photos();
+        let photos = self.photos_api();
         let guard = self.transfers.begin(
             photo.name.clone(),
             "",
@@ -1035,7 +1035,7 @@ impl Core {
                 tags_to_remove: Vec::new(),
             })
             .collect();
-        if let Err(e) = self.rt.block_on(self.photos().update_photos(&updates)) {
+        if let Err(e) = self.rt.block_on(self.photos_api().update_photos(&updates)) {
             warn!(error = %e, "marking imported favorites failed");
         }
     }
@@ -1049,7 +1049,7 @@ impl Core {
         summary: &mut ImportSummary,
         report: &Reporter,
     ) -> CoreResult<()> {
-        let photos = self.photos();
+        let photos = self.photos_api();
 
         // Existing albums by decrypted name, so a second import of the same
         // export adds to the album it made the first time instead of a twin.
@@ -1152,14 +1152,14 @@ impl Core {
             state.save();
         }
 
-        let core = self.clone();
+        let this = self.clone();
         if let Err(error) = self.services.spawn_job("pdfs-import", move || {
             // The job is dropped only after the final state is stored: the
             // job leaving the transfer snapshot is the front-ends' cue to ask
             // for the result, which must then be there.
-            let job = core.transfers.begin_job("Importing Google Photos");
+            let job = this.transfers.begin_job("Importing Google Photos");
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                core.import_takeout(&archives, dry_run, &cancel, &job)
+                this.import_takeout(&archives, dry_run, &cancel, &job)
             }));
             // A panic must not leave the import marked as running for the
             // life of the daemon, refusing every later one.
@@ -1179,9 +1179,9 @@ impl Core {
             }
             drop(job);
             if !dry_run {
-                core.log_activity(
+                this.host.log_activity(
                     ActivityKind::Upload,
-                    "Google Photos import",
+                    "Google Photos import".to_string(),
                     activity_line(&summary),
                     summary.complete(),
                 );

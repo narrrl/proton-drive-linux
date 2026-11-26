@@ -70,6 +70,7 @@ async fn run_uploads(
                 ));
             }
             let thumbnails = core
+                .photos()
                 .upload_thumbnails_async(t.path.clone(), t.name.clone())
                 .await;
             match core
