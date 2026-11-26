@@ -105,7 +105,7 @@ impl Db {
     /// The persisted trash listing, folders first then by name — the order the
     /// Trash page shows it in.
     pub fn trash_list(&self) -> Result<Vec<StoredTrash>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT uid, name, is_dir, size, mtime, parent_uid, trashed_at FROM trash
              ORDER BY is_dir DESC, name COLLATE NOCASE",
@@ -132,7 +132,7 @@ impl Db {
     /// restore's tree walk. Kept separate from [`Db::trash_list`] because the
     /// restore wants only the links, not the names, sizes or ordering.
     pub fn trash_parents(&self) -> Result<Vec<(String, Option<String>)>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare("SELECT uid, parent_uid FROM trash")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut pairs = Vec::new();
@@ -145,7 +145,7 @@ impl Db {
     /// When each node now in the trash was first seen there, keyed by uid, so
     /// a refresh can carry the times over into the listing it writes.
     pub fn trash_seen(&self) -> Result<HashMap<String, Option<i64>>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare("SELECT uid, trashed_at FROM trash")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut seen = HashMap::new();

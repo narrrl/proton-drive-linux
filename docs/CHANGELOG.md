@@ -47,6 +47,10 @@ kept, with a list of the folders that changed on Proton Drive since (49).
   first pass, and whenever the change feed lost track (#53).
 
 ### Fixed
+- **A busy database no longer stalls reads or piles up threads.** A read that cannot get its own
+  connection fails instead of waiting behind a long write. `pdfs diagnostics` reports the
+  number of queued operations as unknown when the database does not answer in time, and no
+  longer starts a new thread for every report while it waits (B296).
 - Files dragged in from a file manager on Wayland upload. The compositor offers
   such a drag as a move at first, and My files, answering only to a copy, refused
   it without a word. It now asks for a copy, which the compositor then picks.

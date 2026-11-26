@@ -65,7 +65,7 @@ impl Db {
     /// flag. Synthetic shared listings use this to serve the last completed
     /// snapshot while offline, including after a live event expired its TTL.
     pub fn visible_children(&self, parent: &NodeUid) -> Result<Vec<Node>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let (key, parent) = parent_key(&conn, &parent.to_string())?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {NODE_NOW} FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
@@ -309,7 +309,7 @@ impl Db {
 
     /// Check if a folder node has any non-trashed children in the database.
     pub fn has_children(&self, parent_uid: &NodeUid) -> Result<bool> {
-        let conn = self.read();
+        let conn = self.read()?;
         let (key, parent) = parent_key(&conn, &parent_uid.to_string())?;
         let count: i64 = conn.query_row(
             &format!(
@@ -329,7 +329,7 @@ impl Db {
     /// mountpoint — resolve the roots once through this and do the rest as
     /// string arithmetic, instead of a `path_relative_to` walk per pair.
     pub fn node_path(&self, uid: &str) -> Result<Option<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let exists: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM nodes WHERE uid = ?1 AND node_json IS NOT NULL",
@@ -351,7 +351,7 @@ impl Db {
     /// chain keeps callers from accidentally joining a Drive-wide path onto the
     /// wrong mountpoint. The ancestor itself resolves to the empty path.
     pub fn path_relative_to(&self, ancestor_uid: &str, uid: &str) -> Result<Option<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(
             "WITH RECURSIVE anc(uid, parent_lid, name, depth) AS (
                SELECT uid, parent_lid, name, 0 FROM nodes WHERE uid = ?1
@@ -403,7 +403,7 @@ impl Db {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.read();
+        let conn = self.read()?;
         let rows: Vec<HitRow> = if query.chars().count() < TRIGRAM_MIN {
             let pat = format!("%{}%", like_escape(query));
             let mut stmt = conn.prepare(&format!(
@@ -461,7 +461,7 @@ impl Db {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.read();
+        let conn = self.read()?;
         let terms = candidate_trigrams(query);
         let lane_limit = limit.div_ceil(2);
         let mut rows: Vec<HitRow> = if terms.is_empty() {
@@ -547,7 +547,7 @@ impl Db {
     /// local id: a folder that landed has its new uid there, while the node
     /// stored below it may still hold the placeholder.
     pub fn load_all(&self) -> Result<Vec<StoredNode>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {NODE_NOW}, n.listed, n.lid
              FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
@@ -570,7 +570,7 @@ impl Db {
     /// Load one persisted node back by uid. Used to recover the My Files root
     /// when the API is unreachable, so the mount can still serve the cached tree.
     pub fn node_by_uid(&self, uid: &str) -> Result<Option<Node>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let json: Option<String> = conn
             .query_row(
                 &format!(
@@ -590,7 +590,7 @@ impl Db {
     /// The uid of the node with local id `lid`: `None` when it has no row, or
     /// is not on Drive yet.
     pub fn uid_of_lid(&self, lid: i64) -> Result<Option<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         Ok(conn
             .query_row("SELECT uid FROM nodes WHERE lid = ?1", params![lid], |r| {
                 r.get(0)
@@ -604,7 +604,7 @@ impl Db {
     /// create lands and the row takes the uid Drive gave it: a node made on
     /// this machine is found by its stand-in ([`local_uid`]) before and after.
     pub fn lid_of(&self, uid: &str) -> Result<Option<i64>> {
-        node_lid(&self.read(), uid)
+        node_lid(&*self.read()?, uid)
     }
 
     /// The local id of each node, in order, giving a row to each that has none.
@@ -693,7 +693,7 @@ impl Db {
     /// The daemon resumes from this on restart instead of reseeding to the
     /// server head, so changes made while unmounted are still applied (P2).
     pub fn children_if_listed(&self, parent: &NodeUid) -> Result<Option<Vec<Node>>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let (key, folder) = row_key(&parent.to_string());
         let listed: Option<i64> = conn
             .query_row(
@@ -713,7 +713,7 @@ impl Db {
     /// listing is still marked complete. Only for when nothing better can be
     /// had: a listing dropped as stale may miss or keep a child.
     pub fn known_children(&self, parent: &NodeUid) -> Result<Vec<Node>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let (key, parent) = parent_key(&conn, &parent.to_string())?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {NODE_NOW} FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
@@ -736,7 +736,7 @@ impl Db {
     /// while a create in it is queued, after a restart say, loses the file
     /// until the create lands (`docs/BUGS.md` B132).
     pub fn queued_children(&self, parent: &NodeUid) -> Result<(Vec<Node>, HashSet<String>)> {
-        let conn = self.read();
+        let conn = self.read()?;
         let (key, parent) = parent_key(&conn, &parent.to_string())?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {NODE_NOW} FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
