@@ -234,7 +234,10 @@ impl Core {
     /// same name would split the profile across two documents, and the restore
     /// would have no way to tell which is current.
     fn ensure_profile_dir(&self, root_uid: &NodeUid) -> CoreResult<NodeUid> {
-        if let Some(uid) = self.find_device_child_folder(root_uid, PROFILE_DIR_NAME)? {
+        if let Some(uid) = self
+            .devices()
+            .find_device_child_folder(root_uid, PROFILE_DIR_NAME)?
+        {
             return Ok(uid);
         }
         let uid = self
@@ -259,7 +262,10 @@ impl Core {
     /// machine keeps working. A profile that cannot be read is left out and
     /// logged; the others still count.
     fn load_profiles(&self, root_uid: &NodeUid) -> CoreResult<Vec<Profile>> {
-        let mut uids = match self.find_device_child_folder(root_uid, PROFILE_DIR_NAME)? {
+        let mut uids = match self
+            .devices()
+            .find_device_child_folder(root_uid, PROFILE_DIR_NAME)?
+        {
             Some(dir_uid) => self.device_child_files(&dir_uid, is_profile_file_name)?,
             None => Vec::new(),
         };
@@ -301,7 +307,7 @@ impl Core {
         &self,
         device: Option<&str>,
     ) -> CoreResult<Vec<RestorableFolder>> {
-        let device = self.restore_source(device)?;
+        let device = self.devices().restore_source(device)?;
         let root_uid = parse_uid(&device.root_uid).ok_or_else(|| {
             CoreError::internal(format!("bad device root uid: {}", device.root_uid))
         })?;
@@ -387,7 +393,7 @@ impl Core {
         if items.is_empty() {
             return Err(CoreError::invalid("nothing to restore"));
         }
-        let device = self.restore_source(device)?;
+        let device = self.devices().restore_source(device)?;
         let existing = self
             .db
             .sync_folder_list()
@@ -397,7 +403,7 @@ impl Core {
         // where destructive device-only operations would otherwise be allowed.
         let device_root = super::parse_uid(&device.root_uid)
             .ok_or_else(|| CoreError::internal("invalid device root"))?;
-        let children = self.device_root_nodes(&device_root)?;
+        let children = self.devices().device_root_nodes(&device_root)?;
         let reserved = crate::devices::sync_root_reserved();
         let mut roots: Vec<PathBuf> = existing
             .iter()

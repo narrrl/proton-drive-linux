@@ -42,7 +42,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
         core, mountpoint, ..
     } = *ask;
     match request {
-        CtlRequest::ListDevices => match core.list_devices() {
+        CtlRequest::ListDevices => match core.devices().list_devices() {
             Ok(items) => CtlResponse::Devices { items },
             Err(e) => CtlResponse::error(e),
         },
@@ -50,23 +50,23 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             Ok(items) => CtlResponse::Locations { items },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::RenameDevice { uid, name } => match core.rename_device(&uid, &name) {
+        CtlRequest::RenameDevice { uid, name } => match core.devices().rename_device(&uid, &name) {
             Ok(()) => CtlResponse::Ok {
                 message: format!("renamed device to {name}"),
             },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::DeleteDevice { uid } => match core.delete_device(&uid) {
+        CtlRequest::DeleteDevice { uid } => match core.devices().delete_device(&uid) {
             Ok(()) => CtlResponse::Ok {
                 message: "device deleted".to_string(),
             },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::AdoptDevice { uid } => match core.adopt_device(uid.as_deref()) {
+        CtlRequest::AdoptDevice { uid } => match core.devices().adopt_device(uid.as_deref()) {
             Ok(message) => CtlResponse::Ok { message },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::MigrateDevice { uid } => match core.migrate_device(&uid) {
+        CtlRequest::MigrateDevice { uid } => match core.devices().migrate_device(&uid) {
             Ok(message) => CtlResponse::Ok { message },
             Err(e) => CtlResponse::error(e),
         },

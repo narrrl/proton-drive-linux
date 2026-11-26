@@ -790,6 +790,11 @@ on demand.
 the node may be written, drops what describes the old content (cached blocks and open readers)
 and fetches it again if it is kept offline, and adds an activity entry.
 
+`devices::Devices` holds the account's devices on Drive: listing, renaming, deleting, adopting
+and migrating them, and registering this computer. Its `DevicesHost` port moves a folder, runs a
+sync pass and re-enumerates a folder, which is what migrating a device's folders needs. Synced
+folders and on-demand mounts are still methods on `Core`.
+
 The control socket answers each area's requests in a module of its own under `control/`:
 sharing, Photos, synced folders and devices, revisions, and the trash and cache. Each module
 exports a pattern macro naming its requests, and the main match hands them over in one arm, so
