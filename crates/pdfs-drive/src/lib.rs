@@ -29,8 +29,8 @@ use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::{ProtonError, Result};
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid, ShareId};
 use proton_drive_rs::{
-    AvailableNameTarget, Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeMoveItem,
-    ProtonDriveClient, RevisionReader, Thumbnail, ThumbnailType, TrashedNode,
+    AvailableNameTarget, Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeKind,
+    NodeMoveItem, ProtonDriveClient, RevisionReader, Thumbnail, ThumbnailType, TrashedNode,
 };
 
 /// One outcome per node of a batch request; see [`ProtonDriveClient::trash_nodes`].
@@ -593,6 +593,17 @@ pub fn is_network_error(e: &ProtonError) -> bool {
             )
         }
         _ => false,
+    }
+}
+
+/// The server revision id of a node's active revision, if it is a file that has
+/// one. The stable identity the drain conflict-checks against (see `Baseline` in pdfs-store).
+pub fn node_revision_id(node: &Node) -> Option<String> {
+    match &node.kind {
+        NodeKind::Folder => None,
+        NodeKind::File {
+            active_revision_id, ..
+        } => active_revision_id.clone(),
     }
 }
 

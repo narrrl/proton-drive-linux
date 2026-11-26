@@ -3715,6 +3715,7 @@ dependencies = [
  "pdfs-core",
  "pdfs-drive",
  "pdfs-store",
+ "pdfs-sync",
  "proton-drive-rs",
  "proton-gallery-app-rs",
  "proton-gallery-rs",
@@ -3768,6 +3769,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tracing",
+]
+
+[[package]]
+name = "pdfs-sync"
+version = "3.10.0"
+dependencies = [
+ "pdfs-core",
+ "pdfs-drive",
+ "pdfs-store",
+ "proton-drive-rs",
  "tracing",
 ]
 

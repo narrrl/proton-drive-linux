@@ -91,6 +91,10 @@ mod diagnostics;
 mod drain;
 use drive::{DriveApi, RevisionRead};
 use pdfs_drive as drive;
+use pdfs_drive::node_revision_id;
+#[cfg(test)]
+use pdfs_sync::naming::{conflict_label, conflict_label_of, conflict_name_as};
+use pdfs_sync::naming::{conflict_name, this_hostname};
 mod events;
 mod filesystem;
 mod gallery;
@@ -6503,70 +6507,6 @@ fn is_gone(e: &(dyn std::error::Error + 'static)) -> bool {
     api_code(e) == Some(ResponseCode::DoesNotExist)
 }
 
-/// A variant of `name` to fall back on when the remote already has that name.
-///
-/// Deliberately the same shape the sync engine uses for its conflict copies
-/// (`sync.rs`, `conflict_path`), so the two halves of the product name the same
-/// situation the same way and a user only has to learn it once.
-fn conflict_name(name: &str, stamp: i64) -> String {
-    conflict_name_as(name, conflict_label(), stamp)
-}
-
-/// [`conflict_name`] with the machine's label given.
-fn conflict_name_as(name: &str, label: &str, stamp: i64) -> String {
-    let path = Path::new(name);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
-    let tag = conflict_tag(label, stamp, 0);
-    match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) => format!("{stem} (sync-conflict {tag}).{ext}"),
-        None => format!("{stem} (sync-conflict {tag})"),
-    }
-}
-
-/// This machine's name as its conflict copies carry it (`docs/BUGS.md` B251).
-///
-/// Two computers syncing one folder that each keep a copy of the same file in
-/// the same second would otherwise make the same name on Drive, and nobody
-/// could tell which computer a copy came from. Read once, from the hostname.
-fn conflict_label() -> &'static str {
-    static LABEL: OnceLock<String> = OnceLock::new();
-    LABEL.get_or_init(|| conflict_label_of(&this_hostname()))
-}
-
-/// `host` as one token: anything but ASCII letters, digits, `-`, `_` and `.`
-/// becomes `-`, so the label holds no space for `conflict_base_name` to trip
-/// on and no `/` or `)` to break the name.
-fn conflict_label_of(host: &str) -> String {
-    let label: String = host
-        .chars()
-        .take(32)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    label.trim_matches('-').to_string()
-}
-
-/// The inside of a conflict copy's marker: `<label> <stamp>`, with `-<n>`
-/// when an earlier copy already holds that name. Without a label it is the
-/// bare stamp that copies had before B251.
-fn conflict_tag(label: &str, stamp: i64, suffix: u32) -> String {
-    let suffix = if suffix == 0 {
-        String::new()
-    } else {
-        format!("-{suffix}")
-    };
-    if label.is_empty() {
-        format!("{stamp}{suffix}")
-    } else {
-        format!("{label} {stamp}{suffix}")
-    }
-}
-
 /// Fabricate the node the server would have returned, for a `create`/`mkdir`
 /// that could not reach it. Everything the kernel asks about a fresh node —
 /// name, kind, size, times — is knowable locally; the uid is the only invention,
@@ -6606,16 +6546,6 @@ fn local_node(uid: NodeUid, parent_uid: NodeUid, name: String, is_dir: bool) -> 
         direct_role: None,
         share_id: None,
     }
-}
-
-/// This machine's hostname, used to name (and later recover) its Proton Drive
-/// Device. Reads the live kernel hostname, falling back to a generic label.
-fn this_hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Linux device".to_string())
 }
 
 /// Whether `dir` has no entries.
@@ -7127,17 +7057,6 @@ fn expand_restore(
     }
     waves.retain(|wave| !wave.is_empty());
     waves
-}
-
-/// The server revision id of a node's active revision, if it is a file that has
-/// one. The stable identity the drain conflict-checks against (see [`Baseline`]).
-fn node_revision_id(node: &Node) -> Option<String> {
-    match &node.kind {
-        NodeKind::Folder => None,
-        NodeKind::File {
-            active_revision_id, ..
-        } => active_revision_id.clone(),
-    }
 }
 
 /// The plaintext content SHA-1 of a file node, if its active revision carried one.
