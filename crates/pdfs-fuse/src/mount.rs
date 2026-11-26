@@ -612,7 +612,7 @@ pub(crate) fn mount_with(
         info!(mode = ?sweep_mode, "conflict sweep enabled");
         list.push(Box::new(services::ConflictSweep(core.sweeper())));
     }
-    list.push(Box::new(services::OnlineProbe(core.clone())));
+    list.push(Box::new(services::OnlineProbe(core.online_probe())));
     list.push(Box::new(services::PinKeeper(core.clone())));
     if matches!(host, Host::Daemon) {
         list.push(Box::new(services::LocalIndex {

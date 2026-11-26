@@ -94,7 +94,7 @@ impl Service for ConflictSweep {
 
 /// Watches the link for the life of the mount: a mount from the cache waits
 /// for the network to come back, and an online one can lose it at any moment.
-pub(crate) struct OnlineProbe(pub(crate) Core);
+pub(crate) struct OnlineProbe(pub(crate) super::link::OnlineProbe);
 
 impl Service for OnlineProbe {
     fn name(&self) -> String {
@@ -102,7 +102,7 @@ impl Service for OnlineProbe {
     }
 
     fn run(self: Box<Self>) {
-        self.0.run_online_probe();
+        self.0.run();
     }
 }
 

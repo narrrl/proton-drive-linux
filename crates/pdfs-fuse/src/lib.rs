@@ -4149,7 +4149,7 @@ mod tests {
             "enumerate_folder_children_node_uids",
         );
         assert_eq!(ensure.matches("adopt_stale_listing(").count(), 3);
-        let online = function_source(include_str!("link.rs"), "fn mark_online(");
+        let online = function_source(include_str!("link.rs"), "fn after_reconnect(");
         assert!(online.contains("self.relist_offline_listings();"));
     }
 
