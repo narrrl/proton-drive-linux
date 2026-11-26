@@ -68,6 +68,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B297](#b297--the-simulations-fail-and-hang-when-run-in-parallel-and-nothing-stops-that) | The simulations fail and hang when run in parallel, and nothing stops that | Not fixed |
 | [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy) | On a slow link, a file's last write can land only in a conflict copy | Cause not found; seen once in CI |
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
@@ -308,6 +309,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B295](#b295--a-resize-the-scratch-file-refused-still-succeeded) | A resize the scratch file refused still succeeded |
 | [B293](#b293--a-large-trash-never-lists-and-empty-trash-never-empties-it) | A large trash never lists, and Empty Trash never empties it |
 | [B292](#b292--two-programs-changing-settings-at-once-lose-one-of-the-changes) | Two programs changing settings at once lose one of the changes |
 | [B290](#b290--reopening-the-database-right-after-closing-it-can-be-refused-as-another-daemon) | Reopening the database right after closing it can be refused as another daemon |
@@ -398,6 +400,41 @@ a live account since.
 
 Newest first.
 
+### B297 — The simulations fail and hang when run in parallel, and nothing stops that
+
+**Status:** Open
+**Found:** 2026-11-25, while running the full simulation suite several times each for #134, #135
+and the 4.0 crate moves, with `cargo test -p pdfs-fuse --lib -- --ignored sim::`. That command
+leaves out `--test-threads=1`, which CI and [TESTING.md](TESTING.md) use, so libtest ran up to
+eight simulations at once in one process.
+**Where:** `crates/pdfs-fuse/src/sim/daemon.rs`, `Daemon::start` and `Daemon::shut_down`
+
+**Repro:** Run the suite without `--test-threads=1`. Of 18 such runs on three branches based on
+main, 6 passed, 10 failed and 2 hung until a 900 s timeout. The failures were timing asserts
+in many tests, among them `a_write_that_failed_on_a_short_outage_goes_out_soon_after_the_link_returns`,
+`three_clients_one_writer_each` and `one_client_with_stale_hashes_and_reordered_echoes`.
+Each passes when run alone.
+
+In a hung run, one test thread stayed in state D in `request_wait_answer`, waiting on a FUSE
+request to a mount its own process serves. Killing the process left it a zombie and left its
+mounts in place until their connections were aborted through
+`/sys/fs/fuse/connections/<n>/abort`.
+
+Run serially, the same branches pass in CI (#133 to #137).
+
+**Cause.** The simulations share process-wide state: `isolate_from_the_developer` sets the XDG
+variables once, which is sound only while no other test reads the environment, and every
+daemon runs drain workers, a sync engine and a runtime on the same few cores. In parallel the
+timing asserts miss their deadlines, and the harness has no way out of a mount that stops
+answering.
+
+**Fix.** Not done.
+
+Separately, CI on main (`0b9e849`) failed `a_move_blocked_by_trash_can_be_retried_after_restore`
+once, serially ([run](https://github.com/narrrl/proton-drive-linux/actions/runs/45694939718)):
+the assert at `daemon.rs:2209` found an empty list. It has not failed since.
+
+---
 ### B296 — A busy database stalls reads, and piles up diagnostics threads
 
 **Status:** Fixed (unverified)
