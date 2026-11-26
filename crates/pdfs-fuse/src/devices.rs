@@ -17,6 +17,7 @@ use pdfs_core::control::{
     ActivityKind, DeviceInfo, JobItem, MountKind, MountSpec, SyncFolderInfo, SyncPhase,
     SyncProgress,
 };
+use pdfs_core::lockrank::{Rank, Ranked};
 use pdfs_core::mounts::MountMode;
 use pdfs_core::profile::PROFILE_DIR_NAME;
 use pdfs_core::{CoreError, CoreResult};
@@ -698,8 +699,12 @@ impl Core {
     }
 
     /// The lock guarding sync-folder `id` against concurrent reconcile/mode-switch.
-    pub(crate) fn sync_lock(&self, id: i64) -> Arc<Mutex<()>> {
-        self.sync_locks.lock().entry(id).or_default().clone()
+    pub(crate) fn sync_lock(&self, id: i64) -> Arc<Ranked<()>> {
+        self.sync_locks
+            .lock()
+            .entry(id)
+            .or_insert_with(|| Arc::new(Ranked::new(Rank::SyncFolder, ())))
+            .clone()
     }
 
     /// Remove a synced folder from the sync set. `delete_remote` also deletes its

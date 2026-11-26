@@ -32,6 +32,7 @@
 //! remainder of the file is pulled from the remote — lazily, at commit.
 
 use parking_lot::{Condvar, Mutex};
+use pdfs_core::lockrank::{Rank, Ranked};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -520,7 +521,7 @@ struct Core {
     /// directory belongs exclusively to the primary My Files mount.
     primary: bool,
     /// The one tree every mount of the daemon serves from.
-    state: Arc<Mutex<State>>,
+    state: Arc<Ranked<State>>,
     /// The tree inode this mount's session is rooted at, set when the session
     /// is built ([`ProtonFs::new`]). Each fork has its own cell.
     root: Arc<OnceLock<u64>>,
@@ -557,7 +558,7 @@ struct Core {
     db: Arc<Db>,
     /// Serializes only shared-list publication and access-loss invalidation.
     /// Network calls happen before taking it.
-    shared_publication: Arc<Mutex<()>>,
+    shared_publication: Arc<Ranked<()>>,
     /// Invalidates in-flight shared responses when access/list events arrive.
     shared_generation: Arc<AtomicU64>,
     /// Successful refreshes suppress retries even if persisting their timestamp
@@ -771,7 +772,7 @@ struct Core {
     /// FUSE over it, so it must never overlap a pass that is walking and
     /// uploading that same tree — the engine would upload files as they vanish
     /// and then walk the FUSE mount as if it were local.
-    sync_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
+    sync_locks: Arc<Mutex<HashMap<i64, Arc<Ranked<()>>>>>,
     /// Per-sync-folder paths the last pass could not read, so the activity feed
     /// says so when the set changes rather than on every poll (B196).
     sync_unscanned: Arc<Mutex<HashMap<i64, Vec<String>>>>,

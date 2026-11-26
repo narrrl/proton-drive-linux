@@ -374,12 +374,12 @@ impl DbWrite {
 /// write still happens synchronously on this thread before the caller proceeds,
 /// so a read that follows a mutation still sees it.
 pub(crate) struct StateGuard<'a> {
-    guard: Option<parking_lot::MutexGuard<'a, State>>,
+    guard: Option<pdfs_core::lockrank::RankedGuard<'a, State>>,
     db: &'a Arc<Db>,
 }
 
 impl<'a> StateGuard<'a> {
-    pub(crate) fn new(guard: parking_lot::MutexGuard<'a, State>, db: &'a Arc<Db>) -> Self {
+    pub(crate) fn new(guard: pdfs_core::lockrank::RankedGuard<'a, State>, db: &'a Arc<Db>) -> Self {
         Self {
             guard: Some(guard),
             db,
@@ -1641,7 +1641,7 @@ mod tests {
         let (st, _dir) = state();
         let db = st.db.clone();
         let root = uid("root").to_string();
-        let state = parking_lot::Mutex::new(st);
+        let state = pdfs_core::lockrank::Ranked::new(pdfs_core::lockrank::Rank::State, st);
         {
             let mut guard = StateGuard::new(state.lock(), &db);
             guard.intern(0, node("root", "none", "My Files", true));

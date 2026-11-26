@@ -18,7 +18,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
 use pdfs_core::{CoreError, CoreResult};
 use pdfs_store::db::{StoredSyncEntry, StoredSyncFolder};
 use proton_drive_rs::NodeKind;
@@ -200,7 +199,8 @@ impl Core {
             .collect();
         ids.sort_unstable();
         ids.dedup();
-        let locks: Vec<Arc<Mutex<()>>> = ids.iter().map(|&id| self.sync_lock(id)).collect();
+        let locks: Vec<Arc<pdfs_core::lockrank::Ranked<()>>> =
+            ids.iter().map(|&id| self.sync_lock(id)).collect();
         let mut guards = Vec::with_capacity(locks.len());
         for lock in &locks {
             guards.push(lock.try_lock_for(MIRROR_LOCK_WAIT).ok_or_else(|| {

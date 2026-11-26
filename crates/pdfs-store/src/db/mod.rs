@@ -24,6 +24,7 @@
 //! and never name a submodule.
 
 use parking_lot::Mutex;
+use pdfs_core::lockrank::{Rank, Ranked, RankedGuard};
 use rusqlite::Connection;
 
 use pdfs_core::{Error, Result};
@@ -96,7 +97,7 @@ const WAL_AUTOCHECKPOINT_PAGES: i64 = 500;
 /// Cheap to wrap in an `Arc`; clone the `Arc`, not this. All access goes through
 /// the inner `Mutex<Connection>`.
 pub struct Db {
-    conn: Mutex<Connection>,
+    conn: Ranked<Connection>,
     /// Read-only connections for `SELECT`-only methods. `None` for an in-memory
     /// database, where a second connection would open a different, empty one —
     /// those fall back to the write connection.
@@ -153,7 +154,7 @@ impl ReadPool {
 /// for `self.read()?` and nothing else.
 pub(super) struct Reader<'a> {
     pooled: Option<Connection>,
-    writer: Option<parking_lot::MutexGuard<'a, Connection>>,
+    writer: Option<RankedGuard<'a, Connection>>,
     pool: Option<&'a ReadPool>,
 }
 
@@ -185,10 +186,10 @@ impl Drop for Reader<'_> {
 /// reachable; losing that row loses a write `close()` already reported as
 /// done. A FULL commit syncs the WAL, which covers every NORMAL commit before
 /// it as well.
-pub(super) struct Durable<'a>(parking_lot::MutexGuard<'a, Connection>);
+pub(super) struct Durable<'a>(RankedGuard<'a, Connection>);
 
 impl<'a> Durable<'a> {
-    pub(super) fn new(conn: parking_lot::MutexGuard<'a, Connection>) -> Result<Self> {
+    pub(super) fn new(conn: RankedGuard<'a, Connection>) -> Result<Self> {
         conn.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self(conn))
     }
@@ -284,7 +285,7 @@ impl Db {
             Err(e) => return Err(e),
         };
         let db = Self {
-            conn: Mutex::new(conn),
+            conn: Ranked::new(Rank::DbWriter, conn),
             // No pool for `:memory:`. A second connection to that name is a
             // second, empty database rather than another view of this one, so
             // every routed read would find a schema that does not exist.
@@ -380,7 +381,7 @@ impl Db {
         conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
 
         let db = Self {
-            conn: Mutex::new(conn),
+            conn: Ranked::new(Rank::DbWriter, conn),
             readers: None,
             _single_writer: None,
         };
@@ -404,7 +405,7 @@ impl Db {
         // connection unless explicitly enabled.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Self {
-            conn: Mutex::new(conn),
+            conn: Ranked::new(Rank::DbWriter, conn),
             readers: None,
             _single_writer: None,
         };
