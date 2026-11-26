@@ -108,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B299](#b299--a-synced-folder-in-the-trash-blocks-attaching-any-other-folder) | A synced folder in the trash blocks attaching any other folder |
 | [B298](#b298--a-synced-folder-edit-whose-upload-lost-its-answer-is-kept-as-a-conflict-copy-of-itself) | A synced-folder edit whose upload lost its answer is kept as a conflict copy of itself |
 | [B297](#b297--the-simulations-fail-and-hang-when-run-in-parallel-and-nothing-stops-that) | The simulations fail and hang when run in parallel, and nothing stops that |
 | [B296](#b296--a-busy-database-stalls-reads-and-piles-up-diagnostics-threads) | A busy database stalls reads, and piles up diagnostics threads |
@@ -400,6 +401,30 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B299 — A synced folder in the trash blocks attaching any other folder
+
+**Status:** Fixed (unverified)
+
+**Found:** 2026-11-26, by the live one-edit benchmark: a run cut short left its synced folder
+behind after the folder had been removed on Drive, and every later `pdfs sync attach` failed.
+
+**Where:** `attach_sync_folder` in `crates/pdfs-fuse/src/attach.rs`
+
+**Repro:** Attach a folder, then move its Drive folder to the trash (from the web or another
+client) without removing the synced folder. Attach any other folder: it fails with "remote sync
+folder is in the trash", which names neither folder. The simulation
+`a_synced_folder_trashed_on_drive_does_not_block_attaching_another` does this.
+
+**Cause.** To refuse overlapping folders, attach walks each existing synced folder's ancestry on
+Drive, and that walk fails on a folder in the trash. The overlap check passed the failure on, so
+one dead synced folder failed every attach, whatever was being attached.
+
+**Fix.** The overlap check walks through the trash: a trashed folder keeps its parent, so the
+check still refuses to attach a folder above it. A folder that no longer exists on Drive lies
+below nothing and is skipped. The new folder's own walk still refuses the trash.
+
+**Verified:** `a_synced_folder_trashed_on_drive_does_not_block_attaching_another`.
 
 ### B298 — A synced-folder edit whose upload lost its answer is kept as a conflict copy of itself
 

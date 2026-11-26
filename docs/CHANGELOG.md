@@ -50,6 +50,9 @@ kept, with a list of the folders that changed on Proton Drive since (49).
   first pass, and whenever the change feed lost track (#53).
 
 ### Fixed
+- **A synced folder whose folder on Drive is in the trash no longer blocks attaching another.**
+  Until it was removed, every `pdfs sync attach` failed with "remote sync folder is in the trash",
+  whatever folder it named (B299).
 - **An edit in a synced folder whose upload lost its answer is no longer kept as a conflict copy
   of itself.** When the file on Drive has the same size and content as the local one, the
   next sync records it as in step instead (B298).
