@@ -84,25 +84,7 @@ impl Link {
     }
 }
 
-/// Whether a failed call failed because Proton could not be reached, rather
-/// than because it answered and refused.
-///
-/// A transport error is the network. So is a request timeout: the SDK reports
-/// Proton's own "try again" codes that way, and [`no_answer`] reports our
-/// deadline that way. Anything else Proton actually said, and says again on a
-/// retry, so it must reach the caller rather than be queued.
-pub(crate) fn is_network_error(e: &ProtonError) -> bool {
-    match e {
-        ProtonError::Transport(_) => true,
-        ProtonError::Api(api) => {
-            matches!(
-                api.code,
-                ResponseCode::RequestTimeout | ResponseCode::Timeout
-            )
-        }
-        _ => false,
-    }
-}
+pub(crate) use pdfs_drive::is_network_error;
 
 /// The error a call reports when it runs past `after` without an answer.
 pub(crate) fn no_answer(after: Duration) -> ProtonError {

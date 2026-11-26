@@ -16,8 +16,8 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use pdfs_core::control::{AlbumInfo, PhotoItem, Topic};
-use pdfs_core::db::StoredAlbum;
 use pdfs_core::{CoreError, CoreResult};
+use pdfs_store::db::StoredAlbum;
 
 use proton_drive_rs::NodeKind;
 use proton_drive_rs::proton_sdk::ids::NodeUid;

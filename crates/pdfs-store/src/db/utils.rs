@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::Result;
+use pdfs_core::Result;
 
 /// Below this length the trigram tokenizer indexes nothing (it needs 3-char
 /// grams), so short queries fall back to a `LIKE` scan over `nodes.name`.

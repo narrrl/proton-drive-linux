@@ -526,7 +526,7 @@ mod tests {
     use super::*;
 
     /// A unique temp directory removed on drop; avoids a dev-dependency, as in
-    /// [`crate::cache`]'s tests.
+    /// `pdfs_store::cache`'s tests.
     struct TempDir(std::path::PathBuf);
     impl TempDir {
         fn new() -> Self {

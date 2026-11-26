@@ -11,15 +11,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueHint};
 use clap_complete::engine::{ArgValueCandidates, ArgValueCompleter};
 use pdfs_core::auth;
-use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ConflictKeep, ErrorKind, LinkChange, MountKind, RefreshScope, Request as CtlRequest,
     Response as CtlResponse, RestoreItem as CtlRestoreItem, ShareEntryKind, SyncFolderInfo,
     SyncIssue, SyncPhase, daemon_outdated, pending_summary,
 };
-use pdfs_core::db::Db;
 use pdfs_core::service;
+use pdfs_store::cache::ContentCache;
+use pdfs_store::db::Db;
 
 mod complete;
 mod journal;

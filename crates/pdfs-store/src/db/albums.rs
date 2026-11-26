@@ -12,7 +12,7 @@ use rusqlite::params;
 use std::collections::HashMap;
 
 use super::{Db, StoredPhoto, THUMB_UNKNOWN};
-use crate::Result;
+use pdfs_core::Result;
 
 /// One album of the persisted listing, ordered newest-activity-first in `seq`.
 #[derive(Clone, Debug, PartialEq)]
@@ -199,7 +199,7 @@ impl Db {
                 let name = name.clone().or(learned_name);
                 let media_type = media_type.clone().or(learned_media);
                 let kind =
-                    crate::control::PhotoKind::classify(name.as_deref(), media_type.as_deref());
+                    pdfs_core::control::PhotoKind::classify(name.as_deref(), media_type.as_deref());
                 stmt.execute(params![
                     album_uid,
                     uid,
@@ -271,7 +271,7 @@ impl Db {
                         name: r.get(2)?,
                         ratio: r.get(3)?,
                         thumb_state: r.get(4)?,
-                        kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+                        kind: pdfs_core::control::PhotoKind::from_i64(r.get(5)?),
                         // Album rows have no favorite state of their own: an album
                         // photo on someone else's volume is not in our timeline, and
                         // favouriting one is not supported yet anyway.
@@ -335,7 +335,7 @@ impl Db {
                     name: r.get(2)?,
                     ratio: r.get(3)?,
                     thumb_state: r.get(4)?,
-                    kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+                    kind: pdfs_core::control::PhotoKind::from_i64(r.get(5)?),
                     // Album rows have no favorite state of their own: an album
                     // photo on someone else's volume is not in our timeline, and
                     // favouriting one is not supported yet anyway.

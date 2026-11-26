@@ -7,9 +7,9 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pdfs_core::cache::StagedWrite;
-use pdfs_core::db::Db;
 use pdfs_core::{Access, access_for};
+use pdfs_store::cache::StagedWrite;
+use pdfs_store::db::Db;
 #[cfg(test)]
 use proton_drive_rs::MemberRole;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -1770,9 +1770,9 @@ mod tests {
             node("shared-child", "shared", "pending.txt", false),
         );
         st.flushed_db()
-            .enqueue_op(&pdfs_core::db::PendingOp {
+            .enqueue_op(&pdfs_store::db::PendingOp {
                 id: 0,
-                kind: pdfs_core::db::OP_RENAME.to_string(),
+                kind: pdfs_store::db::OP_RENAME.to_string(),
                 uid: uid("shared-child").to_string(),
                 parent_uid: Some(shared.uid.to_string()),
                 name: Some("pending-renamed.txt".to_string()),

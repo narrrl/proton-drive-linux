@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::params;
 
 use super::Db;
-use crate::Result;
+use pdfs_core::Result;
 
 pub struct StoredTrash {
     pub uid: String,

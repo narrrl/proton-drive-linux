@@ -7,8 +7,8 @@
 use rusqlite::params;
 
 use super::Db;
-use crate::mounts::{MountAccess, MountKind, MountMode, MountSpec};
-use crate::{Error, Result};
+use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
+use pdfs_core::{Error, Result};
 
 impl Db {
     /// Project the configured primary mount into the presentation table.

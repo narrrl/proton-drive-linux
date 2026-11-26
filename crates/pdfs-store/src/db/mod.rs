@@ -26,7 +26,7 @@
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use crate::{Error, Result};
+use pdfs_core::{Error, Result};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};

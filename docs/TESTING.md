@@ -16,7 +16,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Tests sit in `#[cfg(test)]` modules next to the code. Database tests are in
-`crates/pdfs-core/src/db/tests.rs`; a schema change adds one that migrates from the previous
+`crates/pdfs-store/src/db/tests.rs`; a schema change adds one that migrates from the previous
 version.
 
 To check the migrations against a real database, point `PDFS_MIGRATE_DB` at it and run the
@@ -24,7 +24,7 @@ ignored test. It migrates a copy taken with `VACUUM INTO` and never writes the d
 
 ```bash
 PDFS_MIGRATE_DB=~/.local/state/proton-drive-linux/cache.db \
-  cargo test -p pdfs-core a_copy_of_a_real_database -- --ignored
+  cargo test -p pdfs-store a_copy_of_a_real_database -- --ignored
 ```
 
 ## Simulation runs

@@ -1,8 +1,8 @@
 use super::activity::ACTIVITY_KEEP;
 use super::migrations::SCHEMA_VERSION;
 use super::*;
-use crate::control::{ActivityEntry, ActivityKind};
-use crate::localindex::LocalEntry;
+use pdfs_core::control::{ActivityEntry, ActivityKind};
+use pdfs_core::localindex::LocalEntry;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 use serde_json::json;
@@ -157,7 +157,7 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
     // Media type is learned-and-kept like the ratio: p1 keeps the video type
     // it was first seen with even though the later refresh carried `None`, so
     // it stays classified as a video.
-    assert_eq!(page[1].kind, crate::control::PhotoKind::Video);
+    assert_eq!(page[1].kind, pdfs_core::control::PhotoKind::Video);
 
     assert_eq!(db.photos_count().unwrap(), 3);
     // The counts break down by tab, and a filtered page returns only its tab.
@@ -166,7 +166,7 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
         .photos_page(
             0,
             10,
-            Some(crate::control::PhotoKind::Video),
+            Some(pdfs_core::control::PhotoKind::Video),
             None,
             false,
             false,
@@ -193,7 +193,7 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
         .photos_page(
             0,
             10,
-            Some(crate::control::PhotoKind::Video),
+            Some(pdfs_core::control::PhotoKind::Video),
             Some((150, 350)),
             false,
             false,
@@ -324,7 +324,7 @@ fn places_group_photos_by_the_nearest_town() {
     let summary: Vec<(&str, usize, &str)> = places
         .iter()
         .map(|place| {
-            let city = crate::places::city(place.id).expect("a known town");
+            let city = pdfs_core::places::city(place.id).expect("a known town");
             (city.name, place.count, place.cover.uid.as_str())
         })
         .collect();
@@ -448,7 +448,7 @@ fn similar_photos_group_by_look_and_skip_exact_copies() {
     db.photo_set_similar_hash("copy2", !look).unwrap();
     db.photo_set_similar_hash("other", look ^ 0xffff_ffff)
         .unwrap();
-    db.photo_set_similar_hash("flat", crate::similar::NO_HASH)
+    db.photo_set_similar_hash("flat", pdfs_core::similar::NO_HASH)
         .unwrap();
 
     let sets = db.photo_similar().unwrap();
@@ -925,7 +925,7 @@ fn shared_root_replacement_tombstones_without_losing_work_or_authority() {
     let child = foreign_folder("foreign", "child", shared.uid.clone(), "Secret");
     db.upsert_nodes(&[own_root, virtual_root, shared.clone(), child.clone()])
         .unwrap();
-    db.set_share_access(&shared.uid, crate::Access::Editor)
+    db.set_share_access(&shared.uid, pdfs_core::Access::Editor)
         .unwrap();
     db.enqueue_op(&PendingOp {
         id: 0,
@@ -962,7 +962,7 @@ fn shared_root_replacement_tombstones_without_losing_work_or_authority() {
     assert_eq!(db.pending_ops().unwrap().len(), 1);
     assert_eq!(
         db.share_access(&shared.uid).unwrap(),
-        Some(crate::Access::Viewer)
+        Some(pdfs_core::Access::Viewer)
     );
 
     let mut reappeared = shared.clone();
@@ -973,7 +973,7 @@ fn shared_root_replacement_tombstones_without_losing_work_or_authority() {
             std::slice::from_ref(&shared.uid),
             &[PublishedSharedRoot {
                 node: reappeared,
-                access: crate::Access::Viewer,
+                access: pdfs_core::Access::Viewer,
             }],
         )
         .unwrap()
@@ -993,7 +993,7 @@ fn shared_root_replacement_tombstones_without_losing_work_or_authority() {
     assert_eq!(db.pending_ops().unwrap().len(), 1);
     assert_eq!(
         db.share_access(&shared.uid).unwrap(),
-        Some(crate::Access::Viewer),
+        Some(pdfs_core::Access::Viewer),
         "reappearance stays fail-closed until an observed role refresh"
     );
 }
@@ -1012,7 +1012,7 @@ fn shared_root_node_and_authority_publication_roll_back_together() {
     let shared = foreign_folder("foreign", "share", virtual_uid.clone(), "Before");
     db.upsert_nodes(&[own_root, virtual_root, shared.clone()])
         .unwrap();
-    db.set_share_access(&shared.uid, crate::Access::Viewer)
+    db.set_share_access(&shared.uid, pdfs_core::Access::Viewer)
         .unwrap();
     db.set_listed(&virtual_uid, false).unwrap();
     db.with_conn(|conn| {
@@ -1033,7 +1033,7 @@ fn shared_root_node_and_authority_publication_roll_back_together() {
         std::slice::from_ref(&shared.uid),
         &[PublishedSharedRoot {
             node: changed,
-            access: crate::Access::Editor,
+            access: pdfs_core::Access::Editor,
         }],
     );
     assert!(result.is_err());
@@ -1046,7 +1046,7 @@ fn shared_root_node_and_authority_publication_roll_back_together() {
     );
     assert_eq!(
         db.share_access(&shared.uid).unwrap(),
-        Some(crate::Access::Viewer)
+        Some(pdfs_core::Access::Viewer)
     );
     assert!(db.children_if_listed(&virtual_uid).unwrap().is_none());
 }
@@ -1065,7 +1065,7 @@ fn accepted_but_unmaterialized_shared_root_keeps_its_snapshot() {
     let shared = foreign_folder("foreign", "share", virtual_uid.clone(), "Retained");
     db.upsert_nodes(&[own_root, virtual_root, shared.clone()])
         .unwrap();
-    db.set_share_access(&shared.uid, crate::Access::Editor)
+    db.set_share_access(&shared.uid, pdfs_core::Access::Editor)
         .unwrap();
     db.enqueue_op(&PendingOp {
         id: 0,
@@ -1090,7 +1090,7 @@ fn accepted_but_unmaterialized_shared_root_keeps_its_snapshot() {
     assert_eq!(db.pending_ops().unwrap().len(), 1);
     assert_eq!(
         db.share_access(&shared.uid).unwrap(),
-        Some(crate::Access::Viewer),
+        Some(pdfs_core::Access::Viewer),
         "an accepted root without verified materialized membership fails closed"
     );
 }
@@ -1178,7 +1178,7 @@ fn foreign_delete_tombstones_the_subtree_without_losing_pending_work() {
         deep.clone(),
     ])
     .unwrap();
-    db.set_share_access(&deleted.uid, crate::Access::Editor)
+    db.set_share_access(&deleted.uid, pdfs_core::Access::Editor)
         .unwrap();
     db.enqueue_op(&PendingOp {
         id: 0,
@@ -1205,7 +1205,7 @@ fn foreign_delete_tombstones_the_subtree_without_losing_pending_work() {
     assert_eq!(db.pending_ops().unwrap().len(), 1);
     assert_eq!(
         db.share_access(&deleted.uid).unwrap(),
-        Some(crate::Access::Viewer)
+        Some(pdfs_core::Access::Viewer)
     );
 }
 
@@ -2027,10 +2027,10 @@ fn share_access_round_trips_updates_and_deletes() {
 
     assert_eq!(db.share_access(&root).unwrap(), None);
     for access in [
-        crate::Access::Owner,
-        crate::Access::Editor,
-        crate::Access::Viewer,
-        crate::Access::Unknown,
+        pdfs_core::Access::Owner,
+        pdfs_core::Access::Editor,
+        pdfs_core::Access::Viewer,
+        pdfs_core::Access::Unknown,
     ] {
         db.set_share_access(&root, access).unwrap();
         assert_eq!(db.share_access(&root).unwrap(), Some(access));
@@ -2051,16 +2051,16 @@ fn effective_node_access_inherits_from_the_persisted_share_root() {
         .unwrap();
     db.upsert_node(&file("child", "nested", "child.txt", 1))
         .unwrap();
-    db.set_share_access(&uid("shared"), crate::Access::Viewer)
+    db.set_share_access(&uid("shared"), pdfs_core::Access::Viewer)
         .unwrap();
 
     assert_eq!(
         db.effective_node_access(&uid("child")).unwrap(),
-        Some(crate::Access::Viewer)
+        Some(pdfs_core::Access::Viewer)
     );
     assert_eq!(
         db.effective_node_access(&uid("root")).unwrap(),
-        Some(crate::Access::Owner)
+        Some(pdfs_core::Access::Owner)
     );
     assert_eq!(db.effective_node_access(&uid("missing")).unwrap(), None);
 }
@@ -2075,14 +2075,14 @@ fn effective_node_access_uses_the_nearest_nested_share_root() {
         .unwrap();
     db.upsert_node(&file("child", "inner", "child.txt", 1))
         .unwrap();
-    db.set_share_access(&uid("outer"), crate::Access::Editor)
+    db.set_share_access(&uid("outer"), pdfs_core::Access::Editor)
         .unwrap();
-    db.set_share_access(&uid("inner"), crate::Access::Viewer)
+    db.set_share_access(&uid("inner"), pdfs_core::Access::Viewer)
         .unwrap();
 
     assert_eq!(
         db.effective_node_access(&uid("child")).unwrap(),
-        Some(crate::Access::Viewer)
+        Some(pdfs_core::Access::Viewer)
     );
 }
 
@@ -2096,13 +2096,13 @@ fn effective_node_access_keeps_a_missing_share_root_tombstone_authoritative() {
         .unwrap();
     db.upsert_node(&file("child", "nested", "child.txt", 1))
         .unwrap();
-    db.set_share_access(&uid("shared"), crate::Access::Viewer)
+    db.set_share_access(&uid("shared"), pdfs_core::Access::Viewer)
         .unwrap();
     db.delete_node(&uid("shared")).unwrap();
 
     assert_eq!(
         db.effective_node_access(&uid("child")).unwrap(),
-        Some(crate::Access::Viewer)
+        Some(pdfs_core::Access::Viewer)
     );
 }
 
@@ -2112,17 +2112,17 @@ fn downgrade_all_share_access_leaves_unrecorded_owned_nodes_owned() {
     db.upsert_node(&folder("root", None, "My Files")).unwrap();
     db.upsert_node(&folder("shared", Some("root"), "Shared"))
         .unwrap();
-    db.set_share_access(&uid("shared"), crate::Access::Editor)
+    db.set_share_access(&uid("shared"), pdfs_core::Access::Editor)
         .unwrap();
 
     assert_eq!(db.downgrade_all_share_access().unwrap(), 1);
     assert_eq!(
         db.effective_node_access(&uid("shared")).unwrap(),
-        Some(crate::Access::Viewer)
+        Some(pdfs_core::Access::Viewer)
     );
     assert_eq!(
         db.effective_node_access(&uid("root")).unwrap(),
-        Some(crate::Access::Owner)
+        Some(pdfs_core::Access::Owner)
     );
 }
 
@@ -2168,8 +2168,12 @@ fn migration_v17_adds_share_access_to_a_v16_fixture() {
         Some("survives")
     );
     let root = uid("offline-share");
-    db.set_share_access(&root, crate::Access::Viewer).unwrap();
-    assert_eq!(db.share_access(&root).unwrap(), Some(crate::Access::Viewer));
+    db.set_share_access(&root, pdfs_core::Access::Viewer)
+        .unwrap();
+    assert_eq!(
+        db.share_access(&root).unwrap(),
+        Some(pdfs_core::Access::Viewer)
+    );
     // Migrating an old fixture always lands on head, whatever head is today.
     assert_eq!(
         db.state_str("schema_version").unwrap().as_deref(),
@@ -2251,12 +2255,12 @@ fn migration_v18_projects_v17_sync_folders_and_cascades_deletes() {
     let projected = &locations[0];
     assert!(matches!(
         projected.kind,
-        crate::mounts::MountKind::Device {
+        pdfs_core::mounts::MountKind::Device {
             sync_folder_id
         } if sync_folder_id == existing
     ));
     assert_eq!(projected.local_path, "/home/me/Existing");
-    assert_eq!(projected.mode, crate::mounts::MountMode::OnDemand);
+    assert_eq!(projected.mode, pdfs_core::mounts::MountMode::OnDemand);
     assert_eq!(projected.state, "syncing");
     assert_eq!(projected.last_sync, 123);
     assert_eq!(
@@ -2303,7 +2307,7 @@ fn my_files_projection_retains_share_id_only_for_the_same_root() {
     assert_eq!(locations.len(), 1);
     assert!(matches!(
         locations[0].kind,
-        crate::mounts::MountKind::MyFiles
+        pdfs_core::mounts::MountKind::MyFiles
     ));
     assert_eq!(locations[0].local_path, "/mnt/proton");
     assert_eq!(locations[0].root_uid, "vol~root-new");
@@ -3700,7 +3704,7 @@ fn a_stand_in_keeps_its_access_once_its_create_has_landed() {
         .unwrap();
     assert_eq!(
         db.effective_node_access(&stand_in).unwrap(),
-        Some(crate::Access::Owner)
+        Some(pdfs_core::Access::Owner)
     );
     db.claim_next_due_op(1).unwrap().unwrap();
     db.finish_create(
@@ -3714,11 +3718,11 @@ fn a_stand_in_keeps_its_access_once_its_create_has_landed() {
     // The tree still names the file by its stand-in for a moment.
     assert_eq!(
         db.effective_node_access(&stand_in).unwrap(),
-        Some(crate::Access::Owner)
+        Some(pdfs_core::Access::Owner)
     );
     assert_eq!(
         db.effective_node_access(&uid("real")).unwrap(),
-        Some(crate::Access::Owner)
+        Some(pdfs_core::Access::Owner)
     );
 }
 
@@ -3908,7 +3912,7 @@ fn a_landed_folder_keeps_a_row_until_the_server_copy_replaces_it() {
     assert_eq!(landed.name, "New folder");
     assert_eq!(
         db.effective_node_access(&uid("child")).unwrap(),
-        Some(crate::Access::Owner),
+        Some(pdfs_core::Access::Owner),
         "the child's authority resolves without a network re-read"
     );
     let names: Vec<_> = db
@@ -4510,7 +4514,7 @@ fn a_node_keeps_its_lid_across_updates_and_a_new_one_never_reuses_it() {
 fn a_lid_handed_out_before_the_node_is_stored_reads_as_no_node() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_node(&folder("root", None, "My Files")).unwrap();
-    db.set_share_access(&uid("root"), crate::Access::Owner)
+    db.set_share_access(&uid("root"), pdfs_core::Access::Owner)
         .unwrap();
     let stub = file("stub", "root", "stub.txt", 1);
     let [lid] = db.lids_for(&[&stub]).unwrap()[..] else {
@@ -6417,7 +6421,7 @@ fn album_photos_replace_keeps_what_was_learned() {
     assert_eq!(page[2].thumb_state, THUMB_NONE);
     // The media type is learned-and-kept, so p1 stays classified as a video even
     // though the second refresh carried none.
-    assert_eq!(page[1].kind, crate::control::PhotoKind::Video);
+    assert_eq!(page[1].kind, pdfs_core::control::PhotoKind::Video);
     assert_eq!(page[0].thumb_state, THUMB_UNKNOWN);
 
     // Paging is relative to the album, and the shared flag round-trips.
@@ -7197,7 +7201,7 @@ fn a_raw_and_its_jpeg_are_one_entry_in_the_grid() {
         .photos_page(
             0,
             10,
-            Some(crate::control::PhotoKind::Raw),
+            Some(pdfs_core::control::PhotoKind::Raw),
             None,
             false,
             false,
@@ -7857,7 +7861,7 @@ fn a_queued_op_stops_existing_once_the_node_is_deleted() {
 
 #[test]
 fn attachments_have_their_own_location_and_cannot_evict_local_files() {
-    use crate::mounts::MountKind;
+    use pdfs_core::mounts::MountKind;
     let db = Db::open_in_memory().unwrap();
     let id = db
         .sync_folder_attach("/work", "vol~work", "myfiles-share")

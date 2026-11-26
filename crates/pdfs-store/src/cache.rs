@@ -13,7 +13,7 @@
 //!   the mtime, so a stale blob is detected and ignored (and the event poller
 //!   evicts it eagerly anyway).
 //!
-//! [`AppDirs::cache_dir`]: crate::config::AppDirs::cache_dir
+//! [`AppDirs::cache_dir`]: pdfs_core::config::AppDirs::cache_dir
 //! [`Node`]: proton_drive_rs::Node
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -33,7 +33,8 @@ use tracing::debug;
 use parking_lot::Mutex;
 
 use crate::db::{CacheEntryInput, Db};
-use crate::error::{Error, Result};
+pub use pdfs_core::control::Pin;
+use pdfs_core::error::{Error, Result};
 
 /// `cache_entries.kind` tag for whole-file content blobs.
 const KIND_BLOB: &str = "blob";
@@ -274,34 +275,6 @@ struct GeometryMeta {
     size: u64,
     /// Plaintext size of each content block, in block order.
     sizes: Vec<u64>,
-}
-
-/// One pin, as carried over the control socket and listed in `status`.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Pin {
-    /// Node uid in `volume~link` display form.
-    pub uid: String,
-    /// Last path the node was pinned under, for display in `status`. Advisory
-    /// only — the uid is the identity.
-    pub path: String,
-    /// A folder pin whose whole subtree is kept on disk. `false` for a single
-    /// file. Defaulted so a legacy `pins.json` (file pins only) still parses.
-    #[serde(default)]
-    pub recursive: bool,
-    /// Whether the pinned node is a folder, when the node cache knows.
-    ///
-    /// `recursive` is pin *policy*, not node kind: a folder pinned
-    /// non-recursively has `recursive: false`, and a front-end reading it as
-    /// "this is a file" draws a file icon and sends an invalid `OpenFile`. This
-    /// is resolved from the `nodes` row at list time, so it is `None` for a pin
-    /// whose node is not cached — and absent from an older daemon's reply,
-    /// which is why it is defaulted.
-    #[serde(default)]
-    pub is_dir: Option<bool>,
-    /// A pinned file whose content is on disk right now. The daemon fills it
-    /// in when it answers `ListPins`; folders and older daemons say `false`.
-    #[serde(default)]
-    pub cached: bool,
 }
 
 /// The legacy JSON pin registry, kept only to import a pre-P5 `pins.json` into

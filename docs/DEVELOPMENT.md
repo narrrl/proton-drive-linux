@@ -126,8 +126,8 @@ release may still be running when a new front end starts, so treat an error repl
 request as "not supported".
 
 **A schema change.** Migrations are forward-only. Add a new step to
-`crates/pdfs-core/src/db/migrations.rs` and bump `SCHEMA_VERSION`; never edit a shipped step. Add
-a test in `crates/pdfs-core/src/db/tests.rs` that migrates from the previous version.
+`crates/pdfs-store/src/db/migrations.rs` and bump `SCHEMA_VERSION`; never edit a shipped step. Add
+a test in `crates/pdfs-store/src/db/tests.rs` that migrates from the previous version.
 
 **A GUI string.** Wrap it in the helpers from `crates/pdfs-gui/src/i18n.rs`, add any new source
 file to `po/POTFILES.in`, run `po/update.sh`, and translate the new entries in every catalog. See

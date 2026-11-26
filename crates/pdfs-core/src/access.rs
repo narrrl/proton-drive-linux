@@ -16,7 +16,7 @@ impl Access {
         matches!(self, Self::Owner | Self::Editor)
     }
 
-    pub(crate) fn as_db_str(self) -> &'static str {
+    pub fn as_db_str(self) -> &'static str {
         match self {
             Self::Owner => "owner",
             Self::Editor => "editor",
@@ -25,7 +25,7 @@ impl Access {
         }
     }
 
-    pub(crate) fn from_db_str(value: &str) -> Option<Self> {
+    pub fn from_db_str(value: &str) -> Option<Self> {
         match value {
             "owner" => Some(Self::Owner),
             "editor" => Some(Self::Editor),

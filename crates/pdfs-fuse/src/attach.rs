@@ -4,8 +4,8 @@
 //! The existing three-way engine performs the initial, non-destructive union.
 
 use super::{Core, parse_uid, sync};
-use pdfs_core::db::StoredSyncFolder;
 use pdfs_core::{CoreError, CoreResult};
+use pdfs_store::db::StoredSyncFolder;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};

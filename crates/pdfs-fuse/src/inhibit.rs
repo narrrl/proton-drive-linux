@@ -15,7 +15,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use pdfs_core::db::PendingCounts;
+use pdfs_store::db::PendingCounts;
 use tracing::{debug, warn};
 
 use super::Core;

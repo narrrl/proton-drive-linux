@@ -67,10 +67,10 @@ use proton_drive_rs::{
 use sha1::{Digest as _, Sha1};
 
 use super::rng::Rng;
-use crate::drive::{DriveApi, NodeOutcomes, OutcomeStream, RevisionRead};
+use crate::{DriveApi, NodeOutcomes, OutcomeStream, RevisionRead};
 
 /// The volume every fake node lives on.
-pub(crate) const VOLUME: &str = "simvol";
+pub const VOLUME: &str = "simvol";
 
 /// How long superseded versions of a node are kept for lagging reads. Longer
 /// than any lag a test sets.
@@ -350,19 +350,19 @@ impl Server {
 
 /// An in-memory Drive shared by every simulated client. See the module
 /// documentation.
-pub(crate) struct FakeDrive {
+pub struct FakeDrive {
     server: Mutex<Server>,
 }
 
 /// A node of [`FakeDrive::tree`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Entry {
+pub enum Entry {
     Folder,
     File(Arc<Vec<u8>>),
 }
 
 impl FakeDrive {
-    pub(crate) fn new() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         let root = uid("root");
         let mut server = Server {
             root: root.clone(),
@@ -370,7 +370,7 @@ impl FakeDrive {
             next_link: 0,
             next_revision: 0,
             events: Vec::new(),
-            block_pattern: vec![pdfs_core::cache::BLOCK_SIZE],
+            block_pattern: vec![pdfs_store::cache::BLOCK_SIZE],
             max_space: 1 << 40,
             devices: Vec::new(),
         };
@@ -395,7 +395,7 @@ impl FakeDrive {
     }
 
     /// A connection to this Drive for one simulated daemon.
-    pub(crate) fn client(self: &Arc<Self>, seed: u64, faults: Faults) -> FakeClient {
+    pub fn client(self: &Arc<Self>, seed: u64, faults: Faults) -> FakeClient {
         FakeClient(Arc::new(ClientInner {
             drive: self.clone(),
             faults: Mutex::new(faults),
@@ -426,24 +426,24 @@ impl FakeDrive {
 
     /// Plaintext block sizes for content uploaded from now on, cycled with the
     /// last one repeating: `[1 MiB, 4 MiB]` makes a short first block.
-    pub(crate) fn set_block_pattern(&self, pattern: Vec<u64>) {
+    pub fn set_block_pattern(&self, pattern: Vec<u64>) {
         assert!(!pattern.is_empty() && pattern.iter().all(|&size| size > 0));
         self.server.lock().block_pattern = pattern;
     }
 
     /// The account's storage limit; a limit below what is stored refuses every
     /// upload until something is deleted.
-    pub(crate) fn set_quota(&self, max_space: i64) {
+    pub fn set_quota(&self, max_space: i64) {
         self.server.lock().max_space = max_space;
     }
 
-    pub(crate) fn root(&self) -> NodeUid {
+    pub fn root(&self) -> NodeUid {
         self.server.lock().root.clone()
     }
 
     /// The live tree as Drive has it now, by path below the root: every node
     /// that is neither trashed nor below a trashed folder.
-    pub(crate) fn tree(&self) -> BTreeMap<String, Entry> {
+    pub fn tree(&self) -> BTreeMap<String, Entry> {
         let server = self.server.lock();
         let mut tree = BTreeMap::new();
         for uid in server.nodes.keys() {
@@ -483,7 +483,7 @@ impl FakeDrive {
 
     /// Every name a node has had in the root, trashed or not, as far back as
     /// Drive keeps its versions.
-    pub(crate) fn names_ever_in_root(&self) -> Vec<String> {
+    pub fn names_ever_in_root(&self) -> Vec<String> {
         let server = self.server.lock();
         let mut names: Vec<String> = server
             .nodes
@@ -499,7 +499,7 @@ impl FakeDrive {
     }
 
     /// The uid at `path` below the root, as Drive has it now.
-    pub(crate) fn lookup(&self, path: &str) -> Option<NodeUid> {
+    pub fn lookup(&self, path: &str) -> Option<NodeUid> {
         let server = self.server.lock();
         let mut at = server.root.clone();
         for name in path.split('/').filter(|name| !name.is_empty()) {
@@ -509,23 +509,23 @@ impl FakeDrive {
     }
 
     /// Every change Drive has logged, oldest first.
-    pub(crate) fn event_count(&self) -> usize {
+    pub fn event_count(&self) -> usize {
         self.server.lock().events.len()
     }
 
     /// Changes made by another device, straight on the server: what a second
     /// client would do, without the daemon that client would need.
-    pub(crate) fn device(&self) -> Device<'_> {
+    pub fn device(&self) -> Device<'_> {
         Device(self)
     }
 }
 
 /// See [`FakeDrive::device`].
-pub(crate) struct Device<'a>(&'a FakeDrive);
+pub struct Device<'a>(&'a FakeDrive);
 
 impl Device<'_> {
     /// Write `content` at `path`, as a new file or a new revision of one.
-    pub(crate) fn write(&self, path: &str, content: &[u8]) -> NodeUid {
+    pub fn write(&self, path: &str, content: &[u8]) -> NodeUid {
         let (parent, name) = split_path(path);
         let parent = self
             .0
@@ -560,7 +560,7 @@ impl Device<'_> {
     }
 
     /// Make a folder at `path`.
-    pub(crate) fn mkdir(&self, path: &str) -> NodeUid {
+    pub fn mkdir(&self, path: &str) -> NodeUid {
         let (parent, name) = split_path(path);
         let parent = self
             .0
@@ -585,7 +585,7 @@ impl Device<'_> {
     }
 
     /// Move the node at `path` to the trash.
-    pub(crate) fn trash(&self, path: &str) {
+    pub fn trash(&self, path: &str) {
         let uid = self.0.lookup(path).expect("device trash of a missing node");
         let mut server = self.0.server.lock();
         let mut remote = server.current(&uid).cloned().expect("live node");
@@ -594,7 +594,7 @@ impl Device<'_> {
     }
 
     /// Rename the node at `path` in place.
-    pub(crate) fn rename(&self, path: &str, new_name: &str) {
+    pub fn rename(&self, path: &str, new_name: &str) {
         let uid = self
             .0
             .lookup(path)
@@ -616,35 +616,35 @@ struct Lag {
 
 /// The faults and timing of one connection. See the module documentation.
 #[derive(Clone, Debug)]
-pub(crate) struct Faults {
+pub struct Faults {
     /// Each request takes a time drawn from this range, in milliseconds.
-    pub(crate) latency_ms: (u64, u64),
+    pub latency_ms: (u64, u64),
     /// How far behind the present reads are about a node appearing or going
     /// to the trash.
-    pub(crate) listing_lag: Duration,
+    pub listing_lag: Duration,
     /// How far behind the present reads are about a live node's name, folder
     /// or revision.
-    pub(crate) update_lag: Duration,
+    pub update_lag: Duration,
     /// How long a change takes to reach the event feed.
-    pub(crate) event_delay: Duration,
+    pub event_delay: Duration,
     /// Chance that an event is delivered twice.
-    pub(crate) duplicate_events: f64,
+    pub duplicate_events: f64,
     /// Chance that two neighbouring events of a page swap places.
-    pub(crate) reorder_events: f64,
+    pub reorder_events: f64,
     /// Chance that a request never reaches Drive.
-    pub(crate) fail: f64,
+    pub fail: f64,
     /// Chance that a change Drive made loses its reply.
-    pub(crate) drop_reply: f64,
+    pub drop_reply: f64,
     /// Chance that a request stalls for [`Faults::stall_for`] and then fails.
-    pub(crate) stall: f64,
-    pub(crate) stall_for: Duration,
+    pub stall: f64,
+    pub stall_for: Duration,
     /// Whether renames and moves send the entity cache's name, as the SDK does.
-    pub(crate) stale_name_cache: bool,
+    pub stale_name_cache: bool,
 }
 
 impl Faults {
     /// No latency and no faults beyond the SDK's own stale name cache.
-    pub(crate) fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             latency_ms: (0, 0),
             listing_lag: Duration::ZERO,
@@ -661,7 +661,7 @@ impl Faults {
     }
 
     /// A good link: a few milliseconds a request, listings barely behind.
-    pub(crate) fn lan() -> Self {
+    pub fn lan() -> Self {
         Self {
             latency_ms: (2, 15),
             listing_lag: Duration::from_millis(50),
@@ -672,7 +672,7 @@ impl Faults {
 
     /// A good link whose event feed is slow and untidy: every echo of our own
     /// changes comes late, often twice, often out of order.
-    pub(crate) fn echoes() -> Self {
+    pub fn echoes() -> Self {
         Self {
             event_delay: Duration::from_secs(1),
             duplicate_events: 0.3,
@@ -683,7 +683,7 @@ impl Faults {
 
     /// The Wi-Fi of the 2026-10 account runs: slow and lossy, with listings
     /// and events well behind.
-    pub(crate) fn wifi() -> Self {
+    pub fn wifi() -> Self {
         Self {
             latency_ms: (60, 400),
             listing_lag: Duration::from_millis(800),
@@ -787,11 +787,11 @@ async fn wait_until_released(state: &HoldState) {
 /// A call held on its way to or from Drive, from [`FakeClient::hold_next_read`]
 /// or [`FakeClient::hold_reply_to_next_create`]. It goes on when this is
 /// dropped.
-pub(crate) struct Held(Arc<HoldState>);
+pub struct Held(Arc<HoldState>);
 
 impl Held {
     /// Whether the read has come and is being held.
-    pub(crate) fn reached(&self) -> bool {
+    pub fn reached(&self) -> bool {
         self.0.reached.load(Ordering::SeqCst)
     }
 }
@@ -805,32 +805,32 @@ impl Drop for Held {
 /// One daemon's connection to a [`FakeDrive`]. Cheap to clone; clones share
 /// the link, the faults and the entity cache.
 #[derive(Clone)]
-pub(crate) struct FakeClient(Arc<ClientInner>);
+pub struct FakeClient(Arc<ClientInner>);
 
 impl FakeClient {
-    pub(crate) fn set_online(&self, online: bool) {
+    pub fn set_online(&self, online: bool) {
         self.0.online.store(online, Ordering::SeqCst);
     }
 
-    pub(crate) fn set_faults(&self, faults: Faults) {
+    pub fn set_faults(&self, faults: Faults) {
         *self.0.faults.lock() = faults;
     }
 
     /// Take the link down as soon as the next file create has been answered,
     /// so whatever the daemon asks next goes unanswered.
-    pub(crate) fn drop_link_after_next_create(&self) {
+    pub fn drop_link_after_next_create(&self) {
         self.0.drop_after_create.store(true, Ordering::SeqCst);
     }
 
     /// Make the next file create on Drive and lose its answer, as a link that
     /// drops it on the way back does.
-    pub(crate) fn lose_reply_to_next_create(&self) {
+    pub fn lose_reply_to_next_create(&self) {
         self.0.lose_create_reply.store(true, Ordering::SeqCst);
     }
 
     /// Hold the next read of `uid` alone, before it reaches Drive, until the
     /// answer is dropped. Only one read is held at a time.
-    pub(crate) fn hold_next_read(&self, uid: &NodeUid) -> Held {
+    pub fn hold_next_read(&self, uid: &NodeUid) -> Held {
         let state = Arc::new(HoldState {
             uid: uid.clone(),
             reached: AtomicBool::new(false),
@@ -843,7 +843,7 @@ impl FakeClient {
     /// Answer the next read of `uid` alone with what Drive holds now, then
     /// hold the answer until it is dropped, as a slow link does. Only one
     /// answer is held at a time.
-    pub(crate) fn hold_answer_to_next_read(&self, uid: &NodeUid) -> Held {
+    pub fn hold_answer_to_next_read(&self, uid: &NodeUid) -> Held {
         let state = Arc::new(HoldState {
             uid: uid.clone(),
             reached: AtomicBool::new(false),
@@ -855,7 +855,7 @@ impl FakeClient {
 
     /// Hold the next listing of the children of `folder`, before it reaches
     /// Drive, until the answer is dropped.
-    pub(crate) fn hold_next_children_of(&self, folder: &NodeUid) -> Held {
+    pub fn hold_next_children_of(&self, folder: &NodeUid) -> Held {
         let state = Arc::new(HoldState {
             uid: folder.clone(),
             reached: AtomicBool::new(false),
@@ -867,7 +867,7 @@ impl FakeClient {
 
     /// Hold the next trash of `uid` alone, before it reaches Drive, until the
     /// answer is dropped.
-    pub(crate) fn hold_next_trash(&self, uid: &NodeUid) -> Held {
+    pub fn hold_next_trash(&self, uid: &NodeUid) -> Held {
         let state = Arc::new(HoldState {
             uid: uid.clone(),
             reached: AtomicBool::new(false),
@@ -880,16 +880,16 @@ impl FakeClient {
     /// Hold the next download of `uid`'s content once Drive has answered it,
     /// before the bytes reach the daemon, until the answer is dropped.
     /// Give `uid` a server thumbnail, as an upload that carried one would.
-    pub(crate) fn set_thumbnail(&self, uid: &NodeUid, bytes: Vec<u8>) {
+    pub fn set_thumbnail(&self, uid: &NodeUid, bytes: Vec<u8>) {
         self.0.thumbnails.lock().insert(uid.clone(), bytes);
     }
 
     /// File content bytes served so far, by whole downloads and ranged reads.
-    pub(crate) fn content_read(&self) -> u64 {
+    pub fn content_read(&self) -> u64 {
         self.0.content_read.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn hold_next_download(&self, uid: &NodeUid) -> Held {
+    pub fn hold_next_download(&self, uid: &NodeUid) -> Held {
         let state = Arc::new(HoldState {
             uid: uid.clone(),
             reached: AtomicBool::new(false),
@@ -902,7 +902,7 @@ impl FakeClient {
     /// Hold the drain once the next upload to `uid` has landed and its blob
     /// is let go of, before the tree has the node (`DriveApi::landing`), until
     /// the answer is dropped.
-    pub(crate) fn hold_next_landing(&self, uid: &NodeUid) -> Held {
+    pub fn hold_next_landing(&self, uid: &NodeUid) -> Held {
         let state = Arc::new(HoldState {
             uid: uid.clone(),
             reached: AtomicBool::new(false),
@@ -914,7 +914,7 @@ impl FakeClient {
 
     /// [`FakeClient::hold_next_landing`] for whichever node lands next, such
     /// as a new file, whose uid Drive has not minted yet.
-    pub(crate) fn hold_next_landing_of_any(&self) -> Held {
+    pub fn hold_next_landing_of_any(&self) -> Held {
         let held = self.hold_next_landing(&uid("*"));
         self.0.hold_any_landing.store(true, Ordering::SeqCst);
         held
@@ -922,7 +922,7 @@ impl FakeClient {
 
     /// Make the next file create on Drive, then hold its answer until the
     /// answer is dropped, as a slow link does.
-    pub(crate) fn hold_reply_to_next_create(&self) -> Held {
+    pub fn hold_reply_to_next_create(&self) -> Held {
         let state = Arc::new(HoldState {
             uid: self.0.drive.root(),
             reached: AtomicBool::new(false),
@@ -934,7 +934,7 @@ impl FakeClient {
 
     /// Hold the next file create before it reaches Drive, until the answer
     /// is dropped.
-    pub(crate) fn hold_next_create(&self) -> Held {
+    pub fn hold_next_create(&self) -> Held {
         let state = Arc::new(HoldState {
             uid: self.0.drive.root(),
             reached: AtomicBool::new(false),
@@ -945,32 +945,28 @@ impl FakeClient {
     }
 
     /// Make the next revision of a file on Drive and lose its answer.
-    pub(crate) fn lose_reply_to_next_revision(&self) {
+    pub fn lose_reply_to_next_revision(&self) {
         self.0.lose_revision_reply.store(true, Ordering::SeqCst);
     }
 
     /// Make the next revision of a file on Drive and answer it, then lose the
     /// answer to the next read of that file alone, as the read-back after an
     /// upload meets on a link that drops it.
-    pub(crate) fn lose_read_back_of_next_revision(&self) {
+    pub fn lose_read_back_of_next_revision(&self) {
         self.0.lose_revision_read_back.store(true, Ordering::SeqCst);
     }
 
     /// Answer the next `reads` reads of file `uid` alone that find it as Drive
     /// lists a file whose create it has not committed yet: no active revision,
     /// no size.
-    pub(crate) fn answer_reads_unrevised(&self, uid: &NodeUid, reads: usize) {
+    pub fn answer_reads_unrevised(&self, uid: &NodeUid, reads: usize) {
         *self.0.unrevised_reads.lock() = Some((uid.clone(), reads));
     }
 
     /// Answer the next listing of `folder`'s nodes with what Drive holds now,
     /// `unrevised` in it as Drive lists a file whose create it has not
     /// committed yet, then hold the answer until it is dropped.
-    pub(crate) fn hold_answer_to_next_listing(
-        &self,
-        folder: &NodeUid,
-        unrevised: &NodeUid,
-    ) -> Held {
+    pub fn hold_answer_to_next_listing(&self, folder: &NodeUid, unrevised: &NodeUid) -> Held {
         let state = Arc::new(HoldState {
             uid: folder.clone(),
             reached: AtomicBool::new(false),
@@ -994,7 +990,7 @@ impl FakeClient {
     }
 
     /// Requests made through this client so far.
-    pub(crate) fn requests(&self) -> u64 {
+    pub fn requests(&self) -> u64 {
         self.0.requests.load(Ordering::SeqCst)
     }
 
@@ -1849,7 +1845,7 @@ impl RevisionRead for FakeRevision {
 }
 
 /// A uid on the fake volume.
-pub(crate) fn uid(link: &str) -> NodeUid {
+pub fn uid(link: &str) -> NodeUid {
     NodeUid::new(VolumeId::from(VOLUME), LinkId::from(link))
 }
 
@@ -1929,7 +1925,7 @@ fn api(code: ResponseCode, message: &str) -> ProtonError {
 }
 
 /// What a request that never got an answer reports; the daemon reads it as
-/// the network (see `link::is_network_error`).
+/// the network (see [`crate::is_network_error`]).
 fn no_answer() -> ProtonError {
     ProtonError::Api(ProtonApiError {
         code: ResponseCode::RequestTimeout,
@@ -1949,7 +1945,7 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::is_network_error;
+    use crate::is_network_error;
 
     fn code(error: &ProtonError) -> Option<ResponseCode> {
         match error {

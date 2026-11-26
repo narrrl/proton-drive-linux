@@ -55,21 +55,23 @@ use fuser::{
 };
 use futures::StreamExt as _;
 use pdfs_core::batch;
-use pdfs_core::cache::{BLOCK_SIZE, Baseline, BlockGeometry, BlockSpan, ContentCache, StagedWrite};
 use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
     SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncIssue, SyncPhase, SyncProgress,
     ThumbnailBuildStatus, Topic, TransferDirection,
 };
-use pdfs_core::db::{
-    Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
-    PublishedSharedRoot, RenameMeta, StoredNode, StoredSyncFolder, StoredTrash,
-};
 use pdfs_core::localindex;
 use pdfs_core::search::relevance_score;
 use pdfs_core::syncignore::is_transient_name;
 use pdfs_core::{Access, CoreError, CoreResult, access_for, perm_bits};
+use pdfs_store::cache::{
+    BLOCK_SIZE, Baseline, BlockGeometry, BlockSpan, ContentCache, StagedWrite,
+};
+use pdfs_store::db::{
+    Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
+    PublishedSharedRoot, RenameMeta, StoredNode, StoredSyncFolder, StoredTrash,
+};
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
@@ -87,8 +89,8 @@ use control::run_control_socket;
 mod devices;
 mod diagnostics;
 mod drain;
-mod drive;
 use drive::{DriveApi, RevisionRead};
+use pdfs_drive as drive;
 mod events;
 mod filesystem;
 mod gallery;
@@ -3350,7 +3352,7 @@ impl Core {
 
     /// [`Core::landed_row_uid`] for a node known by its stand-in `uid`.
     pub(crate) fn landed_stand_in_uid(&self, uid: &NodeUid) -> Option<NodeUid> {
-        pdfs_core::db::local_lid(&uid.to_string()).and_then(|lid| self.landed_lid_uid(lid))
+        pdfs_store::db::local_lid(&uid.to_string()).and_then(|lid| self.landed_lid_uid(lid))
     }
 
     fn landed_lid_uid(&self, lid: i64) -> Option<NodeUid> {
@@ -4682,7 +4684,7 @@ impl Core {
     /// Every pin, with `cached` saying whether a pinned file's content is on
     /// disk, so a front-end listing pins can badge them without a round-trip
     /// per file.
-    fn list_pins(&self) -> Vec<pdfs_core::cache::Pin> {
+    fn list_pins(&self) -> Vec<pdfs_core::control::Pin> {
         let mut pins = self.cache.list_pins();
         for pin in pins.iter_mut().filter(|pin| pin.is_dir == Some(false)) {
             if let Ok(Some(node)) = self.db.node_by_uid(&pin.uid) {
@@ -6410,7 +6412,7 @@ fn parse_node_uid(s: &str) -> Option<NodeUid> {
 
 /// The uid a node made on this machine goes by until it lands, so it can be
 /// interned, listed and written to before the server has ever heard of it:
-/// its row's local id, as [`pdfs_core::db::local_uid`]
+/// its row's local id, as [`pdfs_store::db::local_uid`]
 /// has it.
 fn local_node_uid(lid: i64) -> NodeUid {
     NodeUid::new(VolumeId::from(LOCAL_VOLUME), LinkId::from(lid.to_string()))
@@ -7317,7 +7319,7 @@ fn unix_secs(secs: i64) -> SystemTime {
 #[cfg(test)]
 mod merge_over_pending_tests {
     use super::{PendingRevision, merge_over_pending};
-    use pdfs_core::cache::{Baseline, StagedWrite};
+    use pdfs_store::cache::{Baseline, StagedWrite};
     use std::io::Write as _;
     use std::path::PathBuf;
 
@@ -7822,13 +7824,13 @@ mod local_uid_tests {
         let uid = local_node_uid(42);
         assert!(is_local_uid(&uid));
         assert!(is_local_uid_str(&uid.to_string()));
-        assert_eq!(uid.to_string(), pdfs_core::db::local_uid(42));
+        assert_eq!(uid.to_string(), pdfs_store::db::local_uid(42));
 
         // It has to survive the trip through `pending_op.uid` as text, like any
         // other uid does, and give back the row it stands for.
         let parsed = parse_node_uid(&uid.to_string()).expect("parses back");
         assert_eq!(parsed, uid);
-        assert_eq!(pdfs_core::db::local_lid(&uid.to_string()), Some(42));
+        assert_eq!(pdfs_store::db::local_lid(&uid.to_string()), Some(42));
     }
 
     #[test]
@@ -8150,8 +8152,8 @@ mod tests {
         }
     }
     use crate::filesystem::access_allowed;
-    use pdfs_core::cache::{Baseline, StagedWrite};
-    use pdfs_core::db::{OP_REVISION, OP_TRASH, PendingOp};
+    use pdfs_store::cache::{Baseline, StagedWrite};
+    use pdfs_store::db::{OP_REVISION, OP_TRASH, PendingOp};
 
     fn session_flag(live: bool) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(live))
@@ -9964,7 +9966,7 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir_path).unwrap();
-        let db = pdfs_core::db::Db::open(&dir_path.join("cache.db")).unwrap();
+        let db = pdfs_store::db::Db::open(&dir_path.join("cache.db")).unwrap();
         let share_access = db.all_share_access().unwrap();
         let st = crate::state::State::new(std::sync::Arc::new(db), share_access);
         (st, TestDir(dir_path))
