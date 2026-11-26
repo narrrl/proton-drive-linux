@@ -13,10 +13,17 @@
 //! one up to a shared deadline, naming any that is still running then.
 //! [`ServiceBoard`] is the live view of the same threads, for diagnostics.
 //!
+//! A service can also be an async task on the mount's runtime
+//! ([`Services::spawn_task`]), such as the loops that follow Drive's event
+//! streams. A stop aborts it at its next `.await` and waits for it to go, up
+//! to the same deadline. Such a task used to run until the runtime went
+//! away, which on a stop is when the process exits.
+//!
 //! Work a request starts and does not wait for runs as a one-shot job
-//! ([`ServiceBoard::spawn_job`]): a named thread, listed on the board while
-//! it runs, and not joined on stop.
+//! ([`ServiceBoard::spawn_job`] on a thread, [`ServiceBoard::spawn_task_job`]
+//! on the runtime): listed on the board while it runs, and not joined on stop.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -105,16 +112,7 @@ impl ServiceBoard {
     where
         F: FnOnce() + Send + 'static,
     {
-        let id = self.0.next_job.fetch_add(1, Ordering::Relaxed);
-        self.0.jobs.lock().push(Job {
-            id,
-            name: name.to_owned(),
-            started: Instant::now(),
-        });
-        let guard = JobGuard {
-            board: self.0.clone(),
-            id,
-        };
+        let guard = self.add_job(name);
         std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
@@ -124,6 +122,34 @@ impl ServiceBoard {
             // On an error the closure, and the guard in it, are already
             // dropped, so the job is off the list.
             .map(|_| ())
+    }
+
+    /// Start `task` on `rt` as a one-shot job, like [`spawn_job`](Self::spawn_job)
+    /// for work that is async: a refresh a listing starts and does not wait
+    /// for. It shows in [`jobs`](Self::jobs) until it ends, by return, panic
+    /// or the runtime going away.
+    pub fn spawn_task_job<F>(&self, rt: &tokio::runtime::Handle, name: &str, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let guard = self.add_job(name);
+        rt.spawn(async move {
+            let _guard = guard;
+            task.await;
+        });
+    }
+
+    fn add_job(&self, name: &str) -> JobGuard {
+        let id = self.0.next_job.fetch_add(1, Ordering::Relaxed);
+        self.0.jobs.lock().push(Job {
+            id,
+            name: name.to_owned(),
+            started: Instant::now(),
+        });
+        JobGuard {
+            board: self.0.clone(),
+            id,
+        }
     }
 
     fn add(&self, name: &str) -> Arc<AtomicBool> {
@@ -159,8 +185,26 @@ impl Drop for Running {
 }
 
 struct Service {
-    handle: JoinHandle<()>,
+    handle: Handle,
     wake: Option<Wake>,
+}
+
+/// A service is a thread, or an async task on the mount's runtime.
+enum Handle {
+    Thread(JoinHandle<()>),
+    Task {
+        name: String,
+        task: tokio::task::JoinHandle<()>,
+    },
+}
+
+impl Handle {
+    fn is_finished(&self) -> bool {
+        match self {
+            Handle::Thread(handle) => handle.is_finished(),
+            Handle::Task { task, .. } => task.is_finished(),
+        }
+    }
 }
 
 /// The service threads one mount started, and how to stop them.
@@ -195,7 +239,10 @@ impl Services {
             });
         match spawned {
             Ok(handle) => {
-                self.started.push(Service { handle, wake });
+                self.started.push(Service {
+                    handle: Handle::Thread(handle),
+                    wake,
+                });
                 Ok(())
             }
             Err(error) => {
@@ -206,31 +253,64 @@ impl Services {
         }
     }
 
-    /// How many threads were started.
+    /// Start `task` on `rt` as a service named `name`. [`stop`](Self::stop)
+    /// aborts it, so it ends at its next `.await`; a task does not need to
+    /// watch the [`Shutdown`] signal itself. Code between two `.await`s runs
+    /// to its end, so a write it makes there is not cut in half.
+    pub fn spawn_task<F>(&mut self, rt: &tokio::runtime::Handle, name: &str, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let guard = Running(self.board.add(name));
+        let task = rt.spawn(async move {
+            let _guard = guard;
+            task.await;
+        });
+        self.started.push(Service {
+            handle: Handle::Task {
+                name: name.to_owned(),
+                task,
+            },
+            wake: None,
+        });
+    }
+
+    /// How many services were started.
     pub fn len(&self) -> usize {
         self.started.len()
     }
 
-    /// Whether no thread was started.
+    /// Whether no service was started.
     pub fn is_empty(&self) -> bool {
         self.started.is_empty()
     }
 
-    /// Stop every thread: signal `shutdown`, wake each thread in reverse start
-    /// order, then join them in the same order until `deadline`. Returns the
-    /// names of the threads still running at the deadline; they are left
-    /// behind rather than waited for.
+    /// Stop every service: signal `shutdown`, wake each thread and abort each
+    /// task in reverse start order, then join them in the same order until
+    /// `deadline`. Returns the names of the services still running at the
+    /// deadline; they are left behind rather than waited for.
     pub fn stop(self, shutdown: &Shutdown, deadline: Instant) -> Vec<String> {
         shutdown.stop();
         for service in self.started.iter().rev() {
             if let Some(wake) = &service.wake {
                 wake();
             }
+            if let Handle::Task { task, .. } = &service.handle {
+                task.abort();
+            }
         }
-        join_until(
-            self.started.into_iter().rev().map(|service| service.handle),
-            deadline,
-        )
+        let mut running = Vec::new();
+        for service in self.started.into_iter().rev() {
+            while !service.handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            match service.handle {
+                Handle::Thread(handle) => running.extend(join_until([handle], deadline)),
+                Handle::Task { name, task } if !task.is_finished() => running.push(name),
+                Handle::Task { .. } => {}
+            }
+        }
+        running
     }
 }
 
@@ -357,6 +437,83 @@ mod tests {
 
         release.send(()).unwrap();
         let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !board.jobs().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(board.jobs().is_empty());
+    }
+
+    #[test]
+    fn a_stop_aborts_a_task_and_shows_it_ended() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let board = ServiceBoard::default();
+        let mut services = Services::new(board.clone());
+        // Never ends on its own and never looks at the shutdown signal.
+        services.spawn_task(rt.handle(), "poller", async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        assert_eq!(services.len(), 1);
+        assert!(board.health()[0].running);
+
+        let left = services.stop(
+            &Shutdown::default(),
+            Instant::now() + Duration::from_secs(5),
+        );
+
+        assert!(left.is_empty(), "still running: {left:?}");
+        assert!(!board.health()[0].running);
+    }
+
+    #[test]
+    fn a_task_stuck_between_awaits_is_named_at_the_deadline() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut services = Services::new(ServiceBoard::default());
+        let (release, wait) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        // Blocks its worker thread, so an abort cannot reach it until it yields.
+        services.spawn_task(rt.handle(), "blocking", async move {
+            let _ = started_tx.send(());
+            let _ = wait.recv();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let left = services.stop(
+            &Shutdown::default(),
+            Instant::now() + Duration::from_millis(100),
+        );
+
+        assert_eq!(left, ["blocking"]);
+        drop(release);
+    }
+
+    #[test]
+    fn a_task_job_shows_while_it_runs_and_leaves_when_it_ends() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let board = ServiceBoard::default();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        board.spawn_task_job(rt.handle(), "pdfs-test-refresh", async move {
+            let _ = wait.await;
+        });
+        let jobs = board.jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "pdfs-test-refresh");
+
+        release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !board.jobs().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));

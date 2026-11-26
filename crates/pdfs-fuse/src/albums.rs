@@ -140,16 +140,17 @@ impl Core {
             return;
         }
         let core = self.clone();
-        self.rt.spawn(async move {
-            let refreshed = core.refresh_albums().await;
-            core.photo_jobs
-                .albums_refreshing
-                .store(false, Ordering::SeqCst);
-            match refreshed {
-                Ok(_) => core.events.publish(&[Topic::Photos]),
-                Err(e) => warn!(error = %e, "background album refresh failed"),
-            }
-        });
+        self.services
+            .spawn_task_job(&self.rt, "pdfs-albums-refresh", async move {
+                let refreshed = core.refresh_albums().await;
+                core.photo_jobs
+                    .albums_refreshing
+                    .store(false, Ordering::SeqCst);
+                match refreshed {
+                    Ok(_) => core.events.publish(&[Topic::Photos]),
+                    Err(e) => warn!(error = %e, "background album refresh failed"),
+                }
+            });
     }
 
     /// A page of one album's photos, newest capture first. The album's contents
@@ -179,11 +180,12 @@ impl Core {
         } else if self.listing_stale(&stamp, TIMELINE_TTL) {
             let core = self.clone();
             let album = album.clone();
-            self.rt.spawn(async move {
-                if let Err(e) = core.refresh_album(&album).await {
-                    warn!(%album, error = %e, "background album refresh failed");
-                }
-            });
+            self.services
+                .spawn_task_job(&self.rt, "pdfs-album-refresh", async move {
+                    if let Err(e) = core.refresh_album(&album).await {
+                        warn!(%album, error = %e, "background album refresh failed");
+                    }
+                });
         }
 
         let page = self
