@@ -90,6 +90,7 @@ use control::run_control_socket;
 mod devices;
 mod diagnostics;
 mod drain;
+mod enqueue;
 use drive::{DriveApi, RevisionRead};
 use pdfs_core::timestamp::now_secs;
 use pdfs_drive as drive;
@@ -98,23 +99,28 @@ pub(crate) use pdfs_drive::{media_type_for, node_content_sha1, parse_uid, remote
 #[cfg(test)]
 use pdfs_sync::naming::{conflict_label, conflict_label_of, conflict_name_as};
 use pdfs_sync::naming::{conflict_name, this_hostname};
+mod echoes;
 mod events;
 mod filesystem;
 mod gallery;
 mod inhibit;
 mod keeper;
 mod link;
+mod listing;
 pub use filesystem::ProtonFs;
 mod maintenance;
 mod mount;
 mod pause;
 mod photos;
+mod pins;
 mod profile;
 mod queue;
 mod reads;
+mod recovery;
 mod redate;
 mod relocate;
 mod revisions;
+mod search;
 mod shared;
 mod sharing;
 mod sizes;
@@ -662,7 +668,7 @@ struct Core {
     ///
     /// Shared across forks like `pending`: the drain that records the change and
     /// the event task that consumes the echo are both per-daemon.
-    self_changes: Arc<Mutex<HashMap<NodeUid, SelfChange>>>,
+    self_changes: Arc<Mutex<HashMap<NodeUid, echoes::SelfChange>>>,
     /// Every live mount: the primary and one per on-demand fork
     /// ([`Core::fork_state`]), with its mountpoint, root and kernel channel.
     /// Shared by every fork.
@@ -676,58 +682,6 @@ struct Core {
     ///
     /// `Weak`, so an unmounted fork is dropped rather than pinned here.
     states: Arc<StateRegistry>,
-}
-
-/// How long a change this daemon made stays recognisable as its own. Generous
-/// against a feed that can lag, but finite: past it, an event for the node is
-/// applied like any other. See [`Core::self_changes`].
-const SELF_CHANGE_TTL_MS: i64 = 120_000;
-
-/// A remote change this daemon made, awaiting its echo from the event feed.
-struct SelfChange {
-    /// When we made it, in the same epoch millis as [`now_millis`].
-    at_ms: i64,
-    /// Echoes not yet seen. More than one because a single file can be created
-    /// and then have a revision uploaded, and the feed reports both.
-    echoes: u32,
-}
-
-/// Record one remote change this daemon made. Split from [`Core`] so the
-/// expiry and echo-counting rules can be tested against a clock the test owns.
-fn note_self_change(changes: &mut HashMap<NodeUid, SelfChange>, uid: &NodeUid, now_ms: i64) {
-    // Echoes that never arrived — a node trashed before its event came round, a
-    // feed that skipped it — would otherwise accumulate for the life of the
-    // daemon. Pruning on write keeps the map the size of the recent queue.
-    changes.retain(|_, c| now_ms - c.at_ms < SELF_CHANGE_TTL_MS);
-    let change = changes.entry(uid.clone()).or_insert(SelfChange {
-        at_ms: now_ms,
-        echoes: 0,
-    });
-    change.at_ms = now_ms;
-    change.echoes += 1;
-}
-
-/// Claim one echo, per [`Core::take_self_change`].
-fn take_self_change(
-    changes: &mut HashMap<NodeUid, SelfChange>,
-    uid: &NodeUid,
-    now_ms: i64,
-) -> bool {
-    let Some(change) = changes.get_mut(uid) else {
-        return false;
-    };
-    // Too old to attribute: the feed is far enough behind that this is as likely
-    // to be someone else's change as ours, and guessing wrong here costs the user
-    // a stale file.
-    if now_ms - change.at_ms >= SELF_CHANGE_TTL_MS {
-        changes.remove(uid);
-        return false;
-    }
-    change.echoes -= 1;
-    if change.echoes == 0 {
-        changes.remove(uid);
-    }
-    true
 }
 
 /// One live mount, as published to the shared registry.
@@ -1524,836 +1478,6 @@ impl Core {
         }
     }
 
-    /// Record that this daemon just changed `uid` on the remote, so the event
-    /// feed's echo of that change is recognised instead of re-applied. Called
-    /// from the drain once the remote has actually accepted the change and the
-    /// tree has been brought level with it. See [`Core::self_changes`].
-    pub(crate) fn note_self_change(&self, uid: &NodeUid) {
-        note_self_change(&mut self.self_changes.lock(), uid, now_millis());
-    }
-
-    /// Claim one outstanding echo for `uid`, reporting whether this event is one
-    /// this daemon caused. Consuming rather than merely testing is what bounds
-    /// the suppression: the next event for the node applies normally.
-    fn take_self_change(&self, uid: &NodeUid) -> bool {
-        take_self_change(&mut self.self_changes.lock(), uid, now_millis())
-    }
-
-    /// Rehydrate the in-memory `State` maps from the DB on mount, so a cold
-    /// start serves previously-seen metadata (stable inodes, instant listings)
-    /// without re-hitting the API. The root inode is already installed by
-    /// [`ProtonFs::new`]; this fills in every other persisted node and rebuilds
-    /// the child listings of folders the DB records as fully enumerated.
-    fn hydrate(&self) {
-        let stored = match self.db.load_all() {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "db load_all failed; mounting cold");
-                return;
-            }
-        };
-        if stored.is_empty() {
-            return;
-        }
-        // A write queued by a previous run carries the optimistic size the file
-        // grew to, which the sealed remote revision does not yet reflect. The DB
-        // node still holds the pre-write `claimed_size` (often 0 for a fresh
-        // file), so without this a queued 500 MB file `stat`s as 0 bytes until
-        // the drain lands — reads still serve from the staged blob, but `ls`
-        // lying about the size reads as data loss. `hydrate_pending` ran before
-        // us, so the pending map is populated; snapshot it here rather than hold
-        // both locks at once.
-        let pending_sizes: HashMap<NodeUid, u64> = {
-            let pending = self.pending.lock();
-            pending
-                .iter()
-                .map(|(uid, pr)| (uid.clone(), pr.meta.len))
-                .collect()
-        };
-        // `hydrate_pending` runs first and restores queued-trash tombstones.
-        // Their node rows remain persisted as drain-time access authority, but
-        // must not reappear in the mounted namespace after a restart.
-        let hidden = self.hidden.lock().clone();
-        let mut st = self.state();
-
-        // Pass 1: give every uid its inode from its local id (the root is
-        // already mapped).
-        for sn in &stored {
-            if hidden.contains(&sn.node.uid) || st.by_uid.contains_key(&sn.node.uid) {
-                continue;
-            }
-            st.by_uid
-                .insert(sn.node.uid.clone(), state::lid_ino(sn.lid));
-        }
-
-        // Pass 2: materialize entries, resolving each parent's inode by uid.
-        // Track folders flagged complete so their listings rebuild in pass 3.
-        let mut listed_dirs: Vec<u64> = Vec::new();
-        for sn in stored {
-            let StoredNode {
-                mut node, listed, ..
-            } = sn;
-            if hidden.contains(&node.uid) {
-                continue;
-            }
-            let Some(&ino) = st.by_uid.get(&node.uid) else {
-                continue;
-            };
-            // Re-apply a queued write's optimistic size so `stat` matches what
-            // reads (served from the staged blob) already return.
-            if let Some(&len) = pending_sizes.get(&node.uid)
-                && let NodeKind::File { claimed_size, .. } = &mut node.kind
-            {
-                *claimed_size = Some(len as i64);
-            }
-            if listed && node.is_folder() {
-                listed_dirs.push(ino);
-            }
-            // A root entry is owned by `ProtonFs::new`; don't overwrite it.
-            if st.roots.contains(&ino) {
-                continue;
-            }
-            // A node whose parent row never made it to disk must not be adopted
-            // by the root: it would surface as a phantom top-level entry.
-            let parent = node
-                .parent_uid
-                .as_ref()
-                .and_then(|p| st.by_uid.get(p).copied())
-                .unwrap_or(ORPHAN_INO);
-            let uid = node.uid.clone();
-            st.entries.insert(
-                ino,
-                Entry {
-                    uid,
-                    parent,
-                    node,
-                    access: pdfs_core::Access::Unknown,
-                    lookup_count: 1,
-                    open_count: 0,
-                    unlinked: false,
-                },
-            );
-        }
-        st.hydrate_access();
-
-        // Pass 3: rebuild child listings for fully-enumerated folders.
-        let listings = listed_children(&st.entries, listed_dirs);
-        st.children.extend(listings);
-        info!(nodes = st.entries.len(), "hydrated metadata cache from db");
-    }
-
-    /// Rebuild the in-memory pending map from the `pending_op` table on mount.
-    ///
-    /// A queued write survives a restart — that is the point of persisting it —
-    /// so until the drain worker gets to it, reads of that file must still come
-    /// from its staged blob rather than the remote's older revision.
-    ///
-    /// A row whose blob has gone missing is dropped: there is nothing left to
-    /// upload, and keeping it would fail forever.
-    fn hydrate_pending(&self) {
-        let ops = match self.db.pending_ops() {
-            Ok(ops) => ops,
-            Err(e) => {
-                error!(error = %e, "loading pending uploads failed");
-                return;
-            }
-        };
-        let mut map = self.pending.lock();
-        let mut restored = 0usize;
-        for op in ops {
-            let Some(uid) = parse_node_uid(&op.uid) else {
-                error!(uid = %op.uid, id = op.id, "pending op has an unparseable uid; dropping");
-                let _ = self.db.delete_op(op.id);
-                continue;
-            };
-            if op.kind == OP_TRASH {
-                self.hidden.lock().insert(uid.clone());
-            }
-            restored += 1;
-            // Only a revision must have a blob. A create carries none until
-            // something is written to it (`touch` offline is a legitimate op
-            // with nothing to serve), and a rename never has one. A trash keeps
-            // the blob of a create it withdrew only to find the node by, not
-            // to serve. All still have to be replayed, so only the blob — if
-            // any — is checked.
-            if op.kind == OP_TRASH || (op.blob_path.is_none() && op.kind != OP_REVISION) {
-                continue;
-            }
-            let parsed = op
-                .meta_json
-                .as_deref()
-                .and_then(|j| serde_json::from_str::<StagedWrite>(j).ok())
-                .zip(op.blob_path.as_deref().map(PathBuf::from));
-            let Some((meta, path)) = parsed else {
-                error!(uid = %op.uid, id = op.id, "pending op is unreadable; dropping");
-                self.drop_unrecoverable_op(&op, &uid);
-                restored -= 1;
-                continue;
-            };
-            if !path.exists() {
-                error!(%uid, path = %path.display(), "staged blob is gone; dropping pending op");
-                self.drop_unrecoverable_op(&op, &uid);
-                restored -= 1;
-                continue;
-            }
-            map.insert(uid, PendingRevision { path, meta });
-        }
-        if restored > 0 {
-            info!(count = restored, "restored pending ops");
-        }
-    }
-
-    /// Re-attach staged blobs that no queued op refers to.
-    ///
-    /// `staging/` holds the only copy of writes the kernel has already been
-    /// told succeeded. Three release-path failures put bytes there and return
-    /// `EIO` without leaving a `pending_op` row behind — an access change
-    /// mid-release, a write overlapping an undrained incomplete edit, a create
-    /// that drained out from under its own handle. Until now nothing ever
-    /// walked the directory again: `hydrate_pending` reads the op table and
-    /// [`recover_fsynced_writes`](Self::recover_fsynced_writes) reads
-    /// `recovery/`, so an orphaned staged blob was invisible to the daemon and
-    /// to the user alike, and stayed that way until someone found the file.
-    ///
-    /// Runs once at mount, after `hydrate_pending`, so `pending` already
-    /// describes what the queue owns. An orphan whose sidecar names a real node
-    /// is queued as an ordinary revision — the condition that made it fail is
-    /// gone by definition, since the op it collided with has since drained.
-    /// Anything that cannot be addressed (no sidecar, an unparseable uid, a
-    /// `local~` placeholder whose create is gone) is left in place and named in
-    /// the log: unexplained bytes are never evidence that user data is
-    /// disposable.
-    fn reconcile_staging(&self) {
-        let staged = self.cache.staged_writes();
-        if staged.is_empty() {
-            return;
-        }
-        let claimed = match self.db.op_blob_paths() {
-            Ok(paths) => paths,
-            Err(e) => {
-                error!(error = %e, "cannot read queued blob paths; skipping staging reconcile");
-                return;
-            }
-        };
-        let mut queued = 0usize;
-        let mut stranded = 0usize;
-        let mut retired = 0usize;
-        let mut retired_bytes = 0u64;
-        let mut example: Option<PathBuf> = None;
-        for (blob, meta) in staged {
-            if claimed.contains(&blob.to_string_lossy().into_owned()) {
-                continue;
-            }
-            let addressable = meta.as_ref().and_then(|m| parse_node_uid(&m.uid));
-            let Some((meta, uid)) = meta.zip(addressable).filter(|(_, uid)| !is_local_uid(uid))
-            else {
-                if let Some(bytes) = orphan_past_retention(&blob) {
-                    retired += 1;
-                    retired_bytes += bytes;
-                    warn!(blob = %blob.display(), bytes,
-                          age_days = STAGING_ORPHAN_RETAIN.as_secs() / 86_400,
-                          "retiring staged bytes that name no node and have outlived retention");
-                    self.cache.discard_staged(&blob);
-                    continue;
-                }
-                stranded += 1;
-                example.get_or_insert_with(|| blob.clone());
-                continue;
-            };
-            if self.pending.lock().contains_key(&uid) {
-                // A newer write for the same node is queued and carries its own
-                // blob. These bytes are older; keeping them is right, uploading
-                // them over the newer ones is not.
-                stranded += 1;
-                warn!(%uid, blob = %blob.display(),
-                      "staged bytes are superseded by a queued write; kept for recovery");
-                continue;
-            }
-            if self
-                .db
-                .has_pending_op(&uid.to_string(), OP_TRASH)
-                .unwrap_or(false)
-            {
-                // The node was deleted while a handle still read these bytes,
-                // and the daemon stopped before its trash went out. Queued again,
-                // they lost their blob when the trash landed and retried on it
-                // for good (`docs/BUGS.md` B188).
-                info!(%uid, blob = %blob.display(),
-                      "staged bytes belong to a node whose trash is queued; discarded");
-                self.cache.discard_staged(&blob);
-                continue;
-            }
-            let op = PendingOp {
-                id: 0,
-                kind: OP_REVISION.to_string(),
-                uid: uid.to_string(),
-                parent_uid: None,
-                name: None,
-                blob_path: Some(blob.to_string_lossy().into_owned()),
-                meta_json: Some(serde_json::to_string(&meta).unwrap_or_default()),
-                created_at: now_millis(),
-                attempts: 0,
-                last_error: None,
-                next_attempt_at: now_millis(),
-            };
-            match self.db.enqueue_op(&op) {
-                Ok((_, superseded)) => {
-                    if let Some(old) = superseded {
-                        self.cache.discard_staged(Path::new(&old));
-                    }
-                    self.pending.lock().insert(
-                        uid.clone(),
-                        PendingRevision {
-                            path: blob.clone(),
-                            meta,
-                        },
-                    );
-                    queued += 1;
-                }
-                Err(e) => {
-                    stranded += 1;
-                    error!(%uid, blob = %blob.display(), error = %e,
-                           "cannot queue an orphaned staged write; bytes kept");
-                }
-            }
-        }
-        if stranded > 0 {
-            // One line, not one per blob. A tree of them says exactly as much as
-            // a single count and an example does, and said it on every mount:
-            // 86 identical warnings for the same 86 files, boot after boot.
-            warn!(
-                count = stranded,
-                example = %example.map(|b| b.display().to_string()).unwrap_or_default(),
-                "staged bytes belong to no queued upload and name no node; kept for recovery"
-            );
-        }
-        if queued > 0 || stranded > 0 || retired > 0 {
-            info!(
-                queued,
-                stranded, retired, retired_bytes, "reconciled orphaned staged writes"
-            );
-        }
-    }
-
-    /// Queue the writes that an unclean shutdown caught between `fsync(2)` and
-    /// `close(2)`.
-    ///
-    /// `fsync` promises the bytes survive a crash, but the queueing that makes a
-    /// write outlive the daemon happens at `release`. A crash in between used to
-    /// lose the data outright, because the scratch directory is cleared at open.
-    /// Now `fsync` leaves a sidecar, `ContentCache::open` moves those blobs to
-    /// `recovery/`, and this walks them into the same staging + queued-op path a
-    /// normal release takes.
-    ///
-    /// Runs after [`hydrate_pending`](Self::hydrate_pending), which is what makes
-    /// the incomplete-blob check in [`enqueue_staged_write`](Self::enqueue_staged_write)
-    /// meaningful: a recovered partial write whose earlier write is still queued
-    /// must not gap-fill from a remote revision that no longer describes the
-    /// file. With `pending` already loaded, that case is detected and the bytes
-    /// are parked rather than mis-filled.
-    ///
-    /// Failure is per-write and never fatal: a node that no longer exists, or an
-    /// op that cannot be queued, leaves its blob in `recovery/` for the next run
-    /// (and for a human) instead of taking the mount down.
-    fn recover_fsynced_writes(&self) {
-        let recovered = self.cache.recovered_writes();
-        if recovered.is_empty() {
-            return;
-        }
-        let mut queued = 0usize;
-        for (blob, meta) in recovered {
-            let Some(uid) = parse_node_uid(&meta.uid) else {
-                error!(uid = %meta.uid, "recovered write has an unparseable uid; keeping bytes");
-                continue;
-            };
-
-            // If the write is incomplete and an earlier edit is still queued, merging it
-            // now would use the wrong remote base. enqueue_staged_write would abandon it
-            // to staging; keep it in recovery instead so the drain loop can queue it
-            // once the queue clears.
-            if !meta.complete && self.pending.lock().contains_key(&uid) {
-                continue;
-            }
-
-            // The inode is only used to stamp the in-memory tree with the new
-            // size, and nothing is interned this early — `hydrate` reads the
-            // size back off `pending` when the node is first looked up, so 0
-            // (no such inode) is correct rather than merely tolerable.
-            match self.enqueue_staged_write(&uid, 0, &blob, meta) {
-                Ok(()) => {
-                    self.cache.discard_recovered(&blob);
-                    queued += 1;
-                }
-                Err(e) => {
-                    error!(%uid, blob = %blob.display(), error = ?e,
-                           "cannot queue a recovered write; bytes kept for the next run");
-                    // Some failures (a partial write parked by
-                    // `stage_orphaned_write`) still consume the blob. Its sidecar
-                    // would then describe nothing, so retire it — the bytes are
-                    // in staging, which is where a human looks for them.
-                    if !blob.exists() {
-                        self.cache.discard_recovered(&blob);
-                    }
-                }
-            }
-        }
-        if queued > 0 {
-            info!(
-                count = queued,
-                "recovered fsynced writes from an unclean shutdown"
-            );
-        }
-    }
-
-    /// Discard an op that can never be performed, because the bytes it was to
-    /// upload are gone from staging (something outside the daemon deleted them).
-    ///
-    /// For a node that only ever existed locally, the placeholder goes too. Its
-    /// content is unrecoverable and nothing will ever mint it a real uid, so
-    /// leaving the row would strand a file in the tree that can be listed but
-    /// never read and never uploaded.
-    fn drop_unrecoverable_op(&self, op: &PendingOp, uid: &NodeUid) {
-        let _ = self.db.delete_op(op.id);
-        if is_local_uid(uid) {
-            error!(%uid, name = op.name.as_deref().unwrap_or("?"),
-                   "discarding a node whose only copy was lost");
-            if let Err(e) = self.db.delete_node(uid) {
-                warn!(%uid, error = %e, "db delete_node failed for lost local node");
-            }
-        }
-    }
-
-    /// Whether [`Core::ensure_children`] would answer for `ino` without
-    /// touching the network. Lets a handler decide between answering inline
-    /// and handing off to a worker.
-    ///
-    /// A resident listing is not enough on its own. A shared folder's, or the
-    /// Shared with me root's, is fetched again once it is a minute old, and
-    /// that fetch ran on the dispatch loop, so every request on the mount
-    /// waited for Drive to answer (`docs/BUGS.md` B219).
-    fn children_cached(&self, ino: u64) -> bool {
-        let (uid, resident) = {
-            let st = self.state();
-            match st.entries.get(&ino) {
-                Some(e) => (e.uid.clone(), st.children.contains_key(&ino)),
-                // `list_children` answers ENOENT without the network.
-                None => return true,
-            }
-        };
-        if !resident {
-            return false;
-        }
-        let freshness = if is_virtual_uid(&uid) {
-            Some(SHARED_WITH_ME_SYNCED_MS.to_string())
-        } else if !self.is_own_or_virtual(&uid) && !is_local_uid(&uid) {
-            Some(Self::shared_folder_freshness_key(&uid))
-        } else {
-            None
-        };
-        freshness.is_none_or(|key| {
-            !listing_needs_refresh(
-                self.online.load(Ordering::Relaxed),
-                self.shared_listing_stale(&key),
-            )
-        })
-    }
-
-    /// Re-apply the optimistic size of any queued write to `nodes`.
-    ///
-    /// A node that arrives from the remote (or from its DB row) carries the size
-    /// of the revision the *server* holds, which for a file with a write still
-    /// queued is the pre-write size — often 0 for a file created moments ago.
-    /// Interning it as-is silently reverts the optimistic size that
-    /// `record_pending_write` stamped, and a file that stats as 0 bytes is a file
-    /// the kernel will not issue a single `read` for: `cat` prints nothing and
-    /// the staged blob that `read_range` would have served is never asked for.
-    /// That reads as data loss even though nothing is lost (B11).
-    ///
-    /// [`Core::hydrate`] does the same thing for the restart case. This covers
-    /// every *live* re-enumeration — which is what a rename or move triggers,
-    /// since both invalidate the listings they touch.
-    ///
-    /// Snapshots the pending map and returns before any caller takes the state
-    /// lock: no site in the daemon holds `pending` and `state` at once, and this
-    /// is not the place to become the first.
-    fn stamp_pending_sizes(&self, nodes: &mut [Node]) {
-        let sizes: HashMap<NodeUid, u64> = {
-            let pending = self.pending.lock();
-            if pending.is_empty() {
-                return;
-            }
-            pending
-                .iter()
-                .map(|(uid, pr)| (uid.clone(), pr.meta.len))
-                .collect()
-        };
-        apply_pending_sizes(nodes, &sizes);
-    }
-
-    fn is_own_or_virtual(&self, uid: &NodeUid) -> bool {
-        is_own_or_virtual_uid(uid, &self.primary_root_uid.volume_id)
-    }
-
-    /// The nodes of `before`, queued in `folder_uid` when its listing was asked
-    /// of Drive, that are no longer queued in `after`, as the DB has them now.
-    ///
-    /// Their create landed while the listing was on the wire, after Drive took
-    /// it, and so is in neither. One unlinked or moved away meanwhile is not
-    /// under the folder by that name any more and stays out.
-    fn landed_meanwhile(
-        &self,
-        folder_uid: &NodeUid,
-        before: Vec<Node>,
-        after: &[Node],
-    ) -> Vec<Node> {
-        let still: HashSet<&str> = after.iter().map(|node| node.name.as_str()).collect();
-        let landed: HashSet<String> = before
-            .into_iter()
-            .map(|node| node.name)
-            .filter(|name| !still.contains(name.as_str()))
-            .collect();
-        if landed.is_empty() {
-            return Vec::new();
-        }
-        match self.db.known_children(folder_uid) {
-            Ok(known) => known
-                .into_iter()
-                .filter(|node| landed.contains(&node.name))
-                .collect(),
-            Err(e) => {
-                warn!(%folder_uid, error = %e, "db known_children failed");
-                Vec::new()
-            }
-        }
-    }
-
-    /// Serve a listing without the network: the one already in memory if any,
-    /// else whatever children the DB still knows. The fallback only answers
-    /// until the link is back, when [`Core::relist_offline_listings`] drops it:
-    /// a listing dropped as stale may lack a child another device made, and a
-    /// create over that name lands as a conflict copy rather than an `EIO` now.
-    fn adopt_stale_listing(
-        &self,
-        ino: u64,
-        folder_uid: &NodeUid,
-        cached: bool,
-        primary_root: bool,
-    ) -> Result<(), Errno> {
-        if cached {
-            return Ok(());
-        }
-        let nodes = self.db.known_children(folder_uid).map_err(|e| {
-            warn!(%folder_uid, error = %e, "db known_children failed");
-            Errno::EIO
-        })?;
-        debug!(%folder_uid, count = nodes.len(), "offline: listing a folder from what the DB knows");
-        self.link.stale_listings.lock().insert(ino);
-        self.adopt_db_listing(ino, folder_uid, nodes, primary_root)
-    }
-
-    /// Relist every folder [`Core::adopt_stale_listing`] served while offline.
-    pub(crate) fn relist_offline_listings(&self) {
-        let stale = std::mem::take(&mut *self.link.stale_listings.lock());
-        if stale.is_empty() {
-            return;
-        }
-        let mut st = self.state();
-        for &ino in &stale {
-            st.invalidate_listing(ino);
-        }
-        drop(st);
-        for mount in self.states.live() {
-            if let Some(notifier) = mount.notifier.get() {
-                for &ino in &stale {
-                    let _ = notifier.inval_inode(ino);
-                }
-            }
-        }
-    }
-
-    /// Install `nodes`, read from the DB, as `ino`'s listing.
-    fn adopt_db_listing(
-        &self,
-        ino: u64,
-        folder_uid: &NodeUid,
-        mut nodes: Vec<Node>,
-        primary_root: bool,
-    ) -> Result<(), Errno> {
-        let folder_uid = folder_uid.clone();
-        if primary_root {
-            nodes.retain(|node| !is_virtual_uid(&node.uid));
-        }
-        // Before the lock: a DB row carries the size the server last
-        // sealed, which a queued write is ahead of (B11).
-        self.stamp_pending_sizes(&mut nodes);
-        let hidden = self.hidden.lock().clone();
-        let mut st = self.state();
-        if st.children.contains_key(&ino) {
-            return Ok(());
-        }
-        let mut child_inos = Vec::with_capacity(nodes.len());
-        let mut needs_size = Vec::new();
-        for node in nodes {
-            if !node_visible(&node, &folder_uid, &hidden) {
-                continue;
-            }
-            if matches!(
-                &node.kind,
-                NodeKind::File {
-                    claimed_size: None,
-                    ..
-                }
-            ) {
-                needs_size.push(node.uid.clone());
-            }
-            child_inos.push(st.intern_from_db(ino, node));
-        }
-        st.children.insert(ino, child_inos);
-        let root_snapshot = primary_root.then(|| RootListingSnapshot::capture(&st, ino).unwrap());
-        drop(st);
-        self.flush_access_changes();
-        if let Some(snapshot) = root_snapshot {
-            self.reconcile_virtual_root_dentry(ino, snapshot)?;
-        }
-        // Rows persisted from a cheap enumeration whose upgrade never
-        // ran (a restart in between, say) still owe their real sizes.
-        self.spawn_size_upgrade(ino, needs_size);
-        Ok(())
-    }
-
-    /// Enumerate `ino`'s children from the remote and cache them. No-op if the
-    /// directory has already been listed. Network I/O happens without the lock
-    /// held so concurrent metadata reads aren't blocked behind a fetch.
-    ///
-    /// A listing that changed while it was being published answers EAGAIN: the
-    /// root listed again after a restart, an event, a newer refresh of a shared
-    /// folder. The listing is still owed, so it is taken again rather than
-    /// handed to the lookup or open that asked (B159).
-    fn ensure_children(&self, ino: u64) -> Result<(), Errno> {
-        for _ in 1..LISTING_ATTEMPTS {
-            match self.list_children(ino) {
-                Err(e) if e.code() == Errno::EAGAIN.code() => {
-                    debug!(ino, "listing changed while it was published; listing again");
-                }
-                done => return done,
-            }
-        }
-        self.list_children(ino)
-    }
-
-    fn list_children(&self, ino: u64) -> Result<(), Errno> {
-        let (folder_uid, cached) = {
-            let st = self.state();
-            match st.entries.get(&ino) {
-                Some(e) => (e.uid.clone(), st.children.contains_key(&ino)),
-                None => return Err(Errno::ENOENT),
-            }
-        };
-        if is_virtual_uid(&folder_uid) {
-            return self.ensure_shared_children(ino);
-        }
-
-        let primary_root =
-            is_primary_root_listing(self.primary, &folder_uid, &self.primary_root_uid);
-        let foreign = !self.is_own_or_virtual(&folder_uid) && !is_local_uid(&folder_uid);
-        let foreign_key = foreign.then(|| Self::shared_folder_freshness_key(&folder_uid));
-        let refresh_foreign = foreign_key.as_deref().is_some_and(|key| {
-            listing_needs_refresh(
-                self.online.load(Ordering::Relaxed),
-                self.shared_listing_stale(key),
-            )
-        });
-        if cached && !refresh_foreign {
-            if primary_root {
-                self.reconcile_virtual_root_dentry(ino, self.resident_root_listing_snapshot(ino)?)?;
-            }
-            return Ok(());
-        }
-        // Offline fast path: a folder the DB still records as fully enumerated
-        // can be rebuilt from disk without hitting the API, even if its listing
-        // was trimmed from the hot cache mid-run.
-        let cached_nodes = if refresh_foreign {
-            Ok(None)
-        } else {
-            self.db.children_if_listed(&folder_uid)
-        };
-        match cached_nodes {
-            Ok(Some(nodes)) => return self.adopt_db_listing(ino, &folder_uid, nodes, primary_root),
-            Ok(None) => {}
-            Err(e) => warn!(%folder_uid, error = %e, "db children_if_listed failed"),
-        }
-        // Drive knows nothing by a stand-in. Until its mkdir lands the folder
-        // is only here, and once it has, the DB holds what Drive does. A
-        // listing dropped meanwhile was asked of Drive, and every lookup in
-        // the folder failed with EIO (`docs/BUGS.md` B125).
-        if is_local_uid(&folder_uid) {
-            let nodes = self.db.known_children(&folder_uid).map_err(|e| {
-                warn!(%folder_uid, error = %e, "db known_children failed");
-                Errno::EIO
-            })?;
-            return self.adopt_db_listing(ino, &folder_uid, nodes, primary_root);
-        }
-        if !self.is_online() {
-            return self.adopt_stale_listing(ino, &folder_uid, cached, primary_root);
-        }
-
-        let refresh_generation =
-            refresh_foreign.then(|| self.shared.shared_generation.load(Ordering::SeqCst));
-        // What is queued before Drive is asked: a create that lands while the
-        // listing is on the wire is in neither Drive's answer nor the queue read
-        // after it (`docs/BUGS.md` B166).
-        let queued_before = (!foreign)
-            .then(|| self.db.queued_children(&folder_uid).ok())
-            .flatten();
-        let uids = match self
-            .rt
-            .block_on(self.drive.enumerate_folder_children_node_uids(&folder_uid))
-        {
-            Ok(uids) => uids,
-            Err(e) if self.lost_link(&e, "list folder") => {
-                return self.adopt_stale_listing(ino, &folder_uid, cached, primary_root);
-            }
-            Err(e) => {
-                error!(%folder_uid, error = %e, "enumerate folder children failed");
-                return Err(Errno::EIO);
-            }
-        };
-        // Cheap enumeration: `Light` skips unlocking each *file's* node key,
-        // which is an S2K derivation per file and was ~74% of the cost of a cold
-        // listing (B12 — measured with `perf`, 64% of cycles in SHA-256 alone).
-        // Folders are unlocked either way; their keys are what the children are
-        // decrypted with, so the walk cannot proceed without them.
-        //
-        // The price is that files come back without a `claimed_size`, so
-        // `node_size` falls back to the *ciphertext* size until
-        // `spawn_size_upgrade` below fills the real one in.
-        let mut nodes = match self.rt.block_on(self.drive.enumerate_nodes_light(&uids)) {
-            Ok(nodes) => nodes,
-            Err(e) if self.lost_link(&e, "list folder") => {
-                return self.adopt_stale_listing(ino, &folder_uid, cached, primary_root);
-            }
-            Err(e) => {
-                error!(%folder_uid, error = %e, "enumerate nodes failed");
-                return Err(Errno::EIO);
-            }
-        };
-        // Drive shows none of what is still queued for the folder (B132).
-        // A shared folder's listing is published as Drive has it.
-        if !foreign {
-            match self.db.queued_children(&folder_uid) {
-                Ok((mut queued, gone)) => {
-                    if let Some((before, _)) = queued_before {
-                        queued.extend(self.landed_meanwhile(&folder_uid, before, &queued));
-                    }
-                    overlay_queued(&mut nodes, queued, &gone)
-                }
-                Err(e) => warn!(%folder_uid, error = %e, "db queued_children failed"),
-            }
-        }
-        // Same as the DB path above: the remote's size for a file with a write
-        // still queued is the pre-write one (B11).
-        self.stamp_pending_sizes(&mut nodes);
-        let hidden = self.hidden.lock().clone();
-        let mut filtered_nodes: Vec<Node> = nodes
-            .into_iter()
-            .filter(|node| node_visible(node, &folder_uid, &hidden))
-            .collect();
-        if foreign {
-            for node in &mut filtered_nodes {
-                node.parent_uid = Some(folder_uid.clone());
-            }
-            let _publication = self.shared.shared_publication.lock();
-            if !refresh_generation_is_current(
-                refresh_generation.expect("foreign refresh has a generation"),
-                self.shared.shared_generation.load(Ordering::SeqCst),
-            ) {
-                return Err(Errno::EAGAIN);
-            }
-            let removed = self
-                .db
-                .publish_foreign_children(&folder_uid, &uids, &filtered_nodes)
-                .map_err(|error| {
-                    error!(%folder_uid, %error, "publishing foreign-folder listing failed");
-                    Errno::EIO
-                })?;
-            let mut snapshot = self.db.visible_children(&folder_uid).map_err(|error| {
-                error!(%folder_uid, %error, "loading published foreign-folder listing failed");
-                Errno::EIO
-            })?;
-            self.stamp_pending_sizes(&mut snapshot);
-            snapshot.retain(|node| node_visible(node, &folder_uid, &hidden));
-            let needs_size: Vec<NodeUid> = snapshot
-                .iter()
-                .filter(|node| {
-                    matches!(
-                        &node.kind,
-                        NodeKind::File {
-                            claimed_size: None,
-                            ..
-                        }
-                    )
-                })
-                .map(|node| node.uid.clone())
-                .collect();
-            let mut st = self.state();
-            for uid in &removed {
-                st.hide_foreign_subtree(uid);
-            }
-            let children = snapshot
-                .into_iter()
-                .map(|node| st.intern_from_db(ino, node))
-                .collect();
-            st.children.insert(ino, children);
-            drop(st);
-            self.flush_access_changes();
-            self.mark_shared_refresh_success(
-                foreign_key
-                    .as_deref()
-                    .expect("foreign refresh has a freshness key"),
-            );
-            self.spawn_size_upgrade(ino, needs_size);
-            return Ok(());
-        }
-
-        let preassigned = state::inos_for(&self.db, &filtered_nodes);
-        let mut st = self.state();
-        // Lost the race? Another thread already populated it.
-        if st.children.contains_key(&ino) {
-            return Ok(());
-        }
-        let mut child_inos = Vec::with_capacity(filtered_nodes.len());
-        // Files whose real size the cheap enumeration could not read. Collected
-        // before interning so the upgrade below has the uids without re-walking.
-        let needs_size: Vec<NodeUid> = filtered_nodes
-            .iter()
-            .filter(|n| {
-                matches!(
-                    &n.kind,
-                    NodeKind::File {
-                        claimed_size: None,
-                        ..
-                    }
-                )
-            })
-            .map(|n| n.uid.clone())
-            .collect();
-        let inos = st.intern_batch_with_inos(ino, filtered_nodes, preassigned);
-        child_inos.extend(inos);
-        st.children.insert(ino, child_inos);
-        let root_snapshot = primary_root.then(|| RootListingSnapshot::capture(&st, ino).unwrap());
-        // Record the listing as complete so a later restart (or a trimmed hot
-        // cache) can rebuild it from the DB without the API. Written with the
-        // children's rows when the lock goes, not under it.
-        st.record_listed(folder_uid.clone());
-        drop(st);
-        self.flush_access_changes();
-        if let Some(snapshot) = root_snapshot {
-            self.reconcile_virtual_root_dentry(ino, snapshot)?;
-        }
-        self.spawn_size_upgrade(ino, needs_size);
-        Ok(())
-    }
-
     /// Resolve a child `name` within `parent` to its `(inode, uid)`, ensuring
     /// the parent's listing is cached first.
     fn lookup_child(&self, parent: u64, name: &str) -> Result<(u64, NodeUid), Errno> {
@@ -2602,815 +1726,6 @@ impl Core {
             .filter(|uid| !is_local_uid(uid))
     }
 
-    /// Queue what the write handles the kernel never released hold.
-    ///
-    /// `close(2)` returns before the kernel sends `release`, and the stop
-    /// aborts the FUSE connection with the releases still queued: a file a
-    /// program had just saved was never queued, and Drive kept it as it was
-    /// (`docs/BUGS.md` B190). Runs once every session has ended, so no release
-    /// can race it. A handle still open in a program goes the same way, with
-    /// what it wrote so far; one on an unlinked file only leaves its scratch.
-    pub(crate) fn queue_unreleased_writes(&self) {
-        let handles: Vec<(WriteHandle, bool)> = {
-            let mut st = self.state();
-            st.handles.clear();
-            let inos: Vec<u64> = st.active_writes.keys().copied().collect();
-            inos.into_iter()
-                .filter_map(|ino| {
-                    let unlinked = st.entries.get(&ino).is_some_and(|e| e.unlinked);
-                    st.active_writes.remove(&ino).map(|h| (h, unlinked))
-                })
-                .collect()
-        };
-        for (mut h, unlinked) in handles {
-            if unlinked {
-                self.cache.clear_scratch_durable(&h.path);
-                let _ = std::fs::remove_file(&h.path);
-                continue;
-            }
-            self.follow_landed_create(&mut h);
-            match self.queue_revision(&mut h) {
-                Ok(()) => info!(uid = %h.uid, "queued a write the kernel never released"),
-                Err(error) => {
-                    warn!(uid = %h.uid, ?error, "cannot queue a write the kernel never released")
-                }
-            }
-        }
-    }
-
-    /// Accept a released write handle's bytes and queue their upload.
-    ///
-    /// This is what makes a copy into the mount run at disk speed: the caller's
-    /// `close` returns once the bytes are staged on local disk and the intent is
-    /// in `pending_op`, instead of waiting out a full upload inside the FUSE
-    /// handler. It is also what makes an offline write succeed rather than EIO —
-    /// the queued op simply waits for the network.
-    ///
-    /// The scratch file is *moved* into staging, never copied: it is the only
-    /// copy of what the user wrote.
-    fn queue_revision(&self, h: &mut WriteHandle) -> Result<(), Errno> {
-        // Closing an untouched writable handle is not a mutation. It remains
-        // valid after a downgrade and only owes cleanup of its empty scratch.
-        if !h.dirty {
-            self.cache.clear_scratch_durable(&h.path);
-            let _ = std::fs::remove_file(&h.path);
-            // A new file's create waits for this release to wake the drain
-            // (`Core::queue_local_node`). Closed empty, it attached nothing
-            // that would, and sat until the idle poll (`docs/BUGS.md` B192).
-            if is_local_uid(&h.uid) {
-                self.wake_drain();
-            }
-            return Ok(());
-        }
-        preserve_on_access_denied(self.require_uid_writable(&h.uid), h.dirty, || {
-            let meta = self.recovery_meta(h);
-            self.stage_orphaned_write(
-                &h.uid,
-                h.ino,
-                &h.path,
-                &meta,
-                "access changed before the write could be queued",
-            );
-        })?;
-        // The handle is being retired either way, so any durability sidecar an
-        // `fsync` left has done its job: from here the bytes are tracked as a
-        // staged write and a queued op, and a sidecar outliving them would offer
-        // recovery a second, stale copy of the same write.
-        self.cache.clear_scratch_durable(&h.path);
-        if is_local_uid(&h.uid) && !self.db.has_create_op(&h.uid.to_string()).unwrap_or(true) {
-            // A create that landed since the handle last looked left no op
-            // either. It moved the row to its uid in the same transaction, so
-            // the row says which it was (`docs/BUGS.md` B176).
-            self.follow_landed_create(h);
-            if is_local_uid(&h.uid) {
-                debug!(uid = %h.uid, "local node was unlinked before creation; dropping revision");
-                let _ = std::fs::remove_file(&h.path);
-                return Ok(());
-            }
-        }
-        // Materialize as much of the full content as is free to materialize. A
-        // complete blob is uploadable without the network and lets a later write
-        // to the same file supersede this one without any reconstruction at all.
-        //
-        // What is deliberately *not* done here is fetching the untouched ranges
-        // from the remote: that is a download of everything the edit did not
-        // touch, and this runs on the FUSE dispatch loop, so closing a large
-        // file after a small edit stopped every other request on the mount for
-        // the length of it (audit F1). An incomplete blob is first-class —
-        // `read_pending` resolves its gaps against the base, and `drain_revision`
-        // fills them on the drain thread — so the network half of the fill
-        // belongs there, and only there.
-        //
-        // A node that exists only locally has no remote base to fill from: its
-        // untouched ranges live in the blob queued by an earlier write, which
-        // `merge_over_pending` folds in below.
-        if let Err(e) = h.file.set_len(h.len) {
-            error!(uid = %h.uid, error = %e, "resize scratch file failed");
-            return Err(Errno::EIO);
-        }
-        let mut written = h.written.clone();
-        if !(is_local_uid(&h.uid) && h.base_size > 0) {
-            // A local node has no remote base, so nothing of it can be fetched
-            // or cached: passing zero says so, and leaves the fill doing only
-            // the part that still applies — claiming the zeroed tail.
-            let base_size = if is_local_uid(&h.uid) { 0 } else { h.base_size };
-            self.fill_gaps_cached(
-                &h.uid,
-                &h.file,
-                h.len,
-                h.base_mtime,
-                base_size,
-                &mut written,
-            );
-        }
-        let authored: Vec<(u64, u64)> = written
-            .segments(0, h.len)
-            .into_iter()
-            .filter(|&(_, _, authored)| authored)
-            .map(|(s, e, _)| (s, e))
-            .collect();
-        let meta = StagedWrite {
-            uid: h.uid.to_string(),
-            len: h.len,
-            base_size: h.base_size,
-            base_mtime: h.base_mtime,
-            complete: StagedWrite::covers(&authored, h.len),
-            authored,
-            based_on: self.remote_baseline(
-                &h.uid,
-                h.base_mtime,
-                h.base_size,
-                h.base_revision_id.clone(),
-            ),
-        };
-        let complete = meta.complete;
-        self.enqueue_staged_write(&h.uid, h.ino, &h.path, meta)?;
-        debug!(uid = %h.uid, len = h.len, complete, "queued revision upload");
-        Ok(())
-    }
-
-    /// Describe the locally authored ranges without gap-filling them.
-    ///
-    /// Used when a write was accepted by the kernel but a queue-time access
-    /// check now denies it. Building this metadata is side-effect free, so the
-    /// permission guard still precedes cache, database, and tree mutation.
-    fn recovery_meta(&self, h: &WriteHandle) -> StagedWrite {
-        let authored: Vec<(u64, u64)> = h
-            .written
-            .segments(0, h.len)
-            .into_iter()
-            .filter(|&(_, _, authored)| authored)
-            .map(|(start, end, _)| (start, end))
-            .collect();
-        StagedWrite {
-            uid: h.uid.to_string(),
-            len: h.len,
-            base_size: h.base_size,
-            base_mtime: h.base_mtime,
-            complete: StagedWrite::covers(&authored, h.len),
-            authored,
-            based_on: self.remote_baseline(
-                &h.uid,
-                h.base_mtime,
-                h.base_size,
-                h.base_revision_id.clone(),
-            ),
-        }
-    }
-
-    /// The remote revision a change to `uid` is being made against, for
-    /// [`StagedWrite::based_on`].
-    ///
-    /// Normally that is simply the base the handle opened over. The exception is
-    /// a write that supersedes a still-queued one: its "base" is the previous
-    /// *staged blob*, whose size and mtime are ours, not the server's — so the
-    /// baseline is inherited from the op being superseded, which is the last one
-    /// that actually observed the remote. Without that, chaining two writes
-    /// before the queue drains would leave the drain comparing the remote
-    /// against a revision it never had, and cutting a conflict copy over
-    /// nothing.
-    ///
-    /// `None` for a node that has never existed remotely: there is no revision
-    /// to conflict with until its create drains.
-    fn remote_baseline(
-        &self,
-        uid: &NodeUid,
-        base_mtime: i64,
-        base_size: u64,
-        base_revision_id: Option<String>,
-    ) -> Option<Baseline> {
-        if is_local_uid(uid) {
-            return None;
-        }
-        match self.pending.lock().get(uid) {
-            Some(p) => p.meta.based_on.clone(),
-            None => Some(Baseline {
-                mtime: base_mtime,
-                size: base_size,
-                hash: None,
-                revision_id: base_revision_id,
-            }),
-        }
-    }
-
-    /// Move a file holding a node's intended new content into staging and queue
-    /// the upload that will make it the remote's content. Shared by the release
-    /// of a write handle and by a path-based truncate.
-    ///
-    /// `src` is consumed either way: on success it is *moved* into staging, and
-    /// on the refusal below it is moved there too, just without an op to upload
-    /// it. It is the only copy of what the user wrote, so nothing here may
-    /// simply delete it.
-    fn enqueue_staged_write(
-        &self,
-        uid: &NodeUid,
-        ino: u64,
-        src: &Path,
-        mut meta: StagedWrite,
-    ) -> Result<(), Errno> {
-        preserve_on_access_denied(self.require_uid_writable(uid), true, || {
-            self.stage_orphaned_write(
-                uid,
-                ino,
-                src,
-                &meta,
-                "access changed before the staged write could be queued",
-            );
-        })?;
-        // An incomplete blob's gaps refer to the *remote* base. If an earlier
-        // write to this file is still queued, the remote no longer holds that
-        // base — the previous staged blob does — so taking those gaps at face
-        // value would fill them from the wrong revision. Fold the blob being
-        // superseded into this one instead: its authored bytes are a local copy
-        // of exactly the ranges this write did not touch, and what neither wrote
-        // is still the remote content that the earlier write was based on, which
-        // is why the baseline is inherited along with them.
-        let previous = self.pending.lock().get(uid).cloned();
-        if !meta.complete
-            && let Some(previous) = previous
-            && let Err(error) = merge_over_pending(&mut meta, src, &previous)
-        {
-            // Without the earlier bytes the gaps cannot be resolved against
-            // anything, so this is where the write stops being uploadable.
-            // Keep it recoverable rather than corrupting the file.
-            warn!(%uid, %error, "folding in the undrained edit failed");
-            self.stage_orphaned_write(
-                uid,
-                ino,
-                src,
-                &meta,
-                "write overlaps an undrained incomplete edit",
-            );
-            return Err(Errno::EIO);
-        }
-        let path = self.cache.stage_write(&meta, src).map_err(|e| {
-            error!(%uid, error = %e, "staging write failed");
-            // The scratch file is still the only copy of these bytes, and the
-            // caller is releasing the handle it belongs to — without a
-            // durability sidecar `discard_unmarked_scratch` deletes it at the
-            // next mount, the one place the "never delete on a failure path"
-            // invariant would break. Mark it first, whatever went wrong.
-            if let Err(mark) = self.cache.mark_scratch_durable(src, &meta) {
-                error!(%uid, error = %mark,
-                       "could not mark an unstageable write durable; bytes at risk");
-            }
-            if e.is_disk_full() {
-                // Free cached blobs so the retry has somewhere to land, and tell
-                // the caller what is actually wrong.
-                self.cache.emergency_evict();
-                Errno::ENOSPC
-            } else {
-                Errno::EIO
-            }
-        })?;
-        // Whatever this write supersedes, it supersedes now — including an
-        // upload already on the wire, whose bytes describe a revision the row
-        // written just below replaces. Signalled before the enqueue so the
-        // in-flight reader stops at its next block rather than after however
-        // much of the file is left.
-        self.cancel_upload(uid);
-        let mut uid = uid.clone();
-        let len = meta.len;
-        let superseded = 'queued: {
-            if is_local_uid(&uid) {
-                // The node has no server-side identity to hang a revision on, so
-                // the bytes ride on the create that will mint it. Attached and
-                // recorded under one hold of `pending`, which is what the drain
-                // takes to retire a landed create: it either sees this blob and
-                // carries it over, or has already finished and this write
-                // queues against the real uid below (`Core::retire_create`).
-                let meta_json = serde_json::to_string(&meta).unwrap_or_default();
-                let mut pending = self.pending.lock();
-                let attached = self
-                    .db
-                    .attach_blob_to_create(&uid.to_string(), &path.to_string_lossy(), &meta_json)
-                    .map_err(|e| {
-                        error!(%uid, error = %e, "attaching write to queued create failed");
-                        Errno::EIO
-                    })?;
-                if let Some(attached) = attached {
-                    pending.insert(uid.clone(), PendingRevision { path, meta });
-                    break 'queued attached.superseded;
-                }
-                drop(pending);
-                // The create landed while this handle was open, and its row
-                // already has the uid Drive gave it.
-                let Some(real) = self.landed_row_uid(ino) else {
-                    error!(%uid, staged = %path.display(),
-                           "queued create vanished under a write; bytes kept in staging");
-                    return Err(Errno::EIO);
-                };
-                debug!(local = %uid, %real, "create landed under an open write; queueing a revision");
-                uid = real;
-                meta.uid = uid.to_string();
-                let previous = self.pending.lock().get(&uid).cloned();
-                meta.based_on = previous.as_ref().and_then(|p| p.meta.based_on.clone());
-                if !meta.complete
-                    && let Some(previous) = previous
-                    && let Err(error) = merge_over_pending(&mut meta, &path, &previous)
-                {
-                    error!(%uid, %error, staged = %path.display(),
-                           "folding in the write the create carried failed; bytes kept in staging");
-                    return Err(Errno::EIO);
-                }
-            }
-            let op = PendingOp {
-                id: 0,
-                kind: OP_REVISION.to_string(),
-                uid: uid.to_string(),
-                parent_uid: None,
-                name: None,
-                blob_path: Some(path.to_string_lossy().into_owned()),
-                meta_json: Some(serde_json::to_string(&meta).unwrap_or_default()),
-                created_at: now_millis(),
-                attempts: 0,
-                last_error: None,
-                next_attempt_at: now_millis() + self.revision_debounce(&uid).as_millis() as i64,
-            };
-            let (_id, superseded) = self.db.enqueue_op(&op).map_err(|e| {
-                error!(%uid, error = %e, "queueing upload failed");
-                Errno::EIO
-            })?;
-            self.pending
-                .lock()
-                .insert(uid.clone(), PendingRevision { path, meta });
-            superseded
-        };
-        if let Some(old) = superseded {
-            self.cache.discard_staged(Path::new(&old));
-        }
-        let uid = &uid;
-        // Reflect the write in the tree straight away: `ls` must show the new
-        // size and mtime even though the remote still holds the old revision.
-        let now = now_secs();
-        let updated = {
-            let mut st = self.state();
-            st.record_pending_write(ino, len, now)
-        };
-        // The only record that the file is as long as the caller was told. If it
-        // cannot be written the write did not fully take, and saying so beats
-        // acknowledging a `close(2)` and then serving the old size — the bytes
-        // themselves are already staged and queued either way. Written out here
-        // rather than inside `State` so the commit does not hold the inode lock.
-        let recorded = match updated {
-            Some(node) => self.db.upsert_node(&node),
-            None => Ok(()),
-        };
-        // Cached blobs and open readers describe the superseded revision. Reads
-        // come from the staged blob until the op drains, so just drop them.
-        // Done even when the row above failed: the staged blob is the file's
-        // content now either way, and leaving a stale one cached would serve it.
-        self.cache.evict(uid);
-        self.evict_reader(uid);
-        self.wake_drain();
-        if let Err(e) = recorded {
-            error!(%uid, error = %e, "recording a queued write's size failed");
-            return Err(if e.is_disk_full() {
-                Errno::ENOSPC
-            } else {
-                Errno::EIO
-            });
-        }
-        Ok(())
-    }
-
-    /// Queue the new content of a path-based truncate — `> file`, or any
-    /// `setattr(size=…)` arriving without a write handle.
-    ///
-    /// No bytes have been authored at truncate time, which is why this path was
-    /// never staged and instead resized the remote content inline. That is also
-    /// why a shell redirect failed offline *before* the write that follows it:
-    /// the truncate itself needed the network. Staging a blob describing the
-    /// result puts it on the same queue as every other write.
-    ///
-    /// The blob is a hole of the new length; what is real about it is `authored`:
-    ///
-    /// - `> file` (size 0) is the whole point and needs nothing at all — an
-    ///   empty file is complete content, so it queues and drains offline.
-    /// - Extending past the end authors the new tail (zeros, by definition) and
-    ///   leaves the head to be gap-filled from the base.
-    /// - Shrinking authors nothing: every remaining byte still comes from the
-    ///   base, so it is the drain that has to fetch it.
-    fn queue_truncate(&self, ino: u64, size: u64) -> Result<(), Errno> {
-        let (uid, base_mtime, base_size, base_revision_id) = {
-            let st = self.state();
-            match st.entries.get(&ino) {
-                Some(e) if e.node.is_file() => (
-                    e.uid.clone(),
-                    e.node.modification_time,
-                    node_size(&e.node),
-                    node_revision_id(&e.node),
-                ),
-                Some(_) => return Err(Errno::EISDIR),
-                None => return Err(Errno::ENOENT),
-            }
-        };
-        self.require_uid_writable(&uid)?;
-        if size == base_size {
-            return Ok(());
-        }
-        // A close immediately followed by truncate is common (`write`, close,
-        // `truncate(2)`) and usually beats the write-back debounce. In that
-        // case the remote is *not* our base: the complete staged revision is.
-        // Compose from those local bytes so the truncate can supersede the
-        // queued upload without fetching stale remote content or returning EIO.
-        let pending_base = self.pending.lock().get(&uid).cloned();
-        if pending_base
-            .as_ref()
-            .is_some_and(|pending| !pending.meta.complete)
-        {
-            // An incomplete pending blob still has holes referring to the
-            // remote revision. Stacking another incomplete transform on it is
-            // not representable safely; preserve the existing refusal.
-            return Err(Errno::EIO);
-        }
-        let (authored, complete) = if size == 0 {
-            // An empty file has no content to be missing.
-            (Vec::new(), true)
-        } else if base_size == 0 {
-            // Nothing to gap-fill from: every byte is a zero this truncate
-            // defines.
-            (vec![(0, size)], true)
-        } else if size > base_size {
-            (vec![(base_size, size)], false)
-        } else {
-            (Vec::new(), false)
-        };
-        let (file, path) = self.cache.create_scratch().map_err(|e| {
-            error!(%uid, error = %e, "create scratch file for truncate failed");
-            Errno::EIO
-        })?;
-        if let Some(pending) = &pending_base
-            && let Err(e) = copy_pending_for_truncate(pending, &file)
-        {
-            error!(%uid, source = %pending.path.display(), error = %e,
-                "copy pending revision for truncate failed");
-            let _ = std::fs::remove_file(&path);
-            return Err(Errno::EIO);
-        }
-        file.set_len(size).map_err(|e| {
-            error!(%uid, error = %e, "resize scratch file for truncate failed");
-            let _ = std::fs::remove_file(&path);
-            Errno::EIO
-        })?;
-        let meta = match pending_base {
-            Some(pending) => StagedWrite {
-                uid: uid.to_string(),
-                len: size,
-                base_size: pending.meta.len,
-                base_mtime: pending.meta.base_mtime,
-                authored: if size == 0 {
-                    Vec::new()
-                } else {
-                    vec![(0, size)]
-                },
-                complete: true,
-                // Both local revisions descend from the same last-observed
-                // remote revision. Never replace this with the optimistic
-                // mtime/size currently published by State.
-                based_on: pending.meta.based_on,
-            },
-            None => StagedWrite {
-                uid: uid.to_string(),
-                len: size,
-                base_size,
-                base_mtime,
-                authored,
-                complete,
-                based_on: self.remote_baseline(&uid, base_mtime, base_size, base_revision_id),
-            },
-        };
-        self.enqueue_staged_write(&uid, ino, &path, meta)?;
-        debug!(%uid, size, complete, "queued truncate");
-        Ok(())
-    }
-
-    /// Invent a node under `parent_uid` and queue the op that will make it real.
-    /// Returns the node to intern, exactly as the online
-    /// path returns the one the server minted.
-    ///
-    /// The parent may itself be a placeholder — `mkdir -p` offline, or `cp -r` of
-    /// a tree. That is fine: the op records the parent it was made under by local
-    /// id, and is not sent until the parent's row has the uid it landed as.
-    fn queue_local_node(
-        &self,
-        parent_uid: &NodeUid,
-        name: &str,
-        is_dir: bool,
-        hold: bool,
-    ) -> Result<Node, Errno> {
-        self.require_uid_writable(parent_uid)?;
-        // The row the tree would give it anyway, now: the node goes by its
-        // local id until it lands.
-        let lid = self
-            .db
-            .add_local_row(&parent_uid.to_string(), name, is_dir, now_secs())
-            .map_err(|e| {
-                error!(%parent_uid, name, error = %e, "giving a local node its row failed");
-                Errno::EIO
-            })?;
-        let uid = local_node_uid(lid);
-        let node = local_node(uid.clone(), parent_uid.clone(), name.to_string(), is_dir);
-        let op = PendingOp {
-            id: 0,
-            kind: if is_dir { OP_MKDIR } else { OP_CREATE }.to_string(),
-            uid: uid.to_string(),
-            parent_uid: Some(parent_uid.to_string()),
-            name: Some(name.to_string()),
-            blob_path: None,
-            meta_json: None,
-            created_at: now_millis(),
-            attempts: 0,
-            last_error: None,
-            // Parked when the name is transient: its bytes ride on this create
-            // (via `attach_blob_to_create`) and must not upload until a rename to
-            // the finished name un-parks it (docs/BUGS.md B70).
-            next_attempt_at: if hold { PARK_UNTIL } else { 0 },
-        };
-        self.db.enqueue_op(&op).map_err(|e| {
-            error!(%parent_uid, name, error = %e, "queueing local node failed");
-            Errno::EIO
-        })?;
-        debug!(%uid, %parent_uid, name, is_dir, "created node offline; queued");
-        // A folder is due now; without this the workers slept through it to
-        // the idle poll (B160). A file is not: its bytes ride on the create, and
-        // its release wakes the drain, with bytes or without (B192).
-        if is_dir {
-            self.wake_drain();
-        }
-        Ok(node)
-    }
-
-    /// Queue giving a node a new parent and/or name, and apply it to the tree
-    /// now.
-    ///
-    /// The op records the desired end state rather than the step, so it both
-    /// supersedes any earlier queued rename and lets the drain skip whichever
-    /// half the remote already agrees with.
-    ///
-    /// `new_parent_uid` may be a placeholder — moving a file into a folder
-    /// created offline — which is why this cannot simply be the online call with
-    /// a retry around it: the API would 404 on a `local~` parent. The op waits
-    /// for that folder's drain to rewrite it, exactly as a queued create does.
-    fn queue_rename(
-        &self,
-        ino: u64,
-        uid: &NodeUid,
-        old_parent_uid: &NodeUid,
-        new_parent_ino: u64,
-        new_parent_uid: &NodeUid,
-        new_name: &str,
-    ) -> Result<(), Errno> {
-        self.require_uid_writable(uid)?;
-        self.require_uid_writable(old_parent_uid)?;
-        self.require_uid_writable(new_parent_uid)?;
-        self.queue_rename_authorized(
-            ino,
-            uid,
-            old_parent_uid,
-            new_parent_ino,
-            new_parent_uid,
-            new_name,
-        )
-    }
-
-    /// Enqueue a rename whose access was linearized immediately before a
-    /// replacement victim was removed. Rechecking here could reject after that
-    /// destructive half had already completed.
-    fn queue_rename_authorized(
-        &self,
-        ino: u64,
-        uid: &NodeUid,
-        old_parent_uid: &NodeUid,
-        new_parent_ino: u64,
-        new_parent_uid: &NodeUid,
-        new_name: &str,
-    ) -> Result<(), Errno> {
-        self.enqueue_rename(ino, uid, old_parent_uid, new_parent_uid, new_name)?;
-        self.state
-            .lock()
-            .rename_in_place(ino, new_parent_ino, new_parent_uid, new_name);
-        self.wake_drain();
-        debug!(%uid, %new_parent_uid, new_name, "renamed offline; queued");
-        Ok(())
-    }
-
-    /// Record the queued rename op, and nothing else: the caller moves the node
-    /// in the tree, through the kernel or around it.
-    fn enqueue_rename(
-        &self,
-        ino: u64,
-        uid: &NodeUid,
-        old_parent_uid: &NodeUid,
-        new_parent_uid: &NodeUid,
-        new_name: &str,
-    ) -> Result<(), Errno> {
-        // A rename that replaces a queued one keeps where the node started.
-        let meta = match self.db.pending_op_meta(&uid.to_string(), OP_RENAME) {
-            Ok(Some(json)) => serde_json::from_str::<RenameMeta>(&json).map_err(|error| {
-                error!(%uid, %error, "queued rename authority metadata is invalid");
-                Errno::EIO
-            })?,
-            Ok(None) => RenameMeta {
-                original_parent_uid: old_parent_uid.to_string(),
-                original_name: self
-                    .state
-                    .lock()
-                    .entries
-                    .get(&ino)
-                    .map(|entry| entry.node.name.clone()),
-            },
-            Err(error) => {
-                error!(%uid, %error, "reading queued rename authority failed");
-                return Err(Errno::EIO);
-            }
-        };
-        let meta_json = serde_json::to_string(&meta).map_err(|error| {
-            error!(%uid, %error, "serializing queued rename authority failed");
-            Errno::EIO
-        })?;
-        let op = PendingOp {
-            id: 0,
-            kind: OP_RENAME.to_string(),
-            uid: uid.to_string(),
-            parent_uid: Some(new_parent_uid.to_string()),
-            name: Some(new_name.to_string()),
-            blob_path: None,
-            meta_json: Some(meta_json),
-            created_at: now_millis(),
-            attempts: 0,
-            last_error: None,
-            next_attempt_at: 0,
-        };
-        self.db.enqueue_op(&op).map_err(|e| {
-            error!(%uid, new_name, error = %e, "queueing rename failed");
-            Errno::EIO
-        })?;
-        Ok(())
-    }
-
-    fn has_pending_moves_out_of(&self, uid: &NodeUid) -> Result<bool, Errno> {
-        self.db
-            .has_pending_moves_out_of(&uid.to_string())
-            .map_err(|error| {
-                error!(%uid, %error, "checking for moves out of a trash target failed");
-                Errno::EIO
-            })
-    }
-
-    /// Queue trashing a node the server knows about, and drop it from the tree
-    /// now.
-    ///
-    /// Anything else queued for this node is discarded first: the user has said
-    /// the file should not exist, so uploading bytes to it or renaming it are
-    /// both work towards an outcome nobody wants any more. That does throw away
-    /// staged bytes that never landed — which is precisely what deleting an
-    /// un-uploaded file means, and the alternative (upload it, then trash it) is
-    /// worse in every way.
-    ///
-    /// A file still open keeps the bytes its handle reads, the queued ones and
-    /// the cached ones, as when the trash is sent at once: a partial write
-    /// fills its gaps from them, offline too (`docs/BUGS.md` B186). The final
-    /// close or the trash landing, whichever comes last, lets go of them.
-    ///
-    /// `open` is whether the caller found the file open. A create that landed
-    /// under a delete is trashed by its real uid before the tree has it, so
-    /// asking the tree alone took an open file for closed (`docs/BUGS.md`
-    /// B257).
-    fn queue_trash(&self, uid: &NodeUid, name: &str, open: bool) -> Result<(), Errno> {
-        self.require_uid_writable(uid)?;
-        // The bytes below are about to be discarded, and a drain worker may be
-        // reading them onto the wire right now. Stop it first: with several
-        // workers the trash op this queues can be claimed while that upload is
-        // still running, and the two would race to decide whether the file
-        // exists.
-        self.cancel_upload(uid);
-        let (_, blobs) = self
-            .db
-            .replace_ops_with_trash(&uid.to_string(), name, now_millis())
-            .map_err(|e| {
-                error!(%uid, error = %e, "queueing trash failed");
-                Errno::EIO
-            })?;
-        let open_now = open || self.is_open_anywhere(uid);
-        if open_now {
-            let read_from = self.pending_blob(uid);
-            self.release_dropped_below(
-                blobs
-                    .into_iter()
-                    .filter(|blob| read_from.as_deref() != Some(Path::new(blob)))
-                    .collect(),
-            );
-        } else {
-            self.release_dropped_ops(uid, blobs);
-        }
-        self.hidden.lock().insert(uid.clone());
-        // Withdrawn from the tree, which every mount serves from, so no other
-        // mount goes on serving a file the user just trashed (`docs/BUGS.md`
-        // B74).
-        self.for_each_state(|st| {
-            st.unlink_mem(uid);
-        });
-        if !open_now {
-            self.cache.evict(uid);
-            self.evict_reader(uid);
-        }
-        self.wake_drain();
-        debug!(%uid, name, "trashed offline; queued");
-        Ok(())
-    }
-
-    /// Drop every op queued against a node, and the staged bytes they own.
-    fn discard_queued_ops(&self, uid: &NodeUid) -> Result<(), Errno> {
-        // Same reason as `queue_trash`: an upload may be reading the very blobs
-        // this is about to unlink.
-        self.cancel_upload(uid);
-        let blobs = self.db.delete_ops_for_uid(&uid.to_string()).map_err(|e| {
-            error!(%uid, error = %e, "dropping queued ops failed");
-            Errno::EIO
-        })?;
-        self.release_dropped_ops(uid, blobs);
-        Ok(())
-    }
-
-    /// Drop every op queued against a node that just left the namespace while
-    /// a handle still has it open, but keep the bytes that handle reads.
-    ///
-    /// The ops cannot wait for the final close: the node is already trashed, and
-    /// a revision the drain sends in the meantime lands on it after the trash —
-    /// an editor's save loop then found the name it was renaming onto still
-    /// taken (`docs/BUGS.md` B106). The pending entry and its staged blob are
-    /// what the open handle reads, so they stay until the final close drops
-    /// them.
-    fn withdraw_queued_ops(&self, uid: &NodeUid) -> Result<(), Errno> {
-        self.cancel_upload(uid);
-        let blobs = self.db.delete_ops_for_uid(&uid.to_string()).map_err(|e| {
-            error!(%uid, error = %e, "withdrawing queued ops failed");
-            Errno::EIO
-        })?;
-        let read_from = self.pending_blob(uid);
-        let blobs = blobs
-            .into_iter()
-            .filter(|blob| read_from.as_deref() != Some(Path::new(blob)))
-            .collect();
-        self.release_dropped_below(blobs);
-        Ok(())
-    }
-
-    /// Let go of what the ops just dropped for `uid` held: their pending
-    /// entries, any upload still reading their bytes, and the bytes.
-    ///
-    /// Removing a folder also drops the queued revisions of the files below it
-    /// (`docs/BUGS.md` B102), so the entries to forget are found by blob, not
-    /// only by `uid`.
-    fn release_dropped_ops(&self, uid: &NodeUid, blobs: Vec<String>) {
-        self.pending.lock().remove(uid);
-        self.release_dropped_below(blobs);
-    }
-
-    /// [`Core::release_dropped_ops`] without touching the node's own pending
-    /// entry.
-    fn release_dropped_below(&self, blobs: Vec<String>) {
-        let below: Vec<NodeUid> = {
-            let mut pending = self.pending.lock();
-            let below: Vec<NodeUid> = pending
-                .iter()
-                .filter(|(_, p)| blobs.iter().any(|b| p.path == Path::new(b)))
-                .map(|(k, _)| k.clone())
-                .collect();
-            for k in &below {
-                pending.remove(k);
-            }
-            below
-        };
-        for k in &below {
-            self.cancel_upload(k);
-        }
-        for blob in blobs {
-            self.cache.discard_staged(Path::new(&blob));
-        }
-    }
-
     /// Which staged blob is currently queued for `uid`, if any.
     ///
     /// The path identifies the revision: publication stages a fresh file and
@@ -3425,73 +1740,6 @@ impl Core {
         let (lock, cv) = &*self.drain.drain_wake;
         *lock.lock() = true;
         cv.notify_all();
-    }
-
-    /// Keep a write we cannot safely queue, so the bytes are recoverable even
-    /// though the caller is getting an error. See [`Core::queue_revision`].
-    fn stage_orphaned_write(
-        &self,
-        uid: &NodeUid,
-        ino: u64,
-        src: &Path,
-        meta: &StagedWrite,
-        reason: &str,
-    ) {
-        match self.cache.preserve_write(meta, src) {
-            Ok(staged) => {
-                self.cache.clear_scratch_durable(src);
-                error!(
-                    %uid,
-                    staged = %staged.display(),
-                    %reason,
-                    "cannot queue write; bytes kept in staging"
-                );
-                let name = {
-                    let st = self.state();
-                    st.entries
-                        .get(&ino)
-                        .map(|e| e.node.name.clone())
-                        .unwrap_or_default()
-                };
-                self.log_activity(
-                    ActivityKind::Upload,
-                    &name,
-                    format!(
-                        "write not queued ({reason}); changes kept at {}",
-                        staged.display()
-                    ),
-                    false,
-                );
-            }
-            Err(e) => {
-                let surviving = e.surviving_path.clone();
-                let marker = e.marker_path.clone();
-                error!(
-                    %uid,
-                    error = %e,
-                    surviving = %surviving.display(),
-                    marker = ?marker,
-                    %reason,
-                    "write rescue was only partially published; bytes retained"
-                );
-                let name = {
-                    let st = self.state();
-                    st.entries
-                        .get(&ino)
-                        .map(|entry| entry.node.name.clone())
-                        .unwrap_or_default()
-                };
-                self.log_activity(
-                    ActivityKind::Upload,
-                    &name,
-                    format!(
-                        "write not queued ({reason}); changes retained at {}",
-                        surviving.display()
-                    ),
-                    false,
-                );
-            }
-        }
     }
 
     /// Download a whole file's plaintext, registering the transfer so
@@ -3556,149 +1804,6 @@ impl Core {
         Ok(out.into_inner())
     }
 
-    /// Pin the node at mountpoint-relative `rel`. A file downloads its full
-    /// plaintext into the content cache before this returns. A folder records a
-    /// recursive pin and downloads every descendant file on a background thread,
-    /// reported as a job: a big folder far outlasts the socket read timeout.
-    /// Returns a human message.
-    ///
-    /// `recorded` is the path the pin registry keeps for the front ends to
-    /// open the pin by: `rel` itself on the primary mount, which they join to
-    /// the mountpoint, and the absolute local path on an on-demand folder's
-    /// mount, whose node is not reachable under the primary mountpoint at all.
-    fn pin(&self, rel: &Path, recorded: &Path) -> CoreResult<String> {
-        let (ino, uid) = self.resolve(rel)?;
-        let (name, is_folder, mtime, size) = {
-            let st = self.state();
-            let e = st
-                .entries
-                .get(&ino)
-                .ok_or_else(|| CoreError::not_found("node vanished"))?;
-            (
-                e.node.name.clone(),
-                e.node.is_folder(),
-                e.node.modification_time,
-                node_size(&e.node),
-            )
-        };
-        if is_folder {
-            // Offline, every download would fail and the folder would only look
-            // kept. Refuse instead, as a file pin does.
-            if !self.is_online() {
-                return Err(CoreError::offline());
-            }
-            // Record the recursive pin first so every descendant is eviction-
-            // exempt before we start filling the cache with the subtree.
-            self.cache
-                .add_pin(&uid, recorded, true)
-                .map_err(|e| CoreError::from_api(&e, "pin"))?;
-            let core = self.clone();
-            let folder = name.clone();
-            std::thread::Builder::new()
-                .name("pin-folder".into())
-                .spawn(move || core.pin_subtree(ino, &uid, &folder))
-                .map_err(|e| CoreError::internal(format!("spawn pin: {e}")))?;
-            return Ok(format!("{name}: downloading its files in the background"));
-        }
-        // Stored under a provisional size, the copy would never match the
-        // plaintext it holds (`docs/BUGS.md` B282).
-        let size = match self.kept_file(ino) {
-            Some(file) if file.uid == uid => file.size,
-            _ => size,
-        };
-        self.fetch_content(&uid, &name, mtime, size)?;
-        self.cache
-            .add_pin(&uid, recorded, false)
-            .map_err(|e| CoreError::from_api(&e, "pin"))?;
-        Ok(name)
-    }
-
-    /// Download and cache every file in the subtree rooted at the pinned folder
-    /// `ino` (`folder`, named `name`), as a job the front ends show. Walks the
-    /// tree depth-first, enumerating each folder so a cold subtree is fully
-    /// discovered; the lock is dropped before each network download. Stops when
-    /// the folder is unpinned or the daemon stops.
-    fn pin_subtree(&self, ino: u64, folder: &NodeUid, name: &str) {
-        let job = self
-            .transfers
-            .begin_job(format!("Making {name} available offline"));
-        match self.pin_subtree_files(ino) {
-            Ok(files) => {
-                job.set_total(files.len() as u64);
-                let mut failed = 0usize;
-                for ino in files {
-                    if self.shutdown.is_stopping() || !self.cache.is_pinned(folder) {
-                        return;
-                    }
-                    // A file with a queued write, or no readable size, is
-                    // left to the drain and the keeper (`keeper::kept_file`).
-                    if let Some(file) = self.kept_file(ino) {
-                        job.detail(file.name.clone());
-                        if let Err(e) =
-                            self.fetch_pinned(&file.uid, &file.name, file.mtime, file.size)
-                        {
-                            warn!(uid = %file.uid, error = %e, "pin folder: download failed");
-                            failed += 1;
-                        }
-                    }
-                    job.step();
-                }
-                info!(folder = %name, failed, "pin folder: done");
-            }
-            Err(e) => warn!(folder = %name, error = %e, "pin folder: enumerate failed"),
-        }
-    }
-
-    /// Cache the file `uid` for a folder pin. Its `mtime` and `size` were read
-    /// before the download, and a create landing or a remote edit can change
-    /// them while it runs. The blob is then stored under the old ones and reads
-    /// as stale, so the file is listed as kept but not available offline. Fetch
-    /// it again under the new ones, a few times at most.
-    fn fetch_pinned(&self, uid: &NodeUid, name: &str, mtime: i64, size: u64) -> CoreResult<()> {
-        let mut fetched = (mtime, size);
-        for _ in 0..3 {
-            self.fetch_content(uid, name, fetched.0, fetched.1)?;
-            let current = {
-                let st = self.state();
-                st.by_uid
-                    .get(uid)
-                    .and_then(|ino| st.entries.get(ino))
-                    .map(|e| (e.node.modification_time, node_size(&e.node)))
-            };
-            match current {
-                Some(now) if now != fetched => fetched = now,
-                _ => break,
-            }
-        }
-        Ok(())
-    }
-
-    /// The inode of every file in the subtree rooted at folder `ino`.
-    fn pin_subtree_files(&self, ino: u64) -> CoreResult<Vec<u64>> {
-        let mut files: Vec<u64> = Vec::new();
-        let mut stack = vec![ino];
-        while let Some(dir) = stack.pop() {
-            if self.shutdown.is_stopping() {
-                break;
-            }
-            self.ensure_children(dir)
-                .map_err(|e| self.errno_error(e, "enumerate"))?;
-            let st = self.state();
-            if let Some(kids) = st.children.get(&dir) {
-                for &k in kids {
-                    if let Some(e) = st.entries.get(&k) {
-                        if e.node.is_folder() {
-                            stack.push(k);
-                        } else {
-                            files.push(k);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(files)
-    }
-
     /// Fetch a thumbnail of `ttype` for the file at `ino`, served from the cache
     /// when fresh and otherwise downloaded from the remote and cached. Returns
     /// `Ok(None)` when the node is not a file or has no thumbnail of that type.
@@ -3752,60 +1857,6 @@ impl Core {
             }
         }
         Ok(bytes)
-    }
-
-    /// Unpin the node at `rel`, evicting its cached content. For a folder, also
-    /// evicts every descendant's cached blob (the subtree is no longer kept).
-    /// A node kept only because a folder above it is pinned is refused: there
-    /// is no pin of its own to remove, and it would stay kept all the same.
-    fn unpin(&self, rel: &Path) -> CoreResult<String> {
-        let (ino, uid) = self.resolve(rel)?;
-        let (name, is_folder) = {
-            let st = self.state();
-            st.entries
-                .get(&ino)
-                .map(|e| (e.node.name.clone(), e.node.is_folder()))
-                .unwrap_or_default()
-        };
-        if self.pinned_by_folder(ino) {
-            return Err(CoreError::conflict(format!(
-                "{name} is kept offline because a folder above it is; unpin that folder instead"
-            )));
-        }
-        self.cache
-            .remove_pin(&uid)
-            .map_err(|e| CoreError::from_api(&e, "unpin"))?;
-        // A recursively-pinned folder's descendants were eviction-exempt; now
-        // that the pin is gone, reclaim their blobs eagerly instead of waiting
-        // for budget pressure. Descendants come from the DB node tree. One
-        // pinned on its own, or under a pinned subfolder, is still kept.
-        if is_folder && let Ok(uids) = self.db.descendants(&uid.to_string()) {
-            let still_pinned = self.pinned_set();
-            for s in uids {
-                if still_pinned.contains(&s) {
-                    continue;
-                }
-                if let Some(u) = parse_uid(&s) {
-                    self.cache.evict(&u);
-                    self.evict_reader(&u);
-                }
-            }
-        }
-        Ok(name)
-    }
-
-    /// Whether the node at `ino` is kept offline because a folder above it is
-    /// pinned, whether or not it is also pinned on its own.
-    fn pinned_by_folder(&self, ino: u64) -> bool {
-        let parent = {
-            let st = self.state();
-            st.entries
-                .get(&ino)
-                .filter(|e| e.parent != ino)
-                .and_then(|e| st.entries.get(&e.parent))
-                .map(|p| p.uid.clone())
-        };
-        parent.is_some_and(|uid| self.cache.is_pinned(&uid))
     }
 
     /// A Photos API handle sharing this Core's Drive client and session, so it
@@ -3879,230 +1930,6 @@ impl Core {
                     .map(|issue| SyncIssue::parse(issue)),
             })
             .collect())
-    }
-
-    /// Every uid that is pinned right now, as one set.
-    ///
-    /// `cache.is_pinned` is a direct lookup plus an ancestor walk; asking it per
-    /// candidate was a thousand walks per keystroke. The recursive expansion is
-    /// the same query, run once.
-    fn pinned_set(&self) -> HashSet<String> {
-        self.db
-            .pinned_uids()
-            .unwrap_or_default()
-            .into_iter()
-            .collect()
-    }
-
-    /// The local locations a search result can be opened through, resolved once
-    /// per search rather than once per hit.
-    ///
-    /// An on-demand folder only answers while its mount is live — without the
-    /// mount its `local_path` is an ordinary empty directory. A mirror folder
-    /// needs no mount: its files are real local copies the sync loop pushes
-    /// back, so it is a valid open target whenever it is configured.
-    ///
-    /// This used to be a per-hit call that re-read the sync-folder list and ran
-    /// an ancestor walk per folder, against a candidate pool of up to a
-    /// thousand: the whole cost of a keystroke was in here.
-    fn search_roots(&self) -> SearchRoots {
-        let live_mounts = self.mounts.lock();
-        let folders = self.db.sync_folder_list().unwrap_or_default();
-        SearchRoots {
-            roots: folders
-                .into_iter()
-                .filter(|folder| match folder.mode.as_str() {
-                    "ondemand" => live_mounts.contains_key(&folder.id),
-                    "mirror" => true,
-                    _ => false,
-                })
-                .filter_map(|folder| {
-                    let root = self.db.node_path(&folder.remote_uid).ok().flatten()?;
-                    Some((root, PathBuf::from(folder.local_path)))
-                })
-                .collect(),
-        }
-    }
-
-    /// Full-text search node names against the local SQLite index, mapping each
-    /// DB hit to the wire [`SearchHit`] (resolving live pin state from the cache,
-    /// which the DB doesn't track). Pure local lookup — never hits the network.
-    /// Every pin, with `cached` saying whether a pinned file's content is on
-    /// disk, so a front-end listing pins can badge them without a round-trip
-    /// per file.
-    fn list_pins(&self) -> Vec<pdfs_core::control::Pin> {
-        let mut pins = self.cache.list_pins();
-        for pin in pins.iter_mut().filter(|pin| pin.is_dir == Some(false)) {
-            if let Ok(Some(node)) = self.db.node_by_uid(&pin.uid) {
-                pin.cached =
-                    self.cache
-                        .is_cached(&node.uid, node.modification_time, node_size(&node));
-            }
-        }
-        pins
-    }
-
-    fn search(&self, query: &str, limit: usize, scope: Option<&str>) -> CoreResult<Vec<SearchHit>> {
-        let hits = self
-            .db
-            .search_in(query, limit, scope)
-            .map_err(|e| CoreError::from_api(&e, "search"))?;
-        let roots = self.search_roots();
-        let pinned = self.pinned_set();
-        Ok(hits
-            .into_iter()
-            .map(|h| SearchHit {
-                name: h.node.name.clone(),
-                is_dir: h.node.is_folder(),
-                size: node_size(&h.node),
-                modified: h.node.modification_time,
-                pinned: pinned.contains(&h.node.uid.to_string()),
-                cached: !h.node.is_folder()
-                    && self.cache.is_cached(
-                        &h.node.uid,
-                        h.node.modification_time,
-                        node_size(&h.node),
-                    ),
-                uid: h.node.uid.to_string(),
-                mounted_path: roots.resolve(&h.path),
-                path: h.path,
-                score: 0,
-            })
-            .collect())
-    }
-
-    /// Search the index of files on this machine (outside Drive), built by the
-    /// background scanner in [`run_local_index`]. Pure local lookup, never hits
-    /// the network — and never touches the FUSE mount, which the scanner excludes.
-    fn search_local(&self, query: &str, limit: usize) -> CoreResult<Vec<LocalHit>> {
-        let hits = self
-            .db
-            .search_local(query, limit)
-            .map_err(|e| CoreError::from_api(&e, "local search"))?;
-        Ok(hits
-            .into_iter()
-            .map(|h| LocalHit {
-                name: h.name,
-                path: h.path,
-                is_dir: h.is_dir,
-                size: h.size.max(0) as u64,
-                modified: h.mtime,
-                score: 0,
-            })
-            .collect())
-    }
-
-    /// Search both prompt sources with identical query and per-source limits.
-    /// Keeping the composition in the daemon core gives every control surface
-    /// the same semantics while preserving the legacy source-specific methods.
-    fn search_v2(
-        &self,
-        query: &str,
-        limit: usize,
-        filters: &SearchFilters,
-    ) -> CoreResult<(Vec<SearchHit>, Vec<LocalHit>)> {
-        if query.trim().is_empty() || limit == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        // Candidate generation is intentionally broader than the final result
-        // cap: filtering and fuzzy rejection happen below, so limiting at the
-        // SQLite boundary to `limit` would recreate the old empty-filter bug.
-        let candidate_limit = limit.saturating_mul(10).clamp(100, 1_000);
-        let mut drive_hits = if filters.sources.contains(&SearchSource::Drive) {
-            let roots = self.search_roots();
-            let pinned = self.pinned_set();
-            self.db
-                .search_candidates(query, candidate_limit)
-                .map_err(|e| CoreError::from_api(&e, "search candidates"))?
-                .into_iter()
-                .filter(|hit| filters.kind.accepts(&hit.node.name, hit.node.is_folder()))
-                .filter_map(|hit| {
-                    let parent = Path::new(&hit.path)
-                        .parent()
-                        .map_or_else(String::new, |path| path.display().to_string());
-                    let uid = hit.node.uid.to_string();
-                    let is_pinned = pinned.contains(&uid);
-                    let score = relevance_score(query, &hit.node.name, &parent)?
-                        + if is_pinned { 250 } else { 0 };
-                    Some(SearchHit {
-                        name: hit.node.name.clone(),
-                        is_dir: hit.node.is_folder(),
-                        size: node_size(&hit.node),
-                        modified: hit.node.modification_time,
-                        pinned: is_pinned,
-                        cached: !hit.node.is_folder()
-                            && self.cache.is_cached(
-                                &hit.node.uid,
-                                hit.node.modification_time,
-                                node_size(&hit.node),
-                            ),
-                        uid,
-                        mounted_path: roots.resolve(&hit.path),
-                        path: hit.path,
-                        score,
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let mut local_hits = if filters.sources.contains(&SearchSource::Local) {
-            self.db
-                .search_local_candidates(query, candidate_limit)
-                .map_err(|e| CoreError::from_api(&e, "local search candidates"))?
-                .into_iter()
-                .filter(|hit| filters.kind.accepts(&hit.name, hit.is_dir))
-                .filter_map(|hit| {
-                    let parent = Path::new(&hit.path)
-                        .parent()
-                        .map_or_else(String::new, |path| path.display().to_string());
-                    Some(LocalHit {
-                        score: relevance_score(query, &hit.name, &parent)?,
-                        name: hit.name,
-                        path: hit.path,
-                        is_dir: hit.is_dir,
-                        size: hit.size.max(0) as u64,
-                        modified: hit.mtime,
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        drive_hits.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        local_hits.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        drive_hits.truncate(limit);
-        local_hits.truncate(limit);
-        Ok((drive_hits, local_hits))
-    }
-
-    /// A page of the photos timeline (newest first), sliced out of the DB.
-    /// `Ok(None)` when the account has no photos volume.
-    ///
-    /// Stale-while-revalidate: a persisted timeline is served *immediately*, and
-    /// refreshed on the runtime if it is older than [`TIMELINE_TTL`] — so opening
-    /// the app paints from disk rather than waiting on a full `enumerate_timeline`
-    /// (which returns the whole timeline, not a page). Only an empty DB blocks on
-    /// the network, i.e. the very first run.
-    ///
-    /// Metadata only: a thumbnail path is attached for photos whose thumbnail is
-    /// already cached, and nothing is downloaded here — the front-end pulls the
-    /// thumbnails it actually paints via [`Core::photo_thumbs`].
-    fn listing_stale(&self, key: &str, ttl: Duration) -> bool {
-        match self.db.state_i64(key).ok().flatten() {
-            Some(ms) => now_ms().saturating_sub(ms) >= ttl.as_millis() as i64,
-            None => true,
-        }
     }
 
     /// Re-fetch the whole photos timeline and persist it. Returns whether the
@@ -5865,18 +3692,18 @@ mod pending_size_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::echoes::{SELF_CHANGE_TTL_MS, note_self_change, take_self_change};
     use super::trash::{expand_restore, first_seen_in_trash};
     use super::{
         Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, RootListingSnapshot,
-        SELF_CHANGE_TTL_MS, ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan,
-        accepted_share_provenance, conflict_label, conflict_label_of, conflict_name,
-        conflict_name_as, copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible,
-        note_self_change, off_the_runtime, orphan_past_retention, parse_node_uid,
-        prepare_shared_roots, preserve_on_access_denied, publish_virtual_root_in_listing,
-        reconcile_virtual_root_in_listing, release_can_discard_unlinked,
-        release_must_retain_queued_trash, release_unlinked_entry, rename_needs_queue,
-        require_node_parent_access, require_rename_access, resolve_anywhere_with,
-        shared_with_me_uid, take_self_change, uid_write_authority, virtual_node,
+        ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan, accepted_share_provenance,
+        conflict_label, conflict_label_of, conflict_name, conflict_name_as,
+        copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, off_the_runtime,
+        orphan_past_retention, parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
+        publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
+        release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
+        rename_needs_queue, require_node_parent_access, require_rename_access,
+        resolve_anywhere_with, shared_with_me_uid, uid_write_authority, virtual_node,
     };
     use super::{Db, WriteAuthority};
     use std::time::Duration;
@@ -7241,6 +5068,22 @@ mod tests {
         );
     }
 
+    /// `Core`'s source: `lib.rs` and the modules its methods were split into.
+    const CORE_SOURCE: &str = concat!(
+        include_str!("enqueue.rs"),
+        include_str!("listing.rs"),
+        include_str!("maintenance.rs"),
+        include_str!("pins.rs"),
+        include_str!("recovery.rs"),
+        include_str!("search.rs"),
+        include_str!("shared.rs"),
+        include_str!("sizes.rs"),
+        include_str!("trash.rs"),
+        // Last: the tests below quote signatures, and a search must find the
+        // function before it finds the quote.
+        include_str!("lib.rs"),
+    );
+
     fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
         let start = source.find(signature).expect("function signature exists");
         let body = &source[start..];
@@ -7269,7 +5112,7 @@ mod tests {
 
     #[test]
     fn production_queue_guards_precede_mutating_work() {
-        let source = include_str!("lib.rs");
+        let source = CORE_SOURCE;
 
         let revision = function_source(source, "fn queue_revision(");
         assert_before(revision, "if !h.dirty", "preserve_on_access_denied");
@@ -7377,7 +5220,7 @@ mod tests {
     fn a_listing_for_the_cli_settles_sizes_before_reading_them() {
         // A fresh listing holds ciphertext sizes until its upgrade lands
         // (`docs/BUGS.md` B115).
-        let list = function_source(include_str!("lib.rs"), "fn list_dir(&self, rel: &Path)");
+        let list = function_source(CORE_SOURCE, "fn list_dir(&self, rel: &Path)");
         assert_before(
             list,
             "self.ensure_children(ino)",
@@ -7390,7 +5233,7 @@ mod tests {
     fn a_replaced_node_survives_its_open_handles() {
         // A rename over a file someone is reading must leave that reader on the
         // replaced bytes; forgetting the inode outright made its next read EIO.
-        let source = include_str!("lib.rs");
+        let source = CORE_SOURCE;
         let replaced = function_source(source, "fn remove_replaced(");
         assert!(replaced.contains("forget_or_unlink(uid)"));
         assert!(!replaced.contains("st.forget(uid)"));
@@ -7412,7 +5255,7 @@ mod tests {
         // file for one unlinked before it was created and dropped the write
         // (B176). The landing removes the op and moves the row at once, so a
         // missing op is checked against the row.
-        let revision = function_source(include_str!("lib.rs"), "fn queue_revision(");
+        let revision = function_source(CORE_SOURCE, "fn queue_revision(");
         assert_before(
             revision,
             "self.db.has_create_op(",
@@ -7429,7 +5272,7 @@ mod tests {
     fn a_replaced_node_put_back_shows_in_the_mount_again() {
         // The restore after a failed rename left the node hidden and out of
         // the listing, so a create by its name failed with ENOENT (B124).
-        let restore = function_source(include_str!("lib.rs"), "fn restore_replaced(");
+        let restore = function_source(CORE_SOURCE, "fn restore_replaced(");
         assert_before(
             restore,
             "self.drive.restore_nodes(",
@@ -7443,7 +5286,7 @@ mod tests {
     fn a_size_upgrade_leaves_the_page_cache_alone() {
         // Reads resolve provisional sizes inline, while the kernel holds the
         // page lock of that read; dropping pages here waited on it forever.
-        let upgrade = function_source(include_str!("sizes.rs"), "fn apply_size_upgrade(");
+        let upgrade = function_source(CORE_SOURCE, "fn apply_size_upgrade(");
         assert!(upgrade.contains("notifier.inval_attrs(ino)"));
         assert!(!upgrade.contains("notifier.inval_inode("));
         let read = function_source(include_str!("filesystem.rs"), "    fn read(");
@@ -7506,7 +5349,7 @@ mod tests {
     #[test]
     fn every_remote_rename_and_move_rides_out_a_stale_hash() {
         for source in [
-            include_str!("lib.rs"),
+            CORE_SOURCE,
             include_str!("filesystem.rs"),
             include_str!("drain.rs"),
             include_str!("relocate.rs"),
@@ -7536,15 +5379,15 @@ mod tests {
         // The SDK would send the old name hash with the node's next rename or
         // move until the event poll caught up (B121), and the echo of the
         // change, taken for someone else's, evicted the cached bytes (B123).
-        let change = function_source(include_str!("lib.rs"), "fn change_remote(");
+        let change = function_source(CORE_SOURCE, "fn change_remote(");
         assert!(
             change.contains("self.forget_sdk_node(uid)"),
             "forget the node before each retry"
         );
         assert!(change.contains("self.changed_remote(uid)"));
-        let moved = function_source(include_str!("lib.rs"), "fn move_rename_remote(");
+        let moved = function_source(CORE_SOURCE, "fn move_rename_remote(");
         assert!(moved.contains("self.change_remote(uid"));
-        let changed = function_source(include_str!("lib.rs"), "fn changed_remote(");
+        let changed = function_source(CORE_SOURCE, "fn changed_remote(");
         assert!(changed.contains("self.forget_sdk_node(uid)"));
         assert!(changed.contains("self.note_self_change(uid)"));
     }
@@ -7553,7 +5396,7 @@ mod tests {
     fn a_listing_changed_while_published_is_taken_again() {
         // The root listed again after a restart while a lookup was publishing
         // the "Shared with me" entry, and the lookup answered EAGAIN (B159).
-        let ensure = function_source(include_str!("lib.rs"), "fn ensure_children(");
+        let ensure = function_source(CORE_SOURCE, "fn ensure_children(");
         assert_before(
             ensure,
             "for _ in 1..LISTING_ATTEMPTS",
@@ -7570,7 +5413,7 @@ mod tests {
     fn a_folder_lists_from_the_db_while_the_link_is_down() {
         // A listing dropped as stale mid-run, then a drop: every create in that
         // folder looks the name up first, and answered EIO for want of it.
-        let ensure = function_source(include_str!("lib.rs"), "fn list_children(");
+        let ensure = function_source(CORE_SOURCE, "fn list_children(");
         assert_before(
             ensure,
             "if !self.is_online()",
@@ -7585,7 +5428,7 @@ mod tests {
     fn a_stale_shared_listing_is_fetched_off_the_dispatch_loop() {
         // A resident listing that `list_children` would fetch again anyway
         // must not be answered inline (B219).
-        let cached = function_source(include_str!("lib.rs"), "fn children_cached(");
+        let cached = function_source(CORE_SOURCE, "fn children_cached(");
         assert!(cached.contains("SHARED_WITH_ME_SYNCED_MS"));
         assert!(cached.contains("Self::shared_folder_freshness_key(&uid)"));
         assert!(cached.contains("listing_needs_refresh("));
@@ -7596,13 +5439,13 @@ mod tests {
     fn a_handler_does_not_wait_out_the_sdk_retry_budget() {
         // Thumbnails, size upgrades and the share list held mount threads for
         // minutes on a stalled link (B220).
-        let lib = include_str!("lib.rs");
+        let lib = CORE_SOURCE;
         let thumbnail = function_source(lib, "fn thumbnail(");
         assert_before(thumbnail, "if !self.is_online()", "download_thumbnail");
         assert!(thumbnail.contains(".block_on_bounded(self.client.download_thumbnail("));
-        let upgrade = function_source(include_str!("sizes.rs"), "fn run_size_upgrade(");
+        let upgrade = function_source(CORE_SOURCE, "fn run_size_upgrade(");
         assert!(upgrade.contains("block_on_within(BATCH_CALL_TIMEOUT"));
-        let shared = function_source(include_str!("shared.rs"), "fn ensure_shared_children(");
+        let shared = function_source(CORE_SOURCE, "fn ensure_shared_children(");
         assert!(shared.contains("block_on_within(BATCH_CALL_TIMEOUT"));
         assert!(!shared.contains("self.rt"));
     }
@@ -7643,7 +5486,7 @@ mod tests {
         assert!(rt.block_on(notice).unwrap().is_ok());
 
         // Every notice to a session goes through it.
-        let lib = include_str!("lib.rs");
+        let lib = CORE_SOURCE;
         for method in [
             "fn inval_inode(&self",
             "fn inval_attrs(&self",
@@ -7678,7 +5521,7 @@ mod tests {
     fn a_trashed_open_node_sends_nothing_more() {
         // Trashing a file under an open handle withdraws its queued upload at
         // once; the bytes the handle reads go with the last close.
-        let withdraw = function_source(include_str!("lib.rs"), "fn withdraw_queued_ops(");
+        let withdraw = function_source(CORE_SOURCE, "fn withdraw_queued_ops(");
         assert_before(withdraw, "self.pending_blob(uid)", "release_dropped_below");
         assert!(!withdraw.contains("self.pending.lock().remove(uid)"));
 
