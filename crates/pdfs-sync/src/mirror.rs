@@ -54,7 +54,7 @@ use crate::model;
 use crate::planner;
 use crate::trace;
 pub use engine::SYNC_CONCURRENCY;
-pub use engine::{EngineHealth, SyncMsg, spawn};
+pub use engine::{EngineHealth, SyncMsg, run};
 #[cfg(test)]
 use engine::{Running, burst_order, keep_wanted, smallest_first};
 #[cfg(test)]

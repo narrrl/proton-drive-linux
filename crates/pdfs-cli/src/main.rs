@@ -3635,6 +3635,23 @@ fn cmd_diagnostics() -> Result<()> {
                     human_secs(worker.age_secs)
                 );
             }
+            if !d.services.is_empty() {
+                let ended: Vec<&str> = d
+                    .services
+                    .iter()
+                    .filter(|service| !service.running)
+                    .map(|service| service.name.as_str())
+                    .collect();
+                if ended.is_empty() {
+                    println!("services: {} running", d.services.len());
+                } else {
+                    println!(
+                        "services: {} running, ended: {}",
+                        d.services.len() - ended.len(),
+                        ended.join(", ")
+                    );
+                }
+            }
             if let Some(sync) = &d.sync {
                 println!("sync engine: {}", sync_engine_line(sync));
                 for trace in &sync.traces {

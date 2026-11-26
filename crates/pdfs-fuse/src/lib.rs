@@ -611,6 +611,9 @@ struct Core {
     /// The daemon's stop signal, shared with every background loop this `Core`
     /// was cloned into so teardown can end and join them (`docs/BUGS.md` B44).
     shutdown: Arc<shutdown::Shutdown>,
+    /// The long-lived threads the mount started, and which are still
+    /// running, for diagnostics and the supervisor.
+    services: pdfs_core::lifecycle::ServiceBoard,
     /// How long this node's last upload actually took, in milliseconds, with
     /// the time it was measured for eviction. Feeds
     /// [`Core::revision_debounce`]: a file that takes 30 seconds to send needs
