@@ -91,6 +91,8 @@ mod devices;
 mod diagnostics;
 mod drain;
 use drive::{DriveApi, RevisionRead};
+use pdfs_core::timestamp::now_secs;
+pub(crate) use pdfs_drive::{media_type_for, node_content_sha1, parse_uid, remote_name_is_safe};
 use pdfs_drive as drive;
 use pdfs_drive::node_revision_id;
 #[cfg(test)]
@@ -6266,23 +6268,6 @@ fn public_link_info(link: proton_drive_rs::PublicLink) -> PublicLinkInfo {
     }
 }
 
-/// Parse a `volume~link` uid display string back into a [`NodeUid`]. Front-ends
-/// receive uids as strings over the control socket and pass them back verbatim.
-pub(crate) fn parse_uid(s: &str) -> Option<NodeUid> {
-    let (vol, link) = s.split_once('~')?;
-    if vol.is_empty() || link.is_empty() || link.contains('~') {
-        return None;
-    }
-    Some(NodeUid::new(VolumeId::from(vol), LinkId::from(link)))
-}
-/// Current wall-clock time as epoch seconds (0 if the clock is before the epoch).
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Current wall-clock time as epoch milliseconds, the resolution `pending_op`
 /// timestamps and backoff deadlines are kept in.
 fn now_millis() -> i64 {
@@ -6471,22 +6456,6 @@ fn sync_folder_info(
         last_sync: f.last_sync,
         progress,
         paused,
-    }
-}
-
-/// A coarse MIME type guessed from a file name's extension; Proton stores this
-/// on the node but an exact value is not required for correctness.
-fn media_type_for(name: &str) -> &'static str {
-    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("txt" | "md" | "log") => "text/plain",
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("pdf") => "application/pdf",
-        Some("json") => "application/json",
-        Some("html" | "htm") => "text/html",
-        _ => "application/octet-stream",
     }
 }
 
@@ -6944,16 +6913,6 @@ fn expand_restore(
     waves
 }
 
-/// The plaintext content SHA-1 of a file node, if its active revision carried one.
-/// A download-free content fingerprint the conflict sweep uses to prove two files
-/// hold identical bytes before it removes one.
-fn node_content_sha1(node: &Node) -> Option<String> {
-    match &node.kind {
-        NodeKind::Folder => None,
-        NodeKind::File { content_sha1, .. } => content_sha1.clone(),
-    }
-}
-
 /// `"1 file"` / `"3 files"` — a count with a correctly pluralised noun, for
 /// human-readable activity-log lines.
 fn count_noun(n: usize, one: &str, many: &str) -> String {
@@ -7007,22 +6966,6 @@ fn fuse_name(name: &OsStr) -> Result<String, Errno> {
         return Err(Errno::EINVAL);
     }
     name.to_str().map(str::to_owned).ok_or(Errno::EILSEQ)
-}
-
-/// Whether a decrypted remote name can stand as one local path component.
-///
-/// Drive checks names only when a client creates or renames a node, and only
-/// for length, so a name made by another client, or by a server that should
-/// not be trusted, can hold anything. Joined onto a local path, a `/` or a `..`
-/// in it walks out of the folder it belongs to, and the mirror engine would
-/// then write or delete outside the sync root. In the mount, the kernel fails
-/// the whole listing with EIO on a single such name (`docs/BUGS.md` B215).
-pub(crate) fn remote_name_is_safe(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name.len() <= 255
-        && !name.contains(['/', '\0'])
 }
 
 fn node_visible(node: &Node, folder_uid: &NodeUid, hidden: &HashSet<NodeUid>) -> bool {
