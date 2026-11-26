@@ -2369,6 +2369,22 @@ pub struct Diagnostics {
     /// The folder-sync engine. `None` from a daemon that predates the field.
     #[serde(default)]
     pub sync: Option<SyncEngineState>,
+    /// Every kind of call made to Drive since start: how many, how many
+    /// failed, and how long they took. Empty from a daemon that predates the
+    /// field.
+    #[serde(default)]
+    pub drive_calls: Vec<DriveCallStat>,
+}
+
+/// One kind of call to Drive, in [`Diagnostics::drive_calls`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct DriveCallStat {
+    /// The client method, such as `enumerate_folder_children_node_uids`.
+    pub call: String,
+    pub count: u64,
+    pub errors: u64,
+    pub total_ms: u64,
+    pub longest_ms: u64,
 }
 
 /// What the folder-sync engine is doing, for [`Diagnostics`].

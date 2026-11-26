@@ -506,6 +506,8 @@ struct Core {
     /// downloads, renames, moves and trashes. The real client in production, an
     /// in-memory Drive in the simulation tests. See [`drive`].
     drive: Arc<dyn DriveApi>,
+    /// What [`Core::drive`] has been asked, for the diagnostics report.
+    drive_calls: Arc<pdfs_drive::counted::CallStats>,
     /// The concrete client, for what [`DriveApi`] does not cover: sharing,
     /// Photos, devices, invitations and public links.
     client: ProtonDriveClient,
