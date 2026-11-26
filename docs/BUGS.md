@@ -108,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B298](#b298--a-synced-folder-edit-whose-upload-lost-its-answer-is-kept-as-a-conflict-copy-of-itself) | A synced-folder edit whose upload lost its answer is kept as a conflict copy of itself |
 | [B297](#b297--the-simulations-fail-and-hang-when-run-in-parallel-and-nothing-stops-that) | The simulations fail and hang when run in parallel, and nothing stops that |
 | [B296](#b296--a-busy-database-stalls-reads-and-piles-up-diagnostics-threads) | A busy database stalls reads, and piles up diagnostics threads |
 | [B294](#b294--a-mirror-folder-too-large-to-finish-in-one-run-never-syncs-and-holds-back-the-others) | A mirror folder too large to finish in one run never syncs, and holds back the others |
@@ -399,6 +400,33 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B298 — A synced-folder edit whose upload lost its answer is kept as a conflict copy of itself
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-26, in the 4.0 review of the mirror planner. B155 fixed the same symptom in
+the mount's drain; the mirror engine has its own path.
+**Where:** `plan_file` in `crates/pdfs-sync/src/planner.rs`
+
+**Repro:** Edit a file in a mirrored folder. Drive makes the new revision, but the answer to
+the upload never comes back. The next pass sees the local file changed since the baseline,
+and the file on Drive changed too, so it keeps the local file as `a (sync-conflict …).txt`
+and downloads Drive's copy, which holds the same bytes. The simulation
+`a_mirror_edit_whose_reply_was_lost_is_not_kept_as_a_conflict` does this with a lost
+revision reply.
+
+**Cause.** The planner hashed the local file against Drive's digest only on a first sync,
+with no baseline. With a baseline, both sides changed always meant a conflict.
+
+**Fix.** When both sides changed, the sizes match and Drive has a digest, the planner asks
+for the same hash check whether or not there is a baseline. The same bytes record a new
+baseline without a transfer. Different bytes take the conflict path as before.
+
+**Verified:** `a_mirror_edit_whose_reply_was_lost_is_not_kept_as_a_conflict`, which fails
+without the fix, and the planner test
+`a_new_remote_revision_is_a_change_even_at_the_same_mtime_and_size`.
+
+---
 
 ### B297 — The simulations fail and hang when run in parallel, and nothing stops that
 
