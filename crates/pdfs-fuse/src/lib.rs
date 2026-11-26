@@ -136,7 +136,7 @@ pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
     SecondaryInsertRejection, SecondaryMount, clear_stale_mount, fuse_connection_id, spawn_session,
 };
-use reads::{BlockFlight, BlockRing, PREFETCH_BUDGET, Prefetch, ReaderSlot, STREAM_BYPASS_MIN};
+use reads::STREAM_BYPASS_MIN;
 use state::{Entry, Intervals, PendingRevision, State, StateGuard, WriteHandle};
 pub use systemd::{
     idle_sleep, status as notify_status, stretch_watchdog_for_startup, wait_for_restart,
@@ -528,28 +528,9 @@ struct Core {
     /// is built ([`ProtonFs::new`]). Each fork has its own cell.
     root: Arc<OnceLock<u64>>,
     cache: Arc<ContentCache>,
-    /// Open [`RevisionReader`]s keyed by node, so the block fetches of a file
-    /// resolve its keys and block table once instead of once per block.
-    /// Validated by `(mtime, size)` exactly like the content cache, and bounded
-    /// by [`MAX_OPEN_READERS`].
-    readers: Arc<Mutex<HashMap<NodeUid, ReaderSlot>>>,
-    /// Decrypted blocks held in memory, so the ~32 kernel reads a 4 MiB block is
-    /// delivered in cost the block once — a download for a streaming file, a
-    /// disk read for a cached one. See [`BlockRing`].
-    block_ring: Arc<Mutex<BlockRing>>,
-    /// Block fetches in flight, so concurrent readers of one block (demand read,
-    /// kernel read-ahead, our own prefetch) share a single download and decrypt.
-    /// See [`BlockFlight`].
-    block_flight: Arc<BlockFlight>,
-    /// One lock per file being repaired by [`Core::repair_block`], so the
-    /// concurrent block reads that all discover the same untrustworthy block
-    /// table share a single whole-file download instead of one each.
-    content_repairs: Arc<tokio::sync::Mutex<HashMap<NodeUid, Arc<tokio::sync::Mutex<()>>>>>,
-    /// Per-file sequential-read detection driving [`Core::prefetch`].
-    prefetch: Arc<Prefetch>,
-    /// Permits bounding speculative block fetches, so prefetch cannot queue in
-    /// front of a read someone is waiting on.
-    prefetch_budget: Arc<tokio::sync::Semaphore>,
+    /// What the read path keeps between reads: open revision readers, decrypted
+    /// blocks, fetches in flight and prefetch. See [`reads::ReadState`].
+    reads: reads::ReadState,
     /// Threads that serve the FUSE handlers which touch the network, so the
     /// session's dispatch loop stays free to answer cheap metadata calls while a
     /// cold read is on the wire. See [`Workers`].

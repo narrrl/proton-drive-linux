@@ -127,6 +127,49 @@ static NEXT_OPEN_ID: AtomicU64 = AtomicU64::new(0);
 /// re-planned read misses rather than being served the wrong bytes.
 type RingKey = (NodeUid, BlockSpan);
 
+/// What the read path keeps between reads, shared by every mount of the
+/// daemon: open revision readers, decrypted blocks, block fetches in flight,
+/// whole-file repairs, and the prefetch detector with its permits.
+#[derive(Clone)]
+pub(crate) struct ReadState {
+    /// Open [`RevisionReader`]s keyed by node, so the block fetches of a file
+    /// resolve its keys and block table once instead of once per block.
+    /// Validated by `(mtime, size)` exactly like the content cache, and bounded
+    /// by [`MAX_OPEN_READERS`].
+    pub(crate) readers: Arc<Mutex<HashMap<NodeUid, ReaderSlot>>>,
+    /// Decrypted blocks held in memory, so the ~32 kernel reads a 4 MiB block is
+    /// delivered in cost the block once — a download for a streaming file, a
+    /// disk read for a cached one. See [`BlockRing`].
+    pub(crate) block_ring: Arc<Mutex<BlockRing>>,
+    /// Block fetches in flight, so concurrent readers of one block (demand read,
+    /// kernel read-ahead, our own prefetch) share a single download and decrypt.
+    /// See [`BlockFlight`].
+    pub(crate) block_flight: Arc<BlockFlight>,
+    /// One lock per file being repaired by [`Core::repair_block`], so the
+    /// concurrent block reads that all discover the same untrustworthy block
+    /// table share a single whole-file download instead of one each.
+    pub(crate) content_repairs:
+        Arc<tokio::sync::Mutex<HashMap<NodeUid, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-file sequential-read detection driving [`Core::prefetch`].
+    pub(crate) prefetch: Arc<Prefetch>,
+    /// Permits bounding speculative block fetches, so prefetch cannot queue in
+    /// front of a read someone is waiting on.
+    pub(crate) prefetch_budget: Arc<tokio::sync::Semaphore>,
+}
+
+impl ReadState {
+    pub(crate) fn new() -> Self {
+        Self {
+            readers: Arc::new(Mutex::new(HashMap::new())),
+            block_ring: Arc::new(Mutex::new(BlockRing::default())),
+            block_flight: Arc::new(BlockFlight::default()),
+            content_repairs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            prefetch: Arc::new(Prefetch::default()),
+            prefetch_budget: Arc::new(tokio::sync::Semaphore::new(PREFETCH_BUDGET)),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct BlockRing {
     blocks: HashMap<RingKey, Arc<Vec<u8>>>,
@@ -296,7 +339,7 @@ impl Core {
                 ),
             }
             let act = {
-                let mut readers = self.readers.lock();
+                let mut readers = self.reads.readers.lock();
                 match readers.get_mut(uid) {
                     Some(ReaderSlot::Ready(entry))
                         if entry.mtime == mtime && entry.size == fsize =>
@@ -355,7 +398,7 @@ impl Core {
                         }
                     };
                     {
-                        let mut readers = self.readers.lock();
+                        let mut readers = self.reads.readers.lock();
                         // Publish only into the slot we claimed. If it is gone
                         // or belongs to a later attempt, an eviction or a newer
                         // revision overtook us: our reader still answers the
@@ -421,11 +464,11 @@ impl Core {
     /// to cache what it opened, which is what we want — the eviction says that
     /// revision is no longer the truth.
     pub(super) fn evict_reader(&self, uid: &NodeUid) {
-        self.readers.lock().remove(uid);
+        self.reads.readers.lock().remove(uid);
         // The ring holds decrypted bytes of the same revision, and an eviction is
         // exactly the statement that those are no longer the file's content.
-        self.block_ring.lock().drop_node(uid);
-        self.prefetch.streams.lock().remove(uid);
+        self.reads.block_ring.lock().drop_node(uid);
+        self.reads.prefetch.streams.lock().remove(uid);
     }
 
     /// How this revision's plaintext is divided into content blocks.
@@ -551,7 +594,8 @@ impl Core {
         cache_blocks: bool,
     ) -> BlockResult {
         let key: BlockKey = (uid.clone(), mtime, fsize, span);
-        self.block_flight
+        self.reads
+            .block_flight
             .join(key, || {
                 self.read_block(reader, uid, mtime, fsize, span, cache_blocks)
             })
@@ -625,7 +669,8 @@ impl Core {
                 let _ = cache.store_block(&uid, mtime, fsize, span, &bytes);
             });
         }
-        self.block_ring
+        self.reads
+            .block_ring
             .lock()
             .insert(uid, mtime, fsize, span, bytes.clone());
         Ok(bytes)
@@ -665,7 +710,7 @@ impl Core {
         // One download per file, not per block: every block of a file with a bad
         // block table discovers the same problem at once.
         let lock = {
-            let mut locks = self.content_repairs.lock().await;
+            let mut locks = self.reads.content_repairs.lock().await;
             locks.entry(uid.clone()).or_default().clone()
         };
         let guard = lock.clone().lock_owned().await;
@@ -746,7 +791,7 @@ impl Core {
     /// Drop a repair lock's map entry once nobody else holds it, so a file
     /// repaired long ago does not keep a mutex alive forever.
     async fn release_repair_lock(&self, uid: &NodeUid, lock: Arc<tokio::sync::Mutex<()>>) {
-        let mut locks = self.content_repairs.lock().await;
+        let mut locks = self.reads.content_repairs.lock().await;
         // Two: the map's and ours. Anything more means a waiter still needs it.
         if Arc::strong_count(&lock) <= 2 {
             locks.remove(uid);
@@ -775,7 +820,7 @@ impl Core {
         last: u64,
         cache_blocks: bool,
     ) {
-        let depth = self.prefetch.window(uid, first, last);
+        let depth = self.reads.prefetch.window(uid, first, last);
         if depth == 0 {
             return;
         }
@@ -787,7 +832,8 @@ impl Core {
                 // Blocks already in memory need nothing; blocks already on disk
                 // are cheap enough to serve that spending a round-trip to move
                 // them into the ring would be the wrong trade.
-                self.block_ring
+                self.reads
+                    .block_ring
                     .lock()
                     .get(uid, mtime, fsize, span)
                     .is_none()
@@ -809,7 +855,7 @@ impl Core {
             // finishes.
             let mut set = tokio::task::JoinSet::new();
             for span in wanted {
-                let Ok(permit) = core.prefetch_budget.clone().try_acquire_owned() else {
+                let Ok(permit) = core.reads.prefetch_budget.clone().try_acquire_owned() else {
                     break; // the budget is spent; the demand path can have it
                 };
                 let (core, reader, uid) = (core.clone(), reader.clone(), uid.clone());
@@ -870,7 +916,7 @@ impl Core {
             // no other cache at all, and a cached one would otherwise pay two
             // opens, a JSON parse and a 4 MiB read+alloc for every 128 KiB the
             // kernel asks for (audit T3).
-            let hit = self.block_ring.lock().get(uid, mtime, fsize, span);
+            let hit = self.reads.block_ring.lock().get(uid, mtime, fsize, span);
             let hit = hit.or_else(|| {
                 if !cache_blocks {
                     return None;
@@ -878,7 +924,8 @@ impl Core {
                 let bytes = Arc::new(self.cache.cached_block(uid, mtime, fsize, span)?);
                 // Promote it, so the other ~31 reads of this block are answered
                 // from memory.
-                self.block_ring
+                self.reads
+                    .block_ring
                     .lock()
                     .insert(uid, mtime, fsize, span, bytes.clone());
                 Some(bytes)
@@ -1152,7 +1199,7 @@ impl Core {
         }
         let mut out = Vec::with_capacity((end - offset) as usize);
         for span in self.block_geometry(uid, mtime, fsize).spans(offset, end) {
-            let ring = self.block_ring.lock().get(uid, mtime, fsize, span);
+            let ring = self.reads.block_ring.lock().get(uid, mtime, fsize, span);
             let block = match ring {
                 Some(bytes) => bytes,
                 None => Arc::new(self.cache.cached_block(uid, mtime, fsize, span)?),
