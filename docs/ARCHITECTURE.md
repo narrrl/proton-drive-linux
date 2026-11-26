@@ -672,4 +672,60 @@ local state per node as each batch lands.
 - **Mirrored folders** still have their own engine (§7). They move onto the local tree and the
   queue after that.
 
+### 4.0: from one daemon to composed services
+
+The daemon grew one feature at a time inside `pdfs-fuse`, which now holds the FUSE handlers, the
+drain, the sync engine, photos, thumbnails, takeout, devices, the control server, the supervisor
+and diagnostics. Everything shares one `Core` struct (`lib.rs`) with over seventy fields, so any
+code can take any lock in any order, and a new feature can deadlock an old one (`docs/BUGS.md`
+B110, the cold size upgrade, the diagnostics threads stuck behind the database writer). Over
+forty threads are spawned ad hoc, each with its own stop and join rules. The only real seam is
+`DriveApi` (`drive.rs`), which is what lets the simulation tests run against a fake Drive.
+
+4.0 splits the daemon into services that each own their state and threads, behind ports that can
+be swapped and tested alone. Dependencies point inward; inner crates never see GTK, `fuser`,
+`libc` error numbers or SDK node types.
+
+```
+apps       pdfs-cli, pdfs-gui                     talk to the daemon over the control socket only
+daemon     pdfs-daemon                            builds the services, supervisor, diagnostics, control server
+adapters   pdfs-fuse (Linux FUSE), pdfs-local (watch, scan, place), pdfs-drive (SDK adapter, fake Drive)
+services   pdfs-sync (mirrors), pdfs-vfs (mounted files: objects, handles, generations), photos, ...
+base       pdfs-store (SQLite, migrations), pdfs-core (config, protocol, ids, errors)
+```
+
+Six rules hold that shape:
+
+1. **Ownership.** Each service owns its state and its threads. Services talk through typed ports
+   or messages, never through another service's lock.
+2. **Lifecycle.** Each service starts from its dependencies and returns a handle with `stop`, a
+   bounded `join` and a health snapshot. The supervisor starts the services in dependency order
+   and stops them in reverse. No thread is left detached.
+3. **No lock across a boundary.** No lock is held across an SDK call, a FUSE reply or kernel
+   notification, a blocking send or a join. Debug builds check the order of the nested locks
+   that remain.
+4. **Short transactions.** A read never falls back to the writer connection. Diagnostics use
+   their own connection and report "busy" instead of waiting.
+5. **Absence is a fact, not a gap.** A locked, unreadable, partly listed or ignored path is never
+   read as deleted, whether in sync, in the mount or behind a locked store.
+6. **Headless tests.** Each service runs in tests without a mount, a desktop or a Proton account:
+   sync against the fake Drive and a temporary directory, the mounted-files service against a
+   fake store.
+
+The work goes in steps. Each ships the same behaviour with the simulation tests green:
+
+| Step | What |
+|---|---|
+| 0 | Finish what is open: the resumable walk of Drive's changed folders (B294), the ignored `set_len` error on a resize (B295), a reopen after close that depends on the single dispatch thread, and no conflict copy when a lost reply left the same content on Drive |
+| 1 | Seams and measurement: a `DriveApi` decorator that counts calls and their time, diagnostics that cannot hang (B296), lock-order checks, a live one-edit benchmark |
+| 2 | Move code into `pdfs-store`, `pdfs-drive` and `pdfs-sync` without changing it |
+| 3 | Split `Core` into services with a lifecycle, under a supervisor in `pdfs-daemon` |
+| 4 | Sync on evidence: a local dirty set, typed absence, a delete guard over the whole walk, and a durable intent for each effect, first in shadow mode |
+| 5 | `pdfs-vfs`: open files, then directories and renames, behind the FUSE adapter |
+| 6 | One admission policy for mirrors, reads and writeback |
+
+Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
+now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and
+macOS adapters, and a separate repository for the sync engine.
+
 [ROADMAP.md](ROADMAP.md) tracks these and the rest of the planned work.
