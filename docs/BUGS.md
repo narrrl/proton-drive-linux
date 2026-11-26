@@ -68,7 +68,6 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
-| [B297](#b297--the-simulations-fail-and-hang-when-run-in-parallel-and-nothing-stops-that) | The simulations fail and hang when run in parallel, and nothing stops that | Not fixed |
 | [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy) | On a slow link, a file's last write can land only in a conflict copy | Cause not found; seen once in CI |
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
@@ -109,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B297](#b297--the-simulations-fail-and-hang-when-run-in-parallel-and-nothing-stops-that) | The simulations fail and hang when run in parallel, and nothing stops that |
 | [B294](#b294--a-mirror-folder-too-large-to-finish-in-one-run-never-syncs-and-holds-back-the-others) | A mirror folder too large to finish in one run never syncs, and holds back the others |
 | [B66](#b66--local-only-pending-data-is-not-protected-at-shutdown-high-21) | Local-only pending data is not protected at shutdown (HIGH-21) |
 | [B291](#b291--on-fedora-45s-oo7-every-saved-sign-in-is-lost-at-the-next-reboot) | On Fedora 45's oo7, every saved sign-in is lost at the next reboot |
@@ -401,7 +401,7 @@ Newest first.
 
 ### B297 — The simulations fail and hang when run in parallel, and nothing stops that
 
-**Status:** Open
+**Status:** Fixed (unverified)
 **Found:** 2026-11-25, while running the full simulation suite several times each for #134, #135
 and the 4.0 crate moves, with `cargo test -p pdfs-fuse --lib -- --ignored sim::`. That command
 leaves out `--test-threads=1`, which CI and [TESTING.md](TESTING.md) use, so libtest ran up to
@@ -427,7 +427,19 @@ daemon runs drain workers, a sync engine and a runtime on the same few cores. In
 timing asserts miss their deadlines, and the harness has no way out of a mount that stops
 answering.
 
-**Fix.** Not done.
+**Fix.** `Daemon::start` takes a turn: a daemon started on one test thread waits while
+another test thread still has one, so plain `cargo test` runs the simulations one after the
+other. A daemon on the same thread, as in a restart or the multi-client runs, does not wait.
+`--test-threads=1` stays the documented way, because it also keeps the parts of a test
+before its first daemon apart.
+
+A mount that does not stop within 60 s has its FUSE connection aborted through
+`/sys/fs/fuse/connections/<n>/abort`, which the mounting user may write, and the stop fails
+with that message. A daemon alive after 20 minutes gets the same, so a test blocked on a
+request the mount never answers fails with `ENOTCONN` instead of hanging the run.
+
+**Verified:** `a_simulation_on_another_thread_waits_for_this_ones_daemons`, which fails
+without the turn.
 
 Separately, CI on main (`0b9e849`) failed `a_move_blocked_by_trash_can_be_retried_after_restore`
 once, serially ([run](https://github.com/narrrl/proton-drive-linux/actions/runs/45694939718)):
