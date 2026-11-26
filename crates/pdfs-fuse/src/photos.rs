@@ -12,11 +12,12 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Once, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use parking_lot::Mutex;
 use pdfs_core::control::{
     FileThumbRequest, MappingProgress, PhotoItem, PhotoKind, PhotoLocation, PhotoThumb, PlaceInfo,
     ThumbnailBuildStatus, Topic, is_audio_file_name, is_raw_image_name, is_thumbnail_image_name,
@@ -32,8 +33,8 @@ use tracing::{debug, info, warn};
 
 use super::drive::RevisionRead;
 use super::{
-    Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, WriteAuthority, link,
-    node_size, now_ms, parse_uid,
+    Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, ThumbnailMissCaches,
+    WriteAuthority, link, node_size, now_ms, parse_uid,
 };
 
 /// Longest edge, in px, of a thumbnail generated locally for a photo the server
@@ -46,6 +47,7 @@ const THUMB_QUALITY: u8 = 82;
 /// thumbnails. Bounded: a screenful of 20 MB digicam JPEGs would otherwise
 /// saturate the link and starve the rest of the daemon.
 pub(crate) const THUMB_GEN_CONCURRENCY: usize = 4;
+
 /// Shots the similar-photo pass fetches thumbnails for at a time.
 const SIMILAR_CHUNK: usize = 64;
 /// Images processed between recursive-build progress updates.
@@ -126,6 +128,75 @@ const DECODE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The process-wide [`DecodeBudget`] every thumbnail decode draws from.
 static DECODE_BUDGET: DecodeBudget = DecodeBudget::new(DECODE_BUDGET_BYTES);
+
+/// What the Photos and thumbnail jobs are doing right now: which refreshes
+/// and builds are running, how far they got, and which thumbnails are known
+/// to be missing. Shared by every mount of the daemon; only this module and
+/// the status reports read it.
+#[derive(Clone)]
+pub(crate) struct PhotoJobs {
+    /// True while a background refresh of the photos timeline is already
+    /// running, so a burst of page requests against a stale listing kicks off
+    /// one refresh rather than one per request.
+    pub(crate) timeline_refreshing: Arc<AtomicBool>,
+    /// How far the running timeline refresh has got resolving photo metadata,
+    /// as `(done, total)` photos; `None` when no refresh is resolving any. The
+    /// Places view shows it while a library's locations are first read.
+    pub(crate) timeline_progress: Arc<Mutex<Option<(usize, usize)>>>,
+    /// The same, for the album listing.
+    pub(crate) albums_refreshing: Arc<AtomicBool>,
+    /// True while the similar-photo pass hashes thumbnails (see
+    /// [`Core::photo_similar`]), so asking again doesn't start a second one.
+    pub(crate) similar_hashing: Arc<AtomicBool>,
+    /// Photos whose missing thumbnail is being generated right now. A tile that is
+    /// still on screen asks for its thumbnail again every few seconds, and each of
+    /// those downloads is a full-size photo — so an in-flight uid is never started
+    /// twice.
+    pub(crate) thumb_gen: Arc<Mutex<HashSet<NodeUid>>>,
+    /// Global permit pool for locally generated thumbnails. The old per-request
+    /// limit multiplied when the GUI sent several batches, allowing dozens of
+    /// full-size images to download at once.
+    pub(crate) thumb_gen_budget: Arc<tokio::sync::Semaphore>,
+    /// Current ordinary-file listing generation and a wake-up for tasks waiting
+    /// on a permit or a download when that listing is abandoned.
+    pub(crate) file_thumb_generation: Arc<AtomicU64>,
+    pub(crate) file_thumb_cancel: Arc<tokio::sync::Notify>,
+    /// Progress of the explicit recursive build started from the Files toolbar.
+    pub(crate) thumbnail_build: Arc<Mutex<ThumbnailBuildStatus>>,
+    /// Cancellation for the explicit recursive build. Separate from ordinary
+    /// listing cancellation because the two jobs have independent lifetimes.
+    pub(crate) thumbnail_build_cancelled: Arc<AtomicBool>,
+    pub(crate) thumbnail_build_cancel: Arc<tokio::sync::Notify>,
+    /// Negative thumbnail knowledge, separated by whether the remote lacked a
+    /// thumbnail or local decoding proved this revision unsupported.
+    ///
+    /// Absence has to be cached or it costs a round trip every time it is asked
+    /// for, and it is asked for constantly: an `ls -l` from an xattr-aware lister
+    /// issues a `getxattr` per advertised name per entry, so a 65-file directory
+    /// of videos re-probed 130 times per listing at ~186 ms each (B5). The mtime
+    /// is the validity tag — a new revision may well have a thumbnail — matching
+    /// how [`ContentCache::read_thumbnail`] validates the positive side.
+    pub(crate) thumbnail_misses: Arc<Mutex<ThumbnailMissCaches>>,
+}
+
+impl PhotoJobs {
+    pub(crate) fn new() -> Self {
+        Self {
+            timeline_refreshing: Arc::new(AtomicBool::new(false)),
+            timeline_progress: Arc::new(Mutex::new(None)),
+            albums_refreshing: Arc::new(AtomicBool::new(false)),
+            similar_hashing: Arc::new(AtomicBool::new(false)),
+            thumb_gen: Arc::new(Mutex::new(HashSet::new())),
+            thumb_gen_budget: Arc::new(tokio::sync::Semaphore::new(THUMB_GEN_CONCURRENCY)),
+            file_thumb_generation: Arc::new(AtomicU64::new(0)),
+            file_thumb_cancel: Arc::new(tokio::sync::Notify::new()),
+            thumbnail_build: Arc::new(Mutex::new(Default::default())),
+            thumbnail_build_cancelled: Arc::new(AtomicBool::new(false)),
+            thumbnail_build_cancel: Arc::new(tokio::sync::Notify::new()),
+            thumbnail_misses: Arc::new(Mutex::new(Default::default())),
+        }
+    }
+}
 
 /// A counting gate over bytes: [`acquire`](Self::acquire) waits until the cost
 /// fits beside what is already held.
@@ -1301,6 +1372,7 @@ impl Core {
         let sets = self.db.photo_similar().map_err(CoreError::from)?;
         let (done, total) = self.db.similar_progress().map_err(CoreError::from)?;
         let hashing = self
+            .photo_jobs
             .similar_hashing
             .load(Ordering::SeqCst)
             .then_some(MappingProgress { done, total });
@@ -1313,7 +1385,7 @@ impl Core {
     }
 
     fn spawn_similar_hashing(&self) {
-        if self.similar_hashing.swap(true, Ordering::SeqCst) {
+        if self.photo_jobs.similar_hashing.swap(true, Ordering::SeqCst) {
             return;
         }
         let core = self.clone();
@@ -1323,11 +1395,15 @@ impl Core {
                 if let Err(e) = core.hash_similar() {
                     warn!(error = %e, "similar-photo hashing failed");
                 }
-                core.similar_hashing.store(false, Ordering::SeqCst);
+                core.photo_jobs
+                    .similar_hashing
+                    .store(false, Ordering::SeqCst);
             });
         if let Err(e) = spawned {
             warn!(error = %e, "could not start similar-photo hashing");
-            self.similar_hashing.store(false, Ordering::SeqCst);
+            self.photo_jobs
+                .similar_hashing
+                .store(false, Ordering::SeqCst);
         }
     }
 
@@ -1697,7 +1773,7 @@ impl Core {
             }
         }
 
-        let pending = self.thumb_gen.lock();
+        let pending = self.photo_jobs.thumb_gen.lock();
         requested
             .iter()
             .zip(uids)
@@ -1748,8 +1824,8 @@ impl Core {
         items: &[FileThumbRequest],
         generation: u64,
     ) -> Option<Vec<PhotoThumb>> {
-        let current =
-            generation != 0 && self.file_thumb_generation.load(Ordering::SeqCst) == generation;
+        let current = generation != 0
+            && self.photo_jobs.file_thumb_generation.load(Ordering::SeqCst) == generation;
         if !current {
             return None;
         }
@@ -1781,6 +1857,7 @@ impl Core {
                 .cached_thumbnail_path(uid, ttype, *modified)
                 .is_some()
                 || self
+                    .photo_jobs
                     .thumbnail_misses
                     .lock()
                     .local_contains(&(uid.clone(), ttype), *modified)
@@ -1795,7 +1872,7 @@ impl Core {
             self.spawn_generate_thumbs(wanted, &tags, &names, ThumbJob::Files(generation));
         }
 
-        let pending = self.thumb_gen.lock();
+        let pending = self.photo_jobs.thumb_gen.lock();
         Some(
             items
                 .iter()
@@ -1821,13 +1898,14 @@ impl Core {
     pub(crate) fn reserve_file_thumb_generation(&self) -> u64 {
         let next = |current| if current == u64::MAX { 1 } else { current + 1 };
         let previous = self
+            .photo_jobs
             .file_thumb_generation
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 Some(next(current))
             })
             .expect("generation update always succeeds");
         let generation = next(previous);
-        self.file_thumb_cancel.notify_waiters();
+        self.photo_jobs.file_thumb_cancel.notify_waiters();
         generation
     }
 
@@ -1836,10 +1914,11 @@ impl Core {
     /// recursive builds do not use this generation and continue normally.
     pub(crate) fn cancel_file_thumbs(&self, generation: u64) {
         let previous = self
+            .photo_jobs
             .file_thumb_generation
             .fetch_max(generation, Ordering::SeqCst);
         if generation > previous {
-            self.file_thumb_cancel.notify_waiters();
+            self.photo_jobs.file_thumb_cancel.notify_waiters();
         }
     }
 
@@ -1854,7 +1933,7 @@ impl Core {
         job: ThumbJob,
     ) {
         let fresh: Vec<NodeUid> = {
-            let mut inflight = self.thumb_gen.lock();
+            let mut inflight = self.photo_jobs.thumb_gen.lock();
             uids.into_iter()
                 .filter(|uid| inflight.insert(uid.clone()))
                 .collect()
@@ -1872,7 +1951,7 @@ impl Core {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 core.generate_thumbs(&fresh, &tags, &names, job)
             }));
-            let mut inflight = core.thumb_gen.lock();
+            let mut inflight = core.photo_jobs.thumb_gen.lock();
             for uid in &fresh {
                 inflight.remove(uid);
             }
@@ -1894,10 +1973,13 @@ impl Core {
     fn thumb_job_current(&self, job: ThumbJob) -> bool {
         match job {
             ThumbJob::Files(generation) => {
-                self.file_thumb_generation.load(Ordering::SeqCst) == generation
+                self.photo_jobs.file_thumb_generation.load(Ordering::SeqCst) == generation
             }
             ThumbJob::Photos => true,
-            ThumbJob::Build => !self.thumbnail_build_cancelled.load(Ordering::SeqCst),
+            ThumbJob::Build => !self
+                .photo_jobs
+                .thumbnail_build_cancelled
+                .load(Ordering::SeqCst),
         }
     }
 
@@ -1934,13 +2016,13 @@ impl Core {
                         // One shared permit pool bounds all thumbnail batches,
                         // rather than multiplying the limit by every control
                         // request the GUI happens to have in flight.
-                        let acquire = core.thumb_gen_budget.clone().acquire_owned();
+                        let acquire = core.photo_jobs.thumb_gen_budget.clone().acquire_owned();
                         tokio::pin!(acquire);
                         let _permit = match job {
                             ThumbJob::Files(_) => loop {
                                 tokio::select! {
                                     permit = &mut acquire => break permit.ok(),
-                                    _ = core.file_thumb_cancel.notified() => {
+                                    _ = core.photo_jobs.file_thumb_cancel.notified() => {
                                         if !core.thumb_job_current(job) {
                                             return (uid, ThumbAttempt::Cancelled);
                                         }
@@ -1955,7 +2037,7 @@ impl Core {
                             ThumbJob::Build => loop {
                                 tokio::select! {
                                     permit = &mut acquire => break permit.ok(),
-                                    _ = core.thumbnail_build_cancel.notified() => {
+                                    _ = core.photo_jobs.thumbnail_build_cancel.notified() => {
                                         if !core.thumb_job_current(job) {
                                             return (uid, ThumbAttempt::Cancelled);
                                         }
@@ -2015,7 +2097,7 @@ impl Core {
                             ThumbJob::Files(_) => loop {
                                 tokio::select! {
                                     result = &mut download => break Some(result),
-                                    _ = core.file_thumb_cancel.notified() => {
+                                    _ = core.photo_jobs.file_thumb_cancel.notified() => {
                                         if !core.thumb_job_current(job) {
                                             break None;
                                         }
@@ -2030,7 +2112,7 @@ impl Core {
                             ThumbJob::Build => loop {
                                 tokio::select! {
                                     result = &mut download => break Some(result),
-                                    _ = core.thumbnail_build_cancel.notified() => {
+                                    _ = core.photo_jobs.thumbnail_build_cancel.notified() => {
                                         if !core.thumb_job_current(job) {
                                             break None;
                                         }
@@ -2120,7 +2202,8 @@ impl Core {
                     match self.cache.store_thumbnail(&uid, ttype, tag, &thumb.bytes) {
                         Ok(()) => {
                             summary.made += 1;
-                            self.thumbnail_misses
+                            self.photo_jobs
+                                .thumbnail_misses
                                 .lock()
                                 .forget_local(&(uid.clone(), ttype));
                             self.record_thumb(&uid, db::THUMB_HAVE, Some(thumb.ratio));
@@ -2136,7 +2219,8 @@ impl Core {
                 ThumbAttempt::Undecodable => {
                     summary.undecodable += 1;
                     if let Some(&tag) = tags.get(&uid.to_string()) {
-                        self.thumbnail_misses
+                        self.photo_jobs
+                            .thumbnail_misses
                             .lock()
                             .remember_local((uid.clone(), ttype), tag);
                     }
@@ -2229,7 +2313,7 @@ impl Core {
     }
 
     pub(crate) fn thumbnail_build_status(&self) -> ThumbnailBuildStatus {
-        self.thumbnail_build.lock().clone()
+        self.photo_jobs.thumbnail_build.lock().clone()
     }
 
     /// Start one recursive local-thumbnail build. A request for the same root
@@ -2238,11 +2322,12 @@ impl Core {
     pub(crate) fn start_thumbnail_build(&self, root: PathBuf) -> CoreResult<ThumbnailBuildStatus> {
         let path = root.to_string_lossy().into_owned();
         let status = {
-            let mut status = self.thumbnail_build.lock();
+            let mut status = self.photo_jobs.thumbnail_build.lock();
             if !thumbnail_build_may_start(&status, &path)? {
                 return Ok(status.clone());
             }
-            self.thumbnail_build_cancelled
+            self.photo_jobs
+                .thumbnail_build_cancelled
                 .store(false, Ordering::SeqCst);
             *status = ThumbnailBuildStatus {
                 running: true,
@@ -2264,11 +2349,12 @@ impl Core {
             }))
             .is_err()
             {
-                let mut status = core.thumbnail_build.lock();
+                let mut status = core.photo_jobs.thumbnail_build.lock();
                 status.running = false;
                 status.scanning = false;
                 status.message = Some("Thumbnail generation stopped unexpectedly".to_string());
-                core.thumbnail_build_cancelled
+                core.photo_jobs
+                    .thumbnail_build_cancelled
                     .store(false, Ordering::SeqCst);
                 warn!(path = %status.path, "recursive thumbnail build panicked");
             }
@@ -2278,22 +2364,27 @@ impl Core {
 
     pub(crate) fn cancel_thumbnail_build(&self) -> ThumbnailBuildStatus {
         let (status, cancelled) = {
-            let status = self.thumbnail_build.lock();
+            let status = self.photo_jobs.thumbnail_build.lock();
             let cancelled = status.running;
             if cancelled {
-                self.thumbnail_build_cancelled.store(true, Ordering::SeqCst);
+                self.photo_jobs
+                    .thumbnail_build_cancelled
+                    .store(true, Ordering::SeqCst);
             }
             (status.clone(), cancelled)
         };
         if cancelled {
-            self.thumbnail_build_cancel.notify_waiters();
+            self.photo_jobs.thumbnail_build_cancel.notify_waiters();
         }
         status
     }
 
     fn finish_thumbnail_build(&self) {
-        let mut status = self.thumbnail_build.lock();
-        let cancelled = self.thumbnail_build_cancelled.swap(false, Ordering::SeqCst);
+        let mut status = self.photo_jobs.thumbnail_build.lock();
+        let cancelled = self
+            .photo_jobs
+            .thumbnail_build_cancelled
+            .swap(false, Ordering::SeqCst);
         status.running = false;
         status.scanning = false;
         if cancelled {
@@ -2315,19 +2406,23 @@ impl Core {
         let mut seen_images = HashSet::new();
 
         while let Some(folder) = folders.pop() {
-            if self.thumbnail_build_cancelled.load(Ordering::SeqCst) {
+            if self
+                .photo_jobs
+                .thumbnail_build_cancelled
+                .load(Ordering::SeqCst)
+            {
                 self.finish_thumbnail_build();
                 return;
             }
             let listing = self.list_dir(&folder);
             {
-                let mut status = self.thumbnail_build.lock();
+                let mut status = self.photo_jobs.thumbnail_build.lock();
                 status.folders_scanned += 1;
             }
             let entries = match listing {
                 Ok(entries) => entries,
                 Err(error) => {
-                    let mut status = self.thumbnail_build.lock();
+                    let mut status = self.photo_jobs.thumbnail_build.lock();
                     if status.message.is_none() {
                         status.message = Some(format!(
                             "Some folders could not be read ({}: {error})",
@@ -2359,14 +2454,18 @@ impl Core {
                     }
                 }
             }
-            let mut status = self.thumbnail_build.lock();
+            let mut status = self.photo_jobs.thumbnail_build.lock();
             status.images_found += found_here;
             status.completed += invalid_here;
             status.failed += invalid_here;
         }
 
-        self.thumbnail_build.lock().scanning = false;
-        if self.thumbnail_build_cancelled.load(Ordering::SeqCst) {
+        self.photo_jobs.thumbnail_build.lock().scanning = false;
+        if self
+            .photo_jobs
+            .thumbnail_build_cancelled
+            .load(Ordering::SeqCst)
+        {
             self.finish_thumbnail_build();
             return;
         }
@@ -2378,13 +2477,14 @@ impl Core {
                 .cached_thumbnail_path(&uid, ttype, modified)
                 .is_some()
             {
-                self.thumbnail_build.lock().completed += 1;
+                self.photo_jobs.thumbnail_build.lock().completed += 1;
             } else if self
+                .photo_jobs
                 .thumbnail_misses
                 .lock()
                 .local_contains(&(uid.clone(), ttype), modified)
             {
-                let mut status = self.thumbnail_build.lock();
+                let mut status = self.photo_jobs.thumbnail_build.lock();
                 status.completed += 1;
                 status.failed += 1;
             } else {
@@ -2393,7 +2493,11 @@ impl Core {
         }
 
         for chunk in todo.chunks(THUMB_BUILD_CHUNK) {
-            if self.thumbnail_build_cancelled.load(Ordering::SeqCst) {
+            if self
+                .photo_jobs
+                .thumbnail_build_cancelled
+                .load(Ordering::SeqCst)
+            {
                 self.finish_thumbnail_build();
                 return;
             }
@@ -2406,7 +2510,11 @@ impl Core {
                 // than downloading the full image twice.
                 let waiting_since = Instant::now();
                 loop {
-                    if self.thumbnail_build_cancelled.load(Ordering::SeqCst) {
+                    if self
+                        .photo_jobs
+                        .thumbnail_build_cancelled
+                        .load(Ordering::SeqCst)
+                    {
                         self.finish_thumbnail_build();
                         return;
                     }
@@ -2415,27 +2523,28 @@ impl Core {
                         .cached_thumbnail_path(uid, ttype, *modified)
                         .is_some()
                     {
-                        self.thumbnail_build.lock().completed += 1;
+                        self.photo_jobs.thumbnail_build.lock().completed += 1;
                         break;
                     }
                     if self
+                        .photo_jobs
                         .thumbnail_misses
                         .lock()
                         .local_contains(&(uid.clone(), ttype), *modified)
                     {
-                        let mut status = self.thumbnail_build.lock();
+                        let mut status = self.photo_jobs.thumbnail_build.lock();
                         status.completed += 1;
                         status.failed += 1;
                         break;
                     }
-                    if self.thumb_gen.lock().insert(uid.clone()) {
+                    if self.photo_jobs.thumb_gen.lock().insert(uid.clone()) {
                         tags.insert(uid.to_string(), *modified);
                         names.insert(uid.to_string(), name.clone());
                         claimed.push(uid.clone());
                         break;
                     }
                     if waiting_since.elapsed() >= THUMB_BUILD_CLAIM_TIMEOUT {
-                        let mut status = self.thumbnail_build.lock();
+                        let mut status = self.photo_jobs.thumbnail_build.lock();
                         status.completed += 1;
                         status.failed += 1;
                         if status.message.is_none() {
@@ -2456,12 +2565,12 @@ impl Core {
                 self.generate_thumbs(&claimed, &tags, &names, ThumbJob::Build)
             }));
             {
-                let mut inflight = self.thumb_gen.lock();
+                let mut inflight = self.photo_jobs.thumb_gen.lock();
                 for uid in &claimed {
                     inflight.remove(uid);
                 }
             }
-            let mut status = self.thumbnail_build.lock();
+            let mut status = self.photo_jobs.thumbnail_build.lock();
             match result {
                 Ok(summary) => {
                     status.completed += summary.processed();
@@ -2544,7 +2653,7 @@ impl Core {
         let total = self.db.photos_count().map_err(CoreError::from)?;
         let skipped = total.saturating_sub(pending.len());
         let mut resolved = 0;
-        let progress = ProgressGuard(&self.timeline_progress);
+        let progress = ProgressGuard(&self.photo_jobs.timeline_progress);
         for (index, chunk) in pending.chunks(TIMELINE_ENRICH_CHUNK).enumerate() {
             if self.shutdown.is_stopping() {
                 break;
@@ -2613,8 +2722,14 @@ impl Core {
     /// whole library at once, sharing the session's rate limit and taking
     /// minutes. Returns whether the account has a photos library.
     pub(crate) fn refresh_timeline_joined(&self) -> CoreResult<bool> {
-        if self.timeline_refreshing.swap(true, Ordering::SeqCst) {
-            while self.timeline_refreshing.load(Ordering::SeqCst) && !self.shutdown.is_stopping() {
+        if self
+            .photo_jobs
+            .timeline_refreshing
+            .swap(true, Ordering::SeqCst)
+        {
+            while self.photo_jobs.timeline_refreshing.load(Ordering::SeqCst)
+                && !self.shutdown.is_stopping()
+            {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
             // A refresh that landed stamped the timeline fresh. One that failed
@@ -2625,13 +2740,18 @@ impl Core {
                 .state_i64(PHOTOS_SYNCED_MS)
                 .map_err(CoreError::from)?
                 .is_some()
-                || self.timeline_refreshing.swap(true, Ordering::SeqCst)
+                || self
+                    .photo_jobs
+                    .timeline_refreshing
+                    .swap(true, Ordering::SeqCst)
             {
                 return Ok(self.db.state_i64(PHOTOS_AVAILABLE).ok().flatten() != Some(0));
             }
         }
         let refreshed = self.rt.block_on(self.refresh_timeline());
-        self.timeline_refreshing.store(false, Ordering::SeqCst);
+        self.photo_jobs
+            .timeline_refreshing
+            .store(false, Ordering::SeqCst);
         if refreshed.is_ok() {
             self.events.publish(&[Topic::Photos]);
         }
@@ -2639,13 +2759,19 @@ impl Core {
     }
 
     pub(crate) fn spawn_timeline_refresh(&self) {
-        if self.timeline_refreshing.swap(true, Ordering::SeqCst) {
+        if self
+            .photo_jobs
+            .timeline_refreshing
+            .swap(true, Ordering::SeqCst)
+        {
             return;
         }
         let core = self.clone();
         self.rt.spawn(async move {
             let refreshed = core.refresh_timeline().await;
-            core.timeline_refreshing.store(false, Ordering::SeqCst);
+            core.photo_jobs
+                .timeline_refreshing
+                .store(false, Ordering::SeqCst);
             // Only a refresh that landed: a front-end re-reading after a failed
             // one would find the timeline still stale and start another.
             match refreshed {
@@ -2658,7 +2784,8 @@ impl Core {
     /// How far the running timeline refresh has got reading photo metadata, or
     /// `None` when no refresh is reading any.
     pub(crate) fn timeline_progress(&self) -> Option<MappingProgress> {
-        self.timeline_progress
+        self.photo_jobs
+            .timeline_progress
             .lock()
             .map(|(done, total)| MappingProgress { done, total })
     }
@@ -2666,7 +2793,7 @@ impl Core {
     /// Whether a timeline refresh is running. A front-end that asked for one
     /// watches this to know when the new timeline is worth re-reading.
     pub(crate) fn timeline_refreshing(&self) -> bool {
-        self.timeline_refreshing.load(Ordering::SeqCst)
+        self.photo_jobs.timeline_refreshing.load(Ordering::SeqCst)
     }
 
     /// Download a photo's full content into the content cache, returning its

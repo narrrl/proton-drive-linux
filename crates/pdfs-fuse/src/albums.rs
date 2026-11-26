@@ -132,13 +132,19 @@ impl Core {
 
     /// Refresh the album listing off the request path. At most one runs at a time.
     pub(crate) fn spawn_albums_refresh(&self) {
-        if self.albums_refreshing.swap(true, Ordering::SeqCst) {
+        if self
+            .photo_jobs
+            .albums_refreshing
+            .swap(true, Ordering::SeqCst)
+        {
             return;
         }
         let core = self.clone();
         self.rt.spawn(async move {
             let refreshed = core.refresh_albums().await;
-            core.albums_refreshing.store(false, Ordering::SeqCst);
+            core.photo_jobs
+                .albums_refreshing
+                .store(false, Ordering::SeqCst);
             match refreshed {
                 Ok(_) => core.events.publish(&[Topic::Photos]),
                 Err(e) => warn!(error = %e, "background album refresh failed"),
