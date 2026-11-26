@@ -364,7 +364,7 @@ pub(crate) fn status_response(core: &Core, username: &str, mountpoint: &Path) ->
     let queued = core.db.pending_op_counts().unwrap_or_default();
     // Read after the queue: the drain counts an upload as landing before it
     // retires the op, so one of the two always has it (B119).
-    let landing = core.landing_uploads.load(Ordering::SeqCst);
+    let landing = core.drain.landing_uploads.load(Ordering::SeqCst);
     let staging = core.cache.staging_usage();
     CtlResponse::Status {
         parked_uploads: queued.parked.max(0) as u64,

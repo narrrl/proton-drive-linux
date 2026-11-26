@@ -1469,7 +1469,7 @@ impl ProtonFs {
                 // a lock-tight comparison — against the multi-gigabyte copy
                 // above, which is the window that actually loses data.
                 let current = self.core.pending_blob(&uid);
-                let landed = self.core.landed.lock().get(&uid).cloned();
+                let landed = self.core.drain.landed.lock().get(&uid).cloned();
                 let mut st = self.core.state();
                 // Only a handle this open is about to *create* can carry a stale
                 // base; if one already exists, that handle is authoritative and

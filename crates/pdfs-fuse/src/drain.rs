@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, SyncIssue, TransferDirection};
@@ -52,6 +52,65 @@ use super::{
 };
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
+
+/// The drain's own bookkeeping, shared by its workers and by every mount of
+/// the daemon: the wake-up for idle workers, the creates and uploads on the
+/// wire, and what a landed one left behind until the tree catches up.
+#[derive(Clone)]
+pub(crate) struct DrainState {
+    /// Nudges the drain workers: set true and notify to have them re-examine
+    /// the queue instead of waiting out their backoff.
+    pub(crate) drain_wake: Arc<(Mutex<bool>, Condvar)>,
+    /// The folder and name each create on the wire was sent with, by op id.
+    /// Drive holds that name until the create lands and a rename or trash
+    /// queued behind it frees it again.
+    pub(crate) creating: Arc<Mutex<HashMap<i64, (NodeUid, String)>>>,
+    /// Creates that landed but could not be read back, by the uid Drive gave
+    /// them, with the placeholder's. The drain adopts one before it sends
+    /// anything else for it.
+    pub(crate) unadopted: Arc<Mutex<HashMap<NodeUid, NodeUid>>>,
+    /// The SHA-1 of the last revision this daemon uploaded to a file and could
+    /// not read back, so its revision id is not known (`docs/BUGS.md` B157).
+    pub(crate) sealed_unread: Arc<Mutex<HashMap<NodeUid, String>>>,
+    /// The node an upload has just put on Drive, from when the drain lets go
+    /// of its blob until the tree has the node (`docs/BUGS.md` B170).
+    pub(crate) landed: Arc<Mutex<HashMap<NodeUid, Node>>>,
+    /// How long this node's last upload actually took, in milliseconds, with
+    /// the time it was measured for eviction. Feeds
+    /// [`Core::revision_debounce`]: a file that takes 30 seconds to send needs
+    /// a grace period on that scale, or every save supersedes an upload that
+    /// was already on the wire. Bounded by [`UPLOAD_TIME_MEMORY`].
+    pub(crate) upload_times: Arc<Mutex<HashMap<String, (u64, i64)>>>,
+    /// Cancellation flags for uploads currently on the wire, keyed by node.
+    ///
+    /// Set when a newer revision of the same file is queued: the bytes in
+    /// flight have just been superseded, and the only thing finishing them
+    /// achieves is spending the user's uplink on a revision the next op
+    /// replaces. Read by the upload's own reader ([`CountingReader`]), which is
+    /// the one thing the SDK calls often enough to notice.
+    pub(crate) upload_cancel: Arc<Mutex<HashMap<NodeUid, Arc<AtomicBool>>>>,
+    /// Uploads whose op is retired but whose bytes the content cache has not
+    /// adopted yet, because the revision just sealed is still being read back.
+    /// The status counts them as pending, so an empty queue means every file
+    /// written through the mount reads without the network (`docs/BUGS.md`
+    /// B119).
+    pub(crate) landing_uploads: Arc<AtomicU64>,
+}
+
+impl DrainState {
+    pub(crate) fn new() -> Self {
+        Self {
+            drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
+            creating: Arc::new(Mutex::new(HashMap::new())),
+            unadopted: Arc::new(Mutex::new(HashMap::new())),
+            sealed_unread: Arc::new(Mutex::new(HashMap::new())),
+            landed: Arc::new(Mutex::new(HashMap::new())),
+            upload_times: Arc::new(Mutex::new(HashMap::new())),
+            upload_cancel: Arc::new(Mutex::new(HashMap::new())),
+            landing_uploads: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct TrashedMove(String);
@@ -659,6 +718,7 @@ impl Core {
     /// [`DRAIN_REVISION_DEBOUNCE_MAX`]: super::DRAIN_REVISION_DEBOUNCE_MAX
     pub(crate) fn revision_debounce(&self, uid: &NodeUid) -> Duration {
         let measured = self
+            .drain
             .upload_times
             .lock()
             .get(&uid.to_string())
@@ -674,7 +734,7 @@ impl Core {
     /// takes to send, and feeding that back would let one network fault widen
     /// the debounce for good.
     fn record_upload_time(&self, uid: &NodeUid, took: Duration) {
-        let mut times = self.upload_times.lock();
+        let mut times = self.drain.upload_times.lock();
         let now = now_millis();
         if times.len() >= UPLOAD_TIME_MEMORY
             && !times.contains_key(&uid.to_string())
@@ -697,9 +757,12 @@ impl Core {
     /// leave the newer upload uncancellable.
     fn begin_cancellable_upload(&self, uid: &NodeUid) -> UploadCancel {
         let flag = Arc::new(AtomicBool::new(false));
-        self.upload_cancel.lock().insert(uid.clone(), flag.clone());
+        self.drain
+            .upload_cancel
+            .lock()
+            .insert(uid.clone(), flag.clone());
         UploadCancel {
-            registry: self.upload_cancel.clone(),
+            registry: self.drain.upload_cancel.clone(),
             uid: uid.clone(),
             flag,
         }
@@ -712,7 +775,7 @@ impl Core {
     /// which for a 4 MiB block is soon enough to matter and late enough to be
     /// safe: the staged blob it is reading stays open until it lets go.
     pub(crate) fn cancel_upload(&self, uid: &NodeUid) {
-        if let Some(flag) = self.upload_cancel.lock().get(uid) {
+        if let Some(flag) = self.drain.upload_cancel.lock().get(uid) {
             flag.store(true, Ordering::Relaxed);
             debug!(%uid, "cancelling a superseded upload");
         }
@@ -722,7 +785,7 @@ impl Core {
     /// the shortest outstanding backoff elapsing.
     pub(crate) fn wait_for_drain_work(&self) {
         sleep_for_drain_work(
-            &self.drain_wake,
+            &self.drain.drain_wake,
             || self.shutdown.is_stopping(),
             DRAIN_IDLE_POLL,
         );
@@ -741,7 +804,11 @@ impl Core {
             None
         };
         let timeout = idle_wait(claiming, earliest, now_millis());
-        sleep_for_drain_work(&self.drain_wake, || self.shutdown.is_stopping(), timeout);
+        sleep_for_drain_work(
+            &self.drain.drain_wake,
+            || self.shutdown.is_stopping(),
+            timeout,
+        );
     }
 
     /// Perform one queued op and retire it.
@@ -767,7 +834,7 @@ impl Core {
         let Some(real) = parse_node_uid(&op.uid) else {
             return Ok(());
         };
-        let local = match self.unadopted.lock().get(&real).cloned() {
+        let local = match self.drain.unadopted.lock().get(&real).cloned() {
             Some(local) => local,
             // The map does not outlive a restart, which also forgets the
             // stand-in: the row is under the real uid by then. A file as it was
@@ -779,7 +846,7 @@ impl Core {
         if self.fetch_node_remote(&real)?.is_some() {
             self.adopt_real_uid(&local, &real, |_| {})?;
         }
-        self.unadopted.lock().remove(&real);
+        self.drain.unadopted.lock().remove(&real);
         debug!(%local, %real, "adopted a landed create");
         Ok(())
     }
@@ -1176,12 +1243,13 @@ impl Core {
         if let (Some(parent), Some(name)) = (op.parent_uid.as_deref(), op.name.as_deref())
             && let Some(parent) = parse_node_uid(parent)
         {
-            self.creating
+            self.drain
+                .creating
                 .lock()
                 .insert(op.id, (parent, name.to_string()));
         }
         let created = self.create_local_node(op);
-        self.creating.lock().remove(&op.id);
+        self.drain.creating.lock().remove(&op.id);
         created
     }
 
@@ -1317,7 +1385,7 @@ impl Core {
         // for closed and dropped what its handle reads, and a script that
         // waited for an empty queue read the file before it was cached
         // (`docs/BUGS.md` B257).
-        let _landing = LandingUpload::begin(&self.landing_uploads);
+        let _landing = LandingUpload::begin(&self.drain.landing_uploads);
         let newer = match self.retire_create(op, uploaded, &landing, &local, &real)? {
             CreateRetired::Withdrawn { trash } => {
                 return self.trash_withdrawn_create(op, trash, &local, &real, &name);
@@ -1345,7 +1413,10 @@ impl Core {
             }
         }) {
             warn!(%local, %real, error = %e, "reading back a landed create failed; adopting it later");
-            self.unadopted.lock().insert(real.clone(), local.clone());
+            self.drain
+                .unadopted
+                .lock()
+                .insert(real.clone(), local.clone());
         }
         // The feed will report this create back to us; the tree already has it
         // under its real uid, so that event is ours to ignore (`Core::self_changes`).
@@ -1390,6 +1461,7 @@ impl Core {
             return Ok(false);
         }
         let creating = self
+            .drain
             .creating
             .lock()
             .iter()
@@ -1400,7 +1472,8 @@ impl Core {
     /// Whether a create other than `op` is on the wire under `name`, in any
     /// folder.
     fn creating_named(&self, op: &PendingOp, name: &str) -> bool {
-        self.creating
+        self.drain
+            .creating
             .lock()
             .iter()
             .any(|(id, (_, n))| *id != op.id && n == name)
@@ -1503,6 +1576,7 @@ impl Core {
         // first one's rename took the second one's bytes along
         // (docs/BUGS.md B147).
         let racing = self
+            .drain
             .creating
             .lock()
             .iter()
@@ -1953,7 +2027,7 @@ impl Core {
         // revision id was never recorded as ours. The bytes it sent say the
         // same: the remote holds them, so no other device wrote since
         // (docs/BUGS.md B157).
-        let sealed = self.sealed_unread.lock().get(uid).cloned();
+        let sealed = self.drain.sealed_unread.lock().get(uid).cloned();
         if meta.complete
             && let Some(sealed) = sealed
             && let NodeKind::File {
@@ -2394,7 +2468,7 @@ impl Core {
         // trip in which it did not (B119). The op itself has to go first: one
         // restored after a crash would re-send a revision this daemon has not
         // yet recorded as its own, and come back as a conflict copy.
-        let _landing = LandingUpload::begin(&self.landing_uploads);
+        let _landing = LandingUpload::begin(&self.drain.landing_uploads);
         // Retire the op before dropping the blob: a crash between the two leaves
         // an orphaned file (harmless), whereas the reverse would leave a queued
         // op pointing at nothing.
@@ -2479,7 +2553,7 @@ impl Core {
             .unwrap_or(false);
         let fetched = self.fetch_node_remote(uid);
         if fetched.is_ok() {
-            self.sealed_unread.lock().remove(uid);
+            self.drain.sealed_unread.lock().remove(uid);
         }
         let node = match fetched {
             Ok(Some(node)) => node,
@@ -2495,10 +2569,10 @@ impl Core {
                        the next write to this file may conflict with itself");
                 match staged_sha1(blob) {
                     Ok(sha) => {
-                        self.sealed_unread.lock().insert(uid.clone(), sha);
+                        self.drain.sealed_unread.lock().insert(uid.clone(), sha);
                     }
                     Err(_) => {
-                        self.sealed_unread.lock().remove(uid);
+                        self.drain.sealed_unread.lock().remove(uid);
                     }
                 }
                 // No newer write took over, so the tree's stamp is this upload's.
@@ -2553,14 +2627,14 @@ impl Core {
             // its base: the blob it would have copied is let go of below, and
             // the tree's stamp names the revision this one replaced
             // (docs/BUGS.md B170).
-            self.landed.lock().insert(uid.clone(), node.clone());
+            self.drain.landed.lock().insert(uid.clone(), node.clone());
             self.rebase_open_writes(uid, &node);
         }
         self.release_pending(uid, blob);
         #[cfg(test)]
         self.drive.landing(uid);
         self.place_landed(uid, &node, placed, renaming);
-        self.landed.lock().remove(uid);
+        self.drain.landed.lock().remove(uid);
         Some(node)
     }
 

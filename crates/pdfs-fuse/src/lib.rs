@@ -589,23 +589,9 @@ struct Core {
     /// Nodes removed through this daemon which a briefly stale remote listing
     /// may still return. Uids are not reused; an explicit restore clears one.
     hidden: Arc<Mutex<HashSet<NodeUid>>>,
-    /// The folder and name each create on the wire was sent with, by op id.
-    /// Drive holds that name until the create lands and a rename or trash
-    /// queued behind it frees it again.
-    creating: Arc<Mutex<HashMap<i64, (NodeUid, String)>>>,
-    /// The SHA-1 of the last revision this daemon uploaded to a file and could
-    /// not read back, so its revision id is not known (`docs/BUGS.md` B157).
-    sealed_unread: Arc<Mutex<HashMap<NodeUid, String>>>,
-    /// The node an upload has just put on Drive, from when the drain lets go
-    /// of its blob until the tree has the node (`docs/BUGS.md` B170).
-    landed: Arc<Mutex<HashMap<NodeUid, Node>>>,
-    /// Creates that landed but could not be read back, by the uid Drive gave
-    /// them, with the placeholder's. The drain adopts one before it sends
-    /// anything else for it.
-    unadopted: Arc<Mutex<HashMap<NodeUid, NodeUid>>>,
-    /// Nudges the drain workers: set true and notify to have them re-examine
-    /// the queue instead of waiting out their backoff.
-    drain_wake: Arc<(Mutex<bool>, Condvar)>,
+    /// The drain's own bookkeeping: its wake-up, the creates and uploads on
+    /// the wire, and what they left behind. See [`drain::DrainState`].
+    drain: drain::DrainState,
     /// The pins the keeper owes a check (`keeper`).
     pin_work: Arc<Mutex<keeper::PinWork>>,
     /// The daemon's stop signal, shared with every background loop this `Core`
@@ -614,26 +600,6 @@ struct Core {
     /// The long-lived threads the mount started, and which are still
     /// running, for diagnostics and the supervisor.
     services: pdfs_core::lifecycle::ServiceBoard,
-    /// How long this node's last upload actually took, in milliseconds, with
-    /// the time it was measured for eviction. Feeds
-    /// [`Core::revision_debounce`]: a file that takes 30 seconds to send needs
-    /// a grace period on that scale, or every save supersedes an upload that
-    /// was already on the wire. Bounded by [`UPLOAD_TIME_MEMORY`].
-    upload_times: Arc<Mutex<HashMap<String, (u64, i64)>>>,
-    /// Cancellation flags for uploads currently on the wire, keyed by node.
-    ///
-    /// Set when a newer revision of the same file is queued: the bytes in
-    /// flight have just been superseded, and the only thing finishing them
-    /// achieves is spending the user's uplink on a revision the next op
-    /// replaces. Read by the upload's own reader ([`CountingReader`]), which is
-    /// the one thing the SDK calls often enough to notice.
-    upload_cancel: Arc<Mutex<HashMap<NodeUid, Arc<AtomicBool>>>>,
-    /// Uploads whose op is retired but whose bytes the content cache has not
-    /// adopted yet, because the revision just sealed is still being read back.
-    /// The status counts them as pending, so an empty queue means every file
-    /// written through the mount reads without the network (`docs/BUGS.md`
-    /// B119).
-    landing_uploads: Arc<AtomicU64>,
     /// True while a background refresh of the trash is already running, so a
     /// burst of requests against a stale listing starts one refresh.
     trash_refreshing: Arc<AtomicBool>,
@@ -4135,7 +4101,7 @@ impl Core {
 
     /// Nudge the drain worker to re-examine the queue now.
     fn wake_drain(&self) {
-        let (lock, cv) = &*self.drain_wake;
+        let (lock, cv) = &*self.drain.drain_wake;
         *lock.lock() = true;
         cv.notify_all();
     }
@@ -9560,7 +9526,7 @@ mod tests {
         let drain = function_source(include_str!("drain.rs"), "pub(crate) fn drain_revision(");
         assert_before(
             drain,
-            "let _landing = LandingUpload::begin(&self.landing_uploads)",
+            "let _landing = LandingUpload::begin(&self.drain.landing_uploads)",
             "self.db.delete_op(op.id)",
         );
         assert_before(drain, "self.db.delete_op(op.id)", ".store_file(&uid,");
@@ -9568,7 +9534,7 @@ mod tests {
         assert_before(
             status,
             "core.db.pending_op_counts()",
-            "core.landing_uploads.load(",
+            "core.drain.landing_uploads.load(",
         );
         assert!(status.contains("queued.uploads.max(0) as u64 + landing"));
     }
