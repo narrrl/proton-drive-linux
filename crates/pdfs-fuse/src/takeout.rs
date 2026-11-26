@@ -45,7 +45,7 @@ use proton_drive_rs::{PhotoLocation, PhotoTag, PhotoTagsUpdate, PhotoUploadMetad
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-pub(crate) use pdfs_drive::digest::{hex_lower, sha1_of};
+pub(crate) use pdfs_drive::digest::sha1_of;
 
 use super::Core;
 use crate::photos::can_make_thumbnail;

@@ -22,9 +22,11 @@ pub mod sdkcache;
 pub mod search;
 pub mod service;
 pub mod shell;
+pub mod shutdown;
 pub mod syncignore;
 pub mod syncroot;
 pub mod timestamp;
+pub mod transfers;
 pub mod tray;
 pub mod update;
 

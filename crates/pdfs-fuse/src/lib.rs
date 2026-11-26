@@ -115,7 +115,7 @@ mod redate;
 mod relocate;
 mod revisions;
 mod sharing;
-mod shutdown;
+use pdfs_core::shutdown;
 #[cfg(test)]
 mod sim;
 mod state;
@@ -124,7 +124,7 @@ mod sweep;
 mod sync;
 mod systemd;
 mod takeout;
-mod transfers;
+use pdfs_core::transfers;
 mod upload;
 mod r#virtual;
 mod workers;
@@ -177,7 +177,7 @@ const MAX_BACKGROUND: u16 = 64;
 const MAX_NAME_LEN: u32 = 255;
 
 /// How often the background task polls the remote event cursor.
-const POLL_INTERVAL: Duration = Duration::from_secs(10);
+const POLL_INTERVAL: Duration = pdfs_sync::EVENT_POLL_INTERVAL;
 /// Retry backoff for a queued upload, doubling per attempt between these. The
 /// floor is short because the common failure is a brief network blip; the
 /// ceiling keeps a persistently failing op from spinning.

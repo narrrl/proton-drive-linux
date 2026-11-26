@@ -47,11 +47,11 @@ graph TD
 
 | Crate | Holds |
 |---|---|
-| [`pdfs-core`](../crates/pdfs-core) | Authentication and keyring (`auth`), configuration and directories (`config`), the control protocol (`control`), search scoring, ignore rules, Google Takeout parsing, the machine profile |
+| [`pdfs-core`](../crates/pdfs-core) | Authentication and keyring (`auth`), configuration and directories (`config`), the control protocol (`control`), search scoring, ignore rules, Google Takeout parsing, the machine profile, the transfer registry (`transfers`) and the shutdown signal (`shutdown`) |
 | [`pdfs-store`](../crates/pdfs-store) | The SQLite schema and queries (`db/`), the content cache (`cache`) |
 | [`pdfs-drive`](../crates/pdfs-drive) | The `DriveApi` seam over the SDK, the call counter (`counted`), and `FakeDrive` for the simulations |
-| [`pdfs-sync`](../crates/pdfs-sync) | The sync planner, the pass model and the pass trace: the parts of the sync engine with no I/O |
-| [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), the tree (`state`), reads (`reads`), the queue and the drain (`queue`, `drain`, `upload`), the link state (`link`), remote events (`background`), the sync engine (`sync`, `sync/`; its own state in `SyncParts`, its calls into the daemon through `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
+| [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes and engine thread (`mirror`), and the parts with no I/O: planner, pass model and pass trace. It owns its state (`SyncParts`) and reaches the daemon only through `SyncHost` |
+| [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), the tree (`state`), reads (`reads`), the queue and the drain (`queue`, `drain`, `upload`), the link state (`link`), remote events (`background`), the daemon's side of the sync engine (`sync`, which implements `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
 | [`pdfs-cli`](../crates/pdfs-cli) | The `pdfs` binary. `pdfs daemon` runs the daemon in-process; every other command is a control-socket client |
 | [`pdfs-gui`](../crates/pdfs-gui) | `pdfs-app`, `pdfs-tray` and `pdfs-prompt`. Pages in `src/app/pages/`, widgets in `src/app/widgets/`, CSS and icons in `resources/` |
 
@@ -306,7 +306,7 @@ so it only drops gallery rows or marks the timeline stale (`TIMELINE_TTL`, 60 s)
 ## 7. Synced folders
 
 A synced folder in **mirror** mode is a plain local directory kept in step with a folder under
-this computer's device in Drive. It has its own engine (`sync.rs`, `sync/`); it does not use the
+this computer's device in Drive. It has its own engine (`pdfs-sync`'s `mirror`); it does not use the
 queue of §5 yet (§13). A folder in **online-only** mode is a FUSE session on the tree (§2), and
 its changes go through the queue like My files.
 

@@ -21,7 +21,7 @@ use parking_lot::{Condvar, Mutex};
 /// The daemon's stop signal. Set once, never cleared: a `Core` that has been
 /// told to stop belongs to a mount that is going away.
 #[derive(Default)]
-pub(crate) struct Shutdown {
+pub struct Shutdown {
     stopping: Mutex<bool>,
     changed: Condvar,
 }
@@ -29,14 +29,14 @@ pub(crate) struct Shutdown {
 impl Shutdown {
     /// Whether teardown has begun. Loops check this where they would otherwise
     /// start another unit of work.
-    pub(crate) fn is_stopping(&self) -> bool {
+    pub fn is_stopping(&self) -> bool {
         *self.stopping.lock()
     }
 
     /// Begin teardown and wake everything waiting in [`sleep`](Self::sleep).
     /// Idempotent, because more than one path can reach teardown (a signal, the
     /// kernel mount ending, a failed startup).
-    pub(crate) fn stop(&self) {
+    pub fn stop(&self) {
         let mut stopping = self.stopping.lock();
         *stopping = true;
         self.changed.notify_all();
@@ -47,7 +47,7 @@ impl Shutdown {
     /// Returns `false` if the daemon is stopping — including when it was already
     /// stopping on entry, so `while shutdown.sleep(interval)` is a complete and
     /// correct loop condition and no separate check is needed at the top.
-    pub(crate) fn sleep(&self, duration: Duration) -> bool {
+    pub fn sleep(&self, duration: Duration) -> bool {
         let mut stopping = self.stopping.lock();
         if !*stopping {
             self.changed.wait_for(&mut stopping, duration);
