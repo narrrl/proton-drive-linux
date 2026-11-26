@@ -27,7 +27,11 @@ use tracing::{debug, info, warn};
 use super::transfers::CountingReader;
 use super::{Core, count_noun, human_bytes, human_duration, parse_uid};
 
+mod photos;
+mod revisions;
 mod share;
+mod sync;
+mod trash;
 
 const MAX_CONTROL_REQUEST_BYTES: u64 = 1024 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -504,6 +508,19 @@ fn serve_subscription(core: &Core, username: &str, mountpoint: &Path, mut stream
     }
 }
 
+/// What a request's answer may need besides the request itself.
+#[derive(Clone, Copy)]
+struct Ask<'a> {
+    core: &'a Core,
+    mountpoint: &'a Path,
+    /// The connection, for requests that check who is asking.
+    stream: &'a UnixStream,
+    /// What the hidden gallery keeps out of Photos answers.
+    visibility: &'a super::gallery::Visibility,
+    /// [`Ask::visibility`]'s hidden media, as the JSON the database filters on.
+    excluded: &'a str,
+}
+
 fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: UnixStream) {
     if let Err(e) = stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT)) {
         warn!(error = %e, "control: could not set request timeout");
@@ -601,8 +618,19 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
     };
     let excluded =
         serde_json::to_string(&visibility.media).expect("a set of file identifiers serializes");
+    let ask = Ask {
+        core,
+        mountpoint,
+        stream: &stream,
+        visibility: &visibility,
+        excluded: &excluded,
+    };
     let response = match request {
-        Ok(request @ (share::request!())) => share::answer(core, mountpoint, request),
+        Ok(request @ (share::request!())) => share::answer(&ask, request),
+        Ok(request @ (photos::request!())) => photos::answer(&ask, request),
+        Ok(request @ (sync::request!())) => sync::answer(&ask, request),
+        Ok(request @ (revisions::request!())) => revisions::answer(&ask, request),
+        Ok(request @ (trash::request!())) => trash::answer(&ask, request),
         Ok(CtlRequest::Status) => status_response(core, username, mountpoint),
         Ok(CtlRequest::Subscribe) => {
             CtlResponse::error(CoreError::invalid("a subscription is served on its own"))
@@ -704,184 +732,6 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
             }
         },
-        Ok(CtlRequest::PhotosTimeline {
-            offset,
-            limit,
-            kind,
-            range,
-            favorites,
-            not_in_album,
-        }) => match core.photos_timeline(
-            offset,
-            clamp_limit(limit),
-            kind,
-            range,
-            favorites,
-            not_in_album,
-            &excluded,
-        ) {
-            Ok(Some(items)) => CtlResponse::Photos {
-                available: true,
-                items,
-                counts: core.db.photos_counts_visible(&excluded).ok(),
-            },
-            Ok(None) => CtlResponse::Photos {
-                available: false,
-                items: Vec::new(),
-                counts: None,
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::PhotoDuplicates) => match core.photo_duplicates() {
-            Ok(sets) => CtlResponse::PhotoDuplicates { sets },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::PhotoSimilar) => match core.photo_similar() {
-            Ok((sets, hashing, uncompared)) => CtlResponse::PhotoSimilar {
-                sets,
-                hashing,
-                uncompared,
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::PhotoPlaces) => match core.photo_places(&excluded) {
-            Ok(items) => CtlResponse::Places {
-                items,
-                mapping: core.timeline_progress(),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::PlacePhotos { id, offset, limit }) => {
-            match core.place_photos(id, offset, clamp_limit(limit), &excluded) {
-                Ok(items) => CtlResponse::Photos {
-                    available: true,
-                    items,
-                    counts: None,
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::PlaceLocations { id }) => match core.place_locations(id) {
-            Ok(items) => CtlResponse::PhotoLocations { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::PhotosOnThisDay { limit }) => {
-            match core.photos_on_this_day(clamp_limit(limit), &excluded) {
-                Ok(items) => CtlResponse::Photos {
-                    available: true,
-                    items,
-                    counts: None,
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::PhotoGroup { uid }) => match core.photo_group(&uid) {
-            Ok(items) => CtlResponse::Photos {
-                available: true,
-                items,
-                counts: None,
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::SetPhotoFavorite { uid, favorite }) => match parse_uid(&uid) {
-            Some(node_uid) => match core.set_photo_favorite(&node_uid, favorite) {
-                Ok(()) => CtlResponse::Ok {
-                    message: if favorite {
-                        "added to favorites".to_string()
-                    } else {
-                        "removed from favorites".to_string()
-                    },
-                },
-                Err(e) => CtlResponse::error(e),
-            },
-            None => CtlResponse::error(CoreError::invalid(format!("invalid uid: {uid}"))),
-        },
-        Ok(CtlRequest::PhotoAlbums) => match core.albums() {
-            Ok(Some(items)) => CtlResponse::Albums {
-                available: true,
-                items,
-            },
-            Ok(None) => CtlResponse::Albums {
-                available: false,
-                items: Vec::new(),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::AlbumPhotos { uid, offset, limit }) => match parse_uid(&uid) {
-            // An album page is a timeline page as far as the front-end is
-            // concerned, so it comes back in the same reply — with `counts`
-            // unset, which describe the whole timeline rather than this album.
-            Some(album) => match visibility
-                .permits(&uid)
-                .and_then(|()| core.album_photos(&album, offset, clamp_limit(limit), &excluded))
-            {
-                Ok(items) => CtlResponse::Photos {
-                    available: true,
-                    items,
-                    counts: None,
-                },
-                Err(e) => CtlResponse::error(e),
-            },
-            None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
-        },
-        Ok(CtlRequest::CreateAlbum { name }) => match core.create_album(&name) {
-            Ok(uid) => CtlResponse::AlbumCreated { uid },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RenameAlbum { uid, name }) => match parse_uid(&uid) {
-            Some(album) => match core.rename_album(&album, &name) {
-                Ok(()) => CtlResponse::Ok {
-                    message: format!("renamed album to {name}"),
-                },
-                Err(e) => CtlResponse::error(e),
-            },
-            None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
-        },
-        Ok(CtlRequest::DeleteAlbum { uid, delete_photos }) => match parse_uid(&uid) {
-            Some(album) => match core.delete_album(&album, delete_photos) {
-                Ok(()) => CtlResponse::Ok {
-                    message: "album deleted".to_string(),
-                },
-                Err(e) => CtlResponse::error(e),
-            },
-            None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
-        },
-        Ok(CtlRequest::AddToAlbum { uid, photos }) => {
-            album_change(&uid, &photos, |album, photos| {
-                core.add_to_album(album, photos)
-            })
-        }
-        Ok(CtlRequest::RemoveFromAlbum { uid, photos }) => {
-            album_change(&uid, &photos, |album, photos| {
-                core.remove_from_album(album, photos)
-            })
-        }
-        Ok(CtlRequest::PhotoPresence { uid, album }) => match core.cached_gallery_visibility() {
-            Ok(visibility)
-                if visibility.media.contains(&uid)
-                    || album
-                        .as_ref()
-                        .is_some_and(|uid| visibility.albums.contains(uid)) =>
-            {
-                CtlResponse::PhotoPresence { present: false }
-            }
-            Ok(_) => match core.db.photos_contains(&uid, album.as_deref()) {
-                Ok(present) => CtlResponse::PhotoPresence { present },
-                Err(error) => CtlResponse::error(error.into()),
-            },
-            Err(error) => CtlResponse::error(error),
-        },
-        Ok(CtlRequest::PhotoMonths { .. }) => unreachable!("handled before visibility requests"),
-        Ok(CtlRequest::PhotoThumbs { uids }) => {
-            let parsed: Vec<NodeUid> = uids
-                .iter()
-                .filter(|uid| !visibility.media.contains(*uid))
-                .filter_map(|u| parse_uid(u))
-                .collect();
-            CtlResponse::Thumbs {
-                items: core.photo_thumbs(&parsed),
-            }
-        }
         Ok(CtlRequest::TrashNodes { uids, files_only }) => match Core::parse_uids(&uids) {
             Ok(parsed) => match core.trash_photos(&parsed, files_only) {
                 Ok((trashed, failed)) => CtlResponse::Trashed {
@@ -895,212 +745,12 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::FileThumbs { items, generation }) => {
-            match core.file_thumbs(&items, generation) {
-                Some(items) => CtlResponse::Thumbs { items },
-                None => CtlResponse::FileThumbsStale,
-            }
-        }
-        Ok(CtlRequest::ReserveFileThumbGeneration) => CtlResponse::FileThumbGeneration {
-            generation: core.reserve_file_thumb_generation(),
-        },
-        Ok(CtlRequest::CancelFileThumbs { generation }) => {
-            core.cancel_file_thumbs(generation);
-            CtlResponse::Ok {
-                message: "thumbnail requests cancelled".to_string(),
-            }
-        }
-        Ok(CtlRequest::StartThumbnailBuild { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.start_thumbnail_build(rel) {
-                Ok(status) => CtlResponse::ThumbnailBuild { status },
-                Err(error) => CtlResponse::error(error),
-            },
-            Err(error) => CtlResponse::error(error),
-        },
-        Ok(CtlRequest::CancelThumbnailBuild) => CtlResponse::ThumbnailBuild {
-            status: core.cancel_thumbnail_build(),
-        },
-        Ok(CtlRequest::ThumbnailBuildStatus) => CtlResponse::ThumbnailBuild {
-            status: core.thumbnail_build_status(),
-        },
-        Ok(CtlRequest::PhotosRefreshStatus) => CtlResponse::PhotosRefresh {
-            running: core.timeline_refreshing(),
-        },
-        Ok(CtlRequest::OpenPhoto { uid }) => match parse_uid(&uid) {
-            Some(u) => match visibility.permits(&uid).and_then(|()| core.open_photo(&u)) {
-                Ok(p) => CtlResponse::FilePath {
-                    path: p.display().to_string(),
-                },
-                Err(e) => CtlResponse::error(e),
-            },
-            None => CtlResponse::error(CoreError::invalid(format!("bad uid: {uid}"))),
-        },
-        Ok(CtlRequest::DriveGallery {
-            action: pdfs_core::control::GalleryAction::AuthenticateHidden,
-        }) => core
-            .authenticate_hidden_gallery(&stream)
-            .unwrap_or_else(CtlResponse::error),
-        Ok(CtlRequest::DriveGallery { action }) => core
-            .drive_gallery(action)
-            .unwrap_or_else(CtlResponse::error),
-        Ok(CtlRequest::OpenGalleryVideo { uid, private }) => core
-            .open_gallery_video(&uid, private)
-            .unwrap_or_else(CtlResponse::error),
-        Ok(CtlRequest::OpenGalleryImage { uid, private: true }) => {
-            core.gallery_image(&uid).unwrap_or_else(CtlResponse::error)
-        }
-        Ok(CtlRequest::OpenGalleryImage {
-            uid,
-            private: false,
-        }) => match visibility
-            .permits(&uid)
-            .and_then(|()| core.sharing.open_shared_file(&uid))
-        {
-            Ok(path) => CtlResponse::FilePath {
-                path: path.display().to_string(),
-            },
-            Err(error) => CtlResponse::error(error),
-        },
-        Ok(CtlRequest::CloseGalleryVideo { token }) => core
-            .close_gallery_video(&token)
-            .unwrap_or_else(CtlResponse::error),
-        Ok(CtlRequest::GalleryThumbnail { uid, private }) => core
-            .gallery_thumbnail(&uid, private)
-            .unwrap_or_else(CtlResponse::error),
         // The scan alone walks every archive's central directory, so even the
         // dry run goes to a background thread and is read back through
         // `ImportStatus` rather than answered inline.
-        Ok(CtlRequest::ImportTakeout { archives, dry_run }) => {
-            if archives.is_empty() {
-                CtlResponse::error(CoreError::invalid("no Takeout archives given"))
-            } else {
-                let paths = archives.into_iter().map(PathBuf::from).collect();
-                start_takeout_import(core, paths, dry_run)
-            }
-        }
-        Ok(CtlRequest::ImportStatus) => {
-            let report = crate::takeout::import_status();
-            CtlResponse::ImportStatus {
-                running: report.running,
-                summary: report.summary,
-                progress: report.progress,
-                resumable: report.resumable,
-            }
-        }
-        Ok(CtlRequest::ResumeImport) => match crate::takeout::resumable_archives() {
-            None => CtlResponse::error(CoreError::not_found("there is no import to resume")),
-            Some(paths) => start_takeout_import(core, paths, false),
-        },
-        Ok(CtlRequest::CancelImport) => {
-            if crate::takeout::cancel_import() {
-                CtlResponse::Ok {
-                    message: "stopping the import".to_string(),
-                }
-            } else {
-                CtlResponse::error(CoreError::invalid("no import is running"))
-            }
-        }
         // The scan reads the whole persisted timeline and every candidate is a
         // download plus an upload, so this goes to a background thread and is
         // read back through `RedateStatus`.
-        Ok(CtlRequest::RedatePhotos {
-            dry_run,
-            limit,
-            range,
-        }) => match core.spawn_redate(dry_run, limit, range) {
-            Ok(()) => CtlResponse::Ok {
-                message: if dry_run {
-                    "checking photo dates".to_string()
-                } else {
-                    "fixing photo dates".to_string()
-                },
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RedateStatus) => {
-            let (running, summary) = crate::redate::redate_status();
-            CtlResponse::RedateStatus { running, summary }
-        }
-        Ok(CtlRequest::CancelRedate) => {
-            if crate::redate::cancel_redate() {
-                CtlResponse::Ok {
-                    message: "stopping the re-date".to_string(),
-                }
-            } else {
-                CtlResponse::error(CoreError::invalid("no photo re-date is running"))
-            }
-        }
-        Ok(CtlRequest::UploadPhoto {
-            name,
-            media_type,
-            source_path,
-            capture_time,
-        }) => {
-            // Streamed off disk rather than carried over the socket: see the note
-            // on `Request::UploadPhoto`. The length comes from the same handle the
-            // bytes do, so a file changing size under us cannot make the two
-            // disagree.
-            match std::fs::File::open(&source_path).and_then(|f| f.metadata().map(|m| (f, m.len())))
-            {
-                Err(e) => CtlResponse::error(CoreError::invalid(format!(
-                    "cannot read {source_path}: {e}"
-                ))),
-                Ok((file, len)) => {
-                    let photos = core.photos();
-                    // Unless the caller knows better: the photo's own EXIF,
-                    // then the file's modification time, which a copy resets.
-                    let capture_time = capture_time.or_else(|| {
-                        let path = Path::new(&source_path);
-                        pdfs_core::exiftime::capture_time_of(path).or_else(|| {
-                            let modified =
-                                std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-                            let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-                            Some(since.as_secs() as i64)
-                        })
-                    });
-                    let metadata = proton_drive_rs::PhotoUploadMetadata {
-                        capture_time,
-                        last_modification_time: capture_time
-                            .and_then(pdfs_core::timestamp::modification_time),
-                        ..Default::default()
-                    };
-                    let thumbnails = core.upload_thumbnails(Path::new(&source_path), &name);
-                    let guard =
-                        core.transfers
-                            .begin(name.clone(), "", TransferDirection::Upload, len);
-                    let reader = CountingReader::new(std::io::BufReader::new(file), &guard);
-                    match core.rt.block_on(photos.upload_photo_from(
-                        &name,
-                        &media_type,
-                        reader,
-                        len as i64,
-                        thumbnails,
-                        metadata,
-                        false,
-                    )) {
-                        Ok(uid) => {
-                            // The photo we just uploaded belongs at the head of the
-                            // timeline, and the GUI reloads the gallery the moment this
-                            // reply lands — so refresh now rather than leaving it to a
-                            // background pass that would land just after that reload.
-                            core.invalidate_photos();
-                            if let Err(e) = core.refresh_timeline_joined() {
-                                warn!(error = %e, "timeline refresh after upload failed");
-                            }
-                            CtlResponse::Ok {
-                                message: format!("uploaded photo with uid {uid}"),
-                            }
-                        }
-                        Err(e) => {
-                            // The reply goes to the app's toast only; without
-                            // this the journal shows a failure and no reason.
-                            warn!(error = %e, "photo upload failed");
-                            CtlResponse::error(CoreError::from_api(&e, "upload photo failed"))
-                        }
-                    }
-                }
-            }
-        }
         // A uid addresses the node wherever it lives; the path only works for
         // the primary mount's tree. Prefer the uid when the client sent one.
         Ok(CtlRequest::OpenFile { path, uid }) => {
@@ -1323,124 +973,15 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::Diagnostics) => CtlResponse::Diagnostics {
             diagnostics: core.diagnostics(),
         },
-        Ok(CtlRequest::ListTrash) => match core.list_trash() {
-            Ok(entries) => CtlResponse::Entries { entries },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListTrashedFolder { uid }) => match core.list_trashed_folder(&uid) {
-            Ok(entries) => CtlResponse::Entries { entries },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::Restore { uids }) => match core.restore(&uids) {
-            Ok(n) => {
-                core.log_activity(ActivityKind::Restore, format!("{n} item(s)"), "", true);
-                CtlResponse::Ok {
-                    message: format!("restored {n} item(s)"),
-                }
-            }
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::DeleteForever { uids }) => match core.delete_forever(&uids) {
-            Ok(n) => {
-                core.log_activity(
-                    ActivityKind::DeleteForever,
-                    format!("{n} item(s)"),
-                    "",
-                    true,
-                );
-                CtlResponse::Ok {
-                    message: format!("permanently deleted {n} item(s)"),
-                }
-            }
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::EmptyTrash) => match core.empty_trash() {
-            Ok(n) => {
-                let items = if n == 1 {
-                    "1 item".to_string()
-                } else {
-                    format!("{n} items")
-                };
-                core.log_activity(ActivityKind::EmptyTrash, items.clone(), "", true);
-                CtlResponse::Ok {
-                    message: format!("emptied trash ({items})"),
-                }
-            }
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::PurgeCache) => {
-            let freed = core.cache.clear_unpinned();
-            CtlResponse::Ok {
-                message: format!(
-                    "purged {:.1} MiB of unpinned cache",
-                    freed as f64 / 1_048_576.0
-                ),
-            }
-        }
-        Ok(CtlRequest::CacheInspect { deep }) => match core.db.stats() {
-            Ok(stats) => {
-                // The deep check reads every page — tens of seconds on a real
-                // database, all of it holding the connection every FUSE handler
-                // needs — so it runs on a thread and this request returns
-                // whatever the last completed check found. `integrity_checked`
-                // tells the caller which answer it is holding, since "no
-                // problems found" and "never looked" are both an empty list;
-                // `integrity_running` says a fresh answer is on its way.
-                let (integrity_problems, integrity_checked, integrity_running) = if deep {
-                    core.start_or_read_integrity_check()
-                } else {
-                    (Vec::new(), false, false)
-                };
-                CtlResponse::CacheReport {
-                    integrity_running,
-                    schema_version: stats.schema_version,
-                    db_bytes: stats.total_bytes(),
-                    db_reclaimable_bytes: stats.reclaimable_bytes(),
-                    tables: stats.tables,
-                    cache_used: core.cache.usage(),
-                    cache_budget: core.cache.budget(),
-                    integrity_problems,
-                    integrity_checked,
-                }
-            }
-            Err(e) => CtlResponse::error(CoreError::internal(format!("read db stats: {e:?}"))),
-        },
         // Ack and vacuum on a thread. `VACUUM` rewrites the whole database
         // under the connection mutex — minutes on a large one — and the
         // request's own socket timeout is 10 s, so running it inline both froze
         // the mount and lost its own answer. Progress shows up as a job in
         // `GetQueueStatus`; the outcome goes to the log.
-        Ok(CtlRequest::CacheVacuum) => match core.start_vacuum() {
-            Ok(()) => CtlResponse::Ok {
-                message: "compacting the cache database in the background".into(),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
         Ok(CtlRequest::GetQueueStatus) => CtlResponse::Transfers {
             items: core.transfers.snapshot(),
             jobs: core.jobs_snapshot(),
         },
-        Ok(CtlRequest::SetCacheBudget { bytes }) => {
-            core.cache.set_budget(bytes);
-            // Persist so the next mount keeps the new cap. Best-effort: a config
-            // write failure is reported but the live cap is already applied.
-            match AppDirs::new()
-                .map(|dirs| dirs.update_config(|cfg| cfg.cache_budget = Some(bytes)))
-            {
-                Ok(Ok(())) => {
-                    core.touch_profile();
-                    CtlResponse::Ok {
-                        message: format!("cache budget set to {bytes} bytes"),
-                    }
-                }
-                Ok(Err(e)) => CtlResponse::error(CoreError::internal(format!(
-                    "budget applied but config write failed: {e}"
-                ))),
-                Err(e) => CtlResponse::error(CoreError::internal(format!(
-                    "budget applied but config unavailable: {e}"
-                ))),
-            }
-        }
         Ok(CtlRequest::SetBandwidthLimits { upload, download }) => {
             core.transfers.set_limits(upload, download);
             // Persisted like the cache budget: best-effort, the live caps are
@@ -1464,322 +1005,6 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 ))),
             }
         }
-        Ok(CtlRequest::ListDevices) => match core.list_devices() {
-            Ok(items) => CtlResponse::Devices { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListLocations) => match core.list_locations() {
-            Ok(items) => CtlResponse::Locations { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RenameDevice { uid, name }) => match core.rename_device(&uid, &name) {
-            Ok(()) => CtlResponse::Ok {
-                message: format!("renamed device to {name}"),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::DeleteDevice { uid }) => match core.delete_device(&uid) {
-            Ok(()) => CtlResponse::Ok {
-                message: "device deleted".to_string(),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::AdoptDevice { uid }) => match core.adopt_device(uid.as_deref()) {
-            Ok(message) => CtlResponse::Ok { message },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::MigrateDevice { uid }) => match core.migrate_device(&uid) {
-            Ok(message) => CtlResponse::Ok { message },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::AddSyncFolder { local_path }) => {
-            // Registering the device and uploading a folder tree far outlasts the
-            // socket read timeout, so ack immediately and work on a background
-            // thread. The folder appears in ListSyncFolders once the row lands;
-            // completion (and any failures) go to the activity log.
-            let core = core.clone();
-            let path = PathBuf::from(&local_path);
-            if let Err(error) = core
-                .services
-                .clone()
-                .spawn_job("pdfs-add-sync-folder", move || {
-                    let started = Instant::now();
-                    match core.add_sync_folder(&path) {
-                        Ok(folder) => {
-                            core.touch_profile();
-                            let name = Path::new(&folder.local_path)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or(&folder.local_path)
-                                .to_string();
-                            core.log_activity(
-                                ActivityKind::Upload,
-                                format!("synced {name}"),
-                                human_duration(started.elapsed()),
-                                folder.state != "error",
-                            );
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "add sync folder failed");
-                            core.log_activity(ActivityKind::Upload, "add sync folder", &e, false);
-                        }
-                    }
-                })
-            {
-                tracing::warn!(%error, "could not start pdfs-add-sync-folder");
-            }
-            CtlResponse::Ok {
-                message: format!("adding {local_path}"),
-            }
-        }
-        Ok(CtlRequest::AttachSyncFolder {
-            local_path,
-            remote_path,
-        }) => {
-            let result = rel_to_mount(mountpoint, &remote_path).and_then(|remote| {
-                core.attach_sync_folder(Path::new(&local_path), &remote, mountpoint)
-            });
-            match result {
-                Ok(folder) => CtlResponse::Ok {
-                    message: format!("sync folder {} attached: {}", folder.id, folder.local_path),
-                },
-                Err(error) => CtlResponse::error(error),
-            }
-        }
-        Ok(CtlRequest::ListSyncFolders) => match core.list_sync_folders() {
-            Ok(items) => CtlResponse::SyncFolders { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RemoveSyncFolder { id, delete_remote }) => {
-            match core.remove_sync_folder(id, delete_remote) {
-                Ok(()) => {
-                    core.touch_profile();
-                    CtlResponse::Ok {
-                        message: "removed synced folder".to_string(),
-                    }
-                }
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::SetSyncFolderMode { id, mode }) => {
-            match core.request_sync_folder_mode(id, &mode) {
-                Ok(message) => {
-                    core.touch_profile();
-                    core.log_activity(ActivityKind::Upload, &message, "", true);
-                    CtlResponse::Ok { message }
-                }
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::SetSyncFolderPaused { id, paused }) => {
-            match core.set_sync_folder_paused(id, paused) {
-                Ok(()) => CtlResponse::Ok {
-                    message: match paused {
-                        true => format!("folder {id} paused"),
-                        false => format!("folder {id} resumed"),
-                    },
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::ResetSyncFolder { id }) => match core.reset_sync_folder(id) {
-            Ok(message) => {
-                core.log_activity(ActivityKind::Sync, &message, "", true);
-                CtlResponse::Ok { message }
-            }
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::SyncNow { id }) => {
-            core.sync_now(id);
-            CtlResponse::Ok {
-                message: match id {
-                    Some(id) => format!("reconciling folder {id}"),
-                    None => "reconciling all folders".to_string(),
-                },
-            }
-        }
-        Ok(CtlRequest::SetSyncPaused { paused, until }) => {
-            match core.set_sync_paused(paused, until) {
-                Ok(()) => CtlResponse::Ok {
-                    message: match (paused, until) {
-                        (false, _) => "sync resumed".to_string(),
-                        (true, None) => "sync paused until resumed".to_string(),
-                        (true, Some(_)) => "sync paused".to_string(),
-                    },
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::ListConflicts) => match core.list_conflicts() {
-            Ok(items) => CtlResponse::Conflicts { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ResolveConflict { path, keep }) => {
-            match route_change(core, mountpoint, &path) {
-                Ok((core, rel)) => match core.resolve_conflict(&rel, &keep) {
-                    Ok(message) => CtlResponse::Ok { message },
-                    Err(e) => CtlResponse::error(e),
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::ListPendingOps) => match core.pending_op_infos() {
-            Ok(items) => CtlResponse::PendingOps { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ExportPendingOp { id, dest }) => {
-            match core.export_pending_op(id, Path::new(&dest)) {
-                Ok(written) => CtlResponse::Ok {
-                    message: format!("wrote {} to {dest}", human_bytes(written)),
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::DiscardPendingOp { id }) => match core.discard_pending_op(id) {
-            Ok(path) => CtlResponse::Ok {
-                message: format!("discarded the queued change to {path}"),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RetryPendingOp { id }) => match core.retry_pending_ops(id) {
-            Ok(0) if id.is_some() => CtlResponse::Ok {
-                message: "nothing to retry: the operation is already due or waiting for a rename"
-                    .to_string(),
-            },
-            Ok(moved) => CtlResponse::Ok {
-                message: format!("retrying {moved} queued operation(s) now"),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListRestorableFolders) => match core.list_restorable_folders(None) {
-            Ok(items) => CtlResponse::RestorableFolders { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListDeviceRestorableFolders { device }) => {
-            match core.list_restorable_folders(Some(&device)) {
-                Ok(items) => CtlResponse::RestorableFolders { items },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(
-            request @ (CtlRequest::RestoreSyncFolders { .. }
-            | CtlRequest::RestoreDeviceFolders { .. }),
-        ) => {
-            let (device, items) = match request {
-                CtlRequest::RestoreDeviceFolders { device, items } => (Some(device), items),
-                CtlRequest::RestoreSyncFolders { items } => (None, items),
-                _ => unreachable!("matched above"),
-            };
-            // Like AddSyncFolder: each restored folder downloads a whole tree,
-            // which outlasts the socket timeout. Ack, then work.
-            let core = core.clone();
-            if let Err(error) =
-                core.services
-                    .clone()
-                    .spawn_job("pdfs-restore-sync-folders", move || {
-                        match core.restore_sync_folders(&items, device.as_deref()) {
-                            Ok(outcome) => {
-                                core.touch_profile();
-                                if !outcome.complete() {
-                                    warn!(skipped = ?outcome.skipped, "restore skipped folders");
-                                }
-                                core.log_activity(
-                                    ActivityKind::Download,
-                                    outcome.summary(),
-                                    outcome.skipped.join("; "),
-                                    outcome.complete(),
-                                );
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "restore failed");
-                                core.log_activity(
-                                    ActivityKind::Download,
-                                    "restore folders",
-                                    &e,
-                                    false,
-                                );
-                            }
-                        }
-                    })
-            {
-                tracing::warn!(%error, "could not start pdfs-restore-sync-folders");
-            }
-            CtlResponse::Ok {
-                message: "restoring folders".to_string(),
-            }
-        }
-        Ok(CtlRequest::ListRevisions { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.list_revisions(&rel) {
-                Ok(items) => CtlResponse::Revisions { items },
-                Err(e) => CtlResponse::error(e),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListRevisionsByUid { uid }) => match core.list_revisions_by_uid(&uid) {
-            Ok(items) => CtlResponse::Revisions { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RestoreRevision { path, revision_id }) => {
-            match rel_to_mount(mountpoint, &path) {
-                Ok(rel) => match core.restore_revision(&rel, &revision_id) {
-                    Ok(()) => CtlResponse::Ok {
-                        message: format!("restoring version {revision_id} of {path}"),
-                    },
-                    Err(e) => CtlResponse::error(e),
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::RestoreRevisionByUid { uid, revision_id }) => {
-            match core.restore_revision_by_uid(&uid, &revision_id) {
-                Ok(()) => CtlResponse::Ok {
-                    message: format!("restoring version {revision_id}"),
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::DeleteRevision { path, revision_id }) => {
-            match rel_to_mount(mountpoint, &path) {
-                Ok(rel) => match core.delete_revision(&rel, &revision_id) {
-                    Ok(()) => CtlResponse::Ok {
-                        message: format!("deleted version {revision_id} of {path}"),
-                    },
-                    Err(e) => CtlResponse::error(e),
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::DeleteRevisionByUid { uid, revision_id }) => {
-            match core.delete_revision_by_uid(&uid, &revision_id) {
-                Ok(()) => CtlResponse::Ok {
-                    message: format!("deleted version {revision_id}"),
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::SaveRevisionAs {
-            path,
-            revision_id,
-            dest,
-        }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.save_revision_as(&rel, &revision_id, Path::new(&dest)) {
-                Ok(written) => CtlResponse::Ok {
-                    message: format!("wrote {} to {dest}", human_bytes(written)),
-                },
-                Err(e) => CtlResponse::error(e),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::SaveRevisionAsByUid {
-            uid,
-            revision_id,
-            dest,
-        }) => match core.save_revision_as_by_uid(&uid, &revision_id, Path::new(&dest)) {
-            Ok(written) => CtlResponse::Ok {
-                message: format!("wrote {} to {dest}", human_bytes(written)),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
         Ok(CtlRequest::AccountQuota) => match core.account_quota() {
             Ok((max_space, used_space)) => CtlResponse::AccountQuota {
                 max_space,

@@ -84,7 +84,8 @@ impl Target {
 }
 
 /// Answer a request that [`request!`] matches.
-pub(super) fn answer(core: &Core, mountpoint: &Path, request: CtlRequest) -> CtlResponse {
+pub(super) fn answer(ask: &super::Ask<'_>, request: CtlRequest) -> CtlResponse {
+    let (core, mountpoint) = (ask.core, ask.mountpoint);
     match answer_or_refuse(core, mountpoint, request) {
         Ok(response) => response,
         Err(e) => CtlResponse::error(e),
