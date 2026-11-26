@@ -810,6 +810,13 @@ has no host. Turning the offered folders into synced folders stays on `Core`.
 `maintenance::Maintenance` runs `VACUUM` and the deep integrity check as jobs, one at a time, and
 keeps the last check's findings.
 
+`search::Search` answers searches over the node and home indexes. It holds the database, the
+content cache, the on-demand mounts and the home indexer's busy flag.
+
+`recovery::Recovery` rebuilds the queue after a restart: the pending map, the staging area and
+writes fsynced before the stop. Its `RecoveryHost` port queues a recovered write. Rebuilding the
+tree stays on `Core`.
+
 The mount's background loops are services of their own too, each started from the list in
 `services.rs`:
 
