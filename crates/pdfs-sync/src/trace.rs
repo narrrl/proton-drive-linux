@@ -15,7 +15,7 @@ use super::*;
 /// A stage of a pass. A pass runs them in this order, except that planning
 /// and applying alternate, one folder depth at a time.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Phase {
+pub enum Phase {
     /// Waiting for the folder's lock, held by a mode switch or a relocation.
     LockWait,
     /// Reading the stored baseline from the database.
@@ -57,7 +57,7 @@ impl Phase {
 
 /// A kind of call to Drive, or of work applied for one path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Call {
+pub enum Call {
     /// The child uids of one folder.
     ListChildren,
     /// Names and kinds of one folder's children, without unlocking file keys.
@@ -107,7 +107,7 @@ impl Call {
 
 /// Something a pass counts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Count {
+pub enum Count {
     /// Files and folders the local walk found.
     LocalEntries,
     /// Folders on Drive the remote walk listed.
@@ -184,7 +184,7 @@ impl Stat {
 
 /// The timings and counts of one pass.
 #[derive(Clone, Debug)]
-pub(crate) struct PassTrace {
+pub struct PassTrace {
     folder_id: i64,
     started: Instant,
     /// How the pass ended and how long it ran; `None` while it runs.
@@ -196,7 +196,7 @@ pub(crate) struct PassTrace {
 }
 
 impl PassTrace {
-    pub(crate) fn new(folder_id: i64) -> Self {
+    pub fn new(folder_id: i64) -> Self {
         Self {
             folder_id,
             started: Instant::now(),
@@ -208,28 +208,28 @@ impl PassTrace {
         }
     }
 
-    pub(crate) fn folder_id(&self) -> i64 {
+    pub fn folder_id(&self) -> i64 {
         self.folder_id
     }
 
-    pub(crate) fn is_ended(&self) -> bool {
+    pub fn is_ended(&self) -> bool {
         self.ended.is_some()
     }
 
-    pub(crate) fn phase(&mut self, phase: Phase, took: Duration) {
+    pub fn phase(&mut self, phase: Phase, took: Duration) {
         self.phases[phase as usize].add(took);
     }
 
-    pub(crate) fn call(&mut self, call: Call, took: Duration) {
+    pub fn call(&mut self, call: Call, took: Duration) {
         self.calls[call as usize].add(took);
     }
 
-    pub(crate) fn count(&mut self, count: Count, n: usize) {
+    pub fn count(&mut self, count: Count, n: usize) {
         self.counts[count as usize] += n as u64;
     }
 
     /// Note how long listing the Drive folder at `rel` took, keeping the slowest.
-    pub(crate) fn listing(&mut self, rel: &str, took: Duration) {
+    pub fn listing(&mut self, rel: &str, took: Duration) {
         if self
             .slowest_listing
             .as_ref()
@@ -239,7 +239,7 @@ impl PassTrace {
         }
     }
 
-    pub(crate) fn end(&mut self, how: &'static str) {
+    pub fn end(&mut self, how: &'static str) {
         if self.ended.is_none() {
             self.ended = Some((how, self.started.elapsed()));
         }
@@ -252,7 +252,7 @@ impl PassTrace {
 
     /// The trace as `pdfs diagnostics` reports it. Stages and calls that
     /// never happened are left out.
-    pub(crate) fn summary(&self) -> SyncPassTrace {
+    pub fn summary(&self) -> SyncPassTrace {
         SyncPassTrace {
             folder_id: self.folder_id,
             ended: self

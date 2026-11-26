@@ -16,7 +16,7 @@ use super::*;
 /// Ignored baseline rows are deliberately left in the database rather than
 /// removed: with the row intact, un-ignoring the path later re-adopts the
 /// existing remote file instead of reading as a brand-new local one.
-pub(super) fn classification_order<L, R, B>(
+pub fn classification_order<L, R, B>(
     local: &HashMap<String, L>,
     remote: &HashMap<String, R>,
     baseline: &HashMap<String, B>,
@@ -52,7 +52,7 @@ where
 
 /// Lets [`classification_order`] ask either walk's item whether it is a
 /// directory without knowing which walk it came from.
-pub(super) trait HasKind {
+pub trait HasKind {
     fn is_dir(&self) -> bool;
 }
 
@@ -79,7 +79,7 @@ impl HasKind for RemoteItem {
 /// counts as ignored if it matches as either. Erring towards "ignored" only ever
 /// shrinks the set the guard checks, which weakens a safety net rather than
 /// causing a deletion — the wrong direction to be wrong in is the other one.
-pub(super) fn filter_baseline<'a, B>(
+pub fn filter_baseline<'a, B>(
     baseline: &'a HashMap<String, B>,
     rules: &IgnoreRules,
 ) -> HashMap<String, &'a B> {
@@ -101,7 +101,7 @@ pub(super) fn filter_baseline<'a, B>(
 /// the whole pass instead is what B55 did, and it left one root-owned folder
 /// stopping every other file in the tree from syncing (B196).
 #[derive(Default)]
-pub(super) struct Unscanned {
+pub struct Unscanned {
     covered: HashSet<String>,
     /// The subset worth telling the user about, with why: an entry that only
     /// vanished mid-scan is not, since the next pass sees it settled.
@@ -110,18 +110,18 @@ pub(super) struct Unscanned {
 
 impl Unscanned {
     /// Leave out `rel`, which vanished while the scan looked at it.
-    pub(super) fn vanished(&mut self, rel: String) {
+    pub fn vanished(&mut self, rel: String) {
         self.covered.insert(rel);
     }
 
     /// Leave out `rel`, which cannot be read for `reason`.
-    pub(super) fn unreadable(&mut self, rel: String, reason: &str) {
+    pub fn unreadable(&mut self, rel: String, reason: &str) {
         self.unreadable.push(format!("{rel} ({reason})"));
         self.covered.insert(rel);
     }
 
     /// Whether `rel` is a left-out path or lies under one.
-    pub(super) fn covers(&self, rel: &str) -> bool {
+    pub fn covers(&self, rel: &str) -> bool {
         if self.covered.is_empty() {
             return false;
         }
@@ -138,7 +138,7 @@ impl Unscanned {
     }
 
     /// The unreadable paths with their reasons, sorted, for the activity feed.
-    pub(super) fn report(&self) -> Vec<String> {
+    pub fn report(&self) -> Vec<String> {
         let mut lines = self.unreadable.clone();
         lines.sort_unstable();
         lines
@@ -149,7 +149,7 @@ impl Unscanned {
 /// under a path the scan could not read. This is the set [`guard_local_wipe`]
 /// checks and the set a push pass reads deletions from, since a path outside
 /// it is absent from the local walk by rule or by failure, never by loss.
-pub(super) fn tracked_baseline<'a, B>(
+pub fn tracked_baseline<'a, B>(
     baseline: &'a HashMap<String, B>,
     rules: &IgnoreRules,
     unscanned: &Unscanned,
@@ -167,7 +167,7 @@ pub(super) fn tracked_baseline<'a, B>(
 /// it raw trashed every synced path that later became ignored, because the walk
 /// skips those, and the switch to on-demand that the push pass runs for then
 /// deleted the local copy too (B197).
-pub(super) fn local_deletions<B, L>(
+pub fn local_deletions<B, L>(
     tracked: &HashMap<String, &B>,
     local: &HashMap<String, L>,
 ) -> Vec<String> {
@@ -205,7 +205,7 @@ fn looks_like_a_wipe(missing: usize, total: usize) -> bool {
 /// When the synced paths are all or nearly all absent locally, the likely
 /// cause is an unavailable mount or unreadable folder rather than a deliberate
 /// deletion of the whole tree.
-pub(super) fn guard_local_wipe<B, L>(
+pub fn guard_local_wipe<B, L>(
     baseline: &HashMap<String, B>,
     local: &HashMap<String, L>,
 ) -> Result<(), String> {
@@ -231,7 +231,7 @@ pub(super) fn guard_local_wipe<B, L>(
 /// everything", which a pass answers by deleting the local copies. When all or
 /// nearly all synced paths are gone from Drive at once, a failed listing is far
 /// likelier than a deliberate wipe of the folder, so the pass stops instead.
-pub(super) fn guard_remote_wipe<B, R>(
+pub fn guard_remote_wipe<B, R>(
     baseline: &HashMap<String, B>,
     remote: &HashMap<String, R>,
 ) -> Result<(), String> {
@@ -259,7 +259,7 @@ pub(super) fn guard_remote_wipe<B, R>(
 /// every path under that folder that the walk did not return is then left out,
 /// as [`Unscanned`] leaves out what the local scan could not read.
 #[derive(Default)]
-pub(super) struct RemoteGaps {
+pub struct RemoteGaps {
     /// Folders whose listing came back with fewer nodes than it named.
     short: HashSet<String>,
     /// Paths seen, but whose entry could not be read.
@@ -271,35 +271,35 @@ pub(super) struct RemoteGaps {
 
 impl RemoteGaps {
     /// The listing of `folder` named nodes that did not come back.
-    pub(super) fn short_listing(&mut self, folder: &str) {
+    pub fn short_listing(&mut self, folder: &str) {
         self.short.insert(folder.to_string());
     }
 
     /// `rel` is on Drive, but the walk could not read what it needs of it.
-    pub(super) fn unread(&mut self, rel: String) {
+    pub fn unread(&mut self, rel: String) {
         self.unread.insert(rel);
     }
 
     /// The listing of `folder` failed, so nothing under it was walked.
-    pub(super) fn unlisted(&mut self, folder: &str) {
+    pub fn unlisted(&mut self, folder: &str) {
         self.unlisted.insert(folder.to_string());
     }
 
     /// `rel` is no longer on Drive, or is about to be read again: whatever
     /// was noted of it goes.
-    pub(super) fn forget(&mut self, rel: &str) {
+    pub fn forget(&mut self, rel: &str) {
         self.short.remove(rel);
         self.unread.remove(rel);
         self.unlisted.remove(rel);
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.short.is_empty() && self.unread.is_empty() && self.unlisted.is_empty()
     }
 
     /// Whether `rel` may be missing from `remote` only because the walk could
     /// not read it. A path the walk returned is never hidden.
-    pub(super) fn hides<R>(
+    pub fn hides<R>(
         &self,
         rel: &str,
         remote: &HashMap<String, R>,
@@ -326,7 +326,7 @@ impl RemoteGaps {
     }
 
     /// The folders to name to the user, sorted.
-    pub(super) fn report(&self) -> Vec<String> {
+    pub fn report(&self) -> Vec<String> {
         let mut lines: Vec<String> = self
             .short
             .iter()
@@ -355,7 +355,7 @@ impl RemoteGaps {
 /// Trashing the folder would take that work with it, and the next pass would
 /// then delete the copy this pass just downloaded. `None` when everything under
 /// it is exactly what the baseline recorded.
-pub(super) fn remote_subtree_changed(
+pub fn remote_subtree_changed(
     rel: &str,
     remote: &HashMap<String, RemoteItem>,
     baseline: &HashMap<String, StoredSyncEntry>,
@@ -389,7 +389,7 @@ pub(super) fn remote_subtree_changed(
 /// Another computer's revision in the same second as that upload kept the
 /// modification time, and only the size could show it (B254). The pass then
 /// records the id on the row, so this costs one read per row.
-pub(super) fn unchanged_remote_size(
+pub fn unchanged_remote_size(
     baseline: &HashMap<String, StoredSyncEntry>,
     rel: &str,
     mtime: i64,
@@ -410,12 +410,12 @@ pub(super) fn unchanged_remote_size(
 /// Whether a baseline row without a revision id can take the one Drive now
 /// reports: the file's modification time and the size just read for real are
 /// the ones the row recorded, so the revision is the one it was synced at.
-pub(super) fn revision_confirms_baseline(base: &StoredSyncEntry, mtime: i64, size: i64) -> bool {
+pub fn revision_confirms_baseline(base: &StoredSyncEntry, mtime: i64, size: i64) -> bool {
     base.remote_revision_id.is_none() && remote_sig(base) == Some((mtime, size))
 }
 
 /// Join a child `name` onto a walk's `prefix`, giving a rel path.
-pub(super) fn join_rel(prefix: &str, name: &str) -> String {
+pub fn join_rel(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
         name.to_string()
     } else {
@@ -427,7 +427,7 @@ pub(super) fn join_rel(prefix: &str, name: &str) -> String {
 /// synced at. Only a revision id on both sides can say so; a row from before
 /// schema 44, or a node read without one, leaves it to the modification time
 /// and size.
-pub(super) fn revision_moved(base: Option<&StoredSyncEntry>, now: Option<&str>) -> bool {
+pub fn revision_moved(base: Option<&StoredSyncEntry>, now: Option<&str>) -> bool {
     match (base.and_then(|b| b.remote_revision_id.as_deref()), now) {
         (Some(recorded), Some(now)) => recorded != now,
         _ => false,
@@ -435,7 +435,7 @@ pub(super) fn revision_moved(base: Option<&StoredSyncEntry>, now: Option<&str>) 
 }
 
 /// The stored remote signature of a baseline row, if it has one.
-pub(super) fn remote_sig(e: &StoredSyncEntry) -> Option<(i64, i64)> {
+pub fn remote_sig(e: &StoredSyncEntry) -> Option<(i64, i64)> {
     match (&e.remote_rev, &e.remote_hash) {
         (Some(m), Some(s)) => Some((m.parse().ok()?, s.parse().ok()?)),
         _ => None,
@@ -443,7 +443,7 @@ pub(super) fn remote_sig(e: &StoredSyncEntry) -> Option<(i64, i64)> {
 }
 
 /// The parent of a `/`-joined relative path (`""` for a top-level entry).
-pub(super) fn parent_rel(rel: &str) -> &str {
+pub fn parent_rel(rel: &str) -> &str {
     match rel.rfind('/') {
         Some(i) => &rel[..i],
         None => "",
@@ -451,7 +451,7 @@ pub(super) fn parent_rel(rel: &str) -> &str {
 }
 
 /// The final component of a `/`-joined relative path.
-pub(crate) fn base_name(rel: &str) -> &str {
+pub fn base_name(rel: &str) -> &str {
     match rel.rfind('/') {
         Some(i) => &rel[i + 1..],
         None => rel,
@@ -460,28 +460,27 @@ pub(crate) fn base_name(rel: &str) -> &str {
 
 /// Turn a `/`-joined relative path into an OS path (`/` is already the separator
 /// on Linux, this keeps the intent explicit).
-pub(super) fn rel_to_path(rel: &str) -> PathBuf {
+pub fn rel_to_path(rel: &str) -> PathBuf {
     rel.split('/').collect()
 }
 
 /// The name for a conflict copy of `path`, e.g.
 /// `notes (sync-conflict laptop 1700000000).txt`.
-#[cfg(test)]
-pub(super) fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
+pub fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
     conflict_path_with_suffix(path, stamp, 0)
 }
 
 /// As [`conflict_path`], with a deterministic suffix used when that name already
 /// exists. This keeps conflict preservation from ever replacing an older copy.
-pub(super) fn conflict_path_with_suffix(path: &Path, stamp: i64, suffix: u32) -> PathBuf {
-    conflict_path_as(path, crate::conflict_label(), stamp, suffix)
+pub fn conflict_path_with_suffix(path: &Path, stamp: i64, suffix: u32) -> PathBuf {
+    conflict_path_as(path, crate::naming::conflict_label(), stamp, suffix)
 }
 
 /// [`conflict_path_with_suffix`] with the machine's label given.
-pub(super) fn conflict_path_as(path: &Path, label: &str, stamp: i64, suffix: u32) -> PathBuf {
+pub fn conflict_path_as(path: &Path, label: &str, stamp: i64, suffix: u32) -> PathBuf {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path.extension().and_then(|s| s.to_str());
-    let tag = crate::conflict_tag(label, stamp, suffix);
+    let tag = crate::naming::conflict_tag(label, stamp, suffix);
     let name = match ext {
         Some(ext) => format!("{stem} (sync-conflict {tag}).{ext}"),
         None => format!("{stem} (sync-conflict {tag})"),
@@ -495,7 +494,7 @@ pub(super) fn conflict_path_as(path: &Path, label: &str, stamp: i64, suffix: u32
 /// A pure decision for one file-shaped path. Transfer identities and filesystem
 /// effects are attached by the executor after this classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FilePlan {
+pub enum FilePlan {
     Unchanged,
     Deferred,
     UploadNew,
@@ -516,7 +515,7 @@ pub(super) enum FilePlan {
     AdoptBaseline,
 }
 
-pub(super) fn plan_file(
+pub fn plan_file(
     local: Option<&LocalItem>,
     remote: Option<&RemoteItem>,
     baseline: Option<&StoredSyncEntry>,

@@ -8,10 +8,10 @@ use super::*;
 /// `mtime_ns` is the whole reason this is a struct rather than a pair — see
 /// [`StoredSyncEntry::local_mtime_ns`](pdfs_store::db::StoredSyncEntry).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct LocalSig {
-    pub(super) mtime: i64,
-    pub(super) mtime_ns: Option<i64>,
-    pub(super) size: i64,
+pub struct LocalSig {
+    pub mtime: i64,
+    pub mtime_ns: Option<i64>,
+    pub size: i64,
 }
 
 impl LocalSig {
@@ -21,7 +21,7 @@ impl LocalSig {
     /// falls back to whole seconds, which is what a baseline row written before
     /// schema 28 — or a filesystem that reports no sub-second time — can support
     /// (`docs/BUGS.md` B25).
-    pub(super) fn same_content(&self, other: &Self) -> bool {
+    pub fn same_content(&self, other: &Self) -> bool {
         if self.size != other.size {
             return false;
         }
@@ -63,52 +63,52 @@ impl From<&StoredSyncEntry> for LocalSig {
     }
 }
 
-pub(super) struct LocalItem {
-    pub(super) is_dir: bool,
-    pub(super) mtime: i64,
+pub struct LocalItem {
+    pub is_dir: bool,
+    pub mtime: i64,
     /// [`LocalItem::mtime`] to nanosecond precision, when the filesystem
     /// reports one.
-    pub(super) mtime_ns: Option<i64>,
-    pub(super) size: i64,
+    pub mtime_ns: Option<i64>,
+    pub size: i64,
     /// True when another process holds this file open for writing (detected via
     /// `/proc/*/fd`). An open-for-write file is kept in the map — so it is not
     /// misread as a deletion — but treated as unchanged for upload purposes,
     /// deferring the upload until the writer closes the file.
-    pub(super) open_for_write: bool,
+    pub open_for_write: bool,
 }
 
 /// One item found while walking a remote tree.
-pub(super) struct RemoteItem {
-    pub(super) uid: NodeUid,
-    pub(super) is_dir: bool,
-    pub(super) mtime: i64,
-    pub(super) size: i64,
+pub struct RemoteItem {
+    pub uid: NodeUid,
+    pub is_dir: bool,
+    pub mtime: i64,
+    pub size: i64,
     /// The active revision's id. The light walk carries it for every file, so
     /// it is the signal that tells another client's new revision from a link
     /// merely re-stamped.
-    pub(super) revision: Option<String>,
+    pub revision: Option<String>,
     /// The active revision's content SHA-1, read only for files the walk
     /// enumerated in full (no baseline, or a moved mtime). `None` is never
     /// proof of anything.
-    pub(super) sha1: Option<String>,
+    pub sha1: Option<String>,
 }
 
 /// What a pass saw of a remote file: the signature its baseline records once
 /// the file is synced, and what an upload checks Drive still holds before it
 /// supersedes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct RemoteSeen {
-    pub(super) mtime: i64,
-    pub(super) size: i64,
-    pub(super) revision: Option<String>,
+pub struct RemoteSeen {
+    pub mtime: i64,
+    pub size: i64,
+    pub revision: Option<String>,
 }
 
 impl RemoteSeen {
     /// Whether `node` is still the revision this was taken from. The revision
     /// id decides it when both sides have one; otherwise the modification time
     /// and size, which is all a baseline row from before schema 44 holds.
-    pub(super) fn still_current(&self, node: &Node) -> bool {
-        match (&self.revision, crate::node_revision_id(node)) {
+    pub fn still_current(&self, node: &Node) -> bool {
+        match (&self.revision, pdfs_drive::node_revision_id(node)) {
             (Some(seen), Some(now)) => *seen == now,
             _ => (self.mtime, self.size) == remote_file_sig(node),
         }
@@ -129,28 +129,28 @@ impl From<&RemoteItem> for RemoteSeen {
 /// conflict copies, and how many failed to apply (and so still need another
 /// pass). The counts drive both the folder's state and its activity summary.
 #[derive(Default)]
-pub(super) struct Outcome {
-    pub(super) uploaded: usize,
-    pub(super) downloaded: usize,
-    pub(super) created: usize,
-    pub(super) deleted: usize,
-    pub(super) conflicts: usize,
-    pub(super) errors: usize,
+pub struct Outcome {
+    pub uploaded: usize,
+    pub downloaded: usize,
+    pub created: usize,
+    pub deleted: usize,
+    pub conflicts: usize,
+    pub errors: usize,
     /// Files skipped because another process held them open for writing.
-    pub(super) deferred: usize,
+    pub deferred: usize,
     /// Paths the local scan could not read, left out of the pass. Not part of
     /// [`is_empty`](Self::is_empty) or the summary: an unreadable folder stays
     /// unreadable from one poll to the next, so the pass reports it once, when
     /// the set changes, rather than on every poll.
-    pub(super) unscanned: Vec<String>,
+    pub unscanned: Vec<String>,
     /// The first step that failed in this pass, so the line that ends a pass
     /// in `error` says why without a search back through the journal.
-    pub(super) first_error: Option<String>,
+    pub first_error: Option<String>,
 }
 
 impl Outcome {
     /// Count one failed step, keeping the first one's message.
-    pub(super) fn failed(&mut self, error: &str) {
+    pub fn failed(&mut self, error: &str) {
         self.errors += 1;
         if self.first_error.is_none() {
             self.first_error = Some(error.to_string());
@@ -158,7 +158,7 @@ impl Outcome {
     }
 
     /// Fold in one applied op.
-    pub(super) fn record(&mut self, applied: &Applied) {
+    pub fn record(&mut self, applied: &Applied) {
         match applied {
             Applied::Dir(..) => self.created += 1,
             Applied::Uploaded => self.uploaded += 1,
@@ -170,7 +170,7 @@ impl Outcome {
 
     /// Whether the pass moved nothing at all — the common case on a poll of an
     /// unchanged folder, which should not add a line to the activity feed.
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.uploaded == 0
             && self.downloaded == 0
             && self.created == 0
@@ -181,7 +181,7 @@ impl Outcome {
     }
 
     /// A human summary of the pass: "3 uploaded, 1 downloaded, 2 failed".
-    pub(super) fn summary(&self) -> String {
+    pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         for (n, label) in [
             (self.uploaded, "uploaded"),
@@ -203,7 +203,7 @@ impl Outcome {
 /// A network operation queued during classification and run concurrently in a
 /// per-depth batch. Parent uids are resolved up front (the parent folder is one
 /// depth shallower and already created), so tasks share nothing mutable.
-pub(super) enum Pending {
+pub enum Pending {
     /// Create a new remote folder under `parent`.
     CreateDir { rel: String, parent: NodeUid },
     /// Upload a brand-new local file into `parent`.
@@ -255,7 +255,7 @@ pub(super) enum Pending {
 
 impl Pending {
     /// The path this op acts on, relative to the folder root.
-    pub(super) fn rel(&self) -> &str {
+    pub fn rel(&self) -> &str {
         match self {
             Pending::CreateDir { rel, .. }
             | Pending::UploadNew { rel, .. }
@@ -268,7 +268,7 @@ impl Pending {
     }
 
     /// Which call of the pass's trace this op counts as.
-    pub(super) fn call(&self) -> Call {
+    pub fn call(&self) -> Call {
         match self {
             Pending::CreateDir { .. } => Call::CreateFolder,
             Pending::UploadNew { .. } | Pending::PushConflict { .. } => Call::Upload,
@@ -280,7 +280,7 @@ impl Pending {
     }
 
     /// How this op reads in the activity feed.
-    pub(super) fn kind(&self) -> ActivityKind {
+    pub fn kind(&self) -> ActivityKind {
         match self {
             Pending::CreateDir { .. } => ActivityKind::CreateFolder,
             Pending::UploadNew { .. }
@@ -293,7 +293,7 @@ impl Pending {
     }
 
     /// The activity line's detail, which distinguishes ops that share a kind.
-    pub(super) fn detail(&self) -> &'static str {
+    pub fn detail(&self) -> &'static str {
         match self {
             Pending::CreateDir { .. } => "on Drive",
             Pending::UploadNew { .. } => "new file",
@@ -307,7 +307,7 @@ impl Pending {
 }
 
 /// Why a full reconcile pass stopped without a result.
-pub(super) enum PassAbort {
+pub enum PassAbort {
     /// An on-demand switch was queued while the pass was running. Everything left
     /// to do is work on a local copy about to be evicted, so the pass gives up its
     /// remaining work to a [`push pass`](Core::push_pass) instead. Not a failure —
@@ -328,4 +328,61 @@ impl From<String> for PassAbort {
     fn from(e: String) -> Self {
         PassAbort::Failed(e)
     }
+}
+
+/// What a [`Pending`] op did, so the reconcile can update shared state on the
+/// engine thread (never inside a task).
+pub enum Applied {
+    /// A folder was created; register `uid` in `remote_dirs` for its children.
+    Dir(String, NodeUid),
+    /// A local file was uploaded (new file or new revision).
+    Uploaded,
+    /// A remote file was downloaded.
+    Downloaded,
+    /// A conflict copy was kept.
+    Conflict,
+    /// A path already the same on both sides got its first baseline. Nothing
+    /// moved, so it is neither counted nor logged.
+    Adopted,
+    /// The local file to upload was deleted after the scan planned it. There is
+    /// nothing left to send, and the next pass sees the deletion (B108).
+    Vanished,
+}
+
+/// A remote node's `(mtime, size)` change signature. Size prefers the plaintext
+/// `claimed_size`; otherwise the encrypted storage size (stable either way, and
+/// only ever compared against the same node's own baseline).
+pub fn remote_file_sig(node: &Node) -> (i64, i64) {
+    let size = match &node.kind {
+        NodeKind::File {
+            claimed_size,
+            total_size_on_storage,
+            ..
+        } => claimed_size.unwrap_or(*total_size_on_storage),
+        NodeKind::Folder => 0,
+    };
+    (node.modification_time, size)
+}
+
+/// A file's modification time as epoch seconds (0 if unavailable).
+pub fn system_mtime(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The same modification time in nanoseconds, when the filesystem reports one.
+///
+/// Whole seconds cannot distinguish an edit made in the same second as the last
+/// sync from no edit at all, and if the size did not change either, that file
+/// was never uploaded (`docs/BUGS.md` B25). `None` for a clock or filesystem that
+/// cannot answer, which falls the comparison back to seconds rather than
+/// asserting an mtime of zero.
+pub fn system_mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
 }

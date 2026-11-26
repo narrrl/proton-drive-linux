@@ -25,7 +25,7 @@ The daemon already knows what changed:
   `NodeUpdated { node_uid, parent_node_uid }` and `NodeDeleted { node_uid }` name the exact nodes.
   Today only the FUSE cache uses these events.
 
-The pass trace (`sync/trace.rs`) is how we measure this design against the current one. Get
+The pass trace (`crates/pdfs-sync/src/trace.rs`) is how we measure this design against the current one. Get
 traces from #53 and from a local 100k-file test folder before Phase 2, so the work goes where the
 time goes.
 
