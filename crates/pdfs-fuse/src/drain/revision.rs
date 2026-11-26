@@ -21,8 +21,8 @@ impl Core {
     /// still has to reach Drive, and a single pathological stall must not park
     /// it.
     ///
-    /// [`DRAIN_REVISION_DEBOUNCE`]: super::DRAIN_REVISION_DEBOUNCE
-    /// [`DRAIN_REVISION_DEBOUNCE_MAX`]: super::DRAIN_REVISION_DEBOUNCE_MAX
+    /// [`DRAIN_REVISION_DEBOUNCE`]: crate::DRAIN_REVISION_DEBOUNCE
+    /// [`DRAIN_REVISION_DEBOUNCE_MAX`]: crate::DRAIN_REVISION_DEBOUNCE_MAX
     pub(crate) fn revision_debounce(&self, uid: &NodeUid) -> Duration {
         let measured = self
             .drain
