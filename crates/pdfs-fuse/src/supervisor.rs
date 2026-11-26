@@ -15,6 +15,7 @@
 //! 3. **Sample memory.** That hang peaked at 5.2 GiB resident, and nobody knew
 //!    until it was over.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -64,10 +65,12 @@ pub(crate) fn run(core: Core, control_socket: PathBuf) {
     // Per-lane completion counts from the previous tick, to tell a queue that is
     // being worked through from one that is not moving at all.
     let mut last_completed = (0_u64, 0_u64);
+    // The services already reported as ended, so each is reported once.
+    let mut ended = HashSet::new();
 
     while core.shutdown.sleep(TICK) {
         let report = core.diagnostics();
-        let stalled = report_stalls(&report, last_completed);
+        let stalled = report_stalls(&report, last_completed) | report_ended(&report, &mut ended);
         last_completed = (report.meta_completed, report.transfer_completed);
 
         if last_rss.elapsed() >= RSS_EVERY {
@@ -174,6 +177,24 @@ fn report_stalls(report: &pdfs_core::control::Diagnostics, last_completed: (u64,
     stalled
 }
 
+/// WARN once about each service thread that has ended. Every one of them runs
+/// until the mount stops, and the supervisor stops looking once a stop
+/// begins, so an ended one died early: a panic, or a loop that gave up.
+/// Returns whether any is ended.
+fn report_ended(report: &pdfs_core::control::Diagnostics, reported: &mut HashSet<String>) -> bool {
+    let mut any = false;
+    for service in report.services.iter().filter(|service| !service.running) {
+        any = true;
+        if reported.insert(service.name.clone()) {
+            warn!(
+                service = %service.name,
+                "a daemon service has ended while the mount runs; it does not restart until the daemon does"
+            );
+        }
+    }
+    any
+}
+
 /// Whether the watchdog wants its next ping. The first one is due at once.
 fn ping_due(last_ping: Option<Instant>, period: Duration) -> bool {
     last_ping.is_none_or(|at| at.elapsed() >= period)
@@ -208,7 +229,36 @@ fn probe(control_socket: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfs_core::control::{Diagnostics, InflightRequest, SyncEngineState, WorkerState};
+    use pdfs_core::control::{
+        Diagnostics, InflightRequest, ServiceState, SyncEngineState, WorkerState,
+    };
+
+    /// A service that ended is reported, once, and one still running is not.
+    #[test]
+    fn an_ended_service_is_reported_once() {
+        let service = |name: &str, running| ServiceState {
+            name: name.into(),
+            running,
+            age_secs: 60,
+        };
+        let report = Diagnostics {
+            services: vec![
+                service("pdfs-sync", true),
+                service("pdfs-pin-keeper", false),
+            ],
+            ..Default::default()
+        };
+        let mut reported = HashSet::new();
+        assert!(report_ended(&report, &mut reported));
+        assert_eq!(reported, HashSet::from(["pdfs-pin-keeper".to_string()]));
+        assert!(report_ended(&report, &mut reported));
+        assert_eq!(reported.len(), 1);
+        let healthy = Diagnostics {
+            services: vec![service("pdfs-sync", true)],
+            ..Default::default()
+        };
+        assert!(!report_ended(&healthy, &mut HashSet::new()));
+    }
 
     fn busy_worker(age_secs: u64) -> WorkerState {
         WorkerState {

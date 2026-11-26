@@ -49,22 +49,6 @@ pub enum SyncMsg {
     Stop,
 }
 
-/// Start the sync engine: a control thread that owns the filesystem watcher and
-/// serialises reconcile passes, plus a periodic poll thread. The engine receives
-/// on `rx`; senders live in [`SyncParts::tx`].
-pub fn spawn(core: Syncer, rx: Receiver<SyncMsg>) -> Option<std::thread::JoinHandle<()>> {
-    match std::thread::Builder::new()
-        .name("pdfs-sync".into())
-        .spawn(move || engine_loop(core, rx))
-    {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            warn!(error = %e, "failed to start sync engine");
-            None
-        }
-    }
-}
-
 /// Whether the engine is alive and which pass it is on, for
 /// [`Core::diagnostics`] and the supervisor.
 ///
@@ -238,8 +222,11 @@ fn run_pass_by_id(core: &Syncer, id: i64) {
     }
 }
 
-/// The engine control loop. Single-threaded so reconcile passes never overlap.
-fn engine_loop(core: Syncer, rx: Receiver<SyncMsg>) {
+/// The sync engine, run on the daemon's `pdfs-sync` thread: it owns the
+/// filesystem watcher and serialises reconcile passes, and starts the periodic
+/// poll thread. It receives on `rx`; senders live in [`SyncParts::tx`]. Passes
+/// never overlap. Returns on [`SyncMsg::Stop`] or when the channel closes.
+pub fn run(core: Syncer, rx: Receiver<SyncMsg>) {
     let health = core.engine.clone();
     let _running = Running::start(&health);
     // No pass runs before this thread starts one, so a folder in `syncing` was

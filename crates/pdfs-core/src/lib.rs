@@ -10,6 +10,7 @@ pub mod control;
 pub mod error;
 pub mod kernelkey;
 pub mod keycheck;
+pub mod lifecycle;
 pub mod localindex;
 pub mod lockrank;
 pub mod menu;

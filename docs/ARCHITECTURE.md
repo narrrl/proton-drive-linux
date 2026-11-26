@@ -476,8 +476,13 @@ both with `pdfs_core::search::relevance_score`, so the prompt can merge them int
 | Smaller helpers | `pdfs-localindex` (home index for search), `pdfs-pause` (ends a timed pause), `pdfs-similar` (similar photos, on request), `pdfs-diagnostics` |
 
 Long-running loops wait on one shared `Shutdown` signal instead of sleeping, so a stop joins them
-instead of leaving them behind (`docs/BUGS.md` B44). `pdfs diagnostics` reports what each worker
-is doing.
+instead of leaving them behind (`docs/BUGS.md` B44). The mount starts its long-lived threads
+through `pdfs_core::lifecycle::Services`. Each one is started with its name and, if it blocks where
+the signal does not reach, the call that wakes it: the drain's condvar, the sync engine's `Stop`
+message, a connection to the control socket. A stop signals, wakes and joins them in reverse start
+order, up to one 10-second deadline, and names any that are still running at the end.
+`pdfs diagnostics` reports what each worker is doing and which services are still running. The
+supervisor warns once about a service that ended while the mount runs.
 
 ---
 

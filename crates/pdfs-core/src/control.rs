@@ -2374,6 +2374,22 @@ pub struct Diagnostics {
     /// field.
     #[serde(default)]
     pub drive_calls: Vec<DriveCallStat>,
+    /// The daemon's long-lived threads, in start order, and whether each is
+    /// still running. Empty from a daemon that predates the field.
+    #[serde(default)]
+    pub services: Vec<ServiceState>,
+}
+
+/// One long-lived daemon thread, in [`Diagnostics::services`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceState {
+    /// The thread's name, such as `pdfs-sync`.
+    pub name: String,
+    /// `false` once the thread has ended, by return or by panic. Every service
+    /// runs until the mount stops, so one that ended early is a fault.
+    pub running: bool,
+    /// How long ago the thread was started.
+    pub age_secs: u64,
 }
 
 /// One kind of call to Drive, in [`Diagnostics::drive_calls`].
