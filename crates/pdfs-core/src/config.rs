@@ -26,8 +26,92 @@ pub const USER_AGENT: &str = concat!("proton-drive-linux/", env!("CARGO_PKG_VERS
 const LEGACY_APP_VERSION: &str = "external-drive-linux@0.1.0-alpha";
 const LEGACY_USER_AGENT: &str = "proton-drive-linux/0.1.0";
 
-/// Keyring service name; one entry per credential kind keyed by username.
+/// Keyring service name of the default instance; see [`keyring_service`].
 pub const KEYRING_SERVICE: &str = "proton-drive-linux";
+
+/// Environment variable that names a separate instance of the client.
+///
+/// Unset, everything is as it always was. Set to a name, every place the client
+/// keeps an account apart is suffixed with it: the XDG config, state and cache
+/// directories (and with them the database, the control socket and the
+/// machine id), the Secret Service entry, the kernel keys and the default
+/// mountpoint. A second daemon can then run on another account next to the
+/// user's own, and neither sees the other's session. The test tooling uses it
+/// to run against a test account without signing the user out.
+///
+/// The systemd unit belongs to the default instance only: with an instance
+/// set, the `service` calls do nothing, so a `pdfs login` for a test account
+/// never restarts the user's daemon. Start that instance's `pdfs daemon` by
+/// hand.
+pub const INSTANCE_ENV: &str = "PDFS_INSTANCE";
+
+/// Base name of the client's directories and Secret Service entry.
+const APP_NAME: &str = "proton-drive-linux";
+
+/// The instance named by [`INSTANCE_ENV`], read once per process. `None` for
+/// the default instance.
+///
+/// # Panics
+///
+/// When the name is not 1 to 32 lowercase ASCII letters, digits or `-`. A name
+/// that was ignored instead would fall back to the default instance and touch
+/// the user's own account. Front ends call [`check_instance`] first to report
+/// it as an error.
+pub fn instance() -> Option<&'static str> {
+    match parsed_instance() {
+        Ok(instance) => *instance,
+        Err(message) => panic!("{message}"),
+    }
+}
+
+/// Fails when [`INSTANCE_ENV`] is set to a name [`instance`] would refuse.
+pub fn check_instance() -> Result<()> {
+    match parsed_instance() {
+        Ok(_) => Ok(()),
+        Err(message) => Err(Error::Other(message.clone())),
+    }
+}
+
+fn parsed_instance() -> &'static std::result::Result<Option<&'static str>, String> {
+    static INSTANCE: std::sync::OnceLock<std::result::Result<Option<&'static str>, String>> =
+        std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| match std::env::var(INSTANCE_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(name) if name.is_empty() => Ok(None),
+        Ok(name) if is_instance_name(&name) => Ok(Some(Box::leak(name.into_boxed_str()))),
+        _ => Err(format!(
+            "{INSTANCE_ENV} must be 1 to 32 lowercase letters, digits or '-'"
+        )),
+    })
+}
+
+fn is_instance_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `base`, or `base` and the instance name joined by `separator`.
+pub fn instance_suffixed(base: &str, separator: char) -> String {
+    match instance() {
+        Some(name) => format!("{base}{separator}{name}"),
+        None => base.to_string(),
+    }
+}
+
+/// The Secret Service name the session is stored under: [`KEYRING_SERVICE`],
+/// suffixed with the [`instance`] when one is set.
+pub fn keyring_service() -> &'static str {
+    static SERVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SERVICE.get_or_init(|| instance_suffixed(KEYRING_SERVICE, '-'))
+}
+
+/// The directory name under each XDG base directory: `proton-drive-linux`,
+/// suffixed with the [`instance`] when one is set.
+pub fn app_dir_name() -> String {
+    instance_suffixed(APP_NAME, '-')
+}
 
 /// Default soft cap on the on-disk content cache (5 GiB). LRU-evicts unpinned
 /// blobs back under this; pinned files are exempt. See `pdfs_store::cache`.
@@ -526,7 +610,7 @@ pub struct AppDirs {
 
 impl AppDirs {
     pub fn new() -> Result<Self> {
-        let dirs = ProjectDirs::from("io", "narl", "proton-drive-linux")
+        let dirs = ProjectDirs::from("io", "narl", &app_dir_name())
             .ok_or_else(|| Error::Other("cannot resolve home directory".into()))?;
         Ok(Self { dirs })
     }
@@ -659,11 +743,13 @@ impl AppDirs {
         directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
     }
 
-    /// Default mountpoint when the user does not pass one explicitly.
+    /// Default mountpoint when the user does not pass one explicitly:
+    /// `~/ProtonDrive`, or `~/ProtonDrive-<instance>` for a named [`instance`].
     pub fn default_mountpoint(&self) -> PathBuf {
+        let name = instance_suffixed("ProtonDrive", '-');
         directories::UserDirs::new()
-            .map(|u| u.home_dir().join("ProtonDrive"))
-            .unwrap_or_else(|| PathBuf::from("/tmp/ProtonDrive"))
+            .map(|u| u.home_dir().join(&name))
+            .unwrap_or_else(|| PathBuf::from("/tmp").join(&name))
     }
 
     /// The effective mountpoint: the config's explicit path, or
@@ -760,6 +846,31 @@ mod tests {
 
     fn mode_of(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn an_instance_name_is_short_lowercase_ascii() {
+        for good in ["test", "bench-1", "a", &"x".repeat(32)] {
+            assert!(is_instance_name(good), "{good:?}");
+        }
+        for bad in ["", "Test", "a/b", "../x", "a b", "ü", &"x".repeat(33)] {
+            assert!(!is_instance_name(bad), "{bad:?}");
+        }
+    }
+
+    /// The test process has no `PDFS_INSTANCE`, so it is the default instance
+    /// and every name is the one releases before 4.0 used.
+    #[test]
+    fn the_default_instance_keeps_the_old_names() {
+        assert_eq!(instance(), None);
+        assert_eq!(keyring_service(), "proton-drive-linux");
+        assert_eq!(app_dir_name(), "proton-drive-linux");
+        assert!(
+            AppDirs::new()
+                .unwrap()
+                .default_mountpoint()
+                .ends_with("ProtonDrive")
+        );
     }
 
     /// Two writers changing different settings at once both keep their change
