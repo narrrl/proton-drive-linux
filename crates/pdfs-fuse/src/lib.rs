@@ -563,10 +563,9 @@ struct Core {
     /// Whether Drive answers, when the link went down and a condvar for its
     /// coming back (see [`link`]).
     link: Arc<link::Link>,
-    /// When the user paused syncing, the Unix second it resumes by itself;
-    /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
-    /// Persisted, so a pause survives a restart (see [`Core::sync_paused`]).
-    sync_paused_until: Arc<AtomicI64>,
+    /// Whether the user paused syncing, and until when. Persisted, so a pause
+    /// survives a restart. See [`pause::SyncPause`].
+    pause: pause::SyncPause,
     /// The write-back's state: writes accepted from the kernel and not yet sent,
     /// nodes removed here that a stale listing may still return, and the changes
     /// this daemon made that Drive's event feed will echo back.

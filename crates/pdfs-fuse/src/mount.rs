@@ -489,7 +489,7 @@ pub(crate) fn mount_with(
     // handlers can trigger reconciles.
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<sync::SyncMsg>();
 
-    let paused_until = pause::load_paused_until(&db);
+    let pause = pause::SyncPause::load(db.clone());
     let gallery_dir = control_socket.with_file_name("gallery-catalog");
     let gallery =
         gallery_session.map(|session| Arc::new(super::gallery::Gallery::new(gallery_dir, session)));
@@ -538,7 +538,7 @@ pub(crate) fn mount_with(
         workers: Arc::new(Workers::new(FUSE_WORKERS)?),
         db,
         link: Arc::new(link::Link::starting(online, start == Start::SessionExpired)),
-        sync_paused_until: Arc::new(AtomicI64::new(paused_until)),
+        pause,
         drain: super::drain::DrainState::new(),
         pin_work: Arc::new(Mutex::new(Default::default())),
         sizes: super::sizes::SizeState::new(),
@@ -617,8 +617,8 @@ pub(crate) fn mount_with(
         }
     }
     // A timed pause persisted by an earlier run still has to end on time.
-    if pause::paused_at(paused_until, now_secs()) && paused_until != pause::PAUSED_INDEFINITELY {
-        core.arm_pause_timer(paused_until);
+    if let Some(until) = core.pause.deadline() {
+        core.arm_pause_timer(until);
     }
 
     // Reconcile leftover `(sync-conflict …)` copies: drop the ones that turned
