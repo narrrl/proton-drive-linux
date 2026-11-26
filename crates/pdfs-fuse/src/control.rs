@@ -260,7 +260,7 @@ fn route_within(
 /// absolute path the request named on an on-demand folder's mount, since
 /// that node is not under the primary mountpoint (`docs/BUGS.md` B281).
 fn pin_record(routed: &Core, rel: &Path, path: &str) -> PathBuf {
-    if routed.primary {
+    if routed.session.primary {
         rel.to_path_buf()
     } else {
         Path::new(path).components().collect()
@@ -380,7 +380,7 @@ pub(crate) fn status_response(core: &Core, username: &str, mountpoint: &Path) ->
         used: core.cache.usage(),
         budget: core.cache.budget(),
         pins,
-        online: core.online.load(Ordering::Relaxed),
+        online: core.is_online(),
         session_expired: core.session_expired(),
         tokens_unsaved: pdfs_core::auth::tokens_unsaved(),
         version: env!("CARGO_PKG_VERSION").to_string(),

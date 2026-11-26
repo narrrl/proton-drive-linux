@@ -32,10 +32,7 @@ impl Core {
             None
         };
         freshness.is_none_or(|key| {
-            !listing_needs_refresh(
-                self.online.load(Ordering::Relaxed),
-                self.shared_listing_stale(&key),
-            )
+            !listing_needs_refresh(self.is_online(), self.shared_listing_stale(&key))
         })
     }
 
@@ -229,14 +226,11 @@ impl Core {
         }
 
         let primary_root =
-            is_primary_root_listing(self.primary, &folder_uid, &self.primary_root_uid);
+            is_primary_root_listing(self.session.primary, &folder_uid, &self.primary_root_uid);
         let foreign = !self.is_own_or_virtual(&folder_uid) && !is_local_uid(&folder_uid);
         let foreign_key = foreign.then(|| Self::shared_folder_freshness_key(&folder_uid));
         let refresh_foreign = foreign_key.as_deref().is_some_and(|key| {
-            listing_needs_refresh(
-                self.online.load(Ordering::Relaxed),
-                self.shared_listing_stale(key),
-            )
+            listing_needs_refresh(self.is_online(), self.shared_listing_stale(key))
         });
         if cached && !refresh_foreign {
             if primary_root {

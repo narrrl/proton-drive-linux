@@ -351,16 +351,17 @@ pub(super) fn spawn_session(
     clear_stale_mount(mountpoint);
     info!(mountpoint = %mountpoint.display(), "mounting Proton Drive location");
     let fs = ProtonFs::new(core.clone(), root);
-    if core.primary {
+    if core.session.primary {
         // Only My Files rehydrates the daemon-wide node cache, once. A
         // secondary mount shares the tree it fills.
         core.hydrate();
     }
     let session = Session::new(fs, mountpoint, &config)?.spawn()?;
     let _ = core
+        .session
         .notifier
         .set(KernelChannel::new(session.notifier(), core.root_ino()));
-    core.session_live.store(true, Ordering::Release);
+    core.session.session_live.store(true, Ordering::Release);
     Ok(session)
 }
 
@@ -519,18 +520,15 @@ pub(crate) fn mount_with(
         rt: rt.clone(),
         maintenance: Arc::new(Mutex::new(Default::default())),
         primary_root_uid: root.uid.clone(),
-        primary: true,
         state: Arc::new(Ranked::new(
             Rank::State,
             State::new(db.clone(), share_access),
         )),
-        root: Arc::new(OnceLock::new()),
         cache,
         reads: super::reads::ReadState::new(),
         workers: Arc::new(Workers::new(FUSE_WORKERS)?),
         db,
-        online: Arc::new(AtomicBool::new(online)),
-        link: Arc::new(link::Link::starting(start == Start::SessionExpired)),
+        link: Arc::new(link::Link::starting(online, start == Start::SessionExpired)),
         sync_paused_until: Arc::new(AtomicI64::new(paused_until)),
         drain: super::drain::DrainState::new(),
         pin_work: Arc::new(Mutex::new(Default::default())),
@@ -540,12 +538,11 @@ pub(crate) fn mount_with(
         quota_cache: super::sharing::QuotaCache::new(),
         sweep: super::sweep::SweepState::new(sweep_mode),
         writes: super::writes::WriteState::new(),
+        session: super::session::SessionCells::new(),
         shutdown,
         services: ServiceBoard::default(),
         photo_jobs: super::photos::PhotoJobs::new(),
         local_first,
-        notifier: Arc::new(OnceLock::new()),
-        session_live: Arc::new(AtomicBool::new(false)),
         transfers,
         sync,
         events: Arc::new(Default::default()),
@@ -734,7 +731,7 @@ pub(crate) fn mount_with(
                         warn!(id, error = %unmount_error, "secondary teardown after control startup failure failed");
                     }
                 }
-                if let Err(unmount_error) = teardown_session(&core.session_live, || {
+                if let Err(unmount_error) = teardown_session(&core.session.session_live, || {
                     umount_session_unblocked(bg, main_conn)
                 }) {
                     warn!(error = %unmount_error, "unmount after control startup failure failed");
@@ -851,7 +848,7 @@ pub(crate) fn mount_with(
             Ok(()) => {
                 info!("stop requested; unmounting");
                 core.mounts.lock().close();
-                if let Err(e) = teardown_session(&core.session_live, || {
+                if let Err(e) = teardown_session(&core.session.session_live, || {
                     umount_session_unblocked(bg, main_conn)
                 }) {
                     warn!(error = %e, "umount_and_join failed");
@@ -863,7 +860,7 @@ pub(crate) fn mount_with(
             {
                 info!("unmounting to resume the stored session");
                 core.mounts.lock().close();
-                if let Err(e) = teardown_session(&core.session_live, || {
+                if let Err(e) = teardown_session(&core.session.session_live, || {
                     umount_session_unblocked(bg, main_conn)
                 }) {
                     warn!(error = %e, "umount_and_join failed");
@@ -874,7 +871,7 @@ pub(crate) fn mount_with(
                 if bg.guard.is_finished() {
                     info!("mount ended externally");
                     core.mounts.lock().close();
-                    if let Err(e) = teardown_session(&core.session_live, || bg.join()) {
+                    if let Err(e) = teardown_session(&core.session.session_live, || bg.join()) {
                         warn!(error = %e, "session join failed");
                     }
                     break MountOutcome::Unmounted;
@@ -883,7 +880,7 @@ pub(crate) fn mount_with(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Signal task gone (failed to install); fall back to join.
                 core.mounts.lock().close();
-                let _ = teardown_session(&core.session_live, || bg.join());
+                let _ = teardown_session(&core.session.session_live, || bg.join());
                 break MountOutcome::Unmounted;
             }
         }

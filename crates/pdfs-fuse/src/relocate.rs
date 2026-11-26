@@ -172,7 +172,7 @@ impl Core {
                 rel: dest_rel,
             },
         ) = (&source, &dest)
-            && Arc::ptr_eq(&core.root, &dest_core.root)
+            && Arc::ptr_eq(&core.session.root, &dest_core.session.root)
         {
             return core.move_to(rel, dest_rel);
         }

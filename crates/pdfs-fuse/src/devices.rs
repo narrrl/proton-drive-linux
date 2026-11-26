@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use parking_lot::Mutex;
 use pdfs_core::batch;
@@ -23,7 +22,6 @@ use pdfs_core::{CoreError, CoreResult};
 use pdfs_store::db::{StoredDevice, StoredSyncFolder};
 use proton_drive_rs::proton_sdk::ids::{DeviceUid, NodeUid};
 use proton_drive_rs::{DeviceType, Node};
-use std::sync::OnceLock;
 use tracing::{info, warn};
 
 use super::sync::{self, base_name};
@@ -782,10 +780,7 @@ impl Core {
     /// kernel channel, both filled in when the session is built.
     pub(crate) fn fork_state(&self) -> Core {
         let mut fork = self.clone();
-        fork.primary = false;
-        fork.root = Arc::new(OnceLock::new());
-        fork.notifier = Arc::new(OnceLock::new());
-        fork.session_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        fork.session = self.session.fork();
         fork
     }
 
@@ -1173,7 +1168,7 @@ impl Core {
         root: Node,
     ) -> CoreResult<SecondaryMount> {
         let core = self.fork_state();
-        let session_live = core.session_live.clone();
+        let session_live = core.session.session_live.clone();
         // The fork owns this state/path registration. `spawn_session` only
         // marks it live after FUSE has spawned successfully.
         core.register_state(local);

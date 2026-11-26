@@ -133,7 +133,7 @@ impl Core {
             // These paths walk the tree lazily, so a cold node needs the API.
             // Offline that surfaces as EIO, which on its own would read to the
             // user as a broken file rather than a missing network.
-            libc::EIO if !self.online.load(Ordering::Relaxed) => CoreError::offline(),
+            libc::EIO if !self.is_online() => CoreError::offline(),
             libc::EINVAL => CoreError::invalid(format!("{what}: not a usable path")),
             libc::ENOSPC => CoreError::new(ErrorKind::Quota, format!("{what}: out of space")),
             libc::EEXIST => CoreError::conflict(format!("{what}: already exists")),

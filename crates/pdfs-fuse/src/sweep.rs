@@ -154,7 +154,7 @@ impl Core {
         }
 
         let roots = self.search_roots();
-        let online = self.online.load(std::sync::atomic::Ordering::Relaxed);
+        let online = self.is_online();
         for node in &nodes {
             if node.trashed || node.is_folder() {
                 continue;

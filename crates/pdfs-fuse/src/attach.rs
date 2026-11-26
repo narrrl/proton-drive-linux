@@ -57,7 +57,7 @@ impl Core {
         mountpoint: &Path,
     ) -> CoreResult<StoredSyncFolder> {
         let _registration = super::devices::SYNC_ROOT_REGISTRATION.lock();
-        if !self.primary {
+        if !self.session.primary {
             return Err(CoreError::invalid("attach must use My files"));
         }
         if remote.is_absolute()

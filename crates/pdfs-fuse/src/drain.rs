@@ -394,7 +394,7 @@ impl Core {
             // the wire, so trashing its folder kept it as a trash; claimed
             // only to be handed back, it was kept although nothing had sent
             // it (`docs/BUGS.md` B178).
-            let online = self.online.load(Ordering::Relaxed);
+            let online = self.is_online();
             let paused = self.sync_paused();
             // One row, chosen and *claimed* by the database. Reading the whole
             // queue to pick one op made a long queue quadratic to drain, and

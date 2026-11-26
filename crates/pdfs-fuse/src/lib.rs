@@ -108,6 +108,7 @@ mod inhibit;
 mod keeper;
 mod link;
 mod listing;
+mod session;
 mod writes;
 pub use filesystem::ProtonFs;
 mod maintenance;
@@ -534,14 +535,15 @@ struct Core {
     /// The daemon's My Files root. Forked on-demand sessions retain this value
     /// so ownership checks never mistake their own mount root for account scope.
     primary_root_uid: NodeUid,
-    /// False only for a forked on-demand device mount. The synthetic shared
-    /// directory belongs exclusively to the primary My Files mount.
-    primary: bool,
+    /// What belongs to one mount's FUSE session rather than to the daemon: whether
+    /// it is the primary My Files mount, the tree inode it is rooted at, its
+    /// kernel channel and whether the session is up.
+    ///
+    /// Every other part of `Core` is shared between the primary mount and its
+    /// on-demand forks. A fork gets fresh cells from [`SessionCells::fork`].
+    session: session::SessionCells,
     /// The one tree every mount of the daemon serves from.
     state: Arc<Ranked<State>>,
-    /// The tree inode this mount's session is rooted at, set when the session
-    /// is built ([`ProtonFs::new`]). Each fork has its own cell.
-    root: Arc<OnceLock<u64>>,
     cache: Arc<ContentCache>,
     /// What the read path keeps between reads: open revision readers, decrypted
     /// blocks, fetches in flight and prefetch. See [`reads::ReadState`].
@@ -557,13 +559,8 @@ struct Core {
     /// Publication of the shared listing, and what invalidates a listing on the
     /// wire or suppresses its next refresh.
     shared: shared::SharedState,
-    /// False while the API is unreachable and we are serving the cached tree.
-    /// Set by the probe thread; read by front-ends through
-    /// `Response::Status` so the UI can say so rather than leaving the user to
-    /// infer it from a wall of EIO.
-    online: Arc<AtomicBool>,
-    /// When the link went down and a condvar for its coming back; the other
-    /// half of `online` (see [`link`]).
+    /// Whether Drive answers, when the link went down and a condvar for its
+    /// coming back (see [`link`]).
     link: Arc<link::Link>,
     /// When the user paused syncing, the Unix second it resumes by itself;
     /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
@@ -615,19 +612,6 @@ struct Core {
     /// The size upgrades running now, and the replies parked on them. Shared
     /// by every mount: the bound that matters is per daemon.
     sizes: sizes::SizeState,
-    /// This mount's kernel notification channel, for telling the kernel to drop
-    /// metadata it has cached. Set once the session exists — which is *after*
-    /// the `Core` it is built from, hence the cell.
-    ///
-    /// Per mount, not per daemon: each session calls its own root inode 1.
-    /// [`Core::fork_state`] gives each fork an empty cell of its own. Work that
-    /// changes the tree for every mount tells every session
-    /// ([`Core::for_each_mount`]).
-    notifier: Arc<OnceLock<KernelChannel>>,
-    /// True only after this mount's FUSE session spawned successfully.
-    /// Registration happens earlier for the primary drain, so registration
-    /// alone cannot answer whether the location is mounted.
-    session_live: Arc<AtomicBool>,
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
@@ -798,16 +782,16 @@ impl Core {
     fn register_state(&self, mountpoint: &Path) {
         self.states.register(
             mountpoint,
-            &self.notifier,
-            self.session_live.clone(),
-            self.root.clone(),
+            &self.session.notifier,
+            self.session.session_live.clone(),
+            self.session.root.clone(),
         );
     }
 
     /// The tree inode this mount is rooted at. [`ROOT_INO`] until the session
     /// is built, which is where a test that builds a bare tree puts its root.
     pub(crate) fn root_ino(&self) -> u64 {
-        self.root.get().copied().unwrap_or(ROOT_INO)
+        self.session.root.get().copied().unwrap_or(ROOT_INO)
     }
 
     /// Whether `uid` names an owned node reachable from the root of a mounted
@@ -835,14 +819,16 @@ impl Core {
         let mount = self.states.covering(abs)?;
         let rel = abs.strip_prefix(&mount.mountpoint).ok()?.to_path_buf();
         let mut core = self.clone();
-        if !Arc::ptr_eq(&mount.notifier, &self.notifier) {
+        if !Arc::ptr_eq(&mount.notifier, &self.session.notifier) {
             // Another mount, so adopt its per-mount half wholesale. `primary`
             // is a property of the mount, and the only mount this `Core` can
             // be the primary of is the one it was built for.
-            core.primary = false;
-            core.notifier = mount.notifier;
-            core.session_live = mount.session_live;
-            core.root = mount.root;
+            core.session = session::SessionCells {
+                primary: false,
+                notifier: mount.notifier,
+                session_live: mount.session_live,
+                root: mount.root,
+            };
         }
         Some((core, rel))
     }
