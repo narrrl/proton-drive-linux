@@ -562,7 +562,7 @@ impl Core {
             report.counts(&summary);
         }
         if summary.uploaded > 0 {
-            self.spawn_timeline_refresh();
+            self.photos().spawn_timeline_refresh();
         }
         summary
     }
@@ -611,7 +611,7 @@ impl Core {
             ));
         }
 
-        let photos = self.photos();
+        let photos = self.photos_api();
         if self
             .rt
             .block_on(photos.get_photos_root())
@@ -668,7 +668,7 @@ impl Core {
         report: &Reporter,
     ) -> CoreResult<()> {
         report.phase(ImportPhase::Checking, 0);
-        let photos = self.photos();
+        let photos = self.photos_api();
         let names: Vec<String> = planned.iter().map(|p| p.photo.name.clone()).collect();
         let collisions = self
             .rt
@@ -930,7 +930,7 @@ impl Core {
                 }
                 planned[done.index].uid = Some(uid);
                 if summary.uploaded.is_multiple_of(TIMELINE_REFRESH_EVERY) {
-                    self.spawn_timeline_refresh();
+                    self.photos().spawn_timeline_refresh();
                 }
                 if summary.uploaded.is_multiple_of(CHECKPOINT_EVERY) {
                     report.counts(summary);
@@ -954,7 +954,7 @@ impl Core {
         tags: Vec<PhotoTag>,
         main_uid: Option<NodeUid>,
     ) -> CoreResult<NodeUid> {
-        let photos = self.photos();
+        let photos = self.photos_api();
         let guard = self.transfers.begin(
             photo.name.clone(),
             "",
@@ -977,7 +977,7 @@ impl Core {
 
         match source {
             Source::Staged(path) => {
-                let thumbnails = self.upload_thumbnails(path, &photo.name);
+                let thumbnails = self.photos().upload_thumbnails(path, &photo.name);
                 // No sidecar date and none in the name: the photo's own EXIF,
                 // then when Google received it, before Drive files it under
                 // today.
@@ -1035,7 +1035,7 @@ impl Core {
                 tags_to_remove: Vec::new(),
             })
             .collect();
-        if let Err(e) = self.rt.block_on(self.photos().update_photos(&updates)) {
+        if let Err(e) = self.rt.block_on(self.photos_api().update_photos(&updates)) {
             warn!(error = %e, "marking imported favorites failed");
         }
     }
@@ -1049,7 +1049,7 @@ impl Core {
         summary: &mut ImportSummary,
         report: &Reporter,
     ) -> CoreResult<()> {
-        let photos = self.photos();
+        let photos = self.photos_api();
 
         // Existing albums by decrypted name, so a second import of the same
         // export adds to the album it made the first time instead of a twin.

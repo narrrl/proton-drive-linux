@@ -475,7 +475,7 @@ impl Core {
         // a newer blob by the time it is retried (`Core::adoptable_twin`).
         let sha = staged_sha1(Path::new(blob))?;
         self.db.note_create_sent(op.id, &sha)?;
-        let thumbnails = self.upload_thumbnails(Path::new(blob), name);
+        let thumbnails = self.photos().upload_thumbnails(Path::new(blob), name);
         let guard = self
             .transfers
             .begin(name, op.uid.clone(), TransferDirection::Upload, meta.len);

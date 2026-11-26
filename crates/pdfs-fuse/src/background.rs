@@ -568,7 +568,7 @@ pub(super) async fn run_event_sync(
 
 /// Follow the Photos volume and commit changes with its durable event cursor.
 pub(super) async fn run_photos_event_sync(core: Core) {
-    let photos = core.photos();
+    let photos = core.photos_api();
     // The photos volume only exists once the user has used Photos at all, and
     // the daemon may well start before the network does.
     let scope = loop {
@@ -635,7 +635,7 @@ pub(super) async fn run_photos_event_sync(core: Core) {
             }
         }
         if core.db.photos_need_work().unwrap_or(true) {
-            core.spawn_timeline_refresh();
+            core.photos().spawn_timeline_refresh();
         }
         core.next_poll(POLL_INTERVAL).await;
     }

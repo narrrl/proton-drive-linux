@@ -173,7 +173,7 @@ impl Core {
             job.step();
         }
 
-        self.spawn_timeline_refresh();
+        self.photos().spawn_timeline_refresh();
         summary.cancelled = cancel.load(Ordering::Relaxed);
         Ok(summary)
     }
@@ -184,13 +184,13 @@ impl Core {
     /// trash the original. Every earlier step failing leaves the account exactly
     /// as it was.
     fn redate_one(&self, candidate: &Candidate, summary: &mut RedateSummary) -> CoreResult<()> {
-        let photos = self.photos();
-        let path = self.open_photo(&candidate.uid)?;
+        let photos = self.photos_api();
+        let path = self.photos().open_photo(&candidate.uid)?;
         let size = std::fs::metadata(&path)
             .map_err(|e| CoreError::internal(format!("stat {}: {e}", path.display())))?
             .len();
         let media_type = media_type_of(&candidate.name).unwrap_or("application/octet-stream");
-        let thumbnails = self.upload_thumbnails(&path, &candidate.name);
+        let thumbnails = self.photos().upload_thumbnails(&path, &candidate.name);
 
         let guard =
             self.transfers

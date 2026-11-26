@@ -69,7 +69,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             range,
             favorites,
             not_in_album,
-        } => match core.photos_timeline(
+        } => match core.photos().photos_timeline(
             offset,
             clamp_limit(limit),
             kind,
@@ -90,11 +90,11 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::PhotoDuplicates => match core.photo_duplicates() {
+        CtlRequest::PhotoDuplicates => match core.photos().photo_duplicates() {
             Ok(sets) => CtlResponse::PhotoDuplicates { sets },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::PhotoSimilar => match core.photo_similar() {
+        CtlRequest::PhotoSimilar => match core.photos().photo_similar() {
             Ok((sets, hashing, uncompared)) => CtlResponse::PhotoSimilar {
                 sets,
                 hashing,
@@ -102,15 +102,18 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             },
             Err(e) => CtlResponse::error(e),
         },
-        CtlRequest::PhotoPlaces => match core.photo_places(excluded) {
+        CtlRequest::PhotoPlaces => match core.photos().photo_places(excluded) {
             Ok(items) => CtlResponse::Places {
                 items,
-                mapping: core.timeline_progress(),
+                mapping: core.photos().timeline_progress(),
             },
             Err(e) => CtlResponse::error(e),
         },
         CtlRequest::PlacePhotos { id, offset, limit } => {
-            match core.place_photos(id, offset, clamp_limit(limit), excluded) {
+            match core
+                .photos()
+                .place_photos(id, offset, clamp_limit(limit), excluded)
+            {
                 Ok(items) => CtlResponse::Photos {
                     available: true,
                     items,
@@ -119,12 +122,15 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                 Err(e) => CtlResponse::error(e),
             }
         }
-        CtlRequest::PlaceLocations { id } => match core.place_locations(id) {
+        CtlRequest::PlaceLocations { id } => match core.photos().place_locations(id) {
             Ok(items) => CtlResponse::PhotoLocations { items },
             Err(e) => CtlResponse::error(e),
         },
         CtlRequest::PhotosOnThisDay { limit } => {
-            match core.photos_on_this_day(clamp_limit(limit), excluded) {
+            match core
+                .photos()
+                .photos_on_this_day(clamp_limit(limit), excluded)
+            {
                 Ok(items) => CtlResponse::Photos {
                     available: true,
                     items,
@@ -133,7 +139,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                 Err(e) => CtlResponse::error(e),
             }
         }
-        CtlRequest::PhotoGroup { uid } => match core.photo_group(&uid) {
+        CtlRequest::PhotoGroup { uid } => match core.photos().photo_group(&uid) {
             Ok(items) => CtlResponse::Photos {
                 available: true,
                 items,
@@ -142,7 +148,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             Err(e) => CtlResponse::error(e),
         },
         CtlRequest::SetPhotoFavorite { uid, favorite } => match parse_uid(&uid) {
-            Some(node_uid) => match core.set_photo_favorite(&node_uid, favorite) {
+            Some(node_uid) => match core.photos().set_photo_favorite(&node_uid, favorite) {
                 Ok(()) => CtlResponse::Ok {
                     message: if favorite {
                         "added to favorites".to_string()
@@ -154,7 +160,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             },
             None => CtlResponse::error(CoreError::invalid(format!("invalid uid: {uid}"))),
         },
-        CtlRequest::PhotoAlbums => match core.albums() {
+        CtlRequest::PhotoAlbums => match core.photos().albums() {
             Ok(Some(items)) => CtlResponse::Albums {
                 available: true,
                 items,
@@ -169,10 +175,10 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             // An album page is a timeline page as far as the front-end is
             // concerned, so it comes back in the same reply — with `counts`
             // unset, which describe the whole timeline rather than this album.
-            Some(album) => match visibility
-                .permits(&uid)
-                .and_then(|()| core.album_photos(&album, offset, clamp_limit(limit), excluded))
-            {
+            Some(album) => match visibility.permits(&uid).and_then(|()| {
+                core.photos()
+                    .album_photos(&album, offset, clamp_limit(limit), excluded)
+            }) {
                 Ok(items) => CtlResponse::Photos {
                     available: true,
                     items,
@@ -182,12 +188,12 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             },
             None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
         },
-        CtlRequest::CreateAlbum { name } => match core.create_album(&name) {
+        CtlRequest::CreateAlbum { name } => match core.photos().create_album(&name) {
             Ok(uid) => CtlResponse::AlbumCreated { uid },
             Err(e) => CtlResponse::error(e),
         },
         CtlRequest::RenameAlbum { uid, name } => match parse_uid(&uid) {
-            Some(album) => match core.rename_album(&album, &name) {
+            Some(album) => match core.photos().rename_album(&album, &name) {
                 Ok(()) => CtlResponse::Ok {
                     message: format!("renamed album to {name}"),
                 },
@@ -196,7 +202,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
         },
         CtlRequest::DeleteAlbum { uid, delete_photos } => match parse_uid(&uid) {
-            Some(album) => match core.delete_album(&album, delete_photos) {
+            Some(album) => match core.photos().delete_album(&album, delete_photos) {
                 Ok(()) => CtlResponse::Ok {
                     message: "album deleted".to_string(),
                 },
@@ -205,11 +211,11 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
             None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
         },
         CtlRequest::AddToAlbum { uid, photos } => album_change(&uid, &photos, |album, photos| {
-            core.add_to_album(album, photos)
+            core.photos().add_to_album(album, photos)
         }),
         CtlRequest::RemoveFromAlbum { uid, photos } => {
             album_change(&uid, &photos, |album, photos| {
-                core.remove_from_album(album, photos)
+                core.photos().remove_from_album(album, photos)
             })
         }
         CtlRequest::PhotoPresence { uid, album } => match core.cached_gallery_visibility() {
@@ -235,42 +241,45 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                 .filter_map(|u| parse_uid(u))
                 .collect();
             CtlResponse::Thumbs {
-                items: core.photo_thumbs(&parsed),
+                items: core.photos().photo_thumbs(&parsed),
             }
         }
         CtlRequest::FileThumbs { items, generation } => {
-            match core.file_thumbs(&items, generation) {
+            match core.photos().file_thumbs(&items, generation) {
                 Some(items) => CtlResponse::Thumbs { items },
                 None => CtlResponse::FileThumbsStale,
             }
         }
         CtlRequest::ReserveFileThumbGeneration => CtlResponse::FileThumbGeneration {
-            generation: core.reserve_file_thumb_generation(),
+            generation: core.photos().reserve_file_thumb_generation(),
         },
         CtlRequest::CancelFileThumbs { generation } => {
-            core.cancel_file_thumbs(generation);
+            core.photos().cancel_file_thumbs(generation);
             CtlResponse::Ok {
                 message: "thumbnail requests cancelled".to_string(),
             }
         }
         CtlRequest::StartThumbnailBuild { path } => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.start_thumbnail_build(rel) {
+            Ok(rel) => match core.photos().start_thumbnail_build(rel) {
                 Ok(status) => CtlResponse::ThumbnailBuild { status },
                 Err(error) => CtlResponse::error(error),
             },
             Err(error) => CtlResponse::error(error),
         },
         CtlRequest::CancelThumbnailBuild => CtlResponse::ThumbnailBuild {
-            status: core.cancel_thumbnail_build(),
+            status: core.photos().cancel_thumbnail_build(),
         },
         CtlRequest::ThumbnailBuildStatus => CtlResponse::ThumbnailBuild {
-            status: core.thumbnail_build_status(),
+            status: core.photos().thumbnail_build_status(),
         },
         CtlRequest::PhotosRefreshStatus => CtlResponse::PhotosRefresh {
-            running: core.timeline_refreshing(),
+            running: core.photos().timeline_refreshing(),
         },
         CtlRequest::OpenPhoto { uid } => match parse_uid(&uid) {
-            Some(u) => match visibility.permits(&uid).and_then(|()| core.open_photo(&u)) {
+            Some(u) => match visibility
+                .permits(&uid)
+                .and_then(|()| core.photos().open_photo(&u))
+            {
                 Ok(p) => CtlResponse::FilePath {
                     path: p.display().to_string(),
                 },
@@ -383,7 +392,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                     "cannot read {source_path}: {e}"
                 ))),
                 Ok((file, len)) => {
-                    let photos = core.photos();
+                    let photos = core.photos_api();
                     // Unless the caller knows better: the photo's own EXIF,
                     // then the file's modification time, which a copy resets.
                     let capture_time = capture_time.or_else(|| {
@@ -401,7 +410,9 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                             .and_then(pdfs_core::timestamp::modification_time),
                         ..Default::default()
                     };
-                    let thumbnails = core.upload_thumbnails(Path::new(&source_path), &name);
+                    let thumbnails = core
+                        .photos()
+                        .upload_thumbnails(Path::new(&source_path), &name);
                     let guard =
                         core.transfers
                             .begin(name.clone(), "", TransferDirection::Upload, len);
@@ -421,7 +432,7 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
                             // reply lands — so refresh now rather than leaving it to a
                             // background pass that would land just after that reload.
                             core.invalidate_photos();
-                            if let Err(e) = core.refresh_timeline_joined() {
+                            if let Err(e) = core.photos().refresh_timeline_joined() {
                                 warn!(error = %e, "timeline refresh after upload failed");
                             }
                             CtlResponse::Ok {

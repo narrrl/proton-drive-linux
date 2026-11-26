@@ -68,7 +68,7 @@ fn clamp_limit(limit: usize) -> usize {
 fn album_change(
     uid: &str,
     photos: &[String],
-    change: impl FnOnce(&NodeUid, &[NodeUid]) -> CoreResult<super::albums::AlbumOutcome>,
+    change: impl FnOnce(&NodeUid, &[NodeUid]) -> CoreResult<super::photos::AlbumOutcome>,
 ) -> CtlResponse {
     let Some(album) = parse_uid(uid) else {
         return CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}")));
@@ -689,7 +689,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         core.invalidate_trash();
                         Ok(())
                     }
-                    RefreshScope::Photos { full } if !full && core.timeline_refreshing() => {
+                    RefreshScope::Photos { full }
+                        if !full && core.photos().timeline_refreshing() =>
+                    {
                         // A refresh is already running and will publish exactly the
                         // timeline this request asks for. Doing the work again
                         // cannot make it newer, and the invalidation plus the
@@ -709,7 +711,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         }
                         // Whatever changed the timeline can just as easily have
                         // changed an album; one scope covers the whole photos view.
-                        core.invalidate_albums();
+                        core.photos().invalidate_albums();
                         // The refresh is started here, not awaited. A library of
                         // twelve thousand photos is re-read in chunks of
                         // `TIMELINE_ENRICH_CHUNK` nodes, which takes minutes —
@@ -717,7 +719,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         // returned `Resource temporarily unavailable` to a caller
                         // whose refresh was in fact running fine (B92). The front
                         // end follows it with `PhotosRefreshStatus`.
-                        core.spawn_timeline_refresh();
+                        core.photos().spawn_timeline_refresh();
                         Ok(())
                     }
                 };
