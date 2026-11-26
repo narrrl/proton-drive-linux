@@ -1104,13 +1104,13 @@ pub(crate) fn run_control_socket(
                 let core = core.clone();
                 let username = username.clone();
                 let mountpoint = mountpoint.clone();
-                if let Err(e) = std::thread::Builder::new()
-                    .name("pdfs-control".into())
-                    .spawn(move || {
-                        let _permit = permit;
-                        handle_control_conn(&core, &username, &mountpoint, stream);
-                    })
-                {
+                // A job, so a stop joins it; a subscription ends on the
+                // stop's wake (`EventHub::wake_all`).
+                let board = core.services.clone();
+                if let Err(e) = board.spawn_job("pdfs-control-conn", move || {
+                    let _permit = permit;
+                    handle_control_conn(&core, &username, &mountpoint, stream);
+                }) {
                     warn!(error = %e, "control: spawn handler failed");
                 }
             }

@@ -21,7 +21,10 @@
 //!
 //! Work a request starts and does not wait for runs as a one-shot job
 //! ([`ServiceBoard::spawn_job`] on a thread, [`ServiceBoard::spawn_task_job`]
-//! on the runtime): listed on the board while it runs, and not joined on stop.
+//! on the runtime): listed on the board while it runs. A stop closes the
+//! board to new jobs, aborts the async ones and joins the rest up to the same
+//! deadline as the services. A job used to be left running, and one still
+//! waiting on Drive when the runtime went away panicked on its next timer.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -57,6 +60,28 @@ struct Board {
     services: Mutex<Vec<Entry>>,
     jobs: Mutex<Vec<Job>>,
     next_job: AtomicU64,
+    /// The running jobs' handles, and whether a stop closed the board. One
+    /// lock for both, so a job is either refused or joined by the stop.
+    handles: Mutex<JobHandles>,
+}
+
+#[derive(Default)]
+struct JobHandles {
+    closed: bool,
+    running: Vec<Handle>,
+}
+
+impl JobHandles {
+    /// Keep `handle`, dropping the handles of jobs that already ended.
+    fn keep(&mut self, handle: Handle) {
+        self.running.retain(|handle| !handle.is_finished());
+        self.running.push(handle);
+    }
+}
+
+/// Why a job did not start: the board's mount is stopping.
+fn closed_error() -> std::io::Error {
+    std::io::Error::other("the mount is stopping; no new jobs start")
 }
 
 struct Entry {
@@ -106,37 +131,69 @@ impl ServiceBoard {
     /// folder pin. It shows in [`jobs`](Self::jobs) until it ends, by return
     /// or by panic.
     ///
-    /// Not joined on stop. A job's work is either safe to cut short (the
-    /// process exits) or bounded by the deadlines of the calls it makes.
+    /// A stop joins it up to its deadline; a job that may run long checks the
+    /// [`Shutdown`] signal. Once a stop has begun, no job starts and this
+    /// returns an error.
     pub fn spawn_job<F>(&self, name: &str, run: F) -> std::io::Result<()>
     where
         F: FnOnce() + Send + 'static,
     {
+        let mut handles = self.0.handles.lock();
+        if handles.closed {
+            return Err(closed_error());
+        }
         let guard = self.add_job(name);
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
                 let _guard = guard;
                 run();
-            })
-            // On an error the closure, and the guard in it, are already
-            // dropped, so the job is off the list.
-            .map(|_| ())
+            })?;
+        // On an error the closure, and the guard in it, are already dropped,
+        // so the job is off the list.
+        handles.keep(Handle::Thread(handle));
+        Ok(())
     }
 
     /// Start `task` on `rt` as a one-shot job, like [`spawn_job`](Self::spawn_job)
     /// for work that is async: a refresh a listing starts and does not wait
     /// for. It shows in [`jobs`](Self::jobs) until it ends, by return, panic
-    /// or the runtime going away.
+    /// or abort. A stop aborts it at its next `.await`; once a stop has begun,
+    /// `task` is dropped without running.
     pub fn spawn_task_job<F>(&self, rt: &tokio::runtime::Handle, name: &str, task: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let mut handles = self.0.handles.lock();
+        if handles.closed {
+            tracing::debug!(job = name, "not started: the mount is stopping");
+            return;
+        }
         let guard = self.add_job(name);
-        rt.spawn(async move {
+        let task = rt.spawn(async move {
             let _guard = guard;
             task.await;
         });
+        handles.keep(Handle::Task {
+            name: name.to_owned(),
+            task,
+        });
+    }
+
+    /// Close the board to new jobs and abort the async ones. The thread jobs
+    /// still running are handed back for [`join`](Handle::join_until).
+    fn close(&self) -> Vec<Handle> {
+        let running = {
+            let mut handles = self.0.handles.lock();
+            handles.closed = true;
+            std::mem::take(&mut handles.running)
+        };
+        for handle in &running {
+            if let Handle::Task { task, .. } = handle {
+                task.abort();
+            }
+        }
+        running
     }
 
     fn add_job(&self, name: &str) -> JobGuard {
@@ -203,6 +260,19 @@ impl Handle {
         match self {
             Handle::Thread(handle) => handle.is_finished(),
             Handle::Task { task, .. } => task.is_finished(),
+        }
+    }
+
+    /// Wait for the thread or task to end, up to `deadline`, and name it if
+    /// it is still running then.
+    fn join_until(self, deadline: Instant) -> Option<String> {
+        while !self.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match self {
+            Handle::Thread(handle) => join_until([handle], deadline).pop(),
+            Handle::Task { name, task } if !task.is_finished() => Some(name),
+            Handle::Task { .. } => None,
         }
     }
 }
@@ -285,12 +355,15 @@ impl Services {
         self.started.is_empty()
     }
 
-    /// Stop every service: signal `shutdown`, wake each thread and abort each
-    /// task in reverse start order, then join them in the same order until
-    /// `deadline`. Returns the names of the services still running at the
-    /// deadline; they are left behind rather than waited for.
+    /// Stop every service and every job: signal `shutdown`, close the board
+    /// to new jobs, wake each thread and abort each task in reverse start
+    /// order. Then join the jobs, which are the services' clients, and the
+    /// services in the same reverse order, all until `deadline`. Returns the
+    /// names of the services and jobs still running at the deadline; they are
+    /// left behind rather than waited for.
     pub fn stop(self, shutdown: &Shutdown, deadline: Instant) -> Vec<String> {
         shutdown.stop();
+        let jobs = self.board.close();
         for service in self.started.iter().rev() {
             if let Some(wake) = &service.wake {
                 wake();
@@ -299,18 +372,13 @@ impl Services {
                 task.abort();
             }
         }
-        let mut running = Vec::new();
-        for service in self.started.into_iter().rev() {
-            while !service.handle.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            match service.handle {
-                Handle::Thread(handle) => running.extend(join_until([handle], deadline)),
-                Handle::Task { name, task } if !task.is_finished() => running.push(name),
-                Handle::Task { .. } => {}
-            }
-        }
-        running
+        let jobs = jobs.into_iter().filter_map(|job| job.join_until(deadline));
+        let services = self
+            .started
+            .into_iter()
+            .rev()
+            .filter_map(|service| service.handle.join_until(deadline));
+        jobs.chain(services).collect()
     }
 }
 
@@ -530,5 +598,57 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(board.jobs().is_empty());
+    }
+
+    #[test]
+    fn a_stop_joins_the_running_jobs_and_names_a_stuck_one() {
+        let board = ServiceBoard::default();
+        let shutdown = Arc::new(Shutdown::default());
+        let services = Services::new(board.clone());
+        let signalled = shutdown.clone();
+        board
+            .spawn_job("pdfs-test-polite", move || {
+                while signalled.sleep(Duration::from_secs(3600)) {}
+            })
+            .unwrap();
+        let (_hold, stuck) = mpsc::channel::<()>();
+        board
+            .spawn_job("pdfs-test-stuck", move || {
+                let _ = stuck.recv();
+            })
+            .unwrap();
+
+        let left = services.stop(&shutdown, Instant::now() + Duration::from_millis(300));
+
+        assert_eq!(left, ["pdfs-test-stuck"]);
+        let jobs: Vec<_> = board.jobs().into_iter().map(|job| job.name).collect();
+        assert_eq!(jobs, ["pdfs-test-stuck"]);
+    }
+
+    #[test]
+    fn a_stop_aborts_a_task_job_and_refuses_new_jobs() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let board = ServiceBoard::default();
+        let services = Services::new(board.clone());
+        board.spawn_task_job(rt.handle(), "pdfs-test-poller", async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let left = services.stop(
+            &Shutdown::default(),
+            Instant::now() + Duration::from_secs(5),
+        );
+
+        assert!(left.is_empty(), "still running: {left:?}");
+        assert!(board.jobs().is_empty());
+        assert!(board.spawn_job("pdfs-test-late", || {}).is_err());
+        board.spawn_task_job(rt.handle(), "pdfs-test-late", async {});
+        assert!(board.jobs().is_empty(), "a job started after the stop");
     }
 }

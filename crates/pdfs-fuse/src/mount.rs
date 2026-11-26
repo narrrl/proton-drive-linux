@@ -721,11 +721,15 @@ pub(crate) fn mount_with(
         // exists, which is the point of the poke, then unlink it so nothing else
         // can arrive behind it. The listener checks the stop flag after every
         // accept, so a connection that races the unlink cannot put it back to
-        // sleep.
+        // sleep. The connections it handed off are jobs, which a stop joins;
+        // a subscription among them waits on its mailbox, so the wake rings
+        // every mailbox too.
         let socket = control_socket.to_path_buf();
+        let events = core.events.clone();
         let wake: Wake = Box::new(move || {
             let _ = std::os::unix::net::UnixStream::connect(&socket);
             let _ = std::fs::remove_file(&socket);
+            events.wake_all();
         });
         match workers.spawn("pdfs-control", Some(wake), move || {
             run_control_socket(control_core, username, mountpoint, listener)

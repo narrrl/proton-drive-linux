@@ -165,9 +165,9 @@ impl Core {
             return;
         }
         let queue = self.sizes.size_waiters.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("pdfs-size-waiters".into())
-            .spawn(move || queue.serve())
+        if let Err(error) = self
+            .services
+            .spawn_job("pdfs-size-waiters", move || queue.serve())
         {
             // Without a thread nothing would ever answer these. A provisional
             // size is wrong; a `stat` that never returns wedges the caller.
@@ -190,6 +190,11 @@ impl Core {
         let (mut key, mut uids, mut slot) = (key, uids, slot);
         loop {
             for chunk in uids.chunks(SIZE_UPGRADE_CHUNK) {
+                // A stop joins this job; the rest of the folder can wait for
+                // the next mount, which lists it afresh.
+                if self.shutdown.is_stopping() {
+                    break;
+                }
                 let result =
                     self.block_on_within(BATCH_CALL_TIMEOUT, self.drive.enumerate_nodes(chunk));
                 self.apply_size_upgrade(key, result);
