@@ -118,6 +118,7 @@ mod photos;
 mod pins;
 mod profile;
 mod queue;
+mod quota;
 mod reads;
 mod recovery;
 mod redate;
@@ -600,7 +601,10 @@ struct Core {
     photo_jobs: photos::PhotoJobs,
     /// The last account quota answer, for `statfs(2)`, and whether a refresh
     /// of it is running.
-    quota_cache: sharing::QuotaCache,
+    quota: quota::QuotaCache,
+    /// Sharing, public links, invitations and bookmarks. See
+    /// [`sharing::Sharing`].
+    sharing: sharing::Sharing,
     /// Database maintenance that has been moved off the request thread.
     ///
     /// `VACUUM` and a deep `integrity_check` both hold the single connection for
@@ -1372,32 +1376,12 @@ impl Core {
         cv.notify_all();
     }
 
-    /// Download a whole file's plaintext, registering the transfer so
+    /// Download a whole file into `out`, registering the transfer so
     /// `GetQueueStatus` can report its progress. `total` is the expected size
     /// (`0` if unknown). Streams through [`download_file_to`] so each block ticks
-    /// the progress counter.
+    /// the progress counter, and nothing is held in memory.
     ///
     /// [`download_file_to`]: ProtonDriveClient::download_file_to
-    fn download_file_tracked(
-        &self,
-        uid: &NodeUid,
-        name: &str,
-        total: u64,
-    ) -> std::result::Result<Vec<u8>, ProtonError> {
-        let guard = self
-            .transfers
-            .begin(name, uid.to_string(), TransferDirection::Download, total);
-        let mut out = CountingWriter::new(Vec::with_capacity(total as usize), &guard);
-        self.rt
-            .block_on(self.drive.download_file_to(uid, &mut out))?;
-        Ok(out.into_inner())
-    }
-
-    /// Download a whole file directly into `out`, without retaining its
-    /// plaintext in memory. This is the disk-backed twin of
-    /// [`Core::download_file_tracked`], and preserves the same transfer
-    /// accounting while allowing callers that only need an on-disk file to
-    /// keep memory use independent of file size.
     fn download_file_tracked_to<W: Write + Send>(
         &self,
         uid: &NodeUid,
@@ -1414,10 +1398,10 @@ impl Core {
         Ok(out.into_inner())
     }
 
-    /// Like [`download_file_tracked`] for a photo, streaming through the photos
-    /// client's [`download_photo_to`].
+    /// Like [`download_file_tracked_to`] for a photo, streaming through the
+    /// photos client's [`download_photo_to`].
     ///
-    /// [`download_file_tracked`]: Core::download_file_tracked
+    /// [`download_file_tracked_to`]: Core::download_file_tracked_to
     /// [`download_photo_to`]: ProtonPhotosClient::download_photo_to
     fn download_photo_tracked(
         &self,

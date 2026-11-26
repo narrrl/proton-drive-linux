@@ -2,54 +2,62 @@
 //! account has received, saved public-link bookmarks, and the reverse view of
 //! everything this account shares out.
 //!
-//! All of it is remote-only state — nothing here touches the inode maps or the
-//! content cache, so every method is a round-trip wrapped in the crate error
-//! shape the control socket expects.
+//! All of it is remote-only state: nothing here changes the tree or the
+//! content cache's entries for this account's own files, so every method is a
+//! round trip wrapped in the error shape the control socket expects.
 
-use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
-use parking_lot::Mutex;
 
 use pdfs_core::control::{
     BookmarkInfo, DirEntry, InvitationInfo, LinkChange, PublicLinkInfo, ShareEntry, ShareEntryKind,
-    SharedItem,
+    SharedItem, TransferDirection,
 };
+use pdfs_core::lockrank::Ranked;
 use pdfs_core::{CoreError, CoreResult};
-use tracing::debug;
-
-use crate::QUOTA_TTL;
+use pdfs_store::cache::ContentCache;
 use proton_drive_rs::proton_sdk::crypto::VerificationStatus;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
-use proton_drive_rs::{MemberRole, NodeKind};
+use proton_drive_rs::{MemberRole, Node, NodeKind, ProtonDriveClient};
+use tracing::debug;
 
-use proton_drive_rs::Node;
+use super::drive::DriveApi;
+use super::transfers::{CountingWriter, TransferRegistry};
+use super::{State, node_size, parse_uid, public_link_info, role_from_str, role_to_str};
 
-use super::{Core, node_size, parse_uid, public_link_info, role_from_str, role_to_str};
-
-/// The last account quota answer, for `statfs(2)`, and whether a refresh
-/// of it is running.
+/// Sharing as a service of its own: what this account shares and with whom,
+/// its public links, what others share with it, and its saved links.
+///
+/// Every method takes a node already resolved to its uid. Turning a path or a
+/// wire-format uid into one, and the check that the node is this daemon's to
+/// share, are the caller's (the control socket's), so this holds only the
+/// handles it calls: the client, Drive, the content cache and the transfer
+/// list for opening a shared file, and a read of the tree for paths.
 #[derive(Clone)]
-pub(crate) struct QuotaCache {
-    /// Last account quota answer and when it was learned, for `statfs(2)`.
-    ///
-    /// `df` and the free-space preflight of every file manager and installer ask
-    /// for this, and the answer costs a round trip — so it is served from here
-    /// for [`QUOTA_TTL`] and refreshed on a worker afterwards. Total account
-    /// storage moves slowly enough that a minute-old number is a better answer
-    /// than either a stall or the zeroes the default implementation returns.
-    pub(crate) quota: Arc<Mutex<Option<(std::time::Instant, i64, i64)>>>,
-    /// Set while a `statfs` is refreshing [`Core::quota`], so the others serve
-    /// the last figures instead of each holding a worker on the same request.
-    pub(crate) quota_refreshing: Arc<AtomicBool>,
+pub(crate) struct Sharing {
+    client: ProtonDriveClient,
+    drive: Arc<dyn DriveApi>,
+    rt: tokio::runtime::Handle,
+    cache: Arc<ContentCache>,
+    transfers: Arc<TransferRegistry>,
+    state: Arc<Ranked<State>>,
 }
 
-impl QuotaCache {
-    pub(crate) fn new() -> Self {
+impl Sharing {
+    pub(crate) fn new(
+        client: ProtonDriveClient,
+        drive: Arc<dyn DriveApi>,
+        rt: tokio::runtime::Handle,
+        cache: Arc<ContentCache>,
+        transfers: Arc<TransferRegistry>,
+        state: Arc<Ranked<State>>,
+    ) -> Self {
         Self {
-            quota: Arc::new(Mutex::new(None)),
-            quota_refreshing: Arc::new(AtomicBool::new(false)),
+            client,
+            drive,
+            rt,
+            cache,
+            transfers,
+            state,
         }
     }
 }
@@ -62,7 +70,7 @@ impl QuotaCache {
 /// offer path-keyed actions on it. The local-state flags (`pinned`, `cached`)
 /// stay false: they describe content this account owns a local copy policy for,
 /// which a share on someone else's volume is not.
-fn shared_entry_of(core: &Core, n: Node) -> DirEntry {
+fn shared_entry_of(sharing: &Sharing, n: Node) -> DirEntry {
     let is_dir = n.is_folder();
     let size = match &n.kind {
         NodeKind::File {
@@ -99,7 +107,7 @@ fn shared_entry_of(core: &Core, n: Node) -> DirEntry {
         pinned: false,
         pinned_by_folder: false,
         cached: false,
-        path: core.rel_path_for_uid(&n.uid).unwrap_or_default(),
+        path: sharing.rel_path_for_uid(&n.uid).unwrap_or_default(),
         uid: n.uid.to_string(),
         role,
         shared_by,
@@ -112,35 +120,12 @@ fn shared_entry_of(core: &Core, n: Node) -> DirEntry {
     }
 }
 
-impl Core {
+impl Sharing {
     // ---- sharing a node ---------------------------------------------------
 
-    /// Invite Proton and/or external emails to the node at `rel` at `role`.
+    /// Invite Proton and/or external emails to the node `uid` at `role`.
     /// Returns `(proton_invited, external_invited)`.
     pub(crate) fn share_node(
-        &self,
-        rel: &Path,
-        emails: &[String],
-        role: &str,
-        message: Option<&str>,
-    ) -> CoreResult<(usize, usize)> {
-        let (_ino, uid) = self.resolve(rel)?;
-        self.share_node_for_uid(&uid, emails, role, message)
-    }
-
-    /// [`Core::share_node`] for a node addressed through any daemon location.
-    pub(crate) fn share_node_by_uid(
-        &self,
-        uid: &str,
-        emails: &[String],
-        role: &str,
-        message: Option<&str>,
-    ) -> CoreResult<(usize, usize)> {
-        let uid = self.resolve_shareable(uid)?;
-        self.share_node_for_uid(&uid, emails, role, message)
-    }
-
-    fn share_node_for_uid(
         &self,
         uid: &NodeUid,
         emails: &[String],
@@ -155,25 +140,8 @@ impl Core {
             .map_err(|e| CoreError::from_api(&e, "share"))
     }
 
-    /// List the members, pending invitations and public link of the node at `rel`.
+    /// List the members, pending invitations and public link of the node `uid`.
     pub(crate) fn list_share(
-        &self,
-        rel: &Path,
-    ) -> CoreResult<(Vec<ShareEntry>, Option<PublicLinkInfo>)> {
-        let (_ino, uid) = self.resolve(rel)?;
-        self.list_share_for_uid(&uid)
-    }
-
-    /// [`Core::list_share`] for a node addressed through any daemon location.
-    pub(crate) fn list_share_by_uid(
-        &self,
-        uid: &str,
-    ) -> CoreResult<(Vec<ShareEntry>, Option<PublicLinkInfo>)> {
-        let uid = self.resolve_shareable(uid)?;
-        self.list_share_for_uid(&uid)
-    }
-
-    fn list_share_for_uid(
         &self,
         uid: &NodeUid,
     ) -> CoreResult<(Vec<ShareEntry>, Option<PublicLinkInfo>)> {
@@ -225,32 +193,8 @@ impl Core {
     }
 
     /// Change the role of a member or pending Proton invitation on the node at
-    /// `rel`. External invitations have no role-update endpoint.
+    /// `uid`. External invitations have no role-update endpoint.
     pub(crate) fn update_share_role(
-        &self,
-        rel: &Path,
-        id: &str,
-        kind: ShareEntryKind,
-        role: &str,
-    ) -> CoreResult<()> {
-        let (_ino, uid) = self.resolve(rel)?;
-        self.update_share_role_for_uid(&uid, id, kind, role)
-    }
-
-    /// [`Core::update_share_role`] for a node addressed through any daemon
-    /// location.
-    pub(crate) fn update_share_role_by_uid(
-        &self,
-        uid: &str,
-        id: &str,
-        kind: ShareEntryKind,
-        role: &str,
-    ) -> CoreResult<()> {
-        let uid = self.resolve_shareable(uid)?;
-        self.update_share_role_for_uid(&uid, id, kind, role)
-    }
-
-    fn update_share_role_for_uid(
         &self,
         uid: &NodeUid,
         id: &str,
@@ -290,30 +234,8 @@ impl Core {
     }
 
     /// Remove a member, pending Proton invite, or external invite from the node
-    /// at `rel`.
+    /// at `uid`.
     pub(crate) fn remove_share_entry(
-        &self,
-        rel: &Path,
-        id: &str,
-        kind: ShareEntryKind,
-    ) -> CoreResult<()> {
-        let (_ino, uid) = self.resolve(rel)?;
-        self.remove_share_entry_for_uid(&uid, id, kind)
-    }
-
-    /// [`Core::remove_share_entry`] for a node addressed through any daemon
-    /// location.
-    pub(crate) fn remove_share_entry_by_uid(
-        &self,
-        uid: &str,
-        id: &str,
-        kind: ShareEntryKind,
-    ) -> CoreResult<()> {
-        let uid = self.resolve_shareable(uid)?;
-        self.remove_share_entry_for_uid(&uid, id, kind)
-    }
-
-    fn remove_share_entry_for_uid(
         &self,
         uid: &NodeUid,
         id: &str,
@@ -359,32 +281,8 @@ impl Core {
         }
     }
 
-    /// Create a public link on the node at `rel`, returning its info (with URL).
+    /// Create a public link on the node `uid`, returning its info (with URL).
     pub(crate) fn create_public_link(
-        &self,
-        rel: &Path,
-        role: &str,
-        password: Option<&str>,
-        expires: Option<i64>,
-    ) -> CoreResult<PublicLinkInfo> {
-        let (_ino, uid) = self.resolve(rel)?;
-        self.create_public_link_for_uid(&uid, role, password, expires)
-    }
-
-    /// [`Core::create_public_link`] for a node addressed through any daemon
-    /// location.
-    pub(crate) fn create_public_link_by_uid(
-        &self,
-        uid: &str,
-        role: &str,
-        password: Option<&str>,
-        expires: Option<i64>,
-    ) -> CoreResult<PublicLinkInfo> {
-        let uid = self.resolve_shareable(uid)?;
-        self.create_public_link_for_uid(&uid, role, password, expires)
-    }
-
-    fn create_public_link_for_uid(
         &self,
         uid: &NodeUid,
         role: &str,
@@ -399,36 +297,11 @@ impl Core {
         Ok(public_link_info(link))
     }
 
-    /// Change the public link `id` on the node at `rel`, keeping its URL.
-    pub(crate) fn update_public_link(
-        &self,
-        rel: &Path,
-        id: &str,
-        role: Option<&str>,
-        password: LinkChange<String>,
-        expires: LinkChange<i64>,
-    ) -> CoreResult<PublicLinkInfo> {
-        let (_ino, uid) = self.resolve(rel)?;
-        self.update_public_link_for_uid(&uid, id, role, password, expires)
-    }
-
-    /// [`Core::update_public_link`] for a node addressed through any daemon
-    /// location.
-    pub(crate) fn update_public_link_by_uid(
-        &self,
-        uid: &str,
-        id: &str,
-        role: Option<&str>,
-        password: LinkChange<String>,
-        expires: LinkChange<i64>,
-    ) -> CoreResult<PublicLinkInfo> {
-        let uid = self.resolve_shareable(uid)?;
-        self.update_public_link_for_uid(&uid, id, role, password, expires)
-    }
-
+    /// Change the public link `id` on the node `uid`, keeping its URL.
+    ///
     /// The SDK sets all three options on every update, so each `Keep` is
     /// filled in from the link as it stands.
-    fn update_public_link_for_uid(
+    pub(crate) fn update_public_link(
         &self,
         uid: &NodeUid,
         id: &str,
@@ -482,20 +355,8 @@ impl Core {
         Ok(public_link_info(link))
     }
 
-    /// Remove the public link `id` from the node at `rel`.
-    pub(crate) fn remove_public_link(&self, rel: &Path, id: &str) -> CoreResult<()> {
-        let (_ino, uid) = self.resolve(rel)?;
-        self.remove_public_link_for_uid(&uid, id)
-    }
-
-    /// [`Core::remove_public_link`] for a node addressed through any daemon
-    /// location.
-    pub(crate) fn remove_public_link_by_uid(&self, uid: &str, id: &str) -> CoreResult<()> {
-        let uid = self.resolve_shareable(uid)?;
-        self.remove_public_link_for_uid(&uid, id)
-    }
-
-    fn remove_public_link_for_uid(&self, uid: &NodeUid, id: &str) -> CoreResult<()> {
+    /// Remove the public link `id` from the node `uid`.
+    pub(crate) fn remove_public_link(&self, uid: &NodeUid, id: &str) -> CoreResult<()> {
         let link = self
             .rt
             .block_on(self.client.get_public_link(uid))
@@ -507,25 +368,15 @@ impl Core {
             .map_err(|e| CoreError::from_api(&e, "remove public link"))
     }
 
-    /// Stop sharing the node at `rel`: remove its public link, then every
+    /// Stop sharing the node `uid`: remove its public link, then every
     /// external invitation, Proton invitation and member. The SDK has no call
     /// that deletes a share outright, so this composes the per-entry ones.
-    pub(crate) fn stop_sharing(&self, rel: &Path) -> CoreResult<StopSharingOutcome> {
-        let (_ino, uid) = self.resolve(rel)?;
-        self.stop_sharing_for_uid(&uid)
-    }
-
-    /// [`Core::stop_sharing`] for a node addressed through any daemon location.
-    pub(crate) fn stop_sharing_by_uid(&self, uid: &str) -> CoreResult<StopSharingOutcome> {
-        let uid = self.resolve_shareable(uid)?;
-        self.stop_sharing_for_uid(&uid)
-    }
-
+    ///
     /// Each step runs even when an earlier one failed, so a single stuck
     /// member does not leave the public link up. The link goes first: it is the
     /// widest exposure. Only a failure to list what is there fails the whole
     /// request; a failed removal is counted in the outcome.
-    fn stop_sharing_for_uid(&self, uid: &NodeUid) -> CoreResult<StopSharingOutcome> {
+    pub(crate) fn stop_sharing(&self, uid: &NodeUid) -> CoreResult<StopSharingOutcome> {
         let mut outcome = StopSharingOutcome::default();
         let link = self
             .rt
@@ -637,9 +488,17 @@ impl Core {
         if let Some(p) = self.cache.cached_content_path(&uid, mtime, size) {
             return Ok(p);
         }
-        let bytes = self
-            .download_file_tracked(&uid, &node.name, size)
+        let guard = self.transfers.begin(
+            &node.name,
+            uid.to_string(),
+            TransferDirection::Download,
+            size,
+        );
+        let mut out = CountingWriter::new(Vec::with_capacity(size as usize), &guard);
+        self.rt
+            .block_on(self.drive.download_file_to(&uid, &mut out))
             .map_err(|e| CoreError::from_api(&e, "download"))?;
+        let bytes = out.into_inner();
         self.cache
             .store(&uid, mtime, size, &bytes)
             .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
@@ -721,62 +580,6 @@ impl Core {
             .map_err(|e| CoreError::from_api(&e, "delete bookmark"))
     }
 
-    // ---- account ----------------------------------------------------------
-
-    /// Total account storage usage `(max_space, used_space)` in bytes, across all
-    /// Proton products (not Drive-only). A remote round-trip; nothing here is
-    /// cached.
-    pub(crate) fn account_quota(&self) -> CoreResult<(i64, i64)> {
-        let q = self.block_on_bounded(self.drive.quota()).map_err(|e| {
-            self.lost_link(&e, "account quota");
-            CoreError::from_api(&e, "account quota")
-        })?;
-        *self.quota_cache.quota.lock() =
-            Some((std::time::Instant::now(), q.max_space, q.used_space));
-        Ok((q.max_space, q.used_space))
-    }
-
-    /// The account quota as `statfs(2)` needs it: cached for [`QUOTA_TTL`],
-    /// refetched after that, and `None` when there is no usable answer at all —
-    /// offline with nothing cached.
-    ///
-    /// Never blocks on the network for a *fresh* value when a recent one exists,
-    /// because the callers are `df` and every "is there room?" preflight, and a
-    /// stale byte count is worth more to them than a stalled syscall. Offline,
-    /// the last known figures keep being served rather than degrading to zero.
-    pub(crate) fn account_quota_cached(&self) -> Option<(i64, i64)> {
-        if let Some((at, max_space, used_space)) = *self.quota_cache.quota.lock()
-            && at.elapsed() < QUOTA_TTL
-        {
-            return Some((max_space, used_space));
-        }
-        let last = || {
-            self.quota_cache
-                .quota
-                .lock()
-                .map(|(_, max, used)| (max, used))
-        };
-        if !self.is_online()
-            || self
-                .quota_cache
-                .quota_refreshing
-                .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return last();
-        }
-        let refreshed = self.account_quota();
-        self.quota_cache
-            .quota_refreshing
-            .store(false, std::sync::atomic::Ordering::Release);
-        match refreshed {
-            Ok(q) => Some(q),
-            Err(error) => {
-                debug!(%error, "account quota refresh failed; serving the last known figures");
-                last()
-            }
-        }
-    }
-
     // ---- shared by me -----------------------------------------------------
 
     /// List the nodes I have shared with others, each with a summary of its share
@@ -846,15 +649,15 @@ impl Core {
     /// tree, by walking parent inodes to the root. `None` when the node has never
     /// been seen through the mount (e.g. shared but not browsed to this session) —
     /// the caller then leaves the path empty.
-    pub(crate) fn rel_path_for_uid(&self, uid: &NodeUid) -> Option<String> {
+    fn rel_path_for_uid(&self, uid: &NodeUid) -> Option<String> {
         // Relative to whichever root the node sits under: a node browsed
         // through a sync folder is under that fork's root, not My Files
         // (`docs/BUGS.md` B74).
-        walk_to_root(&self.state(), uid)
+        walk_to_root(&self.state.lock(), uid)
     }
 }
 
-/// What [`Core::stop_sharing`] managed to remove.
+/// What [`Sharing::stop_sharing`] managed to remove.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct StopSharingOutcome {
     /// Entries removed (the link, invitations and members alike).

@@ -27,6 +27,8 @@ use tracing::{debug, info, warn};
 use super::transfers::CountingReader;
 use super::{Core, count_noun, human_bytes, human_duration, parse_uid};
 
+mod share;
+
 const MAX_CONTROL_REQUEST_BYTES: u64 = 1024 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Answer a [`CtlRequest::FolderSize`].
@@ -36,26 +38,6 @@ fn folder_size_reply(size: CoreResult<proton_drive_rs::FolderSize>) -> CtlRespon
             size: size.size,
             items: size.descendants,
         },
-        Err(e) => CtlResponse::error(e),
-    }
-}
-
-/// Answer a [`CtlRequest::StopSharing`]: log it, and turn a partial removal
-/// into an error that names what is still shared.
-fn stop_sharing_reply(
-    core: &Core,
-    target: &str,
-    result: CoreResult<super::sharing::StopSharingOutcome>,
-) -> CtlResponse {
-    match result.map(|outcome| outcome.into_result()) {
-        Ok(Ok(message)) => {
-            core.log_activity(ActivityKind::Unshare, target, "stopped sharing", true);
-            CtlResponse::Ok { message }
-        }
-        Ok(Err(left)) => {
-            core.log_activity(ActivityKind::Unshare, target, &left, false);
-            CtlResponse::error(CoreError::remote(left))
-        }
         Err(e) => CtlResponse::error(e),
     }
 }
@@ -620,6 +602,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
     let excluded =
         serde_json::to_string(&visibility.media).expect("a set of file identifiers serializes");
     let response = match request {
+        Ok(request @ (share::request!())) => share::answer(core, mountpoint, request),
         Ok(CtlRequest::Status) => status_response(core, username, mountpoint),
         Ok(CtlRequest::Subscribe) => {
             CtlResponse::error(CoreError::invalid("a subscription is served on its own"))
@@ -971,7 +954,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             private: false,
         }) => match visibility
             .permits(&uid)
-            .and_then(|()| core.open_shared_file(&uid))
+            .and_then(|()| core.sharing.open_shared_file(&uid))
         {
             Ok(path) => CtlResponse::FilePath {
                 path: path.display().to_string(),
@@ -1725,202 +1708,6 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 message: "restoring folders".to_string(),
             }
         }
-        Ok(CtlRequest::ShareNode {
-            path,
-            emails,
-            role,
-            message,
-        }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.share_node(&rel, &emails, &role, message.as_deref()) {
-                Ok((proton, external)) => {
-                    core.log_activity(
-                        ActivityKind::Share,
-                        &path,
-                        format!("{} recipient(s) as {role}", proton + external),
-                        true,
-                    );
-                    CtlResponse::Ok {
-                        message: format!("invited {proton} Proton and {external} external user(s)"),
-                    }
-                }
-                Err(e) => {
-                    core.log_activity(ActivityKind::Share, &path, &e, false);
-                    CtlResponse::error(e)
-                }
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ShareNodeByUid {
-            uid,
-            emails,
-            role,
-            message,
-        }) => match core.share_node_by_uid(&uid, &emails, &role, message.as_deref()) {
-            Ok((proton, external)) => {
-                core.log_activity(
-                    ActivityKind::Share,
-                    &uid,
-                    format!("{} recipient(s) as {role}", proton + external),
-                    true,
-                );
-                CtlResponse::Ok {
-                    message: format!("invited {proton} Proton and {external} external user(s)"),
-                }
-            }
-            Err(e) => {
-                core.log_activity(ActivityKind::Share, &uid, &e, false);
-                CtlResponse::error(e)
-            }
-        },
-        Ok(CtlRequest::ListShare { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.list_share(&rel) {
-                Ok((entries, link)) => CtlResponse::Share { entries, link },
-                Err(e) => CtlResponse::error(e),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListShareByUid { uid }) => match core.list_share_by_uid(&uid) {
-            Ok((entries, link)) => CtlResponse::Share { entries, link },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::UpdateShareRole {
-            path,
-            id,
-            kind,
-            role,
-        }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.update_share_role(&rel, &id, kind, &role) {
-                Ok(()) => CtlResponse::Ok {
-                    message: format!("role updated to {role}"),
-                },
-                Err(e) => CtlResponse::error(e),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::UpdateShareRoleByUid {
-            uid,
-            id,
-            kind,
-            role,
-        }) => match core.update_share_role_by_uid(&uid, &id, kind, &role) {
-            Ok(()) => CtlResponse::Ok {
-                message: format!("role updated to {role}"),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RemoveShareEntry { path, id, kind }) => {
-            match rel_to_mount(mountpoint, &path) {
-                Ok(rel) => match core.remove_share_entry(&rel, &id, kind) {
-                    Ok(()) => {
-                        core.log_activity(ActivityKind::Unshare, &path, "access removed", true);
-                        CtlResponse::Ok {
-                            message: "removed".to_string(),
-                        }
-                    }
-                    Err(e) => CtlResponse::error(e),
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::RemoveShareEntryByUid { uid, id, kind }) => {
-            match core.remove_share_entry_by_uid(&uid, &id, kind) {
-                Ok(()) => {
-                    core.log_activity(ActivityKind::Unshare, &uid, "access removed", true);
-                    CtlResponse::Ok {
-                        message: "removed".to_string(),
-                    }
-                }
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::CreatePublicLink {
-            path,
-            role,
-            password,
-            expires,
-        }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.create_public_link(&rel, &role, password.as_deref(), expires) {
-                Ok(link) => {
-                    core.log_activity(ActivityKind::PublicLink, &path, "link created", true);
-                    CtlResponse::PublicLink { link }
-                }
-                Err(e) => {
-                    core.log_activity(ActivityKind::PublicLink, &path, &e, false);
-                    CtlResponse::error(e)
-                }
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::CreatePublicLinkByUid {
-            uid,
-            role,
-            password,
-            expires,
-        }) => match core.create_public_link_by_uid(&uid, &role, password.as_deref(), expires) {
-            Ok(link) => {
-                core.log_activity(ActivityKind::PublicLink, &uid, "link created", true);
-                CtlResponse::PublicLink { link }
-            }
-            Err(e) => {
-                core.log_activity(ActivityKind::PublicLink, &uid, &e, false);
-                CtlResponse::error(e)
-            }
-        },
-        Ok(CtlRequest::UpdatePublicLink {
-            path,
-            id,
-            role,
-            password,
-            expires,
-        }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => {
-                match core.update_public_link(&rel, &id, role.as_deref(), password, expires) {
-                    Ok(link) => CtlResponse::PublicLink { link },
-                    Err(e) => CtlResponse::error(e),
-                }
-            }
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::UpdatePublicLinkByUid {
-            uid,
-            id,
-            role,
-            password,
-            expires,
-        }) => match core.update_public_link_by_uid(&uid, &id, role.as_deref(), password, expires) {
-            Ok(link) => CtlResponse::PublicLink { link },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RemovePublicLink { path, id }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.remove_public_link(&rel, &id) {
-                Ok(()) => {
-                    core.log_activity(ActivityKind::Unshare, &path, "link removed", true);
-                    CtlResponse::Ok {
-                        message: "public link removed".to_string(),
-                    }
-                }
-                Err(e) => CtlResponse::error(e),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RemovePublicLinkByUid { uid, id }) => {
-            match core.remove_public_link_by_uid(&uid, &id) {
-                Ok(()) => {
-                    core.log_activity(ActivityKind::Unshare, &uid, "link removed", true);
-                    CtlResponse::Ok {
-                        message: "public link removed".to_string(),
-                    }
-                }
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::StopSharing { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => stop_sharing_reply(core, &path, core.stop_sharing(&rel)),
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::StopSharingByUid { uid }) => {
-            stop_sharing_reply(core, &uid, core.stop_sharing_by_uid(&uid))
-        }
         Ok(CtlRequest::ListRevisions { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.list_revisions(&rel) {
                 Ok(items) => CtlResponse::Revisions { items },
@@ -1993,72 +1780,11 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::ListSharedWithMe) => match core.list_shared_with_me() {
-            Ok(entries) => CtlResponse::Entries { entries },
-            Err(e) => CtlResponse::error(e),
-        },
         Ok(CtlRequest::AccountQuota) => match core.account_quota() {
             Ok((max_space, used_space)) => CtlResponse::AccountQuota {
                 max_space,
                 used_space,
             },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListSharedFolder { uid }) => match core.list_shared_folder(&uid) {
-            Ok(entries) => CtlResponse::Entries { entries },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::OpenSharedFile { uid }) => match core.open_shared_file(&uid) {
-            Ok(p) => CtlResponse::FilePath {
-                path: p.display().to_string(),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::LeaveShared { uid }) => match core.leave_shared(&uid) {
-            Ok(()) => {
-                core.log_activity(ActivityKind::Unshare, "shared item", "left", true);
-                CtlResponse::Ok {
-                    message: "left shared item".to_string(),
-                }
-            }
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListInvitations) => match core.list_invitations() {
-            Ok(items) => CtlResponse::Invitations { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::AcceptInvitation { id }) => match core.accept_invitation(&id) {
-            Ok(()) => CtlResponse::Ok {
-                message: "invitation accepted".to_string(),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::RejectInvitation { id }) => match core.reject_invitation(&id) {
-            Ok(()) => CtlResponse::Ok {
-                message: "invitation rejected".to_string(),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListBookmarks) => match core.list_bookmarks() {
-            Ok(items) => CtlResponse::Bookmarks { items },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::CreateBookmark { url, password }) => {
-            match core.create_bookmark(&url, password.as_deref()) {
-                Ok(()) => CtlResponse::Ok {
-                    message: "bookmark saved".to_string(),
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
-        Ok(CtlRequest::DeleteBookmark { token }) => match core.delete_bookmark(&token) {
-            Ok(()) => CtlResponse::Ok {
-                message: "bookmark removed".to_string(),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::ListSharedByMe) => match core.list_shared_by_me() {
-            Ok(items) => CtlResponse::SharedByMe { items },
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListActivity { limit }) => CtlResponse::Activity {
