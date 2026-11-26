@@ -51,7 +51,7 @@ graph TD
 | [`pdfs-store`](../crates/pdfs-store) | The SQLite schema and queries (`db/`), the content cache (`cache`) |
 | [`pdfs-drive`](../crates/pdfs-drive) | The `DriveApi` seam over the SDK, the call counter (`counted`), and `FakeDrive` for the simulations |
 | [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes and engine thread (`mirror`), with its reads and writes of the local disk in one module (`mirror::local`), and the parts with no I/O: planner, pass model and pass trace. It owns its state (`SyncParts`), reads and writes its tables only through `SyncStore`, and reaches the daemon only through `SyncHost` |
-| [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), the tree (`state`), reads (`reads`), the queue and the drain (`queue`, `drain`, `upload`), the link state (`link`), remote events (`background`), the daemon's side of the sync engine (`sync`, which implements `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
+| [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), the tree (`state`), finding nodes (`resolve`), folder listings and file sizes (`listing`, `sizes`), reads (`reads`), queueing and the drain (`enqueue`, `queue`, `drain`, `upload`), calls sent straight to Drive (`remote`), requests by path (`requests`), startup recovery (`recovery`), pins, search, trash, the shared tree (`shared`), the link state (`link`), remote events (`background`), the daemon's side of the sync engine (`sync`, which implements `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
 | [`pdfs-cli`](../crates/pdfs-cli) | The `pdfs` binary. `pdfs daemon` runs the daemon in-process; every other command is a control-socket client |
 | [`pdfs-gui`](../crates/pdfs-gui) | `pdfs-app`, `pdfs-tray` and `pdfs-prompt`. Pages in `src/app/pages/`, widgets in `src/app/widgets/`, CSS and icons in `resources/` |
 
@@ -731,6 +731,14 @@ The work goes in steps. Each ships the same behaviour with the simulation tests 
 | 4 | Sync on evidence: a local dirty set, typed absence, a delete guard over the whole walk, and a durable intent for each effect, first in shadow mode |
 | 5 | `pdfs-vfs`: open files, then directories and renames, behind the FUSE adapter |
 | 6 | One admission policy for mirrors, reads and writeback |
+
+Step 3 so far: the daemon's long-lived threads start and stop through one `Services` set (§9).
+`Core`'s fields are grouped by owner, each group a struct in the module that owns it:
+`photos::PhotoJobs`, `drain::DrainState`, `reads::ReadState`, `sizes::SizeState`,
+`trash::TrashState`, `shared::SharedState`, `sharing::QuotaCache` and `sweep::SweepState`.
+`Core`'s methods are split by area out of `lib.rs` into their own modules. What is left in `Core`
+is shared by several owners (the tree, the database, the queue's `pending` map) and needs ports
+before it can move.
 
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and
