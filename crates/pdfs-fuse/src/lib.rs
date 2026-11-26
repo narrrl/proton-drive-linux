@@ -92,9 +92,9 @@ mod diagnostics;
 mod drain;
 use drive::{DriveApi, RevisionRead};
 use pdfs_core::timestamp::now_secs;
-pub(crate) use pdfs_drive::{media_type_for, node_content_sha1, parse_uid, remote_name_is_safe};
 use pdfs_drive as drive;
 use pdfs_drive::node_revision_id;
+pub(crate) use pdfs_drive::{media_type_for, node_content_sha1, parse_uid, remote_name_is_safe};
 #[cfg(test)]
 use pdfs_sync::naming::{conflict_label, conflict_label_of, conflict_name_as};
 use pdfs_sync::naming::{conflict_name, this_hostname};
