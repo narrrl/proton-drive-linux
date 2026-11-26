@@ -39,6 +39,32 @@ use crate::shutdown::Shutdown;
 /// Wakes a thread that blocks somewhere a [`Shutdown::stop`] alone does not reach.
 pub type Wake = Box<dyn Fn() + Send + Sync>;
 
+/// A long-lived loop a mount runs on a thread of its own.
+///
+/// Each one says in one place what it is called, how a stop reaches it and
+/// whether the mount can do without it, next to the loop itself. The mount
+/// starts a list of them with [`Services::start`] instead of spelling out
+/// each spawn, wake and failure path.
+pub trait Service: Send + 'static {
+    /// The thread's name, such as `pdfs-sync`.
+    fn name(&self) -> String;
+
+    /// Whether a mount fails when this cannot start. An optional service is
+    /// logged and skipped: the mount works without it, only less well.
+    fn required(&self) -> bool {
+        true
+    }
+
+    /// The call that wakes the loop on a stop, for one that blocks where the
+    /// [`Shutdown`] signal does not reach: a condvar, a channel, an `accept`.
+    fn wake(&self) -> Option<Wake> {
+        None
+    }
+
+    /// Run the loop until the [`Shutdown`] signal or the wake ends it.
+    fn run(self: Box<Self>);
+}
+
 /// Whether one service thread is still running, for diagnostics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceHealth {
@@ -241,7 +267,7 @@ impl Drop for Running {
     }
 }
 
-struct Service {
+struct Started {
     handle: Handle,
     wake: Option<Wake>,
 }
@@ -280,7 +306,7 @@ impl Handle {
 /// The service threads one mount started, and how to stop them.
 pub struct Services {
     board: ServiceBoard,
-    started: Vec<Service>,
+    started: Vec<Started>,
 }
 
 impl Services {
@@ -309,7 +335,7 @@ impl Services {
             });
         match spawned {
             Ok(handle) => {
-                self.started.push(Service {
+                self.started.push(Started {
                     handle: Handle::Thread(handle),
                     wake,
                 });
@@ -320,6 +346,21 @@ impl Services {
                 // so the board already shows the thread as not running.
                 Err(error)
             }
+        }
+    }
+
+    /// Start `service` on a thread of its own. A required service that cannot
+    /// start returns the error; an optional one is logged and skipped.
+    pub fn start(&mut self, service: Box<dyn Service>) -> std::io::Result<()> {
+        let name = service.name();
+        let required = service.required();
+        let wake = service.wake();
+        match self.spawn(&name, wake, move || service.run()) {
+            Err(error) if !required => {
+                tracing::warn!(service = name, %error, "optional service did not start");
+                Ok(())
+            }
+            started => started,
         }
     }
 
@@ -336,7 +377,7 @@ impl Services {
             let _guard = guard;
             task.await;
         });
-        self.started.push(Service {
+        self.started.push(Started {
             handle: Handle::Task {
                 name: name.to_owned(),
                 task,
@@ -650,5 +691,51 @@ mod tests {
         assert!(board.spawn_job("pdfs-test-late", || {}).is_err());
         board.spawn_task_job(rt.handle(), "pdfs-test-late", async {});
         assert!(board.jobs().is_empty(), "a job started after the stop");
+    }
+
+    struct Waiter {
+        name: &'static str,
+        rx: mpsc::Receiver<()>,
+        tx: mpsc::Sender<()>,
+    }
+
+    impl Service for Waiter {
+        fn name(&self) -> String {
+            self.name.to_owned()
+        }
+
+        fn wake(&self) -> Option<Wake> {
+            let tx = self.tx.clone();
+            Some(Box::new(move || {
+                let _ = tx.send(());
+            }))
+        }
+
+        fn run(self: Box<Self>) {
+            let _ = self.rx.recv();
+        }
+    }
+
+    #[test]
+    fn a_started_service_is_woken_and_joined_by_a_stop() {
+        let board = ServiceBoard::default();
+        let mut services = Services::new(board.clone());
+        let (tx, rx) = mpsc::channel();
+        services
+            .start(Box::new(Waiter {
+                name: "pdfs-test-waiter",
+                rx,
+                tx,
+            }))
+            .unwrap();
+        assert_eq!(board.health()[0].name, "pdfs-test-waiter");
+
+        let left = services.stop(
+            &Shutdown::default(),
+            Instant::now() + Duration::from_secs(5),
+        );
+
+        assert!(left.is_empty(), "still running: {left:?}");
+        assert!(!board.health()[0].running);
     }
 }

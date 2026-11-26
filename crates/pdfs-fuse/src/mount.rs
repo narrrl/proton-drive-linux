@@ -1,7 +1,7 @@
 //! Mount lifecycle and background-service orchestration.
 
 use super::*;
-use pdfs_core::lifecycle::{ServiceBoard, Services, Wake};
+use pdfs_core::lifecycle::{Service, ServiceBoard, Services};
 
 /// Why a [`mount`] call returned. Lets the daemon decide whether to exit (clean
 /// shutdown) or remount (the mount went away under it).
@@ -587,93 +587,49 @@ pub(crate) fn mount_with(
     // in-process remount into a second generation of drain workers, sync engines
     // and sweeps all operating on a mount that no longer exists (`docs/BUGS.md` B44).
     let mut workers = Services::new(core.services.clone());
-    for worker in 0..DRAIN_WORKERS {
-        let drain_core = core.clone();
-        // The drain workers wait on their own condvar, which a stop has to
-        // notify; one notify wakes them all.
-        let wake: Option<Wake> = (worker == 0).then(|| {
-            let core = core.clone();
-            Box::new(move || core.wake_drain()) as Wake
-        });
-        let spawned = workers.spawn(&format!("pdfs-drain-{worker}"), wake, move || {
-            drain_core.run_pending_drain(worker == 0)
-        });
-        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
+    let mut list: Vec<Box<dyn Service>> = Vec::new();
+    for index in 0..DRAIN_WORKERS {
+        list.push(Box::new(services::DrainWorker {
+            core: core.clone(),
+            index,
+        }));
     }
-
-    // Start the folder-sync engine. It watches every mirror folder, polls the
-    // remotes, and reconciles on its own thread — never in front of a FUSE call.
-    // It waits on its channel, so a stop sends it `Stop`.
-    {
-        let syncer = core.syncer();
-        let tx = core.sync.tx.clone();
-        let wake: Wake = Box::new(move || {
-            let _ = tx.send(sync::SyncMsg::Stop);
-        });
-        if let Err(error) =
-            workers.spawn("pdfs-sync", Some(wake), move || sync::run(syncer, sync_rx))
-        {
-            warn!(%error, "failed to start sync engine");
-        }
-    }
-    // A timed pause persisted by an earlier run still has to end on time.
-    if let Some(until) = core.pause.deadline() {
-        core.arm_pause_timer(until);
-    }
-
-    // Reconcile leftover `(sync-conflict …)` copies: drop the ones that turned
-    // out identical to the live file, surface the ones that genuinely diverge.
-    // Its own thread — it enumerates and trashes, and must never block a FUSE call.
+    list.push(Box::new(services::SyncEngine {
+        syncer: core.syncer(),
+        tx: core.sync.tx.clone(),
+        rx: sync_rx,
+    }));
     // `Off` skips the thread entirely rather than starting an idle one, so the
     // setting is verifiable from the outside (`ls /proc/<pid>/task/*/comm`).
     if sweep_mode == SweepMode::Off {
         info!("conflict sweep disabled by configuration");
     } else {
         info!(mode = ?sweep_mode, "conflict sweep enabled");
-        let sweep_core = core.clone();
-        let spawned = workers.spawn("pdfs-conflict-sweep", None, move || {
-            sweep_core.run_conflict_sweep_loop()
-        });
-        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
+        list.push(Box::new(services::ConflictSweep(core.clone())));
     }
-
-    // Watch the link for the life of the mount: a mount from the cache waits for
-    // the network to come back, and an online one can lose it at any moment and
-    // must notice it coming back just the same.
-    {
-        let probe_core = core.clone();
-        let spawned = workers.spawn("pdfs-online-probe", None, move || {
-            probe_core.run_online_probe()
-        });
-        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
-    }
-
-    // Keep pinned files on this computer through changes made elsewhere, and
-    // fetch the ones a failed or missed download left out (`docs/BUGS.md`
-    // B282). Its own thread: a check lists folders and downloads files.
-    {
-        let keeper_core = core.clone();
-        let spawned = workers.spawn("pdfs-pin-keeper", None, move || {
-            keeper_core.run_pin_keeper()
-        });
-        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
-    }
-
-    // Keep the launcher prompt's "This computer" index fresh. Its own thread:
-    // the walk is I/O-heavy and must never sit in front of a FUSE callback.
+    list.push(Box::new(services::OnlineProbe(core.clone())));
+    list.push(Box::new(services::PinKeeper(core.clone())));
     if matches!(host, Host::Daemon) {
-        if let Some(gallery) = &core.gallery {
-            workers.spawn_task(&rt, "pdfs-gallery", gallery.clone().poll(core.clone()));
-        }
-        let db = core.db.clone();
-        let indexing = core.indexing.clone();
-        let transfers = core.transfers.clone();
-        let mountpoint = mountpoint.to_path_buf();
-        let shutdown = core.shutdown.clone();
-        let spawned = workers.spawn("pdfs-localindex", None, move || {
-            run_local_index(db, indexing, transfers, mountpoint, shutdown)
-        });
-        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
+        list.push(Box::new(services::LocalIndex {
+            db: core.db.clone(),
+            indexing: core.indexing.clone(),
+            transfers: core.transfers.clone(),
+            mountpoint: mountpoint.to_path_buf(),
+            shutdown: core.shutdown.clone(),
+        }));
+    }
+    for service in list {
+        let started = workers.start(service);
+        keep_or_abandon(&core, control_socket, &mut workers, started)?;
+    }
+    if matches!(host, Host::Daemon)
+        && let Some(gallery) = &core.gallery
+    {
+        workers.spawn_task(&rt, "pdfs-gallery", gallery.clone().poll(core.clone()));
+    }
+    // A timed pause persisted by an earlier run still has to end on time.
+    if let Some(until) = core.pause.deadline() {
+        core.arm_pause_timer(until);
     }
 
     // Bind the control socket before the FUSE session takes over the thread. A
@@ -713,27 +669,14 @@ pub(crate) fn mount_with(
     // mid-transfer can abort it rather than block `join` (see `abort_fuse_connection`).
     let main_conn = fuse_connection_id(mountpoint);
     {
-        let control_core = core.clone();
-        let username = username.clone();
-        let mountpoint = mountpoint.to_path_buf();
-        // The listener blocks in `accept`, which only returns when a connection
-        // arrives, so a stop connects to it. Connect while the socket still
-        // exists, which is the point of the poke, then unlink it so nothing else
-        // can arrive behind it. The listener checks the stop flag after every
-        // accept, so a connection that races the unlink cannot put it back to
-        // sleep. The connections it handed off are jobs, which a stop joins;
-        // a subscription among them waits on its mailbox, so the wake rings
-        // every mailbox too.
-        let socket = control_socket.to_path_buf();
-        let events = core.events.clone();
-        let wake: Wake = Box::new(move || {
-            let _ = std::os::unix::net::UnixStream::connect(&socket);
-            let _ = std::fs::remove_file(&socket);
-            events.wake_all();
-        });
-        match workers.spawn("pdfs-control", Some(wake), move || {
-            run_control_socket(control_core, username, mountpoint, listener)
-        }) {
+        let control = services::ControlListener {
+            core: core.clone(),
+            username: username.clone(),
+            mountpoint: mountpoint.to_path_buf(),
+            listener,
+            socket: control_socket.to_path_buf(),
+        };
+        match workers.start(Box::new(control)) {
             Ok(()) => {}
             Err(error) => {
                 // A failure here abandons the mount, so the background threads
@@ -755,34 +698,19 @@ pub(crate) fn mount_with(
             }
         }
     }
-    // Publishes what changes without one place to publish it from (status,
-    // transfers, sync progress) to the front-ends subscribed on that socket.
-    {
-        let sampler_core = core.clone();
-        let username = username.clone();
-        let mountpoint = mountpoint.to_path_buf();
-        if let Err(error) = workers.spawn("pdfs-events", None, move || {
-            events::run_event_sampler(sampler_core, username, mountpoint)
-        }) {
-            // Not fatal: front-ends still get every published change, only
-            // not the sampled ones.
-            warn!(error = %error, "could not start the event sampler");
-        }
-    }
-    // The supervisor watches the pool and answers the systemd watchdog. Started
-    // after the listener, because its liveness probe is a round trip over that
-    // socket.
-    {
-        let supervisor_core = core.clone();
-        let socket = control_socket.to_path_buf();
-        if let Err(error) = workers.spawn("pdfs-supervisor", None, move || {
-            supervisor::run(supervisor_core, socket)
-        }) {
-            // Not fatal: the mount works without a supervisor, it just goes back
-            // to being undiagnosable if it wedges.
-            warn!(error = %error, "could not start the daemon supervisor");
-        }
-    }
+    // The supervisor's liveness probe is a round trip over the control socket,
+    // so it starts after the listener. Both are optional.
+    let sampler = services::EventSampler {
+        core: core.clone(),
+        username: username.clone(),
+        mountpoint: mountpoint.to_path_buf(),
+    };
+    let watchdog = services::Supervisor {
+        core: core.clone(),
+        socket: control_socket.to_path_buf(),
+    };
+    start_late(&mut workers, Box::new(sampler));
+    start_late(&mut workers, Box::new(watchdog));
     // The mount is live and the control socket answers: this is the moment the
     // unit is actually usable, which is what `Type=notify` reports. Whatever
     // failure an earlier attempt recorded for the front ends is over.
@@ -835,12 +763,7 @@ pub(crate) fn mount_with(
     // Hold off a shutdown while changes exist only here (B66). Only the real
     // daemon: a simulation's queue is not the user's data.
     if matches!(host, Host::Daemon) {
-        let inhibit_core = core.clone();
-        if let Err(error) = workers.spawn("pdfs-inhibit", None, move || {
-            crate::inhibit::run(inhibit_core)
-        }) {
-            warn!(%error, "start the shutdown inhibitor failed");
-        }
+        start_late(&mut workers, Box::new(services::Inhibitor(core.clone())));
     }
 
     // Stop signals (SIGTERM from `systemctl --user stop`, SIGINT from Ctrl-C)
@@ -987,6 +910,15 @@ fn stop_workers(core: &Core, control_socket: &Path, workers: Services) {
 /// told so would wait for the process to exit and then kill it.
 fn abandon_workers(core: &Core, control_socket: &Path, workers: Services) {
     halt_workers(core, control_socket, workers);
+}
+
+/// Start a service once the session is live. Past that point a failure no
+/// longer abandons the mount, so even a required one is only logged.
+fn start_late(workers: &mut Services, service: Box<dyn Service>) {
+    let name = service.name();
+    if let Err(error) = workers.start(service) {
+        warn!(service = name, %error, "service did not start");
+    }
 }
 
 /// Keep a worker the mount just spawned, or, if the spawn failed, stop the

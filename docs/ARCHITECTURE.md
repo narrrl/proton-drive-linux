@@ -479,10 +479,14 @@ both with `pdfs_core::search::relevance_score`, so the prompt can merge them int
 | Smaller helpers | `pdfs-localindex` (home index for search), `pdfs-pause` (ends a timed pause), `pdfs-similar` (similar photos, on request), `pdfs-diagnostics` |
 
 Long-running loops wait on one shared `Shutdown` signal instead of sleeping, so a stop joins them
-instead of leaving them behind (`docs/BUGS.md` B44). The mount starts its long-lived threads
-through `pdfs_core::lifecycle::Services`. Each one is started with its name and, if it blocks where
-the signal does not reach, the call that wakes it: the drain's condvar, the sync engine's `Stop`
-message, a connection to the control socket. A stop signals, wakes and joins them in reverse start
+instead of leaving them behind (`docs/BUGS.md` B44). Each long-lived thread is a
+`pdfs_core::lifecycle::Service`, defined in `pdfs-fuse/src/services.rs`. A service says what its
+thread is called, whether the mount can run without it, and, if it blocks where the signal does
+not reach, the call that wakes it: the drain's condvar, the sync engine's `Stop` message, a
+connection to the control socket. The mount builds the list and starts it through
+`Services::start`. A required service that cannot start fails the mount attempt, which is retried;
+an optional one (the sync engine, the event sampler, the supervisor, the inhibitor) is logged and
+skipped. A stop signals, wakes and joins them in reverse start
 order, up to one 10-second deadline, and names any that are still running at the end. A
 service can also be an async task on the runtime (`Services::spawn_task`): the event streams and
 the gallery refresh. A stop aborts such a task at its next `.await` and waits for it to end. These
@@ -496,7 +500,10 @@ re-date, a profile backup, a size upgrade) runs as a one-shot job:
 `ServiceBoard::spawn_job` starts it on a named thread and lists it until it ends. `pdfs
 diagnostics` shows the jobs running and how long each has run. Async work of the same kind (the
 trash, timeline and album refreshes a listing starts) goes through `ServiceBoard::spawn_task_job`
-and is listed the same way. Jobs are not joined on stop.
+and is listed the same way. Each control connection is a job too. A stop closes the board to new
+jobs, aborts the async ones and joins the thread jobs before the services, up to the same
+deadline. A long job checks the `Shutdown` signal between steps. Jobs used to be left running, and
+one still waiting on Drive when the runtime went away panicked on its next timer.
 
 ---
 
