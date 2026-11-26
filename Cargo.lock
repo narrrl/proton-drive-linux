@@ -3640,6 +3640,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "pdfs-core",
+ "pdfs-daemon",
  "pdfs-fuse",
  "pdfs-store",
  "rpassword",
@@ -3678,6 +3679,18 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "pdfs-daemon"
+version = "3.10.0"
+dependencies = [
+ "anyhow",
+ "pdfs-core",
+ "pdfs-fuse",
+ "pdfs-store",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

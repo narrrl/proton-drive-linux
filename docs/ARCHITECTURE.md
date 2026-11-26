@@ -52,7 +52,8 @@ graph TD
 | [`pdfs-drive`](../crates/pdfs-drive) | The `DriveApi` seam over the SDK, the call counter (`counted`), and `FakeDrive` for the simulations |
 | [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes and engine thread (`mirror`), with its reads and writes of the local disk in one module (`mirror::local`), and the parts with no I/O: planner, pass model and pass trace. It owns its state (`SyncParts`), reads and writes its tables only through `SyncStore`, and reaches the daemon only through `SyncHost` |
 | [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), the tree (`state`), finding nodes (`resolve`), folder listings and file sizes (`listing`, `sizes`), reads (`reads`), queueing and the drain (`enqueue`, `queue`, `drain`, `upload`), calls sent straight to Drive (`remote`), requests by path (`requests`), startup recovery (`recovery`), pins, search, trash, the shared tree (`shared`), the link state (`link`), remote events (`background`), the daemon's side of the sync engine (`sync`, which implements `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
-| [`pdfs-cli`](../crates/pdfs-cli) | The `pdfs` binary. `pdfs daemon` runs the daemon in-process; every other command is a control-socket client |
+| [`pdfs-daemon`](../crates/pdfs-daemon) | The daemon's composition root: waits for a session, opens the database and the content cache, resumes the session and mounts, then remounts or retries with a backoff and records each failure |
+| [`pdfs-cli`](../crates/pdfs-cli) | The `pdfs` binary. `pdfs daemon` runs `pdfs_daemon::run` in-process; every other command is a control-socket client |
 | [`pdfs-gui`](../crates/pdfs-gui) | `pdfs-app`, `pdfs-tray` and `pdfs-prompt`. Pages in `src/app/pages/`, widgets in `src/app/widgets/`, CSS and icons in `resources/` |
 
 The daemon runs as the systemd user unit `proton-drive.service`. Only the daemon holds the
@@ -736,7 +737,8 @@ Step 3 so far: the daemon's long-lived threads start and stop through one `Servi
 `Core`'s fields are grouped by owner, each group a struct in the module that owns it:
 `photos::PhotoJobs`, `drain::DrainState`, `reads::ReadState`, `sizes::SizeState`,
 `trash::TrashState`, `shared::SharedState`, `sharing::QuotaCache` and `sweep::SweepState`.
-`Core`'s methods are split by area out of `lib.rs` into their own modules. What is left in `Core`
+`Core`'s methods are split by area out of `lib.rs` into their own modules. The daemon's run loop
+moved out of `pdfs-cli` into `pdfs-daemon`, which is where the services will be built. What is left in `Core`
 is shared by several owners (the tree, the database, the queue's `pending` map) and needs ports
 before it can move.
 
