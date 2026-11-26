@@ -771,8 +771,9 @@ State that several owners share sits behind a narrow interface of its own:
 - `session::SessionCells` holds what belongs to one mount's FUSE session: whether it is the
   primary mount, its root inode, its kernel channel and whether it is up. An on-demand fork gets
   fresh cells from `SessionCells::fork`, and shares the rest of `Core`.
-- `link::Link` holds whether Drive answers, next to when the link went down. Code reads it through
-  `Core::is_online`.
+- `link::Link` holds whether Drive answers, next to when the link went down, and is the only
+  code that changes it: it flips the flag, logs the outage and wakes whoever waits. Code reads it
+  through `Core::is_online`.
 
 Some areas are services of their own rather than methods on `Core`. `sharing::Sharing` holds
 only the handles it calls (the client, Drive, the content cache, the transfer list and a read of
@@ -805,6 +806,27 @@ folders and on-demand mounts are still methods on `Core`.
 `profile::ProfileBackup` writes this machine's profile to its device and reads the profiles other
 machines wrote, to offer their folders for restore. It needs nothing from the filesystem, so it
 has no host. Turning the offered folders into synced folders stays on `Core`.
+
+`maintenance::Maintenance` runs `VACUUM` and the deep integrity check as jobs, one at a time, and
+keeps the last check's findings.
+
+The mount's background loops are services of their own too, each started from the list in
+`services.rs`:
+
+- `link::OnlineProbe` probes the link back while it is down. Its `LinkHost` port stores the root
+  Drive answered with, lets what waited on the link go (relisting, retrying backed-off ops,
+  waking the drain, rechecking pins), reports a refused session and repairs the root's share id.
+- `sweep::Sweeper` is the conflict sweep. Its `SweepHost` port asks whether a node is the
+  account's own, whether the mount is online, whether a node is busy in any mount and whether
+  the conflict listing can show a copy; it unhooks a trashed copy from every mount and adds
+  activity entries.
+- `keeper::PinKeeper` keeps pinned files current. Its `KeeperHost` port finds a node in the tree,
+  lists kept folders, describes a file as a pin keeps it and downloads it.
+- The inhibitor takes only the database and the stop signal.
+
+The drain workers, the control listener, the event sampler and the supervisor still take a whole
+`Core`. The drain is the write-back, which is part of the mounted-files service (step 5); the
+other three answer front ends with reports drawn from every area.
 
 The control socket answers each area's requests in a module of its own under `control/`:
 sharing, Photos, synced folders and devices, revisions, and the trash and cache. Each module
