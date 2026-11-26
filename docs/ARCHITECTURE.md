@@ -785,6 +785,11 @@ checks write authority against the tree and drops open readers.
 restored node comes back into, and forget nodes the server no longer has. `Core::trash` builds it
 on demand.
 
+`revisions::Revisions` lists, restores, deletes and saves a file's earlier revisions. Like
+`Sharing`, it only takes a node already resolved to its uid. Its `RevisionsHost` port checks that
+the node may be written, drops what describes the old content (cached blocks and open readers)
+and fetches it again if it is kept offline, and adds an activity entry.
+
 The control socket answers each area's requests in a module of its own under `control/`:
 sharing, Photos, synced folders and devices, revisions, and the trash and cache. Each module
 exports a pattern macro naming its requests, and the main match hands them over in one arm, so
