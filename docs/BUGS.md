@@ -108,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B303](#b303--a-file-made-where-a-withdrawn-create-was-listed-refuses-every-write) | A file made where a withdrawn create was listed refuses every write |
 | [B301](#b301--two-overlapping-fsyncs-can-leave-the-older-ones-record-on-disk) | Two overlapping fsyncs can leave the older one's record on disk |
 | [B300](#b300--a-read-during-a-release-can-be-served-the-revision-the-write-replaced) | A read during a release can be served the revision the write replaced |
 | [B299](#b299--a-synced-folder-in-the-trash-blocks-attaching-any-other-folder) | A synced folder in the trash blocks attaching any other folder |
@@ -403,6 +404,36 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B303 — A file made where a withdrawn create was listed refuses every write
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-27, from a CI failure of the `one_client_on_a_slow_link` simulation (seed 3):
+`rename y/d -> y/c.bin` answered EACCES, and the daemon log had two "access changed before the
+write could be queued" errors for the node.
+**Where:** `Core::trash_withdrawn_create` and `Core::drain_trash` in
+`crates/pdfs-fuse/src/drain/trash.rs`
+
+**Repro:** Make a file and delete it while its create is on the wire, on a slow link. Drive makes
+the node and lists it before the drain has the answer. Refresh the folder in that window. Once the
+drain has trashed the node, make a file under the same name, write to it and rename it. The write
+is kept in staging with "access changed before the write could be queued", and the rename fails
+with EACCES.
+
+**Cause.** The drain hid the node Drive made, so later listings left it out, but it did not take
+it out of a listing already in the tree. The refresh had put the node there under the deleted
+file's name. A new file under that name opened the existing entry, which was the node being
+trashed. Once the trash landed its row was gone, the node had no write authority, and every
+write and rename of it was refused.
+
+**Fix.** `Core::withdraw_landed` hides the node and also removes it from every mount, and drops
+the kernel's entry for its name. Both places that trash a withdrawn create's node call it.
+
+**Verified:** `a_listing_taken_while_a_withdrawn_create_lands_does_not_keep_it` holds the answer to
+a create, deletes the file, refreshes the folder, then lets the answer through. It fails without
+the fix and passes with it.
+
+---
 
 ### B301 — Two overlapping fsyncs can leave the older one's record on disk
 
