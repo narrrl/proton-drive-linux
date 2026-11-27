@@ -31,11 +31,6 @@ impl Entry {
     }
 }
 
-/// One directory's entries as `readdir` reports them: `(ino, is_dir, name)` per
-/// entry, in reply order. The kernel's file-type enum is mapped in at reply
-/// time so this module stays free of `fuser`.
-pub(crate) type DirListing = Vec<(u64, bool, String)>;
-
 /// Where [`State::next_ino`] starts: far above any local id a database hands
 /// out, so a fallback inode never names a node that has a row.
 pub(crate) const FALLBACK_INO: u64 = 1 << 48;
@@ -101,16 +96,6 @@ pub(crate) struct State {
     pub(crate) next_ino: u64,
     /// The files open for writing, their handles and their releases.
     pub(crate) open: OpenFiles,
-    /// One frozen listing per open directory handle, taken at `opendir`.
-    ///
-    /// `readdir` resumes from a byte offset into the listing it is walking, so
-    /// that listing has to stay the same across the calls of one `getdents`
-    /// sequence. Rebuilding it live meant a create or a trash landing between
-    /// two pages shifted every later entry, and the caller silently skipped or
-    /// repeated whatever crossed the page boundary. Each entry is
-    /// `(ino, is_dir, name)` — the kernel type is mapped at reply time so this
-    /// module stays free of `fuser` (`docs/BUGS.md` B43).
-    pub(crate) dir_snapshots: HashMap<u64, Arc<DirListing>>,
     /// Resident inode attributes whose effective access changed during an
     /// intern/root refresh. Core drains this set and notifies the matching
     /// kernel only after releasing the State lock.
@@ -259,7 +244,6 @@ impl State {
             roots: HashSet::new(),
             next_ino: FALLBACK_INO,
             open: OpenFiles::default(),
-            dir_snapshots: HashMap::new(),
             access_changes: HashSet::new(),
             share_access,
             db,

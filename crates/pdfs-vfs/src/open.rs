@@ -171,6 +171,23 @@ impl WriteHandle {
         Ok(())
     }
 
+    /// Record an `fallocate` of `[offset, end)` that the scratch file took.
+    /// Zeroed or punched bytes read as zero, so they count as written: left
+    /// unwritten, the commit refilled them from the remote base and undid
+    /// them. Returns the new length if the file grew.
+    pub fn record_fallocate(&mut self, kind: Fallocate, offset: u64, end: u64) -> Option<u64> {
+        let (written, grown) = kind.effect(offset, end, self.len);
+        if let Some((from, to)) = written {
+            self.written.add(from, to);
+            self.dirty = true;
+        }
+        if let Some(end) = grown {
+            self.len = end;
+            self.dirty = true;
+        }
+        grown
+    }
+
     /// Account for `[offset, end)` having been written through this handle.
     ///
     /// A write past the end leaves a hole that reads as zeros, exactly like a
@@ -203,7 +220,32 @@ pub struct OpenFiles {
     /// The inode each write `fh` is open on. Read-only opens use `fh` 0 and
     /// have no entry.
     handles: HashMap<u64, u64>,
+    /// One frozen listing per open directory handle, taken at `opendir`.
+    ///
+    /// `readdir` resumes from an offset into the listing it is walking, so
+    /// that listing has to stay the same across the calls of one `getdents`
+    /// sequence. Rebuilt live, a create or a trash landing between two pages
+    /// shifted every later entry, and the caller silently skipped or repeated
+    /// whatever crossed the page boundary (`docs/BUGS.md` B43).
+    dirs: HashMap<u64, Arc<DirListing>>,
     next_fh: u64,
+}
+
+/// One directory's entries as `readdir` reports them: `(ino, is_dir, name)`
+/// per entry, in reply order, starting with `.` and `..`.
+pub type DirListing = Vec<(u64, bool, String)>;
+
+/// The entries of `listing` a `readdir` at `offset` replies with, each with
+/// the offset that resumes after it.
+pub fn dir_page(
+    listing: &DirListing,
+    offset: u64,
+) -> impl Iterator<Item = (u64, &(u64, bool, String))> {
+    listing
+        .iter()
+        .enumerate()
+        .skip(offset as usize)
+        .map(|(i, entry)| ((i + 1) as u64, entry))
 }
 
 impl Default for OpenFiles {
@@ -212,6 +254,7 @@ impl Default for OpenFiles {
             writes: HashMap::new(),
             releasing: HashSet::new(),
             handles: HashMap::new(),
+            dirs: HashMap::new(),
             next_fh: 1,
         }
     }
@@ -235,6 +278,24 @@ impl OpenFiles {
         let fh = self.next_fh;
         self.next_fh += 1;
         fh
+    }
+
+    /// Open a directory handle on a snapshot of its listing. Returns the
+    /// handle number.
+    pub fn open_dir(&mut self, listing: DirListing) -> u64 {
+        let fh = self.next_fh();
+        self.dirs.insert(fh, Arc::new(listing));
+        fh
+    }
+
+    /// The listing directory handle `fh` was opened on.
+    pub fn dir(&self, fh: u64) -> Option<Arc<DirListing>> {
+        self.dirs.get(&fh).cloned()
+    }
+
+    /// Close directory handle `fh`.
+    pub fn close_dir(&mut self, fh: u64) {
+        self.dirs.remove(&fh);
     }
 
     /// Open a write handle on `ino`: share the inode's write state, or start
@@ -334,6 +395,53 @@ impl OpenFiles {
     /// Drop the write state of `ino` without queueing it, for tests.
     pub fn remove_writer(&mut self, ino: u64) -> Option<WriteHandle> {
         self.writes.remove(&ino)
+    }
+}
+
+/// What an `fallocate` mode does to a write handle, for the modes it can
+/// record (`docs/BUGS.md` B224).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallocate {
+    /// Reserve space; past the end it grows the file unless `keep_size`.
+    Allocate { keep_size: bool },
+    /// Deallocate a range inside the file, which then reads as zero.
+    Punch,
+    /// Zero a range; past the end it grows the file unless `keep_size`.
+    Zero { keep_size: bool },
+}
+
+impl Fallocate {
+    /// The kind of `mode`, or `None` for a mode a handle cannot record.
+    pub fn from_mode(mode: i32) -> Option<Self> {
+        const KEEP: i32 = libc::FALLOC_FL_KEEP_SIZE;
+        const PUNCH: i32 = libc::FALLOC_FL_PUNCH_HOLE;
+        const ZERO: i32 = libc::FALLOC_FL_ZERO_RANGE;
+        match mode {
+            0 => Some(Fallocate::Allocate { keep_size: false }),
+            KEEP => Some(Fallocate::Allocate { keep_size: true }),
+            m if m == PUNCH | KEEP => Some(Fallocate::Punch),
+            ZERO => Some(Fallocate::Zero { keep_size: false }),
+            m if m == ZERO | KEEP => Some(Fallocate::Zero { keep_size: true }),
+            _ => None,
+        }
+    }
+
+    /// For `[offset, end)` on a file `len` bytes long: the range that now
+    /// reads as zero and must count as written, and the new length if it grew.
+    pub fn effect(self, offset: u64, end: u64, len: u64) -> (Option<(u64, u64)>, Option<u64>) {
+        let grow = |keep_size: bool| (!keep_size && end > len).then_some(end);
+        let zeroed = |to: u64| (offset < to).then_some((offset, to));
+        match self {
+            // Space past the old end reads as zero, and nothing before it moved.
+            Self::Allocate { keep_size } => {
+                (grow(keep_size).map(|end| (len, end)), grow(keep_size))
+            }
+            Self::Punch => (zeroed(end.min(len)), None),
+            Self::Zero { keep_size } => {
+                let to = if keep_size { end.min(len) } else { end };
+                (zeroed(to), grow(keep_size))
+            }
+        }
     }
 }
 
@@ -633,5 +741,93 @@ mod tests {
         assert_ne!(dir, file);
         assert_eq!(open.ino_of(file), Some(2));
         assert_eq!(open.ino_of(dir), None);
+    }
+
+    #[test]
+    fn only_the_modes_a_handle_can_record_are_accepted() {
+        let keep = libc::FALLOC_FL_KEEP_SIZE;
+        assert_eq!(
+            Fallocate::from_mode(0),
+            Some(Fallocate::Allocate { keep_size: false })
+        );
+        assert_eq!(
+            Fallocate::from_mode(keep),
+            Some(Fallocate::Allocate { keep_size: true })
+        );
+        assert_eq!(
+            Fallocate::from_mode(libc::FALLOC_FL_PUNCH_HOLE | keep),
+            Some(Fallocate::Punch)
+        );
+        assert_eq!(
+            Fallocate::from_mode(libc::FALLOC_FL_ZERO_RANGE),
+            Some(Fallocate::Zero { keep_size: false })
+        );
+        for mode in [
+            libc::FALLOC_FL_PUNCH_HOLE,
+            libc::FALLOC_FL_COLLAPSE_RANGE,
+            libc::FALLOC_FL_INSERT_RANGE,
+            libc::FALLOC_FL_UNSHARE_RANGE,
+        ] {
+            assert_eq!(Fallocate::from_mode(mode), None, "{mode:#x}");
+        }
+    }
+
+    /// A zeroed range was left unwritten, so the commit filled it back in
+    /// from the remote base (`docs/BUGS.md` B224).
+    #[test]
+    fn a_zeroed_or_punched_range_counts_as_written() {
+        let zero = Fallocate::Zero { keep_size: false };
+        assert_eq!(zero.effect(10, 20, 100), (Some((10, 20)), None));
+        assert_eq!(zero.effect(90, 120, 100), (Some((90, 120)), Some(120)));
+        let zero_keep = Fallocate::Zero { keep_size: true };
+        assert_eq!(zero_keep.effect(90, 120, 100), (Some((90, 100)), None));
+        assert_eq!(
+            Fallocate::Punch.effect(90, 120, 100),
+            (Some((90, 100)), None)
+        );
+        assert_eq!(Fallocate::Punch.effect(120, 130, 100), (None, None));
+        let alloc = Fallocate::Allocate { keep_size: false };
+        assert_eq!(alloc.effect(0, 50, 100), (None, None));
+        assert_eq!(alloc.effect(90, 120, 100), (Some((100, 120)), Some(120)));
+        assert_eq!(
+            Fallocate::Allocate { keep_size: true }.effect(90, 120, 100),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn a_recorded_fallocate_grows_and_authors_what_it_zeroed() {
+        let mut h = handle(100, 100);
+        let grown = h.record_fallocate(Fallocate::Zero { keep_size: false }, 90, 120);
+        assert_eq!(grown, Some(120));
+        assert_eq!((h.len, h.dirty), (120, true));
+        assert_eq!(
+            h.written.segments(0, 120),
+            vec![(0, 90, false), (90, 120, true)]
+        );
+    }
+
+    #[test]
+    fn a_directory_page_resumes_after_the_last_entry_it_gave() {
+        let mut open = OpenFiles::default();
+        let listing: DirListing = vec![
+            (1, true, ".".into()),
+            (1, true, "..".into()),
+            (5, false, "a".into()),
+            (6, false, "b".into()),
+        ];
+        let fh = open.open_dir(listing);
+        let snapshot = open.dir(fh).unwrap();
+        let first: Vec<_> = dir_page(&snapshot, 0)
+            .take(3)
+            .map(|(next, e)| (next, e.0))
+            .collect();
+        assert_eq!(first, [(1, 1), (2, 1), (3, 5)]);
+        let rest: Vec<_> = dir_page(&snapshot, 3)
+            .map(|(next, e)| (next, e.0))
+            .collect();
+        assert_eq!(rest, [(4, 6)]);
+        open.close_dir(fh);
+        assert!(open.dir(fh).is_none());
     }
 }

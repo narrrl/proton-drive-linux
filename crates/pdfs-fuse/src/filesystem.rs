@@ -1,8 +1,7 @@
 //! Kernel-facing FUSE callback adapter.
 
 use super::*;
-use crate::state::DirListing;
-use pdfs_vfs::open::{Released, WriteError};
+use pdfs_vfs::open::{DirListing, Fallocate, Released, WriteError, dir_page};
 
 impl Filesystem for ProtonFs {
     /// Negotiate kernel-side behaviour once, before any other callback.
@@ -202,7 +201,7 @@ impl Filesystem for ProtonFs {
         // in-memory walk with no chance of a remote call, so it never needs a
         // worker. Only a handle whose `opendir` failed to snapshot (or a kernel
         // that issued `readdir` without one) falls back to the live path.
-        if let Some(listing) = self.core.state().dir_snapshots.get(&fh.0).cloned() {
+        if let Some(listing) = self.core.state().open.dir(fh.0) {
             reply_listing(&listing, offset, self.root, reply);
             return;
         }
@@ -226,7 +225,7 @@ impl Filesystem for ProtonFs {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        self.core.state().dir_snapshots.remove(&fh.0);
+        self.core.state().open.close_dir(fh.0);
         reply.ok();
     }
 
@@ -531,7 +530,7 @@ impl Filesystem for ProtonFs {
         // or insert shifted bytes that `len` and `written` did not follow
         // (`docs/BUGS.md` B224). `EOPNOTSUPP` is also what makes glibc's
         // `posix_fallocate` fall back to writing zeros.
-        let Some(kind) = falloc_kind(mode) else {
+        let Some(kind) = Fallocate::from_mode(mode) else {
             reply.error(Errno::EOPNOTSUPP);
             return;
         };
@@ -559,21 +558,12 @@ impl Filesystem for ProtonFs {
             Err(Errno::from(std::io::Error::last_os_error()))
         } else {
             let mut st = self.core.state();
-            if let Some(aw) = st.open.by_fh_mut(_fh.0) {
-                let len = aw.len;
-                let (authored, grown) = kind.effect(offset, new_end, len);
-                if let Some((from, to)) = authored {
-                    // Zeroed or punched bytes read as zero. Marked authored so
-                    // queue_revision does not refill them from the remote
-                    // baseline and silently undo them at commit.
-                    aw.written.add(from, to);
-                    aw.dirty = true;
-                }
-                if let Some(end) = grown {
-                    aw.len = end;
-                    aw.dirty = true;
-                    st.set_size(ino.0, end);
-                }
+            let grown = st
+                .open
+                .by_fh_mut(_fh.0)
+                .and_then(|aw| aw.record_fallocate(kind, offset, new_end));
+            if let Some(end) = grown {
+                st.set_size(ino.0, end);
             }
             Ok(())
         };
@@ -1072,60 +1062,14 @@ fn build_listing(st: &State, ino: u64) -> DirListing {
 /// The cookie handed back is the index of the *next* entry, so a resumed call
 /// continues exactly where the last one stopped — which is only true because
 /// the listing behind those indexes is a snapshot (`docs/BUGS.md` B43).
-/// What an `fallocate` mode does to a write handle, for the modes it can
-/// record (`docs/BUGS.md` B224).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FallocKind {
-    /// Reserve space; past the end it grows the file unless `keep_size`.
-    Allocate { keep_size: bool },
-    /// Deallocate a range inside the file, which then reads as zero.
-    Punch,
-    /// Zero a range; past the end it grows the file unless `keep_size`.
-    Zero { keep_size: bool },
-}
-
-fn falloc_kind(mode: i32) -> Option<FallocKind> {
-    const KEEP: i32 = libc::FALLOC_FL_KEEP_SIZE;
-    const PUNCH: i32 = libc::FALLOC_FL_PUNCH_HOLE;
-    const ZERO: i32 = libc::FALLOC_FL_ZERO_RANGE;
-    match mode {
-        0 => Some(FallocKind::Allocate { keep_size: false }),
-        KEEP => Some(FallocKind::Allocate { keep_size: true }),
-        m if m == PUNCH | KEEP => Some(FallocKind::Punch),
-        ZERO => Some(FallocKind::Zero { keep_size: false }),
-        m if m == ZERO | KEEP => Some(FallocKind::Zero { keep_size: true }),
-        _ => None,
-    }
-}
-
-impl FallocKind {
-    /// For `[offset, end)` on a file `len` bytes long: the range that now
-    /// reads as zero and must count as written, and the new length if it grew.
-    fn effect(self, offset: u64, end: u64, len: u64) -> (Option<(u64, u64)>, Option<u64>) {
-        let grow = |keep_size: bool| (!keep_size && end > len).then_some(end);
-        let zeroed = |to: u64| (offset < to).then_some((offset, to));
-        match self {
-            // Space past the old end reads as zero, and nothing before it moved.
-            Self::Allocate { keep_size } => {
-                (grow(keep_size).map(|end| (len, end)), grow(keep_size))
-            }
-            Self::Punch => (zeroed(end.min(len)), None),
-            Self::Zero { keep_size } => {
-                let to = if keep_size { end.min(len) } else { end };
-                (zeroed(to), grow(keep_size))
-            }
-        }
-    }
-}
-
 fn reply_listing(listing: &DirListing, offset: u64, root: u64, mut reply: ReplyDirectory) {
-    for (i, (ino, is_dir, name)) in listing.iter().enumerate().skip(offset as usize) {
+    for (next, (ino, is_dir, name)) in dir_page(listing, offset) {
         let ft = if *is_dir {
             FileType::Directory
         } else {
             FileType::RegularFile
         };
-        if reply.add(kernel_ino(root, *ino), (i + 1) as u64, ft, name) {
+        if reply.add(kernel_ino(root, *ino), next, ft, name) {
             break;
         }
     }
@@ -1255,11 +1199,10 @@ impl ProtonFs {
             return;
         }
         let mut st = self.core.state();
-        let listing = Arc::new(build_listing(&st, ino));
+        let listing = build_listing(&st, ino);
         // Shares the counter with write handles, so a directory handle can never
         // collide with a file handle (both are `fh` values in one kernel space).
-        let fh = st.open.next_fh();
-        st.dir_snapshots.insert(fh, listing);
+        let fh = st.open.open_dir(listing);
         drop(st);
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
@@ -2479,62 +2422,5 @@ impl ProtonFs {
         } else {
             reply.data(&buf);
         }
-    }
-}
-
-#[cfg(test)]
-mod falloc_tests {
-    use super::*;
-
-    #[test]
-    fn only_the_modes_a_handle_can_record_are_accepted() {
-        let keep = libc::FALLOC_FL_KEEP_SIZE;
-        assert_eq!(
-            falloc_kind(0),
-            Some(FallocKind::Allocate { keep_size: false })
-        );
-        assert_eq!(
-            falloc_kind(keep),
-            Some(FallocKind::Allocate { keep_size: true })
-        );
-        assert_eq!(
-            falloc_kind(libc::FALLOC_FL_PUNCH_HOLE | keep),
-            Some(FallocKind::Punch)
-        );
-        assert_eq!(
-            falloc_kind(libc::FALLOC_FL_ZERO_RANGE),
-            Some(FallocKind::Zero { keep_size: false })
-        );
-        for mode in [
-            libc::FALLOC_FL_PUNCH_HOLE,
-            libc::FALLOC_FL_COLLAPSE_RANGE,
-            libc::FALLOC_FL_INSERT_RANGE,
-            libc::FALLOC_FL_UNSHARE_RANGE,
-        ] {
-            assert_eq!(falloc_kind(mode), None, "{mode:#x}");
-        }
-    }
-
-    /// A zeroed range was left unwritten, so the commit filled it back in
-    /// from the remote base (`docs/BUGS.md` B224).
-    #[test]
-    fn a_zeroed_or_punched_range_counts_as_written() {
-        let zero = FallocKind::Zero { keep_size: false };
-        assert_eq!(zero.effect(10, 20, 100), (Some((10, 20)), None));
-        assert_eq!(zero.effect(90, 120, 100), (Some((90, 120)), Some(120)));
-        let zero_keep = FallocKind::Zero { keep_size: true };
-        assert_eq!(zero_keep.effect(90, 120, 100), (Some((90, 100)), None));
-        assert_eq!(
-            FallocKind::Punch.effect(90, 120, 100),
-            (Some((90, 100)), None)
-        );
-        assert_eq!(FallocKind::Punch.effect(120, 130, 100), (None, None));
-        let alloc = FallocKind::Allocate { keep_size: false };
-        assert_eq!(alloc.effect(0, 50, 100), (None, None));
-        assert_eq!(alloc.effect(90, 120, 100), (Some((100, 120)), Some(120)));
-        assert_eq!(
-            FallocKind::Allocate { keep_size: true }.effect(90, 120, 100),
-            (None, None)
-        );
     }
 }
