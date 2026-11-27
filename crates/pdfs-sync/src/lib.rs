@@ -16,14 +16,17 @@ use std::time::{Duration, Instant, SystemTime};
 
 use pdfs_core::control::ActivityKind;
 use pdfs_core::syncignore::IgnoreRules;
-use pdfs_store::db::StoredSyncEntry;
+use pdfs_store::db::{DeleteWindow, StoredSyncEntry};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 
+pub mod evidence;
+pub mod local_dirty;
 pub mod mirror;
 pub mod model;
 pub mod naming;
 pub mod planner;
+pub mod root;
 pub mod store;
 pub mod trace;
 

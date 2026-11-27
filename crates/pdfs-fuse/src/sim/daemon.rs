@@ -1963,6 +1963,58 @@ mod tests {
             .map_or(0, |c| c.value)
     }
 
+    /// What the watcher reports covers every change a pass then finds on
+    /// disk: an edit, a new folder with a file in it, a deletion, and a folder
+    /// moved in from outside with a folder and a file in it (`local_dirty`).
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn the_local_dirty_set_covers_what_the_walk_finds() {
+        let drive = FakeDrive::new();
+        let dir = scratch("local-dirty");
+        let (daemon, folder, _client) =
+            start_mirror(&drive, &dir, &[("a.txt", b"one"), ("b.txt", b"two")]);
+        // From the pass after this one, the watch has been live since the
+        // last claim.
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        let settled = quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        assert_eq!(counted(&settled, "local dirty untrusted"), 0, "{settled}");
+
+        let local = dir.join("local");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::write(outside.join("deep").join("x.txt"), b"moved in").unwrap();
+        std::fs::write(local.join("a.txt"), b"edited").unwrap();
+        std::fs::create_dir(local.join("new")).unwrap();
+        std::fs::write(local.join("new").join("c.txt"), b"three").unwrap();
+        std::fs::remove_file(local.join("b.txt")).unwrap();
+        std::fs::rename(&outside, local.join("moved")).unwrap();
+        assert!(wait_until(Duration::from_secs(60), || {
+            drive.lookup("mirrored/new/c.txt").is_some()
+                && drive.lookup("mirrored/moved/deep/x.txt").is_some()
+                && drive.lookup("mirrored/b.txt").is_none()
+        }));
+        let after = quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        assert_eq!(counted(&after, "local dirty untrusted"), 0, "{after}");
+        let logged = take_logged();
+        let missed: Vec<&String> = logged
+            .iter()
+            .filter(|line| line.contains("local dirty set missed"))
+            .collect();
+        assert!(missed.is_empty(), "{missed:?}");
+        // The first pass took the folder from discovery to following, and
+        // nothing since put it in doubt (`root`).
+        let roots: Vec<&String> = logged
+            .iter()
+            .filter(|line| line.contains("sync: root state"))
+            .collect();
+        assert!(
+            roots.len() == 1 && roots[0].contains("to=following"),
+            "{roots:?}"
+        );
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_mirror_pass_reports_where_its_time_went() {

@@ -7,6 +7,18 @@ use super::Db;
 use pdfs_core::Result;
 use std::collections::HashMap;
 
+/// The deletions a mirror folder has made since a window began, which the
+/// wipe guard adds to a pass's own before it lets that pass delete anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteWindow {
+    /// When the window began, in seconds since the epoch.
+    pub started_at: i64,
+    /// The most paths the folder has tracked since then.
+    pub reference: u64,
+    /// The deletions made since then, on either side.
+    pub deleted: u64,
+}
+
 /// What a mirror pass has walked of Drive, saved so a pass cut short
 /// resumes the walk instead of listing every folder again (B294), and so a
 /// finished walk serves as the next pass's picture of Drive.
@@ -777,6 +789,42 @@ impl Db {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The deletion window of a mirror folder, if one is open.
+    pub fn sync_delete_window(&self, folder_id: i64) -> Result<Option<DeleteWindow>> {
+        let conn = self.read()?;
+        conn.query_row(
+            "SELECT started_at, reference, deleted FROM sync_delete_window WHERE folder_id = ?1",
+            params![folder_id],
+            |row| {
+                Ok(DeleteWindow {
+                    started_at: row.get(0)?,
+                    reference: row.get::<_, i64>(1)?.max(0) as u64,
+                    deleted: row.get::<_, i64>(2)?.max(0) as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Record the deletion window of a mirror folder.
+    pub fn sync_delete_window_set(&self, folder_id: i64, window: &DeleteWindow) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO sync_delete_window (folder_id, started_at, reference, deleted)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(folder_id) DO UPDATE SET started_at = excluded.started_at,
+               reference = excluded.reference, deleted = excluded.deleted",
+            params![
+                folder_id,
+                window.started_at,
+                i64::try_from(window.reference).unwrap_or(i64::MAX),
+                i64::try_from(window.deleted).unwrap_or(i64::MAX)
+            ],
+        )?;
         Ok(())
     }
 

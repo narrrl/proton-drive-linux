@@ -11,8 +11,9 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **49**. New tables save a mirror folder's walk of Proton Drive (48). A finished walk is
-kept, with a list of the folders that changed on Proton Drive since (49).
+Schema: **50**. New tables save a mirror folder's walk of Proton Drive (48). A finished walk is
+kept, with a list of the folders that changed on Proton Drive since (49). Each mirror folder
+counts the deletions it made in the last day (50).
 
 ### Added
 - **`pdfs diagnostics` says which of the daemon's background services are running.** If one
@@ -44,6 +45,11 @@ kept, with a list of the folders that changed on Proton Drive since (49).
   any more.
 
 ### Changed
+- **Deletions in a mirror folder add up across passes.** A sync pass already refuses to delete
+  nearly every file of a folder at once. Now a folder lost a little at a time is stopped too:
+  once nine in ten of its synced files would have been deleted within a day, on either side,
+  the pass is refused and the folder shows the error. Emptying one large subfolder of a healthy
+  folder still goes through.
 - **A sync pass over a large folder picks up where a restart stopped it.** A pass lists the
   folder on Proton Drive before it changes anything, and on a folder of hundreds of thousands
   of files that takes hours. A restart used to throw the listing away, so a large enough folder

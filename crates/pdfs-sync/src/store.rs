@@ -1,7 +1,8 @@
 //! The port through which the mirror engine reads and writes its own tables.
 //!
-//! The engine keeps three things in the database: the synced folders, the
-//! per-file baseline of each, and the saved walk of Drive with its dirty marks.
+//! The engine keeps four things in the database: the synced folders, the
+//! per-file baseline of each, the saved walk of Drive with its dirty marks,
+//! and the deletions each folder made lately.
 //! [`SyncStore`] is exactly the calls a pass makes on them, so the engine does
 //! not depend on the whole database, and a test can give it a store of its own.
 //!
@@ -11,7 +12,9 @@
 use std::collections::HashMap;
 
 use pdfs_core::Result;
-use pdfs_store::db::{Db, SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
+use pdfs_store::db::{
+    Db, DeleteWindow, SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder,
+};
 
 /// The sync tables, as the mirror engine uses them.
 pub trait SyncStore: Send + Sync {
@@ -70,6 +73,13 @@ pub trait SyncStore: Send + Sync {
     fn sync_remote_dirty_consume(&self, folder_id: i64, seq: i64) -> Result<()>;
     /// Mark folders to list on Drive again.
     fn sync_remote_mark(&self, folder_id: i64, dirs: &[String]) -> Result<()>;
+
+    // The deletions made lately, for the wipe guard.
+
+    /// The folder's deletion window, if one is open.
+    fn sync_delete_window(&self, folder_id: i64) -> Result<Option<DeleteWindow>>;
+    /// Record the folder's deletion window.
+    fn sync_delete_window_set(&self, folder_id: i64, window: &DeleteWindow) -> Result<()>;
 }
 
 impl SyncStore for Db {
@@ -137,6 +147,12 @@ impl SyncStore for Db {
     }
     fn sync_remote_mark(&self, folder_id: i64, dirs: &[String]) -> Result<()> {
         Db::sync_remote_mark(self, folder_id, dirs)
+    }
+    fn sync_delete_window(&self, folder_id: i64) -> Result<Option<DeleteWindow>> {
+        Db::sync_delete_window(self, folder_id)
+    }
+    fn sync_delete_window_set(&self, folder_id: i64, window: &DeleteWindow) -> Result<()> {
+        Db::sync_delete_window_set(self, folder_id, window)
     }
 }
 

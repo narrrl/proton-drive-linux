@@ -131,6 +131,11 @@ would refuse a user who empties one large folder on purpose. Left out, they woul
 listing or an unmounted disk delete one subtree at a time. Both need a round-level guard
 before planning can be split up.
 
+That guard is the deletion window (`guard_delete_window`): a folder counts the deletions it made
+in the last day against the most paths it tracked in that time, and refuses a pass that would
+bring the count to nine tenths. It already covers a tree lost over several whole passes. Split
+planning would add each step's deletions to the same count.
+
 What is built:
 
 - **Schema 48:** `sync_walk` (root, start time), `sync_walk_dir` (each folder found:
@@ -198,6 +203,26 @@ that grows into hours: it is network-bound, while the local walk only reads the 
 What a quiet pass still costs: loading the baseline and the picture from the database, and the
 local walk. The local dirty set removes the local walk.
 
+## Root reducer as built
+
+The states above are first built as a check. `pdfs_sync::root` holds one reducer per mirror
+folder. `step(state, input)` is pure: the passes, the watcher, the event stream and pause are
+inputs, so a sequence of inputs replays exactly.
+
+| State | Meaning |
+|---|---|
+| Discovering | No pass over the folder has finished yet. |
+| Following | A pass covered the whole folder, and nothing since says a change went unreported. |
+| Auditing | A doubt arrived: a watcher error, an overflowed queue, a gap in Drive's event stream, a restart or a suspension. Only a pass over the whole folder ends it. |
+| Suspended | The local root is missing, or the folder is paused. |
+| Draining | A switch to on-demand is queued, and passes only push. |
+| HandedOff | The folder is on-demand. Going back to a mirror starts discovery again. |
+
+Nothing acts on the state yet: every pass still covers the whole folder, so a finished pass
+always returns the folder to Following. The engine logs each transition as `sync: root state`,
+so the reducer can be compared with what the engine did. Once a Following folder plans from its
+dirty sets alone, the state decides which passes must walk everything.
+
 ## Plan of work (separate PRs)
 
 1. **Frontier checkpoint.**
@@ -205,7 +230,14 @@ local walk. The local dirty set removes the local walk.
    - Left: per-subtree apply, once a round-level guard exists. A resumable local walk matters
      less now that the local walk is the only full walk left, and is cheap next to Drive.
 2. **Remote dirty set.** Done, described above.
-3. **Local dirty set.** `SyncMsg::Dirty`, the `sync_dirty` table, overflow leading to FullCheck.
+3. **Local dirty set.**
+   - Done, as a check: the watcher marks each path an event names in `LocalDirty` (in memory).
+     A pass claims the marks, and retires them once it applied everything it found. A claim is
+     trusted when the watch was live since the last pass claimed; a watcher error, an overflow or
+     a restart breaks that. Each pass still walks the whole folder, and counts the changes it
+     found that a trusted claim did not cover (`missed local changes` in the trace).
+   - Left: once that count stays at zero, a trusted claim stands in for the local walk, and
+     only the marked folders are read.
 4. **Step scheduler.** Replace `run_burst` and the per-pass lock with steps and priorities.
 5. **Drop the 120 s poll** for the daily audit, once 2 and 3 have run for a release with the
    poll still on, and traces show the dirty sets catch everything the poll finds.

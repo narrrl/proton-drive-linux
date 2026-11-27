@@ -38,13 +38,17 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use sha1::{Digest as _, Sha1};
 use tracing::{debug, info, warn};
 
+use crate::evidence::{Evidence, RemoteEvidence, Side};
+use crate::local_dirty::Claim;
+use crate::planner::HasKind;
+use crate::root::{RootInput, Suspension};
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::syncignore::IgnoreRules;
 use pdfs_core::timestamp::now_secs;
 use pdfs_core::transfers::{CountingWriter, OwnedCountingReader};
 use pdfs_drive::parse_uid;
-use pdfs_store::db::{SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
+use pdfs_store::db::{DeleteWindow, SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 
 mod apply;
 mod engine;
@@ -78,10 +82,10 @@ use planner::conflict_path_as;
 #[cfg(test)]
 use planner::filter_baseline;
 use planner::{
-    FilePlan, RemoteGaps, Unscanned, classification_order, guard_local_wipe, guard_remote_wipe,
-    join_rel, local_deletions, parent_rel, plan_file, rel_to_path, remote_sig,
-    remote_subtree_changed, revision_confirms_baseline, revision_moved, tracked_baseline,
-    unchanged_remote_size,
+    FilePlan, RemoteGaps, Unscanned, classification_order, delete_window, guard_delete_window,
+    guard_local_wipe, guard_remote_wipe, join_rel, local_deletions, parent_rel, plan_file,
+    planned_deletions, rel_to_path, remote_sig, remote_subtree_changed, revision_confirms_baseline,
+    revision_moved, tracked_baseline, unchanged_remote_size,
 };
 use trace::{Call, Count, Phase};
 
@@ -98,15 +102,21 @@ impl Syncer {
     pub fn reconcile_folder(&self, folder: &StoredSyncFolder) {
         // A paused folder skips the settle too: a queued switch to on-demand
         // evicts the local tree, which is only safe after a pass uploaded it.
+        self.roots.begin(folder.id, folder.last_sync != 0);
         if self.sync_folder_paused(folder.id) {
             debug!(id = folder.id, "sync: folder paused, skipping reconcile");
+            self.roots
+                .input(folder.id, RootInput::Suspended(Suspension::Paused));
             return;
         }
+        self.roots.input(folder.id, RootInput::Resumed);
         // `ondemand` folders are live FUSE mounts, not mirrored, so there is nothing
         // to reconcile — but one may still carry a queued switch back to `mirror`,
         // so the settle below is not skipped with it.
         if folder.mode == "mirror" {
             self.reconcile_pass(folder);
+        } else {
+            self.roots.input(folder.id, RootInput::HandedOff);
         }
         self.settle_pending_mode(folder.id);
     }
@@ -147,8 +157,18 @@ impl Syncer {
             let _ = self
                 .store
                 .sync_folder_set_state(folder.id, "error", now_secs());
+            self.roots
+                .input(folder.id, RootInput::Suspended(Suspension::RootMissing));
             return;
         }
+        self.roots.input(
+            folder.id,
+            if push_only {
+                RootInput::HandoffQueued
+            } else {
+                RootInput::Mirrored
+            },
+        );
 
         let _ = self
             .store
@@ -209,6 +229,9 @@ impl Syncer {
         let progress = self.progress.lock().get(&folder.id).cloned();
         self.progress_end(folder.id);
         self.log_trace(folder, &result, started.elapsed());
+        if result.is_ok() && !push_only {
+            self.roots.input(folder.id, RootInput::Covered);
+        }
         match result {
             Ok(outcome) => {
                 // A folder only reaches `idle` when every path applied cleanly —
@@ -352,6 +375,35 @@ impl Syncer {
         }
     }
 
+    /// Whether the pass must not make a deletion it planned: the evidence does
+    /// not prove the path gone on the side the deletion is based on. Such a
+    /// deletion is logged, counted in the trace and as a failed step, and left
+    /// out; its baseline row stays, so the next pass plans it again.
+    ///
+    /// The filters before the plan keep such a path out of it, so this
+    /// should never fire. When it does, a file stays on both sides rather than
+    /// going on the strength of a walk that never saw it.
+    fn refuses_deletion<L: HasKind, R: HasKind>(
+        &self,
+        evidence: &Evidence<'_, L, R>,
+        rel: &str,
+        side: Side,
+        outcome: &mut Outcome,
+    ) -> bool {
+        let Some(basis) = evidence.unproven_deletion(rel, side) else {
+            return false;
+        };
+        warn!(
+            rel,
+            ?side,
+            ?basis,
+            "sync: not deleting a path whose absence is not proven"
+        );
+        self.trace_count(Count::UnprovenDeletions, 1);
+        outcome.failed(&format!("{rel}: not deleted, its absence is not proven"));
+        true
+    }
+
     /// Add `took` to a stage of the running pass's trace.
     fn trace_phase(&self, phase: Phase, took: Duration) {
         self.engine.trace(|t| t.phase(phase, took));
@@ -474,6 +526,15 @@ impl Syncer {
         self.trace_count(Count::LocalEntries, local.len());
         // See `push_pass`: the guard must not count excluded paths as lost.
         guard_local_wipe(&tracked_baseline(&baseline, rules, &unscanned), &local)?;
+        // What the watcher reported since the last pass, checked against what
+        // the walk found (`local_dirty`).
+        let claim = self.local_dirty.claim(folder_id);
+        self.check_local_dirty(
+            folder_id,
+            &claim,
+            &tracked_baseline(&baseline, rules, &unscanned),
+            &local,
+        );
 
         let mut remote: HashMap<String, RemoteItem> = HashMap::new();
         let mut remote_dirs: HashMap<String, NodeUid> = HashMap::new();
@@ -501,7 +562,19 @@ impl Syncer {
         // ignored one, and a remote path under it has nowhere to be written.
         // The same holds for a path the remote walk could not read: missing
         // from it, it would read as deleted on Drive (B212).
-        order.retain(|rel| !unscanned.covers(rel) && !gaps.hides(rel, &remote, &remote_dirs));
+        // Only a path both walks know about is classified (`evidence`).
+        order.retain(|rel| {
+            pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps).classifiable(rel)
+        });
+
+        // The deletions this pass plans, added to those the folder made
+        // lately: a tree lost a little at a time passes the guards above one
+        // pass at a time.
+        let window = self.claim_deletions(
+            folder_id,
+            tracked_baseline(&baseline, rules, &unscanned).len(),
+            planned_deletions(&order, &local, &remote, &baseline),
+        )?;
 
         let mut unscanned_report = unscanned.report();
         unscanned_report.extend(gaps.report());
@@ -587,6 +660,14 @@ impl Syncer {
                     }
                     (true, false) => {
                         // In baseline, gone remotely → the remote side deleted it.
+                        if self.refuses_deletion(
+                            &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
+                            rel,
+                            Side::Local,
+                            &mut outcome,
+                        ) {
+                            continue;
+                        }
                         delete_local_dirs.push(rel.clone());
                     }
                     (false, true) if !in_base => {
@@ -601,6 +682,14 @@ impl Syncer {
                     }
                     (false, true) => {
                         // In baseline, gone locally → the local side deleted it.
+                        if self.refuses_deletion(
+                            &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
+                            rel,
+                            Side::Remote,
+                            &mut outcome,
+                        ) {
+                            continue;
+                        }
                         delete_remote_dirs.push((rel.clone(), remote[rel].uid.clone()));
                     }
                     (false, false) => {
@@ -691,6 +780,14 @@ impl Syncer {
                     }
                 },
                 FilePlan::DeleteLocal => {
+                    if self.refuses_deletion(
+                        &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
+                        rel,
+                        Side::Local,
+                        &mut outcome,
+                    ) {
+                        continue;
+                    }
                     let path = local_root.join(rel_to_path(rel));
                     // The plan comes from a scan taken before the remote walk,
                     // which can take minutes. An edit saved since then is not
@@ -717,6 +814,14 @@ impl Syncer {
                     outcome.deleted += 1;
                 }
                 FilePlan::DeleteRemote => {
+                    if self.refuses_deletion(
+                        &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
+                        rel,
+                        Side::Remote,
+                        &mut outcome,
+                    ) {
+                        continue;
+                    }
                     let remote = r.expect("remote deletion requires a remote file");
                     let step = Instant::now();
                     let trashed = self
@@ -852,13 +957,155 @@ impl Syncer {
             outcome.deleted += 1;
         }
         self.trace_phase(Phase::Cleanup, cleanup.elapsed());
+        self.settle_deletions(folder_id, window, outcome.deleted);
+        // A change the pass could not apply stays dirty for the next one.
+        self.local_dirty.looked(
+            folder_id,
+            &claim,
+            outcome.errors == 0 && outcome.deferred == 0,
+        );
 
         Ok(outcome)
     }
+
+    /// Count the claimed marks of the local dirty set, and, when the claim is
+    /// trusted, the local changes the walk found that it did not cover. Acts
+    /// on nothing: the walk is still what the pass plans from.
+    fn check_local_dirty(
+        &self,
+        folder_id: i64,
+        claim: &Claim,
+        tracked: &HashMap<String, &StoredSyncEntry>,
+        local: &HashMap<String, LocalItem>,
+    ) {
+        self.trace_count(Count::LocalDirty, claim.len());
+        if !claim.trusted {
+            self.trace_count(Count::LocalUntrusted, 1);
+            return;
+        }
+        let missed = missed_local(claim, tracked, local);
+        if missed.is_empty() {
+            return;
+        }
+        for rel in &missed {
+            debug!(
+                id = folder_id,
+                rel, "sync: a local change the watcher did not report"
+            );
+        }
+        info!(
+            id = folder_id,
+            missed = missed.len(),
+            first = %missed[0],
+            "sync: the local dirty set missed changes the walk found"
+        );
+        self.trace_count(Count::MissedLocal, missed.len());
+    }
+
+    /// Open or continue the folder's deletion window for a pass that plans
+    /// `planned` deletions, and refuse the pass when they would make the
+    /// window a wipe ([`guard_delete_window`]). `tracked` is how many paths
+    /// the folder tracks now.
+    ///
+    /// The window is recorded before anything is deleted, as if every planned
+    /// deletion will succeed: a pass cut short then leaves the window counting
+    /// at least what it deleted. Returns the window as it was before this
+    /// pass, for [`settle_deletions`](Self::settle_deletions).
+    fn claim_deletions(
+        &self,
+        folder_id: i64,
+        tracked: usize,
+        planned: usize,
+    ) -> Result<Option<DeleteWindow>, String> {
+        let open = self
+            .store
+            .sync_delete_window(folder_id)
+            .map_err(|e| format!("load the deletion window: {e:?}"))?;
+        let window = delete_window(open, tracked, now_secs());
+        guard_delete_window(&window, planned)?;
+        if planned == 0 {
+            return Ok(None);
+        }
+        let claimed = DeleteWindow {
+            deleted: window.deleted + planned as u64,
+            ..window
+        };
+        self.store
+            .sync_delete_window_set(folder_id, &claimed)
+            .map_err(|e| format!("record the deletion window: {e:?}"))?;
+        Ok(Some(window))
+    }
+
+    /// Count what a finished pass actually deleted in the window
+    /// [`claim_deletions`](Self::claim_deletions) opened, in place of what it
+    /// planned to: a deletion that failed is tried again by the next pass and
+    /// would otherwise count twice.
+    fn settle_deletions(&self, folder_id: i64, window: Option<DeleteWindow>, deleted: usize) {
+        let Some(window) = window else {
+            return;
+        };
+        let settled = DeleteWindow {
+            deleted: window.deleted + deleted as u64,
+            ..window
+        };
+        if let Err(e) = self.store.sync_delete_window_set(folder_id, &settled) {
+            debug!(id = folder_id, error = ?e, "sync: cannot settle the deletion window");
+        }
+    }
+}
+
+/// The local changes the walk found since the baseline that `claim` does not
+/// cover: paths new on disk, files whose size or mtime moved, and tracked
+/// paths gone. Sorted, for a stable log.
+fn missed_local(
+    claim: &Claim,
+    tracked: &HashMap<String, &StoredSyncEntry>,
+    local: &HashMap<String, LocalItem>,
+) -> Vec<String> {
+    let changed = local.iter().filter_map(|(rel, item)| {
+        let moved = match tracked.get(rel) {
+            None => true,
+            Some(base) => {
+                !item.is_dir && (base.local_mtime != item.mtime || base.local_size != item.size)
+            }
+        };
+        moved.then_some(rel)
+    });
+    let gone = tracked.keys().filter(|rel| !local.contains_key(*rel));
+    let mut missed: Vec<String> = changed
+        .chain(gone)
+        .filter(|rel| !claim.covers(rel))
+        .cloned()
+        .collect();
+    missed.sort();
+    missed
 }
 
 /// A [`Read`] that hashes what an upload reads through it, so the digest Drive
 /// reports afterwards can be compared with what was sent.
+/// The evidence of a mirror pass, built where it is asked so it borrows the
+/// walks only for the question: `remote_dirs` gains the folders the pass
+/// creates between questions.
+fn pass_evidence<'a>(
+    rules: &'a IgnoreRules,
+    local: &'a HashMap<String, LocalItem>,
+    unscanned: &'a Unscanned,
+    remote: &'a HashMap<String, RemoteItem>,
+    remote_dirs: &'a HashMap<String, NodeUid>,
+    gaps: &'a RemoteGaps,
+) -> Evidence<'a, LocalItem, RemoteItem> {
+    Evidence {
+        rules,
+        local,
+        unscanned,
+        remote: Some(RemoteEvidence {
+            entries: remote,
+            dirs: remote_dirs,
+            gaps,
+        }),
+    }
+}
+
 struct Sha1Tap<R> {
     inner: R,
     hasher: Arc<Mutex<Sha1>>,
@@ -1659,6 +1906,59 @@ mod tests {
                 remote_revision_id: None,
             },
         )])
+    }
+
+    /// A walk's changes that a claim of the local dirty set did not cover:
+    /// one next to a reported change is covered, the rest are missed.
+    #[test]
+    fn missed_local_lists_the_changes_a_claim_does_not_cover() {
+        use crate::local_dirty::LocalDirty;
+        let row = |rel: &str, mtime: i64| StoredSyncEntry {
+            rel_path: rel.to_string(),
+            remote_uid: Some("v~l".into()),
+            local_mtime: mtime,
+            local_size: 1,
+            local_mtime_ns: None,
+            remote_rev: None,
+            remote_hash: None,
+            remote_revision_id: None,
+        };
+        let rows: HashMap<String, StoredSyncEntry> = [
+            ("docs", 0),
+            ("docs/a.txt", 1),
+            ("same.txt", 1),
+            ("top.txt", 1),
+            ("old/x.txt", 1),
+        ]
+        .into_iter()
+        .map(|(rel, mtime)| (rel.to_string(), row(rel, mtime)))
+        .collect();
+        let tracked: HashMap<String, &StoredSyncEntry> =
+            rows.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let item = |is_dir: bool, mtime: i64| LocalItem {
+            mtime_ns: None,
+            is_dir,
+            mtime,
+            size: 1,
+            open_for_write: false,
+        };
+        let local: HashMap<String, LocalItem> = [
+            ("docs", item(true, 9)),
+            ("docs/a.txt", item(false, 2)),
+            ("docs/new.txt", item(false, 1)),
+            ("same.txt", item(false, 1)),
+            ("top.txt", item(false, 2)),
+        ]
+        .into_iter()
+        .map(|(rel, item)| (rel.to_string(), item))
+        .collect();
+        let dirty = LocalDirty::default();
+        dirty.mark(1, "docs/a.txt");
+        let claim = dirty.claim(1);
+        assert_eq!(
+            missed_local(&claim, &tracked, &local),
+            vec!["old/x.txt".to_string(), "top.txt".to_string()]
+        );
     }
 
     #[test]

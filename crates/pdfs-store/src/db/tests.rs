@@ -8420,3 +8420,35 @@ fn a_replace_intent_is_kept_until_it_ends() {
     db.end_replace("vol~src").unwrap();
     assert!(db.open_replaces().unwrap().is_empty());
 }
+
+/// A folder's deletion window outlives the pass that opened it, and goes with
+/// the folder: a change to what the folder is starts the count again.
+#[test]
+fn a_deletion_window_is_kept_per_folder_until_the_folder_changes() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    let other = db
+        .sync_folder_add("/home/me/Other", "v~other", "s")
+        .unwrap();
+    assert_eq!(db.sync_delete_window(id).unwrap(), None);
+    let window = DeleteWindow {
+        started_at: 100,
+        reference: 40,
+        deleted: 12,
+    };
+    db.sync_delete_window_set(id, &window).unwrap();
+    db.sync_delete_window_set(other, &window).unwrap();
+    assert_eq!(db.sync_delete_window(id).unwrap(), Some(window));
+    let more = DeleteWindow {
+        deleted: 20,
+        ..window
+    };
+    db.sync_delete_window_set(id, &more).unwrap();
+    assert_eq!(db.sync_delete_window(id).unwrap(), Some(more));
+
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    assert_eq!(db.sync_delete_window(id).unwrap(), None);
+    assert_eq!(db.sync_delete_window(other).unwrap(), Some(window));
+    db.sync_folder_remove(other).unwrap();
+    assert_eq!(db.sync_delete_window(other).unwrap(), None);
+}

@@ -102,7 +102,8 @@ pub fn filter_baseline<'a, B>(
 /// stopping every other file in the tree from syncing (B196).
 #[derive(Default)]
 pub struct Unscanned {
-    covered: HashSet<String>,
+    /// Each left-out path, with why it was left out.
+    covered: HashMap<String, crate::evidence::Unknown>,
     /// The subset worth telling the user about, with why: an entry that only
     /// vanished mid-scan is not, since the next pass sees it settled.
     unreadable: Vec<String>,
@@ -111,29 +112,37 @@ pub struct Unscanned {
 impl Unscanned {
     /// Leave out `rel`, which vanished while the scan looked at it.
     pub fn vanished(&mut self, rel: String) {
-        self.covered.insert(rel);
+        // An unreadable path stays unreadable: that is the reason the user
+        // is told about.
+        self.covered
+            .entry(rel)
+            .or_insert(crate::evidence::Unknown::Vanished);
     }
 
     /// Leave out `rel`, which cannot be read for `reason`.
     pub fn unreadable(&mut self, rel: String, reason: &str) {
         self.unreadable.push(format!("{rel} ({reason})"));
-        self.covered.insert(rel);
+        self.covered
+            .insert(rel, crate::evidence::Unknown::Unreadable);
     }
 
     /// Whether `rel` is a left-out path or lies under one.
     pub fn covers(&self, rel: &str) -> bool {
+        self.why(rel).is_some()
+    }
+
+    /// Why `rel` was left out, when it is a left-out path or lies under one.
+    /// The nearest left-out path above it decides.
+    pub fn why(&self, rel: &str) -> Option<crate::evidence::Unknown> {
         if self.covered.is_empty() {
-            return false;
+            return None;
         }
         let mut at = rel;
         loop {
-            if self.covered.contains(at) {
-                return true;
+            if let Some(why) = self.covered.get(at) {
+                return Some(*why);
             }
-            match at.rfind('/') {
-                Some(i) => at = &at[..i],
-                None => return false,
-            }
+            at = &at[..at.rfind('/')?];
         }
     }
 
@@ -250,6 +259,84 @@ pub fn guard_remote_wipe<B, R>(
     Ok(())
 }
 
+/// How long the deletions a folder makes add up in one window, before a
+/// new window starts from the folder as it then is.
+pub const DELETE_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// The window a pass's deletions count in: the one `open`, or a new one from
+/// `now` when none is open or it has run out. `tracked` is how many paths the
+/// folder tracks now.
+///
+/// The reference grows with what is added during the window, so a folder that
+/// gains files and then loses them is measured against what it held at its
+/// largest. It never shrinks: a tree lost a little at a time is measured
+/// against the tree it was, which is the point.
+pub fn delete_window(open: Option<DeleteWindow>, tracked: usize, now: i64) -> DeleteWindow {
+    let tracked = tracked as u64;
+    match open {
+        Some(w) if (w.started_at..w.started_at + DELETE_WINDOW_SECS).contains(&now) => {
+            DeleteWindow {
+                reference: w.reference.max(tracked + w.deleted),
+                ..w
+            }
+        }
+        _ => DeleteWindow {
+            started_at: now,
+            reference: tracked,
+            deleted: 0,
+        },
+    }
+}
+
+/// Refuse a pass whose `planned` deletions, added to those the folder made
+/// since its `window` began, would make the window a wipe
+/// ([`looks_like_a_wipe`]).
+///
+/// The per-pass guards see one pass. A tree lost a little at a time, by a
+/// failing disk or a script, passes each of them in turn, and the passes
+/// between delete the rest of the tree in batches (`docs/SYNC_ENGINE.md`).
+/// Measured against the whole folder, a user emptying one large subfolder of
+/// a healthy tree still passes.
+pub fn guard_delete_window(window: &DeleteWindow, planned: usize) -> Result<(), String> {
+    let deleted = window.deleted.saturating_add(planned as u64);
+    if planned > 0 && looks_like_a_wipe(deleted as usize, window.reference as usize) {
+        return Err(format!(
+            "{deleted} of {} synced paths would be deleted within a day; refusing to \
+             delete more. If deleted on purpose, remove the folder from sync; to \
+             upload them again, sync the folder from scratch.",
+            window.reference
+        ));
+    }
+    Ok(())
+}
+
+/// How many of `order` a mirror pass will delete, on either side: the files
+/// [`plan_file`] deletes, and the folders gone from one side that the
+/// baseline still has.
+pub fn planned_deletions(
+    order: &[String],
+    local: &HashMap<String, LocalItem>,
+    remote: &HashMap<String, RemoteItem>,
+    baseline: &HashMap<String, StoredSyncEntry>,
+) -> usize {
+    order
+        .iter()
+        .filter(|rel| {
+            let (l, r) = (local.get(*rel), remote.get(*rel));
+            let in_base = baseline.get(*rel);
+            // As the pass tells a folder: a folder gone from both sides only
+            // loses its baseline row.
+            if l.map(|x| x.is_dir).or(r.map(|x| x.is_dir)).unwrap_or(false) {
+                return in_base.is_some() && l.is_some() != r.is_some();
+            }
+            matches!(
+                plan_file(l, r, in_base),
+                FilePlan::DeleteLocal | FilePlan::DeleteRemote
+            )
+        })
+        .count()
+}
+
 /// What a remote walk saw but could not read: a node the SDK left out because
 /// it would not decrypt, or a file whose size could not be read.
 ///
@@ -305,21 +392,37 @@ impl RemoteGaps {
         remote: &HashMap<String, R>,
         remote_dirs: &HashMap<String, NodeUid>,
     ) -> bool {
+        self.why(rel, remote, remote_dirs).is_some()
+    }
+
+    /// Why `rel` may be missing from `remote` only because the walk could not
+    /// read it, or `None` when its absence is real. A path the walk returned
+    /// is never hidden.
+    pub fn why<R>(
+        &self,
+        rel: &str,
+        remote: &HashMap<String, R>,
+        remote_dirs: &HashMap<String, NodeUid>,
+    ) -> Option<crate::evidence::Unknown> {
+        use crate::evidence::Unknown;
         if self.is_empty() || remote.contains_key(rel) {
-            return false;
+            return None;
         }
         if self.unread.contains(rel) {
-            return true;
+            return Some(Unknown::Unread);
         }
         // The deepest folder the walk did list decides: under a short listing,
         // anything not returned may be one of the nodes it could not read.
         let mut at = parent_rel(rel);
         loop {
             if remote_dirs.contains_key(at) {
-                return self.short.contains(at) || self.unlisted.contains(at);
+                if self.unlisted.contains(at) {
+                    return Some(Unknown::Unlisted);
+                }
+                return self.short.contains(at).then_some(Unknown::ShortListing);
             }
             if at.is_empty() {
-                return false;
+                return None;
             }
             at = parent_rel(at);
         }
@@ -1017,5 +1120,139 @@ mod file_plan_tests {
         assert!(remote_subtree_changed("x", &remote_tree, &base).is_some());
         base.insert("x/sub".to_string(), baseline(0, 0, 0, 0));
         assert_eq!(remote_subtree_changed("x", &remote_tree, &base), None);
+    }
+}
+
+#[cfg(test)]
+mod delete_window_tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn window(started_at: i64, reference: u64, deleted: u64) -> DeleteWindow {
+        DeleteWindow {
+            started_at,
+            reference,
+            deleted,
+        }
+    }
+
+    #[test]
+    fn a_window_opens_from_the_folder_as_it_is_and_runs_out_after_a_day() {
+        assert_eq!(delete_window(None, 100, NOW), window(NOW, 100, 0));
+        let open = window(NOW, 100, 30);
+        assert_eq!(delete_window(Some(open), 70, NOW + 60), open);
+        let later = NOW + DELETE_WINDOW_SECS;
+        assert_eq!(delete_window(Some(open), 70, later), window(later, 70, 0));
+        // A clock that went back does not keep a window open for ever.
+        assert_eq!(
+            delete_window(Some(open), 70, NOW - 1),
+            window(NOW - 1, 70, 0)
+        );
+    }
+
+    #[test]
+    fn what_a_folder_gains_in_a_window_raises_its_reference() {
+        // 30 deleted and 50 added since: the folder has held 150 paths.
+        let open = window(NOW, 100, 30);
+        assert_eq!(delete_window(Some(open), 120, NOW + 1).reference, 150);
+    }
+
+    /// The case the per-pass guard cannot see: a tree lost ten paths a pass.
+    /// Each pass alone deletes a small share of what is left, until the very
+    /// last; counted together the window stops them at nine tenths.
+    #[test]
+    fn a_tree_lost_a_little_each_pass_is_stopped_at_nine_tenths() {
+        let mut open = None;
+        let mut tracked = 100usize;
+        let mut passes = 0;
+        loop {
+            let w = delete_window(open, tracked, NOW + passes);
+            if guard_delete_window(&w, 10).is_err() {
+                break;
+            }
+            assert!(
+                !looks_like_a_wipe(10, tracked),
+                "the per-pass guard let it through"
+            );
+            open = Some(DeleteWindow {
+                deleted: w.deleted + 10,
+                ..w
+            });
+            tracked -= 10;
+            passes += 1;
+        }
+        assert_eq!(
+            passes, 8,
+            "80 deleted, the pass that makes it 90 is refused"
+        );
+    }
+
+    #[test]
+    fn emptying_one_large_subfolder_of_a_healthy_tree_passes() {
+        let w = delete_window(None, 1000, NOW);
+        assert!(guard_delete_window(&w, 600).is_ok());
+        let w = window(NOW, 1000, 600);
+        assert!(guard_delete_window(&w, 250).is_ok());
+    }
+
+    #[test]
+    fn a_pass_with_nothing_to_delete_is_never_refused() {
+        assert!(guard_delete_window(&window(NOW, 100, 95), 0).is_ok());
+        assert!(guard_delete_window(&window(NOW, 100, 95), 1).is_err());
+    }
+
+    #[test]
+    fn planned_deletions_counts_both_sides_and_folders() {
+        use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+        let item = |is_dir| LocalItem {
+            mtime_ns: None,
+            is_dir,
+            mtime: 1,
+            size: 1,
+            open_for_write: false,
+        };
+        let node = |is_dir| RemoteItem {
+            uid: NodeUid::new(VolumeId::from("v"), LinkId::from("l")),
+            is_dir,
+            mtime: 1,
+            size: 1,
+            revision: None,
+            sha1: None,
+        };
+        let row = |rel: &str| StoredSyncEntry {
+            rel_path: rel.into(),
+            remote_uid: Some("v~l".into()),
+            local_mtime: 1,
+            local_mtime_ns: None,
+            local_size: 1,
+            remote_rev: Some("1".into()),
+            remote_hash: Some("1".into()),
+            remote_revision_id: None,
+        };
+        // Gone remotely, gone locally, a folder gone remotely, one on both
+        // sides, a new local file, and a folder gone from both sides.
+        let local: HashMap<String, LocalItem> = [
+            ("a.txt", item(false)),
+            ("d", item(true)),
+            ("kept", item(false)),
+            ("new.txt", item(false)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let remote: HashMap<String, RemoteItem> = [("b.txt", node(false)), ("kept", node(false))]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let baseline: HashMap<String, StoredSyncEntry> = ["a.txt", "b.txt", "d", "kept", "gone"]
+            .into_iter()
+            .map(|rel| (rel.to_string(), row(rel)))
+            .collect();
+        let order: Vec<String> = ["a.txt", "b.txt", "d", "kept", "new.txt", "gone"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(planned_deletions(&order, &local, &remote, &baseline), 3);
     }
 }

@@ -309,6 +309,18 @@ What the parts mean:
   happens on the first pass, once a day, and after the daemon lost track of Proton Drive's
   changes. **`resumed`** counts the paths a pass took from a listing that a restart cut short.
 
+- **`unproven deletions`** counts deletions a pass planned for a path it had not proven gone,
+  and so did not make. It should never appear. If it does, the folder shows an error, the path
+  stays on both sides, and the journal has a `sync: not deleting a path whose absence is not
+  proven` line for each one; please report it with those lines.
+- **`local dirty`** counts the places on disk the filesystem watcher reported changed since the
+  last pass. **`local dirty untrusted`** is 1 when the watch was not live the whole time since
+  then: after a start, a watch that failed, or an overflowed event queue. **`missed local
+  changes`** counts changes the pass found on disk that a trusted watch did not report. It
+  should stay at zero; the journal then has a `sync: the local dirty set missed changes the walk
+  found` line naming the first one. For now these only check the watcher: every pass still
+  walks the whole folder.
+
 Please include these lines when you report a slow folder.
 
 ### Files named `(sync-conflict …)` appeared

@@ -183,7 +183,9 @@ This section is for the curious and for anyone debugging a restore.
   ones become conflict copies, as described above.
 - **The wipe guard.** A sync pass in which every previously synced file has vanished locally is
   refused instead of being mirrored to Proton Drive as a mass deletion. A folder that was emptied
-  by accident therefore does not empty the backup.
+  by accident therefore does not empty the backup. Deletions made over several passes add up:
+  once nine in ten of a folder's synced paths would have gone within a day, further deletions
+  are refused too.
 - **The profile format.** Each profile carries a `version` field. A client refuses a profile
   written by a newer, incompatible client instead of applying part of it.
 

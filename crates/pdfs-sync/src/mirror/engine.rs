@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 
 use super::trace::PassTrace;
 use super::*;
+use crate::local_dirty::LocalDirty;
+use crate::root::{Doubt, RootInput};
 
 /// How long the watcher must go quiet before a burst counts as finished.
 ///
@@ -246,21 +248,33 @@ pub fn run(core: Syncer, rx: Receiver<SyncMsg>) {
 
     let tx_events = core.tx.clone();
     let watched_events = watched.clone();
+    let dirty = core.local_dirty.clone();
+    let roots = core.roots.clone();
     let handler = move |res: notify::Result<notify::Event>| {
         let event = match res {
             Ok(event) => event,
             // Running out of inotify watches for a new subfolder, say: that
             // subfolder's changes are then found by the poll only (B262).
+            // Nothing says which, so no folder's dirty set is whole now.
             Err(e) => {
                 warn!(error = %e, "sync: filesystem watcher error");
+                dirty.lost();
+                roots.input_all(RootInput::Doubted(Doubt::WatchLost));
                 return;
             }
         };
+        if event.need_rescan() {
+            dirty.overflowed();
+            roots.input_all(RootInput::Doubted(Doubt::Overflow));
+        }
         // Ignore pure metadata/access noise; content changes are what matter.
         if matches!(event.kind, notify::EventKind::Access(_)) {
             return;
         }
-        let msg = event_target(&watched_events.lock(), &event.paths);
+        let watched = watched_events.lock();
+        mark_dirty(&dirty, &watched, &event.paths);
+        let msg = event_target(&watched, &event.paths);
+        drop(watched);
         let _ = tx_events.send(msg);
     };
     // The local walk skips symlinks, so following them here would only watch
@@ -513,6 +527,28 @@ pub(super) fn event_target(watched: &[(PathBuf, i64)], paths: &[PathBuf]) -> Syn
     }
 }
 
+/// Mark each of `paths` in the local dirty set of the folder it is in.
+pub(super) fn mark_dirty(dirty: &LocalDirty, watched: &[(PathBuf, i64)], paths: &[PathBuf]) {
+    for path in paths {
+        let Some((root, id)) = watched
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+        else {
+            continue;
+        };
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        // The walk leaves out a name that is not UTF-8, so there is nothing
+        // to mark for one.
+        let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
+        if let Some(parts) = parts {
+            dirty.mark(*id, &parts.join("/"));
+        }
+    }
+}
+
 /// Bring the filesystem watches in line with the current mirror-folder set:
 /// watch newly-added folders, drop removed ones. Returns whether a folder is
 /// left unwatched because its watch failed.
@@ -537,9 +573,14 @@ fn rewatch(
         }
     };
     let mut have = watched.lock().clone();
+    let before = have.clone();
     // Drop watches no longer wanted.
     for path in keep_wanted(&mut have, &want) {
         let _ = watcher.unwatch(&path);
+        if let Some((_, id)) = before.iter().find(|(p, _)| *p == path) {
+            core.local_dirty.forget(*id);
+            core.roots.forget(*id);
+        }
     }
     // Add newly wanted watches.
     let mut failed = false;
@@ -548,8 +589,12 @@ fn rewatch(
             continue;
         }
         match watcher.watch(path, RecursiveMode::Recursive) {
-            Ok(()) => have.push((path.clone(), *id)),
+            Ok(()) => {
+                have.push((path.clone(), *id));
+                core.local_dirty.watched(*id);
+            }
             Err(e) => {
+                core.local_dirty.unwatched(*id);
                 // A recursive watch that fails partway keeps the watches it had
                 // added. Their events would match no folder and run a pass over
                 // every one, and they hold watches the next folder needs (B262).

@@ -86,6 +86,11 @@ pub struct SyncParts {
     /// first read. A pass trusts the feed's dirty folders only while it is
     /// being read.
     pub events_read_at: Arc<AtomicI64>,
+    /// Where each mirror folder changed on disk since a pass last looked,
+    /// as the filesystem watcher reports it.
+    pub local_dirty: Arc<crate::local_dirty::LocalDirty>,
+    /// What each mirror folder's sync knows about its coverage (`root`).
+    pub roots: Arc<crate::root::Roots>,
     /// When each step of a pass may start: its uploads, downloads and folder
     /// creations.
     pub admission: Arc<dyn pdfs_sched::Admission>,

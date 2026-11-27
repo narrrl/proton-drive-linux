@@ -520,6 +520,8 @@ pub(crate) fn mount_with(
         unscanned: Arc::default(),
         abandon: Arc::default(),
         events_read_at: Arc::new(AtomicI64::new(0)),
+        local_dirty: Arc::default(),
+        roots: Arc::default(),
         admission: Arc::new(pdfs_sched::Classes::new(|class| match class {
             pdfs_sched::Class::Mirror => sync::SYNC_CONCURRENCY,
             pdfs_sched::Class::Listing => super::listing::COLD_LISTINGS,
