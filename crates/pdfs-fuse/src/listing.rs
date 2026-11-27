@@ -3,6 +3,16 @@
 
 use super::*;
 
+/// How many folders the mount lists on Drive at once, in the daemon's
+/// admission ([`pdfs_sched::Class::Listing`]).
+///
+/// Above what the mount's workers ([`workers::FUSE_WORKERS`]) and a burst
+/// of commands list at once, so for now the admission counts cold listings
+/// in `pdfs diagnostics` and rarely makes one wait. A lookup must not queue
+/// behind a pin walking a large tree; a lower limit waits for a policy that
+/// tells the two apart.
+pub(crate) const COLD_LISTINGS: usize = 32;
+
 impl Core {
     /// Whether [`Core::ensure_children`] would answer for `ino` without
     /// touching the network. Lets a handler decide between answering inline
@@ -265,6 +275,22 @@ impl Core {
         if !self.is_online() {
             return self.adopt_stale_listing(ino, &folder_uid, cached, primary_root);
         }
+        // Single flight: callers that find the folder unlisted at the same
+        // time share one listing. Each used to ask Drive itself, and all but
+        // the first threw the answer away. A follower waits for the leader and
+        // takes what it published; when the leader failed, the follower lists
+        // the folder itself, so each caller still gets its own answer. A
+        // shared folder's refresh is left out: its generation check answers a
+        // caller EAGAIN on its own.
+        let _lead = if foreign {
+            None
+        } else {
+            match self.listing_flights.join(&folder_uid) {
+                Some(lead) => Some(lead),
+                None if self.state().children.contains_key(&ino) => return Ok(()),
+                None => None,
+            }
+        };
 
         let refresh_generation =
             refresh_foreign.then(|| self.shared.shared_generation.load(Ordering::SeqCst));
@@ -274,6 +300,15 @@ impl Core {
         let queued_before = (!foreign)
             .then(|| self.db.queued_children(&folder_uid).ok())
             .flatten();
+        // Asking Drive waits for the daemon's admission of cold listings,
+        // which counts it in `pdfs diagnostics`. The permit covers the two
+        // calls to Drive and goes before the listing is published.
+        let admitted = self
+            .rt
+            .block_on(self.sync.admission.admit(pdfs_sched::Step {
+                class: pdfs_sched::Class::Listing,
+                root: 0,
+            }));
         let uids = match self
             .rt
             .block_on(self.drive.enumerate_folder_children_node_uids(&folder_uid))
@@ -306,6 +341,7 @@ impl Core {
                 return Err(Errno::EIO);
             }
         };
+        drop(admitted);
         // Drive shows none of what is still queued for the folder (B132).
         // A shared folder's listing is published as Drive has it.
         if !foreign {

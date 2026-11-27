@@ -270,6 +270,34 @@ pub(super) fn sync_engine_line(sync: &pdfs_core::control::SyncEngineState) -> St
     line
 }
 
+/// One class of background step in `pdfs diagnostics`: `mirror: 8 running,
+/// 3 waiting (oldest 2s); 120 admitted, waited 14s in total, 950ms at most`.
+pub(super) fn admission_line(load: &pdfs_core::control::AdmissionLoad) -> String {
+    let mut line = format!(
+        "{}: {} running, {} waiting",
+        load.class, load.running, load.waiting
+    );
+    if let Some(ms) = load.oldest_wait_ms {
+        line.push_str(&format!(" (oldest {})", wait_ms(ms)));
+    }
+    line.push_str(&format!(
+        "; {} admitted, waited {} in total, {} at most",
+        load.admitted,
+        wait_ms(load.waited_ms),
+        wait_ms(load.longest_wait_ms),
+    ));
+    line
+}
+
+/// A wait, in ms below a second, where most admission waits fall.
+fn wait_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        human_secs(ms / 1000)
+    }
+}
+
 pub(super) fn cmd_diagnostics() -> Result<()> {
     let response = control_request(CtlRequest::Diagnostics)?;
     if emit_json(&response)? {
@@ -344,6 +372,12 @@ pub(super) fn cmd_diagnostics() -> Result<()> {
                         trace.folder_id,
                         human_secs(trace.elapsed_ms / 1000),
                     );
+                }
+            }
+            if !d.admission.is_empty() {
+                println!("admission of background steps:");
+                for load in &d.admission {
+                    println!("  {}", admission_line(load));
                 }
             }
             if !d.drive_calls.is_empty() {
@@ -478,5 +512,39 @@ pub(super) fn cmd_cache_inspect(deep: bool) -> Result<()> {
         }
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pdfs_core::control::AdmissionLoad;
+
+    use super::admission_line;
+
+    #[test]
+    fn an_admission_line_says_who_waits_and_for_how_long() {
+        let load = AdmissionLoad {
+            class: "mirror".into(),
+            running: 8,
+            waiting: 3,
+            oldest_wait_ms: Some(2_400),
+            admitted: 120,
+            waited_ms: 14_000,
+            longest_wait_ms: 950,
+        };
+        assert_eq!(
+            admission_line(&load),
+            "mirror: 8 running, 3 waiting (oldest 2s); 120 admitted, waited 14s in total, 950ms at most"
+        );
+        let idle = AdmissionLoad {
+            oldest_wait_ms: None,
+            waiting: 0,
+            running: 0,
+            ..load
+        };
+        assert_eq!(
+            admission_line(&idle),
+            "mirror: 0 running, 0 waiting; 120 admitted, waited 14s in total, 950ms at most"
+        );
     }
 }

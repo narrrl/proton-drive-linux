@@ -3727,6 +3727,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "pdfs-core",
  "pdfs-drive",
+ "pdfs-sched",
  "pdfs-store",
  "pdfs-sync",
  "pdfs-vfs",
@@ -3771,6 +3772,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdfs-sched"
+version = "3.10.0"
+dependencies = [
+ "parking_lot 0.13.0",
+ "tokio",
+]
+
+[[package]]
 name = "pdfs-store"
 version = "3.10.0"
 dependencies = [
@@ -3794,6 +3803,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "pdfs-core",
  "pdfs-drive",
+ "pdfs-sched",
  "pdfs-store",
  "proton-drive-rs",
  "sha1 0.11.0",
