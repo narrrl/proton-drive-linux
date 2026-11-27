@@ -127,9 +127,9 @@ pub enum Count {
     Reused,
     /// Folders on Drive marked as changed since the last pass listed them.
     Dirty,
-    /// Deletions the pass planned that the evidence does not back: the path
-    /// was not proven gone on the side the deletion is based on. Should stay
-    /// zero; see `evidence`.
+    /// Deletions the pass planned that the evidence does not back, and so
+    /// did not make: the path was not proven gone on the side the deletion is
+    /// based on. Should stay zero; see `evidence`.
     UnprovenDeletions,
 }
 

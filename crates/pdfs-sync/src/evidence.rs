@@ -11,9 +11,9 @@
 //! Only [`Presence::Absent`] may lead to a deletion. A pass classifies a path
 //! only when both sides are known ([`Evidence::classifiable`]), and every
 //! deletion it plans is checked against the evidence again
-//! ([`Evidence::unproven_deletion`]). That check acts on nothing yet: it
-//! counts and logs a deletion the evidence does not support, so a regression
-//! in the filters shows up in the pass trace before it can cost data.
+//! ([`Evidence::unproven_deletion`]). A deletion the evidence does not
+//! support is not made: it is logged, counted in the pass trace and failed,
+//! so a regression in the filters keeps files instead of costing them.
 
 use std::collections::HashMap;
 

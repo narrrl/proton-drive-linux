@@ -348,8 +348,9 @@ Safety rules:
   not tell, and why (`Unknown`: unreadable or vanished here; unread, under a short listing or
   under a failed listing on Drive). Only a path known on both sides is classified, and only
   `Absent` backs a deletion. Every deletion a pass plans is checked against the evidence once
-  more. For now that check acts on nothing: it logs the deletion and counts it as `unproven
-  deletions` in the pass trace, which should stay at zero.
+  more, and one it does not back is not made: the pass logs it, counts it as `unproven
+  deletions` in its trace and fails the step, and the next pass plans it again. The count
+  should stay at zero.
 - **Wipe guard.** A pass in which every previously synced file has vanished locally is refused
   instead of trashing the whole folder on Drive. It applies to any non-empty baseline.
 - **Deletion window.** The wipe guard sees one pass. A tree lost a little at a time passes it once

@@ -354,25 +354,33 @@ impl Syncer {
         }
     }
 
-    /// Shadow check of a deletion the pass is about to make: count and log it
-    /// when the evidence does not prove the path gone on the side the
-    /// deletion is based on. Acts on nothing; the filters before the plan are
-    /// what keep such a path out of it, and this says when they did not.
-    fn check_deletion<L: HasKind, R: HasKind>(
+    /// Whether the pass must not make a deletion it planned: the evidence does
+    /// not prove the path gone on the side the deletion is based on. Such a
+    /// deletion is logged, counted in the trace and as a failed step, and left
+    /// out; its baseline row stays, so the next pass plans it again.
+    ///
+    /// The filters before the plan keep such a path out of it, so this
+    /// should never fire. When it does, a file stays on both sides rather than
+    /// going on the strength of a walk that never saw it.
+    fn refuses_deletion<L: HasKind, R: HasKind>(
         &self,
         evidence: &Evidence<'_, L, R>,
         rel: &str,
         side: Side,
-    ) {
-        if let Some(basis) = evidence.unproven_deletion(rel, side) {
-            warn!(
-                rel,
-                ?side,
-                ?basis,
-                "sync: a planned deletion is not backed by proof of absence"
-            );
-            self.trace_count(Count::UnprovenDeletions, 1);
-        }
+        outcome: &mut Outcome,
+    ) -> bool {
+        let Some(basis) = evidence.unproven_deletion(rel, side) else {
+            return false;
+        };
+        warn!(
+            rel,
+            ?side,
+            ?basis,
+            "sync: not deleting a path whose absence is not proven"
+        );
+        self.trace_count(Count::UnprovenDeletions, 1);
+        outcome.failed(&format!("{rel}: not deleted, its absence is not proven"));
+        true
     }
 
     /// Add `took` to a stage of the running pass's trace.
@@ -622,11 +630,14 @@ impl Syncer {
                     }
                     (true, false) => {
                         // In baseline, gone remotely → the remote side deleted it.
-                        self.check_deletion(
+                        if self.refuses_deletion(
                             &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
                             rel,
                             Side::Local,
-                        );
+                            &mut outcome,
+                        ) {
+                            continue;
+                        }
                         delete_local_dirs.push(rel.clone());
                     }
                     (false, true) if !in_base => {
@@ -641,11 +652,14 @@ impl Syncer {
                     }
                     (false, true) => {
                         // In baseline, gone locally → the local side deleted it.
-                        self.check_deletion(
+                        if self.refuses_deletion(
                             &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
                             rel,
                             Side::Remote,
-                        );
+                            &mut outcome,
+                        ) {
+                            continue;
+                        }
                         delete_remote_dirs.push((rel.clone(), remote[rel].uid.clone()));
                     }
                     (false, false) => {
@@ -736,11 +750,14 @@ impl Syncer {
                     }
                 },
                 FilePlan::DeleteLocal => {
-                    self.check_deletion(
+                    if self.refuses_deletion(
                         &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
                         rel,
                         Side::Local,
-                    );
+                        &mut outcome,
+                    ) {
+                        continue;
+                    }
                     let path = local_root.join(rel_to_path(rel));
                     // The plan comes from a scan taken before the remote walk,
                     // which can take minutes. An edit saved since then is not
@@ -767,11 +784,14 @@ impl Syncer {
                     outcome.deleted += 1;
                 }
                 FilePlan::DeleteRemote => {
-                    self.check_deletion(
+                    if self.refuses_deletion(
                         &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
                         rel,
                         Side::Remote,
-                    );
+                        &mut outcome,
+                    ) {
+                        continue;
+                    }
                     let remote = r.expect("remote deletion requires a remote file");
                     let step = Instant::now();
                     let trashed = self

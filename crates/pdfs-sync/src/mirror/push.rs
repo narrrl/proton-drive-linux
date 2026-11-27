@@ -314,9 +314,10 @@ impl Syncer {
             unscanned: &unscanned,
             remote: None,
         };
-        for rel in &deletions {
-            self.check_deletion(&evidence, rel, Side::Remote);
-        }
+        let deletions: Vec<String> = deletions
+            .into_iter()
+            .filter(|rel| !self.refuses_deletion(&evidence, rel, Side::Remote, &mut outcome))
+            .collect();
         let mut trashed: Vec<String> = Vec::new();
         for rel in &deletions {
             if trashed
