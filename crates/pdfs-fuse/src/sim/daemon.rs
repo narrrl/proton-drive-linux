@@ -4581,7 +4581,11 @@ mod tests {
         cut_off_replace(&dir, &source, &victim, &drive.root(), "report.odt");
         drive.device().trash("report.odt");
 
-        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        // Without the listing lag: a lagging read shows the trash made just
+        // above as not done yet, and a restart quicker than the lag then left
+        // the file in the trash as never removed. A real stop comes long
+        // after its own trash.
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::none())).unwrap();
         assert!(
             wait_until(Duration::from_secs(30), || {
                 drive.tree().get("report.odt") == Some(&Entry::File(Arc::new(b"old".to_vec())))
