@@ -485,11 +485,8 @@ impl Core {
             // Unsaved writes, or a release still queueing them, to the file or,
             // for a folder, to any file below it.
             let unsaved = st
-                .active_writes
-                .iter()
-                .filter(|(_, w)| w.dirty)
-                .map(|(&open, _)| open)
-                .chain(st.releasing.iter().copied())
+                .open
+                .owed(true)
                 .any(|open| relocate::ino_is_under(&st, open, ino));
             (entry.node.name.clone(), entry.node.is_folder(), unsaved)
         };

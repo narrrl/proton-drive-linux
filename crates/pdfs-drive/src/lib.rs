@@ -599,6 +599,19 @@ pub fn is_network_error(e: &ProtonError) -> bool {
     }
 }
 
+/// A node's plaintext size as far as its listing knows: the claimed size when
+/// the revision carries one, else the size on storage. Zero for a folder.
+pub fn node_size(node: &Node) -> u64 {
+    match &node.kind {
+        NodeKind::Folder => 0,
+        NodeKind::File {
+            claimed_size,
+            total_size_on_storage,
+            ..
+        } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
+    }
+}
+
 /// The server revision id of a node's active revision, if it is a file that has
 /// one. The stable identity the drain conflict-checks against (see `Baseline` in pdfs-store).
 pub fn node_revision_id(node: &Node) -> Option<String> {

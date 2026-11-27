@@ -564,7 +564,7 @@ impl Core {
                     }
                 }
             }
-            for aw in st.active_writes.values_mut() {
+            for aw in st.open.writers_mut() {
                 if aw.uid == *local {
                     aw.uid = real.clone();
                 }

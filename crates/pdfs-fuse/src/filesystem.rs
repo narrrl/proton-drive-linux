@@ -1,7 +1,7 @@
 //! Kernel-facing FUSE callback adapter.
 
 use super::*;
-use crate::state::DirListing;
+use pdfs_vfs::open::{DirListing, Fallocate, Released, WriteError, dir_page};
 
 impl Filesystem for ProtonFs {
     /// Negotiate kernel-side behaviour once, before any other callback.
@@ -201,7 +201,7 @@ impl Filesystem for ProtonFs {
         // in-memory walk with no chance of a remote call, so it never needs a
         // worker. Only a handle whose `opendir` failed to snapshot (or a kernel
         // that issued `readdir` without one) falls back to the live path.
-        if let Some(listing) = self.core.state().dir_snapshots.get(&fh.0).cloned() {
+        if let Some(listing) = self.core.state().open.dir(fh.0) {
             reply_listing(&listing, offset, self.root, reply);
             return;
         }
@@ -225,7 +225,7 @@ impl Filesystem for ProtonFs {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        self.core.state().dir_snapshots.remove(&fh.0);
+        self.core.state().open.close_dir(fh.0);
         reply.ok();
     }
 
@@ -268,19 +268,13 @@ impl Filesystem for ProtonFs {
         // issued the read before any write that comes after it, so that is
         // the content it asked for. On the loop, the download held every
         // request of the mount (`docs/BUGS.md` B227).
-        let handle = {
-            let st = self.core.state();
-            st.active_writes.get(&ino.0).map(|h| {
-                (
-                    h.file.clone(),
-                    h.len,
-                    h.uid.clone(),
-                    h.base_mtime,
-                    h.base_size,
-                    h.written.clone(),
-                )
-            })
-        };
+        // A writer still open, or one whose release is still queueing it.
+        let handle = self
+            .core
+            .state()
+            .open
+            .reader(ino.0)
+            .map(|v| (v.file, v.len, v.uid, v.base_mtime, v.base_size, v.written));
         if let Some((file, len, uid, base_mtime, base_size, written)) = handle {
             match self.core.serve_open_read_local(
                 &file,
@@ -466,7 +460,7 @@ impl Filesystem for ProtonFs {
             let fh = fh.map(|f| f.0).filter(|&f| f != 0);
             let handled = {
                 let mut st = self.core.state();
-                match st.active_writes.get_mut(&ino.0) {
+                match st.open.writer_mut(ino.0) {
                     Some(aw) => aw.resize(size).map(|()| true).map_err(Errno::from),
                     None => Ok(false),
                 }
@@ -530,13 +524,13 @@ impl Filesystem for ProtonFs {
         // or insert shifted bytes that `len` and `written` did not follow
         // (`docs/BUGS.md` B224). `EOPNOTSUPP` is also what makes glibc's
         // `posix_fallocate` fall back to writing zeros.
-        let Some(kind) = falloc_kind(mode) else {
+        let Some(kind) = Fallocate::from_mode(mode) else {
             reply.error(Errno::EOPNOTSUPP);
             return;
         };
         let file = {
             let st = self.core.state();
-            match st.handles.get(&_fh.0).and_then(|i| st.active_writes.get(i)) {
+            match st.open.by_fh(_fh.0) {
                 Some(aw) => aw.file.clone(),
                 None => {
                     reply.error(if st.entries.contains_key(&ino.0) {
@@ -558,26 +552,12 @@ impl Filesystem for ProtonFs {
             Err(Errno::from(std::io::Error::last_os_error()))
         } else {
             let mut st = self.core.state();
-            if let Some(aw) = st
-                .handles
-                .get(&_fh.0)
-                .copied()
-                .and_then(|i| st.active_writes.get_mut(&i))
-            {
-                let len = aw.len;
-                let (authored, grown) = kind.effect(offset, new_end, len);
-                if let Some((from, to)) = authored {
-                    // Zeroed or punched bytes read as zero. Marked authored so
-                    // queue_revision does not refill them from the remote
-                    // baseline and silently undo them at commit.
-                    aw.written.add(from, to);
-                    aw.dirty = true;
-                }
-                if let Some(end) = grown {
-                    aw.len = end;
-                    aw.dirty = true;
-                    st.set_size(ino.0, end);
-                }
+            let grown = st
+                .open
+                .by_fh_mut(_fh.0)
+                .and_then(|aw| aw.record_fallocate(kind, offset, new_end));
+            if let Some(end) = grown {
+                st.set_size(ino.0, end);
             }
             Ok(())
         };
@@ -609,9 +589,8 @@ impl Filesystem for ProtonFs {
     ) {
         let file = {
             let st = self.core.state();
-            st.handles
-                .get(&fh.0)
-                .and_then(|ino| st.active_writes.get(ino))
+            st.open
+                .by_fh(fh.0)
                 .filter(|aw| aw.dirty)
                 .map(|aw| aw.file.clone())
         };
@@ -669,20 +648,13 @@ impl Filesystem for ProtonFs {
         let (handle, unlinked_uid, releasing) = {
             let mut st = self.core.state();
             let unlinked_uid = release_unlinked_entry(&mut st, ino.0);
-            let ino = st.handles.remove(&fh.0);
-            let h = ino.and_then(|i| {
-                let aw = st.active_writes.get_mut(&i)?;
-                aw.open_count = aw.open_count.saturating_sub(1);
-                if aw.open_count == 0 {
-                    st.active_writes.remove(&i)
-                } else {
-                    None
+            let (h, releasing) = match st.open.release(fh.0) {
+                Released::Last(h) => {
+                    let ino = h.ino;
+                    (Some(h), Some(ino))
                 }
-            });
-            let releasing = ino.filter(|_| h.is_some());
-            if let Some(ino) = releasing {
-                st.releasing.insert(ino);
-            }
+                Released::StillOpen { .. } | Released::NotWriting => (None, None),
+            };
             (h, unlinked_uid, releasing)
         };
         // Deliberately **not** handed to a worker, unlike the other slow
@@ -701,7 +673,7 @@ impl Filesystem for ProtonFs {
         // insert, and at most a bounded copy out of the local cache.
         self.finish_release(handle, unlinked_uid, reply);
         if let Some(ino) = releasing {
-            self.core.state().releasing.remove(&ino);
+            self.core.state().open.finish_release(ino);
         }
     }
 
@@ -1084,60 +1056,14 @@ fn build_listing(st: &State, ino: u64) -> DirListing {
 /// The cookie handed back is the index of the *next* entry, so a resumed call
 /// continues exactly where the last one stopped — which is only true because
 /// the listing behind those indexes is a snapshot (`docs/BUGS.md` B43).
-/// What an `fallocate` mode does to a write handle, for the modes it can
-/// record (`docs/BUGS.md` B224).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FallocKind {
-    /// Reserve space; past the end it grows the file unless `keep_size`.
-    Allocate { keep_size: bool },
-    /// Deallocate a range inside the file, which then reads as zero.
-    Punch,
-    /// Zero a range; past the end it grows the file unless `keep_size`.
-    Zero { keep_size: bool },
-}
-
-fn falloc_kind(mode: i32) -> Option<FallocKind> {
-    const KEEP: i32 = libc::FALLOC_FL_KEEP_SIZE;
-    const PUNCH: i32 = libc::FALLOC_FL_PUNCH_HOLE;
-    const ZERO: i32 = libc::FALLOC_FL_ZERO_RANGE;
-    match mode {
-        0 => Some(FallocKind::Allocate { keep_size: false }),
-        KEEP => Some(FallocKind::Allocate { keep_size: true }),
-        m if m == PUNCH | KEEP => Some(FallocKind::Punch),
-        ZERO => Some(FallocKind::Zero { keep_size: false }),
-        m if m == ZERO | KEEP => Some(FallocKind::Zero { keep_size: true }),
-        _ => None,
-    }
-}
-
-impl FallocKind {
-    /// For `[offset, end)` on a file `len` bytes long: the range that now
-    /// reads as zero and must count as written, and the new length if it grew.
-    fn effect(self, offset: u64, end: u64, len: u64) -> (Option<(u64, u64)>, Option<u64>) {
-        let grow = |keep_size: bool| (!keep_size && end > len).then_some(end);
-        let zeroed = |to: u64| (offset < to).then_some((offset, to));
-        match self {
-            // Space past the old end reads as zero, and nothing before it moved.
-            Self::Allocate { keep_size } => {
-                (grow(keep_size).map(|end| (len, end)), grow(keep_size))
-            }
-            Self::Punch => (zeroed(end.min(len)), None),
-            Self::Zero { keep_size } => {
-                let to = if keep_size { end.min(len) } else { end };
-                (zeroed(to), grow(keep_size))
-            }
-        }
-    }
-}
-
 fn reply_listing(listing: &DirListing, offset: u64, root: u64, mut reply: ReplyDirectory) {
-    for (i, (ino, is_dir, name)) in listing.iter().enumerate().skip(offset as usize) {
+    for (next, (ino, is_dir, name)) in dir_page(listing, offset) {
         let ft = if *is_dir {
             FileType::Directory
         } else {
             FileType::RegularFile
         };
-        if reply.add(kernel_ino(root, *ino), (i + 1) as u64, ft, name) {
+        if reply.add(kernel_ino(root, *ino), next, ft, name) {
             break;
         }
     }
@@ -1267,12 +1193,10 @@ impl ProtonFs {
             return;
         }
         let mut st = self.core.state();
-        let listing = Arc::new(build_listing(&st, ino));
+        let listing = build_listing(&st, ino);
         // Shares the counter with write handles, so a directory handle can never
         // collide with a file handle (both are `fh` values in one kernel space).
-        let fh = st.next_fh;
-        st.next_fh += 1;
-        st.dir_snapshots.insert(fh, listing);
+        let fh = st.open.open_dir(listing);
         drop(st);
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
@@ -1474,7 +1398,7 @@ impl ProtonFs {
                 // Only a handle this open is about to *create* can carry a stale
                 // base; if one already exists, that handle is authoritative and
                 // the scratch prepared above is discarded either way.
-                let creating = !st.active_writes.contains_key(&ino.0);
+                let creating = !st.open.is_writing(ino.0);
                 if creating && current.as_ref() != pending_base.as_ref().map(|p| &p.path) {
                     drop(st);
                     let _ = std::fs::remove_file(&path);
@@ -1512,9 +1436,7 @@ impl ProtonFs {
                         }
                     }
                 }
-                let fh = st.next_fh;
-                st.next_fh += 1;
-                let aw = st.active_writes.entry(ino.0).or_insert_with(|| {
+                let fh = st.open.open_writer(ino.0, || {
                     WriteHandle {
                         ino: ino.0,
                         uid: uid.clone(),
@@ -1531,8 +1453,6 @@ impl ProtonFs {
                         open_count: 0,
                     }
                 });
-                aw.open_count += 1;
-                st.handles.insert(fh, ino.0);
                 break 'install Ok(fh);
             }
             error!(%uid, "queued revision kept changing while opening for write");
@@ -1570,8 +1490,7 @@ impl ProtonFs {
         // across the sync.
         let handle = {
             let st = self.core.state();
-            let ino = st.handles.get(&fh.0).copied();
-            ino.and_then(|i| st.active_writes.get(&i)).map(|aw| {
+            st.open.by_fh(fh.0).map(|aw| {
                 (
                     aw.file.clone(),
                     aw.path.clone(),
@@ -1653,31 +1572,30 @@ impl ProtonFs {
     fn stage_write(&self, ino: u64, fh: u64, offset: u64, data: &[u8]) -> Result<(), Errno> {
         let file = {
             let st = self.core.state();
-            match st.handles.get(&fh).and_then(|&i| st.active_writes.get(&i)) {
+            match st.open.by_fh(fh) {
                 Some(aw) => aw.file.clone(),
                 None => return Err(Errno::EBADF),
             }
         };
-        if let Err(e) = file.write_all_at(data, offset) {
-            error!(ino, fh, error = %e, "scratch write failed");
+        match pdfs_vfs::open::stage_write(&file, offset, data) {
+            Ok(()) => {}
             // A full local disk is not a broken file: answer `ENOSPC` so the
             // application can say so (and so `cp`/editors take their own
             // out-of-space path), and free what the cache is holding — the
             // scratch file the next write goes to shares that filesystem.
-            if e.raw_os_error() == Some(libc::ENOSPC) {
+            Err(WriteError::NoSpace) => {
+                error!(ino, fh, "scratch write failed: no space");
                 self.core.cache.emergency_evict();
                 return Err(Errno::ENOSPC);
             }
-            return Err(Errno::EIO);
+            Err(WriteError::Io(e)) => {
+                error!(ino, fh, error = %e, "scratch write failed");
+                return Err(Errno::EIO);
+            }
         }
         let new_len = {
             let mut st = self.core.state();
-            let Some(aw) = st
-                .handles
-                .get(&fh)
-                .copied()
-                .and_then(|i| st.active_writes.get_mut(&i))
-            else {
+            let Some(aw) = st.open.by_fh_mut(fh) else {
                 return Err(Errno::EBADF);
             };
             aw.record_write(offset, offset + data.len() as u64);
@@ -1792,14 +1710,9 @@ impl ProtonFs {
         {
             kids.push(ino);
         }
-        let fh = st.next_fh;
-        st.next_fh += 1;
-        let aw = st
-            .active_writes
-            .entry(ino)
-            .or_insert_with(|| WriteHandle::created(ino, &node, file, path));
-        aw.open_count += 1;
-        st.handles.insert(fh, ino);
+        let fh = st
+            .open
+            .open_writer(ino, || WriteHandle::created(ino, &node, file, path));
         let entry = st.entries.get(&ino).unwrap();
         let attr = self.attr(ino, &entry.node, entry.access);
         drop(st);
@@ -2503,62 +2416,5 @@ impl ProtonFs {
         } else {
             reply.data(&buf);
         }
-    }
-}
-
-#[cfg(test)]
-mod falloc_tests {
-    use super::*;
-
-    #[test]
-    fn only_the_modes_a_handle_can_record_are_accepted() {
-        let keep = libc::FALLOC_FL_KEEP_SIZE;
-        assert_eq!(
-            falloc_kind(0),
-            Some(FallocKind::Allocate { keep_size: false })
-        );
-        assert_eq!(
-            falloc_kind(keep),
-            Some(FallocKind::Allocate { keep_size: true })
-        );
-        assert_eq!(
-            falloc_kind(libc::FALLOC_FL_PUNCH_HOLE | keep),
-            Some(FallocKind::Punch)
-        );
-        assert_eq!(
-            falloc_kind(libc::FALLOC_FL_ZERO_RANGE),
-            Some(FallocKind::Zero { keep_size: false })
-        );
-        for mode in [
-            libc::FALLOC_FL_PUNCH_HOLE,
-            libc::FALLOC_FL_COLLAPSE_RANGE,
-            libc::FALLOC_FL_INSERT_RANGE,
-            libc::FALLOC_FL_UNSHARE_RANGE,
-        ] {
-            assert_eq!(falloc_kind(mode), None, "{mode:#x}");
-        }
-    }
-
-    /// A zeroed range was left unwritten, so the commit filled it back in
-    /// from the remote base (`docs/BUGS.md` B224).
-    #[test]
-    fn a_zeroed_or_punched_range_counts_as_written() {
-        let zero = FallocKind::Zero { keep_size: false };
-        assert_eq!(zero.effect(10, 20, 100), (Some((10, 20)), None));
-        assert_eq!(zero.effect(90, 120, 100), (Some((90, 120)), Some(120)));
-        let zero_keep = FallocKind::Zero { keep_size: true };
-        assert_eq!(zero_keep.effect(90, 120, 100), (Some((90, 100)), None));
-        assert_eq!(
-            FallocKind::Punch.effect(90, 120, 100),
-            (Some((90, 100)), None)
-        );
-        assert_eq!(FallocKind::Punch.effect(120, 130, 100), (None, None));
-        let alloc = FallocKind::Allocate { keep_size: false };
-        assert_eq!(alloc.effect(0, 50, 100), (None, None));
-        assert_eq!(alloc.effect(90, 120, 100), (Some((100, 120)), Some(120)));
-        assert_eq!(
-            FallocKind::Allocate { keep_size: true }.effect(90, 120, 100),
-            (None, None)
-        );
     }
 }

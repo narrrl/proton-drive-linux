@@ -108,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B300](#b300--a-read-during-a-release-can-be-served-the-revision-the-write-replaced) | A read during a release can be served the revision the write replaced |
 | [B299](#b299--a-synced-folder-in-the-trash-blocks-attaching-any-other-folder) | A synced folder in the trash blocks attaching any other folder |
 | [B298](#b298--a-synced-folder-edit-whose-upload-lost-its-answer-is-kept-as-a-conflict-copy-of-itself) | A synced-folder edit whose upload lost its answer is kept as a conflict copy of itself |
 | [B297](#b297--the-simulations-fail-and-hang-when-run-in-parallel-and-nothing-stops-that) | The simulations fail and hang when run in parallel, and nothing stops that |
@@ -401,6 +402,35 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B300 — A read during a release can be served the revision the write replaced
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-27, by reading the code while moving the open files into `pdfs-vfs` (step 5 of
+`docs/ARCHITECTURE.md`). It was not seen in a run.
+**Where:** `OpenFiles::release` and `OpenFiles::reader` in `crates/pdfs-vfs/src/open.rs`;
+`Core::read_local` in `crates/pdfs-fuse/src/reads.rs` and the `read` callback in
+`crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** Keep one read-only handle open on a file, and read through it from a second thread.
+Write the file through another handle and close it. A read that lands after the release took the
+write state out of the open files, but before the release queued the new revision, finds neither
+of them, and is answered with the revision on Drive from before the write.
+
+**Cause.** The release removed the writer first and queued the revision second. Each read looks for
+an open writer, then for a queued revision, then goes to the cache or Drive. The release runs on the
+dispatch loop, so an `open` and `read` issued after `close(2)` are served after it. A read already
+running on a worker, through a handle opened earlier, is not ordered that way.
+
+**Fix.** A release now keeps a read view of the writer (its scratch file, length, base and written
+ranges) until the revision is queued. `OpenFiles::reader` answers from the open writer, or from that
+view, and both read paths ask it first. The view was already kept in one form, as the set of inodes
+being released, which only the check for unsaved changes looked at.
+
+**Verified:** `the_last_release_hands_back_the_write_and_marks_it_releasing` checks that a read finds
+the write until `finish_release`. No test drives the race through a mount.
+
+---
 
 ### B299 — A synced folder in the trash blocks attaching any other folder
 

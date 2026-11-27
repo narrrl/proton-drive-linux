@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{Node, NodeKind};
 
-pub(crate) const VIRTUAL_VOLUME: &str = "virtual";
+pub(crate) use pdfs_vfs::ids::{VIRTUAL_VOLUME, is_virtual_uid};
 pub(crate) const SHARED_WITH_ME_LINK: &str = "sharedwithme";
 pub(crate) const SHARED_WITH_ME_BASE: &str = "Shared with me";
 const MAX_COMPONENT_BYTES: usize = 255;
@@ -16,10 +16,6 @@ pub(crate) fn shared_with_me_uid() -> NodeUid {
         VolumeId::from(VIRTUAL_VOLUME),
         LinkId::from(SHARED_WITH_ME_LINK),
     )
-}
-
-pub(crate) fn is_virtual_uid(uid: &NodeUid) -> bool {
-    uid.volume_id.as_str() == VIRTUAL_VOLUME
 }
 
 pub(crate) fn is_own_or_virtual_uid(uid: &NodeUid, own_volume: &VolumeId) -> bool {

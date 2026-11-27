@@ -189,8 +189,7 @@ impl Core {
             let Some(&ino) = st.by_uid.get(uid) else {
                 return;
             };
-            busy |=
-                st.active_writes.contains_key(&ino) || st.handles.values().any(|&held| held == ino);
+            busy |= st.open.is_busy(ino);
         });
         busy
     }

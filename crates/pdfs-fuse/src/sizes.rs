@@ -332,7 +332,7 @@ impl Core {
                 };
                 changed.push(ino);
                 // An open write handle is ahead of the server too (B109).
-                if st.active_writes.contains_key(&ino) {
+                if st.open.is_writing(ino) {
                     continue;
                 }
                 let NodeKind::File { claimed_size, .. } = &node.kind else {

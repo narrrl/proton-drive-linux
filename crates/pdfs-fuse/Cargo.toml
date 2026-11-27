@@ -13,6 +13,7 @@ description = "FUSE on-demand filesystem for Proton Drive"
 pdfs-core.workspace = true
 pdfs-drive.workspace = true
 pdfs-sync.workspace = true
+pdfs-vfs.workspace = true
 pdfs-store.workspace = true
 zip.workspace = true
 sha1.workspace = true
@@ -41,6 +42,7 @@ notify = "8"
 parking_lot.workspace = true
 
 [dev-dependencies]
+pdfs-vfs = { workspace = true, features = ["test-support"] }
 pdfs-drive = { workspace = true, features = ["sim"] }
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

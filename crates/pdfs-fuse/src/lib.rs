@@ -93,12 +93,13 @@ mod enqueue;
 use drive::{DriveApi, RevisionRead};
 use pdfs_core::timestamp::now_secs;
 use pdfs_drive as drive;
-use pdfs_drive::node_revision_id;
 pub(crate) use pdfs_drive::{media_type_for, node_content_sha1, parse_uid, remote_name_is_safe};
+use pdfs_drive::{node_revision_id, node_size};
 #[cfg(test)]
 use pdfs_sync::naming::{conflict_label, conflict_label_of, conflict_name_as};
 use pdfs_sync::naming::{conflict_name, this_hostname};
 mod echoes;
+pub(crate) use pdfs_vfs::writes;
 mod events;
 mod filesystem;
 mod gallery;
@@ -107,7 +108,6 @@ mod keeper;
 mod link;
 mod listing;
 mod session;
-mod writes;
 pub use filesystem::ProtonFs;
 mod maintenance;
 mod mount;
@@ -133,7 +133,7 @@ mod trash;
 use pdfs_core::shutdown;
 #[cfg(test)]
 mod sim;
-mod state;
+pub(crate) use pdfs_vfs::tree as state;
 mod supervisor;
 mod sweep;
 mod sync;
@@ -150,8 +150,9 @@ pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
     SecondaryInsertRejection, SecondaryMount, clear_stale_mount, fuse_connection_id, spawn_session,
 };
+use pdfs_vfs::open::{Intervals, PendingRevision, WriteHandle};
 use reads::STREAM_BYPASS_MIN;
-use state::{Entry, Intervals, PendingRevision, State, StateGuard, WriteHandle};
+use state::{Entry, State, StateGuard};
 pub use systemd::{
     idle_sleep, status as notify_status, stretch_watchdog_for_startup, wait_for_restart,
 };
@@ -344,13 +345,15 @@ const LOCAL_INDEX_TTL: Duration = Duration::from_secs(15 * 60);
 /// How often the scanner thread wakes to check whether the index went stale.
 const LOCAL_INDEX_CHECK: Duration = Duration::from_secs(60);
 
-/// The FUSE root inode is always 1.
-const ROOT_INO: u64 = 1;
+use pdfs_vfs::ids::{ORPHAN_INO, ROOT_INO};
 
-/// Parent inode for a persisted node whose parent row is missing from the DB.
-/// No folder carries this inode, so such a node is listed by nobody and stays
-/// inert until a live enumeration re-parents it.
-const ORPHAN_INO: u64 = 0;
+/// The errno the kernel gets for a node the tree refused.
+fn node_errno(error: pdfs_vfs::tree::NodeError) -> Errno {
+    match error {
+        pdfs_vfs::tree::NodeError::NotFound => Errno::ENOENT,
+        pdfs_vfs::tree::NodeError::NotWritable => Errno::EACCES,
+    }
+}
 
 /// Extended attribute exposing the small server-side thumbnail of a file.
 const XATTR_THUMBNAIL: &str = "user.proton.thumbnail";
@@ -892,7 +895,7 @@ impl Core {
     }
 
     fn require_writable(&self, ino: u64) -> Result<(), Errno> {
-        self.state().require_writable(ino)
+        self.state().require_writable(ino).map_err(node_errno)
     }
 
     /// Mutation admission point. Persisted and every resident authority must
@@ -1858,17 +1861,6 @@ fn is_unrevised(node: &Node) -> bool {
     )
 }
 
-fn node_size(node: &Node) -> u64 {
-    match &node.kind {
-        NodeKind::Folder => 0,
-        NodeKind::File {
-            claimed_size,
-            total_size_on_storage,
-            ..
-        } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
-    }
-}
-
 /// `call`, failed with a remote error once it has run for
 /// [`TRASH_CALL_TIMEOUT`].
 async fn within_trash_call<T>(what: &str, call: impl Future<Output = T>) -> CoreResult<T> {
@@ -2407,14 +2399,13 @@ mod pending_size_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::echoes::{SELF_CHANGE_TTL_MS, note_self_change, take_self_change};
     use super::trash::{expand_restore, first_seen_in_trash};
     use super::{
-        Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, RootListingSnapshot,
-        ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan, accepted_share_provenance,
+        Access, AccessFlags, Errno, HashMap, PendingRevision, RootListingSnapshot, ShareId,
+        SharedWithMeItem, StateRegistry, VirtualRootPlan, accepted_share_provenance,
         conflict_label, conflict_label_of, conflict_name, conflict_name_as,
         copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, off_the_runtime,
-        orphan_past_retention, parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
+        orphan_past_retention, prepare_shared_roots, preserve_on_access_denied,
         publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
         release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
         rename_needs_queue, require_node_parent_access, require_rename_access,
@@ -3288,67 +3279,6 @@ mod tests {
         assert!(db_error.message.contains("lookup failed"));
     }
 
-    /// An event feed carries no revision id, so the only thing that tells a
-    /// remote change apart from the echo of one this daemon just made is this
-    /// bookkeeping. Getting it wrong is expensive in both directions: too eager
-    /// and we evict the bytes we uploaded and re-download them from an API that
-    /// may still be serving the previous revision (a SQLite file on the mount
-    /// read back `malformed`); too generous and a real change from another device
-    /// is ignored.
-    #[test]
-    fn a_self_change_is_claimed_once_and_expires() {
-        let mut changes = HashMap::new();
-        let uid = parse_node_uid("vol~link").unwrap();
-        let other = parse_node_uid("vol~other").unwrap();
-        let t0 = 1_000_000;
-
-        assert!(
-            !take_self_change(&mut changes, &uid, t0),
-            "a node we never touched is never ours"
-        );
-
-        note_self_change(&mut changes, &uid, t0);
-        assert!(
-            take_self_change(&mut changes, &uid, t0 + 5_000),
-            "the echo of our own change is claimed"
-        );
-        assert!(
-            !take_self_change(&mut changes, &uid, t0 + 6_000),
-            "and only once, so a later foreign change still applies"
-        );
-
-        // A create followed by a revision upload is two changes to one node, and
-        // the feed reports both.
-        note_self_change(&mut changes, &uid, t0);
-        note_self_change(&mut changes, &uid, t0);
-        assert!(take_self_change(&mut changes, &uid, t0 + 1));
-        assert!(take_self_change(&mut changes, &uid, t0 + 2));
-        assert!(!take_self_change(&mut changes, &uid, t0 + 3));
-
-        // Past the window the attribution is a guess, and a wrong guess leaves
-        // the user looking at a stale file.
-        note_self_change(&mut changes, &uid, t0);
-        assert!(!take_self_change(
-            &mut changes,
-            &uid,
-            t0 + SELF_CHANGE_TTL_MS
-        ));
-        assert!(
-            !changes.contains_key(&uid),
-            "an expired change is dropped, not left to be re-tested"
-        );
-
-        // An echo that never arrives must not accumulate for the life of the
-        // daemon; the next recorded change prunes it.
-        note_self_change(&mut changes, &uid, t0);
-        note_self_change(&mut changes, &other, t0 + SELF_CHANGE_TTL_MS);
-        assert_eq!(
-            changes.len(),
-            1,
-            "recording a change prunes the ones whose echo never came"
-        );
-    }
-
     /// The predicate must answer *only* for a dead FUSE connection. A healthy
     /// directory and an absent path are both "not stale" — widening it to any
     /// `metadata` error would make the on-demand restore lazily unmount paths
@@ -3360,11 +3290,6 @@ mod tests {
         assert!(!is_stale_mount(&dir));
         assert!(!is_stale_mount(&dir.join("no-such-entry")));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Flatten `segments` into a readable form for assertions.
-    fn segs(iv: &Intervals, start: u64, end: u64) -> Vec<(u64, u64, bool)> {
-        iv.segments(start, end)
     }
 
     /// The conflict copy has to stay openable, so the extension survives — and
@@ -3405,76 +3330,6 @@ mod tests {
         assert_eq!(conflict_label_of("a/b) c"), "a-b--c");
         assert_eq!(conflict_label_of("  "), "");
         assert_eq!(conflict_label_of(&"x".repeat(40)).len(), 32);
-    }
-
-    #[test]
-    fn append_merges_into_one_run() {
-        // Sequential writes (an append) coalesce into a single authored range.
-        let mut iv = Intervals::default();
-        iv.add(0, 10);
-        iv.add(10, 20);
-        iv.add(20, 25);
-        assert_eq!(segs(&iv, 0, 25), vec![(0, 25, true)]);
-    }
-
-    #[test]
-    fn partial_overwrite_leaves_base_gap() {
-        // Author [0,4) and [8,12); [4,8) stays base. A read of [0,12) must stitch
-        // authored / base / authored in order.
-        let mut iv = Intervals::default();
-        iv.add(0, 4);
-        iv.add(8, 12);
-        assert_eq!(
-            segs(&iv, 0, 12),
-            vec![(0, 4, true), (4, 8, false), (8, 12, true)]
-        );
-    }
-
-    #[test]
-    fn overlapping_writes_coalesce() {
-        let mut iv = Intervals::default();
-        iv.add(0, 10);
-        iv.add(5, 15);
-        iv.add(14, 20);
-        assert_eq!(segs(&iv, 0, 20), vec![(0, 20, true)]);
-    }
-
-    #[test]
-    fn segments_clamp_to_request_window() {
-        let mut iv = Intervals::default();
-        iv.add(0, 100);
-        // A sub-window of one big authored range is a single authored segment.
-        assert_eq!(segs(&iv, 20, 50), vec![(20, 50, true)]);
-        // A window entirely outside any authored range is all base.
-        let empty = Intervals::default();
-        assert_eq!(segs(&empty, 0, 8), vec![(0, 8, false)]);
-    }
-
-    #[test]
-    fn truncate_shrink_drops_tail() {
-        // Grow-then-shrink: clip removes/truncates authored ranges past the end.
-        let mut iv = Intervals::default();
-        iv.add(0, 100);
-        iv.clip(40);
-        assert_eq!(segs(&iv, 0, 40), vec![(0, 40, true)]);
-        // Authored ranges wholly past the new end disappear.
-        let mut iv2 = Intervals::default();
-        iv2.add(0, 10);
-        iv2.add(50, 60);
-        iv2.clip(40);
-        assert_eq!(segs(&iv2, 0, 40), vec![(0, 10, true), (10, 40, false)]);
-    }
-
-    #[test]
-    fn truncate_extend_authors_zero_tail() {
-        // setattr grow claims the new tail as authored (defined zeros), so commit
-        // never pulls it from the base.
-        let mut iv = Intervals::default();
-        iv.add(0, 10); // base content authored over
-        let old_len = 10u64;
-        let new_len = 30u64;
-        iv.add(old_len, new_len);
-        assert_eq!(segs(&iv, 0, 30), vec![(0, 30, true)]);
     }
 
     fn pending_revision(dir: &TestDir, bytes: &[u8], complete: bool) -> PendingRevision {
