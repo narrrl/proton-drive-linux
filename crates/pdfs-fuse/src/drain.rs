@@ -80,6 +80,13 @@ pub(crate) struct DrainState {
     /// The node an upload has just put on Drive, from when the drain lets go
     /// of its blob until the tree has the node (`docs/BUGS.md` B170).
     pub(crate) landed: Arc<Mutex<HashMap<NodeUid, Node>>>,
+    /// A landed create's placeholder stamp, by the uid Drive gave it, with the
+    /// revision the create sealed. A write released while the create landed
+    /// can be based on the placeholder: a local mtime and no revision id. Its
+    /// bytes are the ones the create sent, so the drain reads that base as the
+    /// sealed revision ([`placeholder_base`]). Dropped once a later upload of
+    /// the file lands.
+    pub(crate) placeholders: Arc<Mutex<HashMap<NodeUid, Baseline>>>,
     /// How long this node's last upload actually took, in milliseconds, with
     /// the time it was measured for eviction. Feeds
     /// [`Core::revision_debounce`]: a file that takes 30 seconds to send needs
@@ -110,6 +117,7 @@ impl DrainState {
             unadopted: Arc::new(Mutex::new(HashMap::new())),
             sealed_unread: Arc::new(Mutex::new(HashMap::new())),
             landed: Arc::new(Mutex::new(HashMap::new())),
+            placeholders: Arc::new(Mutex::new(HashMap::new())),
             upload_times: Arc::new(Mutex::new(HashMap::new())),
             upload_cancel: Arc::new(Mutex::new(HashMap::new())),
             landing_uploads: Arc::new(AtomicU64::new(0)),
@@ -872,6 +880,29 @@ fn revision_changed(base: &Baseline, node: &Node) -> Option<String> {
             base.size, base.mtime
         )
     })
+}
+
+/// `base` as the revision it was made against, for [`revision_changed`].
+///
+/// A base with no revision id whose stamp is a landed create's placeholder
+/// (`placeholder`) was taken from that placeholder by a write released while
+/// the create landed: the release had taken its handle out of the tree, so the
+/// rebase onto the landed node missed it, and it queued after the queued writes
+/// were rebased. The placeholder's bytes are the ones the create sent, so the
+/// base is the revision the create sealed. Compared by its local mtime instead,
+/// the write was a conflict copy of the file's own create whenever the server
+/// stamped the create a second later than the placeholder.
+fn placeholder_base(base: &Baseline, placeholder: Option<&Baseline>) -> Baseline {
+    match placeholder {
+        Some(created)
+            if base.revision_id.is_none()
+                && created.mtime == base.mtime
+                && created.size == base.size =>
+        {
+            created.clone()
+        }
+        _ => base.clone(),
+    }
 }
 
 /// Whether a queued write that found the remote moved on ([`revision_changed`]
@@ -1806,6 +1837,27 @@ mod tests {
         let base = baseline(100, 40, Some("rev-A"));
         let remote = file_node(100, 40, Some("rev-B"));
         assert!(revision_changed(&base, &remote).is_some());
+    }
+
+    /// A write released while its file's create landed keeps the
+    /// placeholder's base: the local mtime, a second before the server's
+    /// stamp, and no revision id.
+    #[test]
+    fn a_write_based_on_a_landed_create_placeholder_is_not_a_conflict() {
+        let placeholder = baseline(1_795_799_834, 28, None);
+        let created = baseline(1_795_799_834, 28, Some("rev-create"));
+        let landed = file_node(1_795_799_835, 28, Some("rev-create"));
+        assert!(revision_changed(&placeholder, &landed).is_some());
+        let base = placeholder_base(&placeholder, Some(&created));
+        assert_eq!(revision_changed(&base, &landed), None);
+        // Another device writing over the create is still a conflict.
+        let edited = file_node(1_795_799_835, 28, Some("theirs"));
+        assert!(revision_changed(&base, &edited).is_some());
+        // A base with a revision of its own, or another stamp, is left alone.
+        let other = baseline(1_795_799_830, 28, None);
+        assert_eq!(placeholder_base(&other, Some(&created)), other);
+        let revised = baseline(1_795_799_834, 28, Some("older"));
+        assert_eq!(placeholder_base(&revised, Some(&created)), revised);
     }
 
     /// The reported shape (docs/BUGS.md B113): a downloader creates a file

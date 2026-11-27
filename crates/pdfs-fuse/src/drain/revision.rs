@@ -116,6 +116,8 @@ impl Core {
         if node.trashed {
             return Ok(Some("the file was trashed remotely".into()));
         }
+        let placeholder = self.drain.placeholders.lock().get(uid).cloned();
+        let base = &placeholder_base(base, placeholder.as_ref());
         let Some(reason) = revision_changed(base, &node) else {
             return Ok(None);
         };
@@ -511,6 +513,8 @@ impl Core {
         if fetched.is_ok() {
             self.drain.sealed_unread.lock().remove(uid);
         }
+        // This upload went after any write based on the create's placeholder.
+        self.drain.placeholders.lock().remove(uid);
         let node = match fetched {
             Ok(Some(node)) => node,
             // Trashed or deleted under us: the tree will hear it from the event
