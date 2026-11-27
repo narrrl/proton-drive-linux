@@ -12,11 +12,14 @@
 //! authored, the released write that waits for its upload, and directory
 //! handles; what the mount accepted but has not sent to Drive yet
 //! ([`writes`]); the POSIX rules on names and on what a rename may replace
-//! ([`names`]); and which nodes a folder lists ([`nodes`]).
+//! ([`names`]); which nodes a folder lists ([`nodes`]); and two services
+//! behind host ports: the open files from open to close ([`files`]), and
+//! create, mkdir, unlink, rmdir and rename ([`namespace`]).
 
 pub mod files;
 pub mod ids;
 pub mod names;
+pub mod namespace;
 pub mod nodes;
 pub mod open;
 pub mod tree;

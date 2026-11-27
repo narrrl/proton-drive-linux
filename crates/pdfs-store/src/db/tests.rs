@@ -8381,3 +8381,42 @@ fn a_read_without_a_reader_connection_fails_instead_of_waiting_on_the_writer() {
         "the read must fail, not queue behind the writer"
     );
 }
+
+/// A replacing rename's journal entry outlives the run that wrote it, and is
+/// gone once ended; other `sync_state` keys are not taken for entries.
+#[test]
+fn a_replace_intent_is_kept_until_it_ends() {
+    let db = Db::open_in_memory().unwrap();
+    let intent = ReplaceIntent {
+        source_uid: "vol~src".into(),
+        victim_uid: "vol~victim".into(),
+        new_parent_uid: "vol~dir".into(),
+        new_name: "report.odt".into(),
+        started_ms: 7,
+        run: 0,
+    };
+    db.begin_replace(&intent).unwrap();
+    db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES ('replacement', 'x'), ('replace;', 'y')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    // This run's own replace is in progress, not cut off.
+    assert!(db.open_replaces().unwrap().is_empty());
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE sync_state SET value = json_set(value, '$.run', 1) WHERE key = 'replace:vol~src'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let open = db.open_replaces().unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].victim_uid, intent.victim_uid);
+    db.end_replace("vol~src").unwrap();
+    assert!(db.open_replaces().unwrap().is_empty());
+}

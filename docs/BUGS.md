@@ -109,6 +109,7 @@ a live account since.
 | Entry | Title |
 |---|---|
 | [B303](#b303--a-file-made-where-a-withdrawn-create-was-listed-refuses-every-write) | A file made where a withdrawn create was listed refuses every write |
+| [B302](#b302--a-stop-during-a-replacing-rename-leaves-the-replaced-file-in-the-trash) | A stop during a replacing rename leaves the replaced file in the trash |
 | [B301](#b301--two-overlapping-fsyncs-can-leave-the-older-ones-record-on-disk) | Two overlapping fsyncs can leave the older one's record on disk |
 | [B300](#b300--a-read-during-a-release-can-be-served-the-revision-the-write-replaced) | A read during a release can be served the revision the write replaced |
 | [B299](#b299--a-synced-folder-in-the-trash-blocks-attaching-any-other-folder) | A synced folder in the trash blocks attaching any other folder |
@@ -432,6 +433,44 @@ the kernel's entry for its name. Both places that trash a withdrawn create's nod
 **Verified:** `a_listing_taken_while_a_withdrawn_create_lands_does_not_keep_it` holds the answer to
 a create, deletes the file, refreshes the folder, then lets the answer through. It fails without
 the fix and passes with it.
+### B302 — A stop during a replacing rename leaves the replaced file in the trash
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-27, from the review of the mounted filesystem in `FUSE.md`, while moving the
+namespace operations toward `pdfs-vfs` (step 5 of `docs/ARCHITECTURE.md`). It was not seen in a
+run.
+**Where:** `serve_rename` and `ReplaceJournal` in `crates/pdfs-fuse/src/filesystem.rs`;
+`Recovery::settle_replaces` in `crates/pdfs-fuse/src/recovery.rs`; `Db::begin_replace` in
+`crates/pdfs-store/src/db/replace.rs`; the settle rules in `crates/pdfs-vfs/src/namespace.rs`
+
+**Repro:** Save a file with an editor that writes a temporary file and renames it over the
+original. Stop the daemon (a crash, a power loss or a `kill -9`) after the original has gone to the
+trash and before the rename. Online, the original is in Drive's trash and the new content is under
+the temporary name. With local-first or offline, the queue holds the original's trash and no rename,
+so the next start sends the trash. Either way, the file is gone from its name.
+
+**Cause.** Drive has no rename that replaces its destination, so `rename(2)` over an existing name
+removes the destination first and renames the source second (B13). A failure between the two steps
+puts the destination back (`restore_replaced`), but a stop between them left nothing to say that a
+rename was half done.
+
+**Fix.** A replacing rename writes a journal entry before it removes the destination, with a synced
+commit, and removes the entry when it returns, whichever way it returns. The entry lives in
+`sync_state`, so the schema does not change. On the next start, and on the drain's idle passes
+while Drive could not be asked, each entry from an earlier run is settled:
+- the source's rename, or the create it rewrote, is queued: the rename stands;
+- the destination's trash is queued and the rename is not: the queued trash is dropped;
+- otherwise Drive is asked. If the source has its new name, the rename stands. If the destination is
+  in the trash, it is restored. If the destination never got there, nothing is undone.
+
+Entries are tagged with the opening of the database that wrote them, so a rename in progress is
+never settled under it. A source created here whose create landed under the rename is known to Drive
+by a uid the entry does not have; it is logged and left as it is.
+
+**Verified:** `a_replace_cut_off_after_its_trash_brings_the_replaced_file_back` and
+`a_replace_cut_off_after_queueing_its_trash_keeps_the_replaced_file` start a daemon on the state a
+stop leaves, and fail without the settle. They write that state directly; no test stops a daemon in
+the middle of a rename.
 
 ---
 

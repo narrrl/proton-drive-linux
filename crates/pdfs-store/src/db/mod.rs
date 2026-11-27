@@ -44,6 +44,7 @@ mod nodes;
 mod ops;
 mod photos;
 mod pins;
+mod replace;
 mod share_access;
 mod state;
 mod sync;
@@ -63,6 +64,7 @@ pub use ops::{
 };
 pub use photos::{StoredPhoto, StoredPlace, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN, TimelineRow};
 pub use pins::PinRow;
+pub use replace::ReplaceIntent;
 pub use sync::{SavedWalk, SavedWalkDir, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 pub use trash::StoredTrash;
 
@@ -108,6 +110,10 @@ pub struct Db {
     /// to be owned here rather than by `open`'s stack frame. `None` for
     /// in-memory databases, which nothing else can reach.
     _single_writer: Option<File>,
+    /// Tells this opening of the database from earlier ones, so that journal
+    /// entries a previous run left behind can be told from this run's own
+    /// (see `replace`).
+    run: u64,
 }
 
 /// Idle read-only connections, opened on demand and kept for reuse.
@@ -294,6 +300,7 @@ impl Db {
                 idle: Mutex::new(Vec::new()),
             }),
             _single_writer: single_writer,
+            run: next_run(),
         };
         // A drain claim names a worker thread in the process that took it, and
         // the single-writer lock above says that process is not running. Any
@@ -384,6 +391,7 @@ impl Db {
             conn: Ranked::new(Rank::DbWriter, conn),
             readers: None,
             _single_writer: None,
+            run: next_run(),
         };
         db.migrate()?;
         Ok(db.into_conn())
@@ -408,6 +416,7 @@ impl Db {
             conn: Ranked::new(Rank::DbWriter, conn),
             readers: None,
             _single_writer: None,
+            run: next_run(),
         };
         db.migrate()?;
         Ok(db)
@@ -427,6 +436,25 @@ impl Db {
 fn is_in_memory(path: &Path) -> bool {
     let p = path.as_os_str();
     p == ":memory:" || p.is_empty()
+}
+
+/// A value no other opening of a database has used: the time in nanoseconds,
+/// made unique within this process by a counter.
+fn next_run() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last + 1);
+        match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => last = seen,
+        }
+    }
 }
 
 /// Take the single-instance write lock for the database at `path`.

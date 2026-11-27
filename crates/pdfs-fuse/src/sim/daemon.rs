@@ -479,6 +479,7 @@ mod tests {
     use super::*;
     use crate::sim::fake_drive::{Entry, FakeDrive, Faults};
     use pdfs_core::control::{RefreshScope, SyncIssue};
+    use proton_drive_rs::proton_sdk::ids::NodeUid;
     use std::collections::BTreeMap;
 
     #[test]
@@ -4616,5 +4617,119 @@ mod tests {
         );
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The state a stop leaves between the two steps of a replacing rename
+    /// sent to Drive inline: the replaced file in the trash, the source under
+    /// its old name, and the journal entry. The next start puts the replaced
+    /// file back (B302).
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_replace_cut_off_after_its_trash_brings_the_replaced_file_back() {
+        let drive = FakeDrive::new();
+        let dir = scratch("replace-cut-trash");
+        // Only this test's daemons in the log a failure prints.
+        take_logged();
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::write(daemon.mountpoint.join("report.odt"), b"old").unwrap();
+        std::fs::write(daemon.mountpoint.join("report.odt.tmp"), b"new").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            let tree = drive.tree();
+            tree.contains_key("report.odt") && tree.contains_key("report.odt.tmp")
+        }));
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+
+        let victim = drive.lookup("report.odt").unwrap();
+        let source = drive.lookup("report.odt.tmp").unwrap();
+        cut_off_replace(&dir, &source, &victim, &drive.root(), "report.odt");
+        drive.device().trash("report.odt");
+
+        // Without the listing lag: a lagging read shows the trash made just
+        // above as not done yet, and a restart quicker than the lag then left
+        // the file in the trash as never removed. A real stop comes long
+        // after its own trash.
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::none())).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                drive.tree().get("report.odt") == Some(&Entry::File(Arc::new(b"old".to_vec())))
+            }),
+            "the replaced file came back: {:?}\n{}",
+            drive.tree(),
+            take_logged().join("\n")
+        );
+        assert!(drive.tree().contains_key("report.odt.tmp"));
+        assert!(wait_until(Duration::from_secs(30), || {
+            std::fs::read(daemon.mountpoint.join("report.odt")).is_ok_and(|b| b == b"old")
+        }));
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let db = Db::open(&dir.join("pdfs.db")).unwrap();
+        assert!(db.open_replaces().unwrap().is_empty());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The state a stop leaves between the two steps of a queued replacing
+    /// rename: the replaced file's trash queued, the rename not. The next
+    /// start drops the queued trash, so the file is never trashed (B302).
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_replace_cut_off_after_queueing_its_trash_keeps_the_replaced_file() {
+        let drive = FakeDrive::new();
+        let dir = scratch("replace-cut-queue");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::write(daemon.mountpoint.join("report.odt"), b"old").unwrap();
+        std::fs::write(daemon.mountpoint.join("report.odt.tmp"), b"new").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            let tree = drive.tree();
+            tree.contains_key("report.odt") && tree.contains_key("report.odt.tmp")
+        }));
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+
+        let victim = drive.lookup("report.odt").unwrap();
+        let source = drive.lookup("report.odt.tmp").unwrap();
+        cut_off_replace(&dir, &source, &victim, &drive.root(), "report.odt");
+        let db = Db::open(&dir.join("pdfs.db")).unwrap();
+        db.replace_ops_with_trash(&victim.to_string(), "report.odt", 1)
+            .unwrap();
+        drop(db);
+
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            std::fs::read(daemon.mountpoint.join("report.odt")).is_ok_and(|b| b == b"old")
+        }));
+        // Long enough for the drain to have sent a trash it still held.
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            drive.tree().contains_key("report.odt"),
+            "the replaced file stayed: {:?}",
+            drive.tree()
+        );
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let db = Db::open(&dir.join("pdfs.db")).unwrap();
+        assert!(db.open_replaces().unwrap().is_empty());
+        assert!(!db.has_pending_op(&victim.to_string(), "trash").unwrap());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write the journal entry of a replacing rename, as an earlier run would
+    /// have before it removed the victim.
+    fn cut_off_replace(
+        dir: &Path,
+        source: &NodeUid,
+        victim: &NodeUid,
+        parent: &NodeUid,
+        name: &str,
+    ) {
+        let db = Db::open(&dir.join("pdfs.db")).unwrap();
+        db.begin_replace(&pdfs_store::db::ReplaceIntent {
+            source_uid: source.to_string(),
+            victim_uid: victim.to_string(),
+            new_parent_uid: parent.to_string(),
+            new_name: name.to_owned(),
+            started_ms: 1,
+            run: 0,
+        })
+        .unwrap();
     }
 }
