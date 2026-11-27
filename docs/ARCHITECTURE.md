@@ -51,6 +51,7 @@ graph TD
 | [`pdfs-store`](../crates/pdfs-store) | The SQLite schema and queries (`db/`), the content cache (`cache`) |
 | [`pdfs-drive`](../crates/pdfs-drive) | The `DriveApi` seam over the SDK, the call counter (`counted`), and `FakeDrive` for the simulations |
 | [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes (`mirror`), split into the walks (`mirror::walk`), applying a plan (`mirror::apply`) and the push pass (`mirror::push`), its engine thread (`mirror::engine`), its reads and writes of the local disk in one module (`mirror::local`), and the parts with no I/O: planner, pass model and pass trace. It owns its state (`SyncParts`), reads and writes its tables only through `SyncStore`, and reaches the daemon only through `SyncHost` |
+| [`pdfs-vfs`](../crates/pdfs-vfs) | The mounted-files service, with no kernel adapter: so far the open file (`open`): a write handle's scratch file and authored ranges, the released write waiting for its upload, and typed write errors the FUSE adapter maps to errno |
 | [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), the tree (`state`), finding nodes (`resolve`), folder listings and file sizes (`listing`, `sizes`), reads (`reads`), queueing and the drain (`enqueue`, `queue`, `drain`, `upload`), calls sent straight to Drive (`remote`), requests by path (`requests`), startup recovery (`recovery`), pins, search, trash, the shared tree (`shared`), the link state (`link`), remote events (`background`), the daemon's side of the sync engine (`sync`, which implements `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
 | [`pdfs-daemon`](../crates/pdfs-daemon) | The daemon's composition root: waits for a session, opens the database and the content cache, resumes the session and mounts, then remounts or retries with a backoff and records each failure |
 | [`pdfs-cli`](../crates/pdfs-cli) | The `pdfs` binary. `pdfs daemon` runs `pdfs_daemon::run` in-process; every other command is a control-socket client |
@@ -846,6 +847,11 @@ queued writes and the drain, listings and sizes, path requests, and the registry
 mounts. Step 5 turns that into the `pdfs-vfs` service. `Core` also implements the services'
 host ports and builds each service on demand, which moves to `pdfs-daemon` once the services no
 longer need the tree.
+
+Step 5 has started. `pdfs-vfs` holds the open file: `WriteHandle` (a handle's scratch file and
+the ranges written through it), `PendingRevision` (a released write waiting for its upload) and
+`stage_write`, which writes the scratch file and reports a full disk as a typed error rather than an
+errno. It depends on no kernel or GUI crate; `cargo tree -p pdfs-vfs` shows neither.
 
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and

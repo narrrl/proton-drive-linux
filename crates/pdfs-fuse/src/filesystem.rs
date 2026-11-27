@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::state::DirListing;
+use pdfs_vfs::open::WriteError;
 
 impl Filesystem for ProtonFs {
     /// Negotiate kernel-side behaviour once, before any other callback.
@@ -1658,17 +1659,21 @@ impl ProtonFs {
                 None => return Err(Errno::EBADF),
             }
         };
-        if let Err(e) = file.write_all_at(data, offset) {
-            error!(ino, fh, error = %e, "scratch write failed");
+        match pdfs_vfs::open::stage_write(&file, offset, data) {
+            Ok(()) => {}
             // A full local disk is not a broken file: answer `ENOSPC` so the
             // application can say so (and so `cp`/editors take their own
             // out-of-space path), and free what the cache is holding — the
             // scratch file the next write goes to shares that filesystem.
-            if e.raw_os_error() == Some(libc::ENOSPC) {
+            Err(WriteError::NoSpace) => {
+                error!(ino, fh, "scratch write failed: no space");
                 self.core.cache.emergency_evict();
                 return Err(Errno::ENOSPC);
             }
-            return Err(Errno::EIO);
+            Err(WriteError::Io(e)) => {
+                error!(ino, fh, error = %e, "scratch write failed");
+                return Err(Errno::EIO);
+            }
         }
         let new_len = {
             let mut st = self.core.state();

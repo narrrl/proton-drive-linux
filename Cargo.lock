@@ -3729,6 +3729,7 @@ dependencies = [
  "pdfs-drive",
  "pdfs-store",
  "pdfs-sync",
+ "pdfs-vfs",
  "proton-drive-rs",
  "proton-gallery-app-rs",
  "proton-gallery-rs",
@@ -3798,6 +3799,16 @@ dependencies = [
  "sha1 0.11.0",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "pdfs-vfs"
+version = "3.10.0"
+dependencies = [
+ "libc",
+ "pdfs-drive",
+ "pdfs-store",
+ "proton-drive-rs",
 ]
 
 [[package]]

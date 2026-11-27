@@ -42,7 +42,6 @@ use tracing::{debug, error, info, warn};
 
 use super::link::{self, is_network_error};
 use super::photos::sha1_of;
-use super::state::{Intervals, PendingRevision};
 use super::transfers::CountingReader;
 use super::{
     Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, DRAIN_REVISION_DEBOUNCE,
@@ -50,6 +49,7 @@ use super::{
     is_already_exists, is_gone, is_local_uid_str, media_type_for, node_revision_id, node_size,
     now_millis, now_secs, parse_node_uid,
 };
+use pdfs_vfs::open::{Intervals, PendingRevision};
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 
@@ -1135,9 +1135,9 @@ fn placed_in(st: &crate::state::State, uid: &NodeUid) -> Option<(String, Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::WriteHandle;
     use pdfs_core::Access;
     use pdfs_store::db::Db;
+    use pdfs_vfs::open::WriteHandle;
     use proton_drive_rs::NodeKind;
     use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
     use std::cell::Cell;

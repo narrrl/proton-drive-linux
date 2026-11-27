@@ -93,8 +93,8 @@ mod enqueue;
 use drive::{DriveApi, RevisionRead};
 use pdfs_core::timestamp::now_secs;
 use pdfs_drive as drive;
-use pdfs_drive::node_revision_id;
 pub(crate) use pdfs_drive::{media_type_for, node_content_sha1, parse_uid, remote_name_is_safe};
+use pdfs_drive::{node_revision_id, node_size};
 #[cfg(test)]
 use pdfs_sync::naming::{conflict_label, conflict_label_of, conflict_name_as};
 use pdfs_sync::naming::{conflict_name, this_hostname};
@@ -150,8 +150,9 @@ pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
     SecondaryInsertRejection, SecondaryMount, clear_stale_mount, fuse_connection_id, spawn_session,
 };
+use pdfs_vfs::open::{Intervals, PendingRevision, WriteHandle};
 use reads::STREAM_BYPASS_MIN;
-use state::{Entry, Intervals, PendingRevision, State, StateGuard, WriteHandle};
+use state::{Entry, State, StateGuard};
 pub use systemd::{
     idle_sleep, status as notify_status, stretch_watchdog_for_startup, wait_for_restart,
 };
@@ -1858,17 +1859,6 @@ fn is_unrevised(node: &Node) -> bool {
     )
 }
 
-fn node_size(node: &Node) -> u64 {
-    match &node.kind {
-        NodeKind::Folder => 0,
-        NodeKind::File {
-            claimed_size,
-            total_size_on_storage,
-            ..
-        } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
-    }
-}
-
 /// `call`, failed with a remote error once it has run for
 /// [`TRASH_CALL_TIMEOUT`].
 async fn within_trash_call<T>(what: &str, call: impl Future<Output = T>) -> CoreResult<T> {
@@ -2410,8 +2400,8 @@ mod tests {
     use super::echoes::{SELF_CHANGE_TTL_MS, note_self_change, take_self_change};
     use super::trash::{expand_restore, first_seen_in_trash};
     use super::{
-        Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, RootListingSnapshot,
-        ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan, accepted_share_provenance,
+        Access, AccessFlags, Errno, HashMap, PendingRevision, RootListingSnapshot, ShareId,
+        SharedWithMeItem, StateRegistry, VirtualRootPlan, accepted_share_provenance,
         conflict_label, conflict_label_of, conflict_name, conflict_name_as,
         copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, off_the_runtime,
         orphan_past_retention, parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
@@ -3362,11 +3352,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Flatten `segments` into a readable form for assertions.
-    fn segs(iv: &Intervals, start: u64, end: u64) -> Vec<(u64, u64, bool)> {
-        iv.segments(start, end)
-    }
-
     /// The conflict copy has to stay openable, so the extension survives — and
     /// the shape matches the sync engine's `conflict_path` so the two features
     /// name the same situation the same way.
@@ -3405,76 +3390,6 @@ mod tests {
         assert_eq!(conflict_label_of("a/b) c"), "a-b--c");
         assert_eq!(conflict_label_of("  "), "");
         assert_eq!(conflict_label_of(&"x".repeat(40)).len(), 32);
-    }
-
-    #[test]
-    fn append_merges_into_one_run() {
-        // Sequential writes (an append) coalesce into a single authored range.
-        let mut iv = Intervals::default();
-        iv.add(0, 10);
-        iv.add(10, 20);
-        iv.add(20, 25);
-        assert_eq!(segs(&iv, 0, 25), vec![(0, 25, true)]);
-    }
-
-    #[test]
-    fn partial_overwrite_leaves_base_gap() {
-        // Author [0,4) and [8,12); [4,8) stays base. A read of [0,12) must stitch
-        // authored / base / authored in order.
-        let mut iv = Intervals::default();
-        iv.add(0, 4);
-        iv.add(8, 12);
-        assert_eq!(
-            segs(&iv, 0, 12),
-            vec![(0, 4, true), (4, 8, false), (8, 12, true)]
-        );
-    }
-
-    #[test]
-    fn overlapping_writes_coalesce() {
-        let mut iv = Intervals::default();
-        iv.add(0, 10);
-        iv.add(5, 15);
-        iv.add(14, 20);
-        assert_eq!(segs(&iv, 0, 20), vec![(0, 20, true)]);
-    }
-
-    #[test]
-    fn segments_clamp_to_request_window() {
-        let mut iv = Intervals::default();
-        iv.add(0, 100);
-        // A sub-window of one big authored range is a single authored segment.
-        assert_eq!(segs(&iv, 20, 50), vec![(20, 50, true)]);
-        // A window entirely outside any authored range is all base.
-        let empty = Intervals::default();
-        assert_eq!(segs(&empty, 0, 8), vec![(0, 8, false)]);
-    }
-
-    #[test]
-    fn truncate_shrink_drops_tail() {
-        // Grow-then-shrink: clip removes/truncates authored ranges past the end.
-        let mut iv = Intervals::default();
-        iv.add(0, 100);
-        iv.clip(40);
-        assert_eq!(segs(&iv, 0, 40), vec![(0, 40, true)]);
-        // Authored ranges wholly past the new end disappear.
-        let mut iv2 = Intervals::default();
-        iv2.add(0, 10);
-        iv2.add(50, 60);
-        iv2.clip(40);
-        assert_eq!(segs(&iv2, 0, 40), vec![(0, 10, true), (10, 40, false)]);
-    }
-
-    #[test]
-    fn truncate_extend_authors_zero_tail() {
-        // setattr grow claims the new tail as authored (defined zeros), so commit
-        // never pulls it from the base.
-        let mut iv = Intervals::default();
-        iv.add(0, 10); // base content authored over
-        let old_len = 10u64;
-        let new_len = 30u64;
-        iv.add(old_len, new_len);
-        assert_eq!(segs(&iv, 0, 30), vec![(0, 30, true)]);
     }
 
     fn pending_revision(dir: &TestDir, bytes: &[u8], complete: bool) -> PendingRevision {
