@@ -18,6 +18,11 @@ use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::{ProtonApiError, ProtonError};
 use tracing::{debug, info, warn};
 
+use std::sync::Arc;
+
+use pdfs_core::shutdown::Shutdown;
+use pdfs_drive::DriveApi;
+
 use crate::{Core, ONLINE_PROBE_MAX, ONLINE_PROBE_MIN};
 
 /// How long a remote call a FUSE handler is waiting on may take before the link
@@ -87,6 +92,75 @@ impl Link {
             session_expired: AtomicBool::new(session_expired),
             ..Default::default()
         }
+    }
+
+    /// Whether the mount currently believes Proton is reachable.
+    pub(crate) fn is_online(&self) -> bool {
+        self.online.load(Ordering::Relaxed)
+    }
+
+    /// Whether Proton refused the session itself, so the mount stays offline
+    /// until the user signs in again.
+    pub(crate) fn session_expired(&self) -> bool {
+        self.session_expired.load(Ordering::Relaxed)
+    }
+
+    /// Flip the mount offline and wake the probe. Only the first caller of an
+    /// outage logs it; the rest are the same outage.
+    pub(crate) fn go_offline(&self, what: &str, error: &dyn std::fmt::Display) {
+        let mut lost_at = self.lost_at.lock();
+        if self.online.swap(false, Ordering::Relaxed) {
+            *lost_at = Some(Instant::now());
+            warn!(during = what, %error,
+                  "lost the connection to Proton; queueing changes until it returns");
+            self.changed.notify_all();
+        }
+    }
+
+    /// Flip the mount back online and wake everything waiting for it.
+    fn go_online(&self) {
+        let mut lost_at = self.lost_at.lock();
+        self.online.store(true, Ordering::Relaxed);
+        match lost_at.take() {
+            Some(since) => {
+                info!(
+                    offline_secs = since.elapsed().as_secs(),
+                    "connection to Proton is back"
+                )
+            }
+            None => info!("back online"),
+        }
+        self.changed.notify_all();
+    }
+
+    /// Wait up to `budget` for the link to come back. Returns whether it is up.
+    pub(crate) fn wait_online(&self, budget: Duration, shutdown: &Shutdown) -> bool {
+        let deadline = Instant::now() + budget;
+        let mut lost_at = self.lost_at.lock();
+        while !self.is_online() {
+            if shutdown.is_stopping() || self.changed.wait_until(&mut lost_at, deadline).timed_out()
+            {
+                return self.is_online();
+            }
+        }
+        true
+    }
+
+    /// Wait while the link is up. Returns `false` if the daemon is stopping.
+    fn wait_offline(&self, shutdown: &Shutdown) -> bool {
+        let mut lost_at = self.lost_at.lock();
+        while self.is_online() {
+            if shutdown.is_stopping() {
+                return false;
+            }
+            self.changed.wait_for(&mut lost_at, IDLE_CHECK);
+        }
+        true
+    }
+
+    /// When the current outage began, if the link is down.
+    fn lost_at(&self) -> Option<Instant> {
+        *self.lost_at.lock()
     }
 }
 
@@ -160,7 +234,7 @@ fn next_probe_delay(delay: Duration, outage: Duration) -> Duration {
 impl Core {
     /// Whether the mount currently believes Proton is reachable.
     pub(crate) fn is_online(&self) -> bool {
-        self.link.online.load(Ordering::Relaxed)
+        self.link.is_online()
     }
 
     /// Whether a namespace change through the mount goes to Drive inside the
@@ -195,7 +269,7 @@ impl Core {
     /// Whether Proton refused the session itself, so nothing reaches it until
     /// the user signs in again.
     pub(crate) fn session_expired(&self) -> bool {
-        self.link.session_expired.load(Ordering::Relaxed)
+        self.link.session_expired()
     }
 
     /// Report a failed remote call. Returns whether it failed for want of a
@@ -239,65 +313,14 @@ impl Core {
         self.mark_offline(what, error);
     }
 
-    /// Flip the mount offline and wake the probe. Only the first caller of an
-    /// outage logs it; the rest are the same outage.
+    /// Flip the mount offline and wake the probe. See [`Link::go_offline`].
     pub(crate) fn mark_offline(&self, what: &str, error: &dyn std::fmt::Display) {
-        let mut lost_at = self.link.lost_at.lock();
-        if self.link.online.swap(false, Ordering::Relaxed) {
-            *lost_at = Some(Instant::now());
-            warn!(during = what, %error,
-                  "lost the connection to Proton; queueing changes until it returns");
-            self.link.changed.notify_all();
-        }
-    }
-
-    /// Flip the mount back online, wake everything waiting for it, and let the
-    /// queue drain.
-    fn mark_online(&self) {
-        {
-            let mut lost_at = self.link.lost_at.lock();
-            self.link.online.store(true, Ordering::Relaxed);
-            match lost_at.take() {
-                Some(since) => {
-                    info!(
-                        offline_secs = since.elapsed().as_secs(),
-                        "connection to Proton is back"
-                    )
-                }
-                None => info!("back online"),
-            }
-            self.link.changed.notify_all();
-        }
-        self.relist_offline_listings();
-        // Anything written while offline is queued and waiting on exactly this,
-        // including ops that failed on the way down and are sitting out a
-        // backoff sized for a server that keeps refusing. Ops Drive refused
-        // keep theirs: the link was not why.
-        if let Err(e) = self.db.retry_unrefused_ops_now(crate::now_millis()) {
-            warn!(error = %e, "moving backed-off ops up after a reconnect failed");
-        }
-        self.wake_drain();
-        // Downloads for pins failed while the link was down, and the events
-        // that would have named the files are behind us (`docs/BUGS.md` B282).
-        self.recheck_all_pins();
+        self.link.go_offline(what, error);
     }
 
     /// Wait up to `budget` for the link to come back. Returns whether it is up.
     pub(crate) fn wait_online(&self, budget: Duration) -> bool {
-        let deadline = Instant::now() + budget;
-        let mut lost_at = self.link.lost_at.lock();
-        while !self.is_online() {
-            if self.shutdown.is_stopping()
-                || self
-                    .link
-                    .changed
-                    .wait_until(&mut lost_at, deadline)
-                    .timed_out()
-            {
-                return self.is_online();
-            }
-        }
-        true
+        self.link.wait_online(budget, &self.shutdown)
     }
 
     /// Wait out `interval` before a background poll of Proton, and while the
@@ -318,29 +341,103 @@ impl Core {
         }
     }
 
+    /// The online probe, with this daemon as its host.
+    pub(crate) fn online_probe(&self) -> OnlineProbe {
+        OnlineProbe {
+            link: self.link.clone(),
+            drive: self.drive.clone(),
+            rt: self.rt.clone(),
+            shutdown: self.shutdown.clone(),
+            host: Arc::new(self.clone()),
+        }
+    }
+
+    /// The link is back: let everything that waited on it go. Anything
+    /// written while offline is queued and waiting on exactly this, including
+    /// ops that failed on the way down and are sitting out a backoff sized
+    /// for a server that keeps refusing. Ops Drive refused keep theirs: the
+    /// link was not why.
+    fn after_reconnect(&self) {
+        self.relist_offline_listings();
+        if let Err(e) = self.db.retry_unrefused_ops_now(crate::now_millis()) {
+            warn!(error = %e, "moving backed-off ops up after a reconnect failed");
+        }
+        self.wake_drain();
+        // Downloads for pins failed while the link was down, and the events
+        // that would have named the files are behind us (`docs/BUGS.md` B282).
+        self.recheck_all_pins();
+    }
+}
+
+/// What the online probe needs from the rest of the daemon.
+pub(crate) trait LinkHost: Send + Sync {
+    /// Drive answered with the My Files root: store it in the tree and the
+    /// database before the mount goes online.
+    fn refresh_root(&self, root: &proton_drive_rs::Node);
+    /// The mount is online again: relist, retry and refetch what waited.
+    fn reconnected(&self);
+    /// Proton refused the session.
+    fn session_refused(&self, what: &str, error: &ProtonError);
+    /// Repair the primary root's share id, which an offline start could not.
+    fn repair_share_id(&self);
+}
+
+impl LinkHost for Core {
+    fn refresh_root(&self, root: &proton_drive_rs::Node) {
+        {
+            let root_ino = self.root_ino();
+            let mut st = self.state();
+            if let Some(e) = st.entries.get_mut(&root_ino) {
+                e.node = root.clone();
+            }
+        }
+        if let Err(e) = self.db.upsert_node(root) {
+            warn!(error = %e, "refresh root after reconnect failed");
+        }
+    }
+
+    fn reconnected(&self) {
+        self.after_reconnect();
+    }
+
+    fn session_refused(&self, what: &str, error: &ProtonError) {
+        self.mark_session_expired(what, error);
+    }
+
+    fn repair_share_id(&self) {
+        self.repair_primary_share_id(&self.primary_root_uid);
+    }
+}
+
+/// Watches the link for the life of the mount and probes it back while it is
+/// down. Holds the link, Drive, the runtime and the stop signal; it reaches
+/// the tree and the queue through [`LinkHost`].
+pub(crate) struct OnlineProbe {
+    link: Arc<Link>,
+    drive: Arc<dyn DriveApi>,
+    rt: tokio::runtime::Handle,
+    shutdown: Arc<Shutdown>,
+    host: Arc<dyn LinkHost>,
+}
+
+impl OnlineProbe {
     /// Watch the link for the life of the mount: sleep while it is up, and
     /// probe it back while it is down.
     ///
     /// A mount that started from the cache is down from the first moment; one
-    /// that started online goes down when [`Core::mark_offline`] says so.
-    pub(crate) fn run_online_probe(&self) {
+    /// that started online goes down when [`Link::go_offline`] says so.
+    pub(crate) fn run(&self) {
         // Only an offline start never had a chance to repair its share id.
-        let mut repair_share_id = !self.is_online();
+        let mut repair_share_id = !self.link.is_online();
         loop {
-            {
-                let mut lost_at = self.link.lost_at.lock();
-                while self.is_online() {
-                    if self.shutdown.is_stopping() {
-                        return;
-                    }
-                    self.link.changed.wait_for(&mut lost_at, IDLE_CHECK);
-                }
+            if !self.link.wait_offline(&self.shutdown) {
+                return;
             }
             if !self.probe_until_online() {
                 return;
             }
             if std::mem::take(&mut repair_share_id) {
-                self.repair_primary_share_id(&self.primary_root_uid);
+                self.host.repair_share_id();
             }
         }
     }
@@ -351,7 +448,7 @@ impl Core {
     /// A refused session is not probed: every probe would be refused the same
     /// way, forever (issue #35). The thread waits for the stop instead.
     fn probe_until_online(&self) -> bool {
-        let started = self.link.lost_at.lock().unwrap_or_else(Instant::now);
+        let started = self.link.lost_at().unwrap_or_else(Instant::now);
         let mut delay = if started.elapsed() < YOUNG_OUTAGE {
             PROBE_AFTER_DROP
         } else {
@@ -361,7 +458,7 @@ impl Core {
             if !self.shutdown.sleep(delay) {
                 return false;
             }
-            if self.session_expired() {
+            if self.link.session_expired() {
                 delay = ONLINE_PROBE_MAX;
                 continue;
             }
@@ -373,20 +470,12 @@ impl Core {
             });
             match probe {
                 Ok(root) => {
-                    {
-                        let root_ino = self.root_ino();
-                        let mut st = self.state();
-                        if let Some(e) = st.entries.get_mut(&root_ino) {
-                            e.node = root.clone();
-                        }
-                    }
-                    if let Err(e) = self.db.upsert_node(&root) {
-                        warn!(error = %e, "refresh root after reconnect failed");
-                    }
-                    self.mark_online();
+                    self.host.refresh_root(&root);
+                    self.link.go_online();
+                    self.host.reconnected();
                     return true;
                 }
-                Err(e) if session_revoked(&e) => self.mark_session_expired("online probe", &e),
+                Err(e) if session_revoked(&e) => self.host.session_refused("online probe", &e),
                 Err(e) => {
                     debug!(error = %e, ?delay, "online probe failed; still offline");
                     delay = next_probe_delay(delay, started.elapsed());

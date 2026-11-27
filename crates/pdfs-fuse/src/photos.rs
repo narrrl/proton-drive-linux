@@ -709,12 +709,32 @@ fn run_bounded(mut command: Command, timeout: Duration) -> Result<Vec<u8>, ToolE
         let _ = child.wait();
         return Err(ToolError::Unavailable);
     };
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).map(|_| output)
-    });
+    // Scoped, so the reader cannot outlive the call even when the child
+    // overruns and is killed.
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).map(|_| output)
+        });
+        let status = wait_bounded(&mut child, timeout);
+        let output = reader
+            .join()
+            .ok()
+            .and_then(Result::ok)
+            .ok_or(ToolError::Unavailable)?;
+        match status {
+            Some(true) => Ok(output),
+            Some(false) => Err(ToolError::Failed),
+            None => Err(ToolError::Unavailable),
+        }
+    })
+}
+
+/// Wait for `child` to exit, up to `timeout`, killing it past that. `None`
+/// when it overran or could not be waited for.
+fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> Option<bool> {
     let started = Instant::now();
-    let status = loop {
+    loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status.success()),
             Ok(None) if started.elapsed() < timeout => {
@@ -726,16 +746,6 @@ fn run_bounded(mut command: Command, timeout: Duration) -> Result<Vec<u8>, ToolE
                 break None;
             }
         }
-    };
-    let output = reader
-        .join()
-        .ok()
-        .and_then(Result::ok)
-        .ok_or(ToolError::Unavailable)?;
-    match status {
-        Some(true) => Ok(output),
-        Some(false) => Err(ToolError::Failed),
-        None => Err(ToolError::Unavailable),
     }
 }
 

@@ -479,10 +479,14 @@ both with `pdfs_core::search::relevance_score`, so the prompt can merge them int
 | Smaller helpers | `pdfs-localindex` (home index for search), `pdfs-pause` (ends a timed pause), `pdfs-similar` (similar photos, on request), `pdfs-diagnostics` |
 
 Long-running loops wait on one shared `Shutdown` signal instead of sleeping, so a stop joins them
-instead of leaving them behind (`docs/BUGS.md` B44). The mount starts its long-lived threads
-through `pdfs_core::lifecycle::Services`. Each one is started with its name and, if it blocks where
-the signal does not reach, the call that wakes it: the drain's condvar, the sync engine's `Stop`
-message, a connection to the control socket. A stop signals, wakes and joins them in reverse start
+instead of leaving them behind (`docs/BUGS.md` B44). Each long-lived thread is a
+`pdfs_core::lifecycle::Service`, defined in `pdfs-fuse/src/services.rs`. A service says what its
+thread is called, whether the mount can run without it, and, if it blocks where the signal does
+not reach, the call that wakes it: the drain's condvar, the sync engine's `Stop` message, a
+connection to the control socket. The mount builds the list and starts it through
+`Services::start`. A required service that cannot start fails the mount attempt, which is retried;
+an optional one (the sync engine, the event sampler, the supervisor, the inhibitor) is logged and
+skipped. A stop signals, wakes and joins them in reverse start
 order, up to one 10-second deadline, and names any that are still running at the end. A
 service can also be an async task on the runtime (`Services::spawn_task`): the event streams and
 the gallery refresh. A stop aborts such a task at its next `.await` and waits for it to end. These
@@ -496,7 +500,10 @@ re-date, a profile backup, a size upgrade) runs as a one-shot job:
 `ServiceBoard::spawn_job` starts it on a named thread and lists it until it ends. `pdfs
 diagnostics` shows the jobs running and how long each has run. Async work of the same kind (the
 trash, timeline and album refreshes a listing starts) goes through `ServiceBoard::spawn_task_job`
-and is listed the same way. Jobs are not joined on stop.
+and is listed the same way. Each control connection is a job too. A stop closes the board to new
+jobs, aborts the async ones and joins the thread jobs before the services, up to the same
+deadline. A long job checks the `Shutdown` signal between steps. Jobs used to be left running, and
+one still waiting on Drive when the runtime went away panicked on its next timer.
 
 ---
 
@@ -764,8 +771,9 @@ State that several owners share sits behind a narrow interface of its own:
 - `session::SessionCells` holds what belongs to one mount's FUSE session: whether it is the
   primary mount, its root inode, its kernel channel and whether it is up. An on-demand fork gets
   fresh cells from `SessionCells::fork`, and shares the rest of `Core`.
-- `link::Link` holds whether Drive answers, next to when the link went down. Code reads it through
-  `Core::is_online`.
+- `link::Link` holds whether Drive answers, next to when the link went down, and is the only
+  code that changes it: it flips the flag, logs the outage and wakes whoever waits. Code reads it
+  through `Core::is_online`.
 
 Some areas are services of their own rather than methods on `Core`. `sharing::Sharing` holds
 only the handles it calls (the client, Drive, the content cache, the transfer list and a read of
@@ -799,14 +807,45 @@ folders and on-demand mounts are still methods on `Core`.
 machines wrote, to offer their folders for restore. It needs nothing from the filesystem, so it
 has no host. Turning the offered folders into synced folders stays on `Core`.
 
+`maintenance::Maintenance` runs `VACUUM` and the deep integrity check as jobs, one at a time, and
+keeps the last check's findings.
+
+`search::Search` answers searches over the node and home indexes. It holds the database, the
+content cache, the on-demand mounts and the home indexer's busy flag.
+
+`recovery::Recovery` rebuilds the queue after a restart: the pending map, the staging area and
+writes fsynced before the stop. Its `RecoveryHost` port queues a recovered write. Rebuilding the
+tree stays on `Core`.
+
+The mount's background loops are services of their own too, each started from the list in
+`services.rs`:
+
+- `link::OnlineProbe` probes the link back while it is down. Its `LinkHost` port stores the root
+  Drive answered with, lets what waited on the link go (relisting, retrying backed-off ops,
+  waking the drain, rechecking pins), reports a refused session and repairs the root's share id.
+- `sweep::Sweeper` is the conflict sweep. Its `SweepHost` port asks whether a node is the
+  account's own, whether the mount is online, whether a node is busy in any mount and whether
+  the conflict listing can show a copy; it unhooks a trashed copy from every mount and adds
+  activity entries.
+- `keeper::PinKeeper` keeps pinned files current. Its `KeeperHost` port finds a node in the tree,
+  lists kept folders, describes a file as a pin keeps it and downloads it.
+- The inhibitor takes only the database and the stop signal.
+
+The drain workers, the control listener, the event sampler and the supervisor still take a whole
+`Core`. The drain is the write-back, which is part of the mounted-files service (step 5); the
+other three answer front ends with reports drawn from every area.
+
 The control socket answers each area's requests in a module of its own under `control/`:
 sharing, Photos, synced folders and devices, revisions, and the trash and cache. Each module
 exports a pattern macro naming its requests, and the main match hands them over in one arm, so
 the compiler still checks that every request has an answer. A module turns a path or a uid into a
 node once, then asks the service.
 
-What is left in `Core` is the tree, the database, the cache and the Drive client, which most
-owners use, plus single fields that belong to one module each.
+What is left in `Core` is the mounted-files side: the tree and its per-mount state, reads,
+queued writes and the drain, listings and sizes, path requests, and the registry of on-demand
+mounts. Step 5 turns that into the `pdfs-vfs` service. `Core` also implements the services'
+host ports and builds each service on demand, which moves to `pdfs-daemon` once the services no
+longer need the tree.
 
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and

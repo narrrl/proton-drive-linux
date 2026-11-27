@@ -6004,7 +6004,7 @@ since Sep 20, 13:13 · Resolved`. `find` showed all six copies still on disk, in
 journal showed the daemon mounting at 17:29:33, and the entries were stamped 17:30. That is the
 sweep's 30-second warmup.
 
-**Where:** `crates/pdfs-fuse/src/sweep.rs` (`flag_conflict`, `sweep_conflicts_once`),
+**Where:** `crates/pdfs-fuse/src/sweep.rs` (`flag_conflict`, `Sweeper::sweep_once`),
 `crates/pdfs-fuse/src/conflicts.rs` (`list_conflicts`), `crates/pdfs-fuse/src/control.rs`
 (`ResolveConflict`).
 

@@ -116,6 +116,14 @@ impl EventHub {
             .retain(|other| !Arc::ptr_eq(other, mailbox));
     }
 
+    /// Wake every subscription waiting on its mailbox, so it sees a stop
+    /// now rather than at its next heartbeat.
+    pub(crate) fn wake_all(&self) {
+        for mailbox in self.mailboxes.lock().iter() {
+            mailbox.ready.notify_one();
+        }
+    }
+
     fn has_subscribers(&self) -> bool {
         !self.mailboxes.lock().is_empty()
     }

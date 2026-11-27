@@ -86,7 +86,6 @@ mod attach;
 mod background;
 mod conflicts;
 mod control;
-use control::run_control_socket;
 mod devices;
 mod diagnostics;
 mod drain;
@@ -126,6 +125,7 @@ mod requests;
 mod resolve;
 mod revisions;
 mod search;
+mod services;
 mod shared;
 mod sharing;
 mod sizes;
@@ -142,7 +142,7 @@ use pdfs_core::transfers;
 mod upload;
 mod r#virtual;
 mod workers;
-use background::{forget_and_notify, run_event_sync, run_local_index, run_photos_event_sync};
+use background::{forget_and_notify, run_event_sync, run_photos_event_sync};
 use link::BATCH_CALL_TIMEOUT;
 pub(crate) use mount::is_stale_mount;
 pub use mount::prepare_mountpoint;
@@ -608,7 +608,7 @@ struct Core {
     /// that needs the database — so the handler acknowledges the request and a
     /// thread does the work, exactly as the other long control requests already
     /// do. See [`Maintenance`].
-    maintenance: Arc<Mutex<maintenance::Maintenance>>,
+    maintenance: maintenance::Maintenance,
     /// The size upgrades running now, and the replies parked on them. Shared
     /// by every mount: the bound that matters is per daemon.
     sizes: sizes::SizeState,
@@ -4149,7 +4149,7 @@ mod tests {
             "enumerate_folder_children_node_uids",
         );
         assert_eq!(ensure.matches("adopt_stale_listing(").count(), 3);
-        let online = function_source(include_str!("link.rs"), "fn mark_online(");
+        let online = function_source(include_str!("link.rs"), "fn after_reconnect(");
         assert!(online.contains("self.relist_offline_listings();"));
     }
 

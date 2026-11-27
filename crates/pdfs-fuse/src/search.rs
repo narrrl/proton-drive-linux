@@ -2,7 +2,49 @@
 
 use super::*;
 
+/// Search over the database's node and home indexes. Holds the database, the
+/// content cache (to say whether a hit is on this computer), the on-demand
+/// mounts (to say which folders a hit can be opened through) and the home
+/// indexer's busy flag.
+pub(crate) struct Search {
+    db: Arc<Db>,
+    cache: Arc<ContentCache>,
+    mounts: Arc<Mutex<mount::SecondaryMountRegistry<SecondaryMount>>>,
+    indexing: Arc<AtomicBool>,
+}
+
 impl Core {
+    /// Search, over this daemon's indexes.
+    pub(crate) fn searcher(&self) -> Search {
+        Search {
+            db: self.db.clone(),
+            cache: self.cache.clone(),
+            mounts: self.mounts.clone(),
+            indexing: self.indexing.clone(),
+        }
+    }
+
+    /// See [`Search::roots`].
+    pub(super) fn search_roots(&self) -> SearchRoots {
+        self.searcher().roots()
+    }
+}
+
+impl Search {
+    /// Whether the home indexer is walking right now.
+    pub(crate) fn indexing(&self) -> bool {
+        self.indexing.load(Ordering::Relaxed)
+    }
+
+    /// The pinned uids, expanded through pinned folders, as one query.
+    fn pinned_set(&self) -> HashSet<String> {
+        self.db
+            .pinned_uids()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
     /// The local locations a search result can be opened through, resolved once
     /// per search rather than once per hit.
     ///
@@ -14,7 +56,7 @@ impl Core {
     /// This used to be a per-hit call that re-read the sync-folder list and ran
     /// an ancestor walk per folder, against a candidate pool of up to a
     /// thousand: the whole cost of a keystroke was in here.
-    pub(super) fn search_roots(&self) -> SearchRoots {
+    pub(super) fn roots(&self) -> SearchRoots {
         let live_mounts = self.mounts.lock();
         let folders = self.db.sync_folder_list().unwrap_or_default();
         SearchRoots {
@@ -43,7 +85,7 @@ impl Core {
             .db
             .search_in(query, limit, scope)
             .map_err(|e| CoreError::from_api(&e, "search"))?;
-        let roots = self.search_roots();
+        let roots = self.roots();
         let pinned = self.pinned_set();
         Ok(hits
             .into_iter()
@@ -105,7 +147,7 @@ impl Core {
         // SQLite boundary to `limit` would recreate the old empty-filter bug.
         let candidate_limit = limit.saturating_mul(10).clamp(100, 1_000);
         let mut drive_hits = if filters.sources.contains(&SearchSource::Drive) {
-            let roots = self.search_roots();
+            let roots = self.roots();
             let pinned = self.pinned_set();
             self.db
                 .search_candidates(query, candidate_limit)

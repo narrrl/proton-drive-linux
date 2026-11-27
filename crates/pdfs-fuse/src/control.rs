@@ -771,15 +771,18 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             query,
             limit,
             scope,
-        }) => match core.search(&query, clamp_limit(limit), scope.as_deref()) {
+        }) => match core
+            .searcher()
+            .search(&query, clamp_limit(limit), scope.as_deref())
+        {
             Ok(hits) => CtlResponse::SearchResults { hits },
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::SearchLocal { query, limit }) => {
-            match core.search_local(&query, clamp_limit(limit)) {
+            match core.searcher().search_local(&query, clamp_limit(limit)) {
                 Ok(hits) => CtlResponse::LocalResults {
                     hits,
-                    indexing: core.indexing.load(Ordering::Relaxed),
+                    indexing: core.searcher().indexing(),
                 },
                 Err(e) => CtlResponse::error(e),
             }
@@ -788,11 +791,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             query,
             limit,
             filters,
-        }) => match core.search_v2(&query, clamp_limit(limit), &filters) {
+        }) => match core
+            .searcher()
+            .search_v2(&query, clamp_limit(limit), &filters)
+        {
             Ok((drive_hits, local_hits)) => CtlResponse::SearchResultsV2 {
                 drive_hits,
                 local_hits,
-                local_indexing: core.indexing.load(Ordering::Relaxed),
+                local_indexing: core.searcher().indexing(),
             },
             Err(e) => CtlResponse::error(e),
         },
@@ -1104,13 +1110,13 @@ pub(crate) fn run_control_socket(
                 let core = core.clone();
                 let username = username.clone();
                 let mountpoint = mountpoint.clone();
-                if let Err(e) = std::thread::Builder::new()
-                    .name("pdfs-control".into())
-                    .spawn(move || {
-                        let _permit = permit;
-                        handle_control_conn(&core, &username, &mountpoint, stream);
-                    })
-                {
+                // A job, so a stop joins it; a subscription ends on the
+                // stop's wake (`EventHub::wake_all`).
+                let board = core.services.clone();
+                if let Err(e) = board.spawn_job("pdfs-control-conn", move || {
+                    let _permit = permit;
+                    handle_control_conn(&core, &username, &mountpoint, stream);
+                }) {
                     warn!(error = %e, "control: spawn handler failed");
                 }
             }

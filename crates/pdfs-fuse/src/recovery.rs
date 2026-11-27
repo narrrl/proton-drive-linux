@@ -101,6 +101,41 @@ impl Core {
         info!(nodes = st.entries.len(), "hydrated metadata cache from db");
     }
 
+    /// Startup recovery of the queue, with this daemon as its host.
+    pub(crate) fn recovery(&self) -> Recovery {
+        Recovery {
+            db: self.db.clone(),
+            cache: self.cache.clone(),
+            writes: self.writes.clone(),
+            host: Arc::new(self.clone()),
+        }
+    }
+}
+
+/// What recovery needs from the rest of the daemon.
+pub(crate) trait RecoveryHost: Send + Sync {
+    /// Queue a write recovered from a blob fsynced before a stop, as if its
+    /// handle had just been released.
+    fn queue_recovered(&self, uid: &NodeUid, blob: &Path, meta: StagedWrite) -> Result<(), Errno>;
+}
+
+impl RecoveryHost for Core {
+    fn queue_recovered(&self, uid: &NodeUid, blob: &Path, meta: StagedWrite) -> Result<(), Errno> {
+        self.enqueue_staged_write(uid, 0, blob, meta)
+    }
+}
+
+/// Rebuilds the queue from the database and the staging area after a
+/// restart. Holds the database, the content cache and the write-back's state;
+/// queueing a recovered write goes through [`RecoveryHost`].
+pub(crate) struct Recovery {
+    db: Arc<Db>,
+    cache: Arc<ContentCache>,
+    writes: writes::WriteState,
+    host: Arc<dyn RecoveryHost>,
+}
+
+impl Recovery {
     /// Rebuild the in-memory pending map from the `pending_op` table on mount.
     ///
     /// A queued write survives a restart — that is the point of persisting it —
@@ -109,7 +144,7 @@ impl Core {
     ///
     /// A row whose blob has gone missing is dropped: there is nothing left to
     /// upload, and keeping it would fail forever.
-    pub(super) fn hydrate_pending(&self) {
+    pub(crate) fn hydrate_pending(&self) {
         let ops = match self.db.pending_ops() {
             Ok(ops) => ops,
             Err(e) => {
@@ -182,7 +217,7 @@ impl Core {
     /// `local~` placeholder whose create is gone) is left in place and named in
     /// the log: unexplained bytes are never evidence that user data is
     /// disposable.
-    pub(super) fn reconcile_staging(&self) {
+    pub(crate) fn reconcile_staging(&self) {
         let staged = self.cache.staged_writes();
         if staged.is_empty() {
             return;
@@ -314,7 +349,7 @@ impl Core {
     /// Failure is per-write and never fatal: a node that no longer exists, or an
     /// op that cannot be queued, leaves its blob in `recovery/` for the next run
     /// (and for a human) instead of taking the mount down.
-    pub(super) fn recover_fsynced_writes(&self) {
+    pub(crate) fn recover_fsynced_writes(&self) {
         let recovered = self.cache.recovered_writes();
         if recovered.is_empty() {
             return;
@@ -338,7 +373,7 @@ impl Core {
             // size, and nothing is interned this early — `hydrate` reads the
             // size back off `pending` when the node is first looked up, so 0
             // (no such inode) is correct rather than merely tolerable.
-            match self.enqueue_staged_write(&uid, 0, &blob, meta) {
+            match self.host.queue_recovered(&uid, &blob, meta) {
                 Ok(()) => {
                     self.cache.discard_recovered(&blob);
                     queued += 1;
@@ -371,7 +406,7 @@ impl Core {
     /// content is unrecoverable and nothing will ever mint it a real uid, so
     /// leaving the row would strand a file in the tree that can be listed but
     /// never read and never uploaded.
-    pub(super) fn drop_unrecoverable_op(&self, op: &PendingOp, uid: &NodeUid) {
+    fn drop_unrecoverable_op(&self, op: &PendingOp, uid: &NodeUid) {
         let _ = self.db.delete_op(op.id);
         if is_local_uid(uid) {
             error!(%uid, name = op.name.as_deref().unwrap_or("?"),

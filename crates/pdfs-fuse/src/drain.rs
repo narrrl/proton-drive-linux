@@ -420,7 +420,7 @@ impl Core {
                         // touches get written (`ContentCache::flush_touches`).
                         // Cheap and a no-op when empty.
                         self.cache.flush_touches();
-                        self.recover_fsynced_writes();
+                        self.recovery().recover_fsynced_writes();
                         // Parked rows are invisible to `claim_next_due_op`, so
                         // an idle queue is exactly when a park that has outlived
                         // its writer has to be noticed.

@@ -15,10 +15,9 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use pdfs_store::db::PendingCounts;
+use pdfs_core::shutdown::Shutdown;
+use pdfs_store::db::{Db, PendingCounts};
 use tracing::{debug, warn};
-
-use super::Core;
 
 /// How often the queue is looked at.
 const CHECK_EVERY: Duration = Duration::from_secs(5);
@@ -29,11 +28,10 @@ fn sendable(counts: &PendingCounts) -> i64 {
 }
 
 /// Run until the daemon stops, holding the inhibitor while changes wait.
-pub(crate) fn run(core: Core) {
+pub(crate) fn run(db: &Db, shutdown: &Shutdown) {
     let mut held: Option<Child> = None;
     loop {
-        let waiting = core
-            .db
+        let waiting = db
             .pending_op_counts()
             .map(|counts| sendable(&counts))
             .unwrap_or(0);
@@ -52,7 +50,7 @@ pub(crate) fn run(core: Core) {
             }
             _ => {}
         }
-        if !core.shutdown.sleep(CHECK_EVERY) {
+        if !shutdown.sleep(CHECK_EVERY) {
             break;
         }
     }

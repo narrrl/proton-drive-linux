@@ -883,10 +883,16 @@ mod tests {
 
         daemon.client.set_online(false);
         std::fs::write(daemon.mountpoint.join("f.txt"), b"0123456789").unwrap();
+        // Usually the drain meets the outage first. Another caller (the event
+        // poll, a sync pass) can meet it first and take the mount offline,
+        // and then the drain claims nothing and the write has no failed
+        // attempt to wait out. Both must end with the write going out soon
+        // after the link returns.
         assert!(wait_until(Duration::from_secs(30), || {
             daemon
                 .pending()
                 .is_ok_and(|items| items.iter().any(|item| item.attempts > 0))
+                || daemon.online().is_ok_and(|online| !online)
         }));
         // The drain records the failure just before it takes the mount
         // offline. Left online, only the event poll would, much later.

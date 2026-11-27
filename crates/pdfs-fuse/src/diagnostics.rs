@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use pdfs_core::control::{Diagnostics, DriveCallStat, InflightRequest, ServiceState, WorkerState};
 
+use pdfs_core::lifecycle::ServiceBoard;
+
 use super::Core;
 
 /// When this process started. Read at the first touch, which
@@ -207,10 +209,15 @@ impl Core {
     /// is not started until the first one has returned.
     fn pending_ops_quickly(&self) -> Option<u64> {
         let db = self.db.clone();
-        probe_once(&self.pending_probe, PENDING_COUNT_DEADLINE, move || {
-            let counts = db.pending_op_counts().ok()?;
-            Some(counts.uploads.max(0) as u64 + counts.changes.max(0) as u64)
-        })
+        probe_once(
+            &self.services,
+            &self.pending_probe,
+            PENDING_COUNT_DEADLINE,
+            move || {
+                let counts = db.pending_op_counts().ok()?;
+                Some(counts.uploads.max(0) as u64 + counts.changes.max(0) as u64)
+            },
+        )
     }
 }
 
@@ -219,6 +226,7 @@ impl Core {
 /// `None` when it did not answer in time, or when the previous probe sharing
 /// `busy` has not returned yet: then no new thread is started at all.
 fn probe_once<T: Send + 'static>(
+    board: &ServiceBoard,
     busy: &Arc<AtomicBool>,
     deadline: Duration,
     probe: impl FnOnce() -> Option<T> + Send + 'static,
@@ -228,13 +236,11 @@ fn probe_once<T: Send + 'static>(
     }
     let done = Arc::clone(busy);
     let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("pdfs-diagnostics".into())
-        .spawn(move || {
-            let answer = probe();
-            done.store(false, Ordering::Release);
-            let _ = tx.send(answer);
-        });
+    let spawned = board.spawn_job("pdfs-diagnostics", move || {
+        let answer = probe();
+        done.store(false, Ordering::Release);
+        let _ = tx.send(answer);
+    });
     if spawned.is_err() {
         busy.store(false, Ordering::Release);
         return None;
@@ -310,11 +316,12 @@ mod tests {
 
     #[test]
     fn a_stuck_probe_is_not_started_again() {
+        let board = ServiceBoard::default();
         let busy = Arc::new(AtomicBool::new(false));
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let short = Duration::from_millis(50);
 
-        let stuck = probe_once(&busy, short, move || {
+        let stuck = probe_once(&board, &busy, short, move || {
             let _ = wait.recv();
             Some(1)
         });
@@ -322,7 +329,7 @@ mod tests {
 
         let started = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&started);
-        let second = probe_once(&busy, short, move || {
+        let second = probe_once(&board, &busy, short, move || {
             flag.store(true, Ordering::SeqCst);
             Some(2)
         });
@@ -339,7 +346,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(
-            probe_once(&busy, Duration::from_secs(10), || Some(3)),
+            probe_once(&board, &busy, Duration::from_secs(10), || Some(3)),
             Some(3)
         );
     }
