@@ -880,6 +880,12 @@ instead of a semaphore of its own. The daemon supplies `Bounded` with the engine
 account-wide controller that weighs mirror steps against mounted reads and the drain plugs in
 behind the same trait.
 
+An admission also reports its load (`Admission::load`): per class of step, how many run, how
+many wait, how long the oldest has waited, and the total and longest wait so far. `pdfs
+diagnostics` prints it, and each pass trace counts the time its steps spent in line
+(`admission wait`) apart from the time they spent on the network. This is the first item of the
+scheduler's delivery order: measure before any policy changes.
+
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and
 macOS adapters, and a separate repository for the sync engine.

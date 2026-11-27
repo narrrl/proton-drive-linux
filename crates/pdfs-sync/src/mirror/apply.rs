@@ -72,6 +72,7 @@ impl Syncer {
                 let core = core.clone();
                 let root = root.clone();
                 set.spawn(async move {
+                    let asked = Instant::now();
                     let _permit = core
                         .admission
                         .admit(pdfs_sched::Step {
@@ -79,6 +80,7 @@ impl Syncer {
                             root: folder_id,
                         })
                         .await;
+                    core.trace_call(Call::Admission, asked.elapsed());
                     // An op still waiting for its turn when the stop comes is
                     // not started; the ones already sending finish.
                     if core.shutdown.is_stopping() {

@@ -3775,6 +3775,7 @@ dependencies = [
 name = "pdfs-sched"
 version = "3.10.0"
 dependencies = [
+ "parking_lot 0.13.0",
  "tokio",
 ]
 

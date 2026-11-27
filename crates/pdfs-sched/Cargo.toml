@@ -11,3 +11,4 @@ description = "Admission of background work for the Proton Drive Linux client"
 
 [dependencies]
 tokio.workspace = true
+parking_lot.workspace = true

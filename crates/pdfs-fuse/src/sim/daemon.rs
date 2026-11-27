@@ -1904,6 +1904,9 @@ mod tests {
         let first = traced_pass(&daemon, folder, |t| calls(t, "upload") > 0)
             .expect("the first pass is traced");
         assert_eq!(calls(&first, "upload"), 3);
+        // Each upload waited for the daemon's admission first, and the time
+        // in line is its own entry, apart from the time on the network.
+        assert_eq!(calls(&first, "admission wait"), 3, "{first}");
         assert_eq!(counted(&first, "local entries"), 3);
         assert!(counted(&first, "remote folders") >= 1);
         for phase in ["baseline", "local walk", "remote walk", "apply"] {
@@ -1917,6 +1920,17 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("sync: pass trace"))
         );
+        let Ok(Response::Diagnostics { diagnostics }) = daemon.request(&Request::Diagnostics)
+        else {
+            panic!("no diagnostics");
+        };
+        let mirror = diagnostics
+            .admission
+            .iter()
+            .find(|load| load.class == "mirror")
+            .expect("the admission reports mirror steps");
+        assert!(mirror.admitted >= 3, "{mirror:?}");
+        assert_eq!((mirror.running, mirror.waiting), (0, 0), "{mirror:?}");
 
         // Drive does not list a node it has just made at once, so the read
         // back after an upload has no revision id to record. The next pass
