@@ -932,6 +932,9 @@ struct Core {
     /// Set while a diagnostics report's database probe is still out, so a
     /// database that does not answer costs one stuck thread, not one per report.
     pending_probe: Arc<AtomicBool>,
+    /// Cold listings in flight, by folder, so callers that find the same
+    /// folder unlisted at once share one listing ([`Core::list_children`]).
+    listing_flights: Arc<pdfs_sched::flights::Flights<NodeUid>>,
     /// Secondary FUSE sessions for `ondemand` sync folders, keyed by sync-folder
     /// id. Each is a `ProtonFs` rooted at the folder's remote
     /// node, mounted over its local path, sharing this Core's client/cache/db and

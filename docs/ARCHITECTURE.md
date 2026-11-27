@@ -886,6 +886,15 @@ diagnostics` prints it, and each pass trace counts the time its steps spent in l
 (`admission wait`) apart from the time they spent on the network. This is the first item of the
 scheduler's delivery order: measure before any policy changes.
 
+The second item moves one cold path behind admission: a folder the mount has not listed yet. The
+daemon's admission is now `Classes`, a limit of its own per class of step, so mirror steps (8) and
+cold listings (32, above what the mount lists at once today) never wait for each other. Callers
+that find the same folder unlisted at once share one listing through a single flight
+(`pdfs_sched::flights`): the first lists it, the others wait and take what it published, and a
+follower whose leader failed lists the folder itself, so each caller still gets its own answer.
+A shared folder's refresh stays out of the flight, since its generation check settles races of
+its own.
+
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and
 macOS adapters, and a separate repository for the sync engine.

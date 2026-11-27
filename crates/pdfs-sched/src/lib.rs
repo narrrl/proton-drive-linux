@@ -13,10 +13,15 @@
 //! mirrors against mounted reads and the drain plugs in behind the same trait
 //! later, without the engine changing.
 //!
+//! [`flights`] holds the single flight that lets callers asking for the same
+//! thing at once share one piece of work.
+//!
 //! An admission decides only; it runs no step and does no I/O. It does say
 //! what it is doing: [`Admission::load`] reports, per class, how many steps
 //! run, how many wait and for how long, so a stall report can tell a step
 //! waiting in line from one already on the network.
+
+pub mod flights;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -32,16 +37,20 @@ pub enum Class {
     /// One effect of a mirror pass: an upload, a download, or a folder made
     /// on Drive.
     Mirror,
+    /// Listing a folder on Drive that the mount has not listed yet, for a
+    /// lookup, a `readdir` or a command that resolves a path.
+    Listing,
 }
 
 impl Class {
     /// Every class, in the order a report lists them.
-    pub const ALL: [Class; 1] = [Class::Mirror];
+    pub const ALL: [Class; 2] = [Class::Mirror, Class::Listing];
 
     /// The class's name in diagnostics.
     pub fn name(self) -> &'static str {
         match self {
             Class::Mirror => "mirror",
+            Class::Listing => "listing",
         }
     }
 }
@@ -51,7 +60,7 @@ impl Class {
 pub struct Step {
     pub class: Class,
     /// The root the step works for, such as the id of a synced folder, so a
-    /// policy can be fair across roots.
+    /// policy can be fair across roots. `0` for work of the mount itself.
     pub root: i64,
 }
 
@@ -264,6 +273,50 @@ impl Admission for Bounded {
     }
 }
 
+/// A limit of its own for each class: steps of one class never wait for
+/// steps of another. Within a class, steps are admitted in the order they
+/// asked.
+pub struct Classes {
+    slots: [Arc<Semaphore>; Class::ALL.len()],
+    meter: Arc<Meter>,
+}
+
+impl Classes {
+    /// A policy with the limit `limit(class)` for each class. Every limit must
+    /// be at least 1.
+    pub fn new(limit: impl Fn(Class) -> usize) -> Self {
+        Self {
+            slots: Class::ALL.map(|class| {
+                let n = limit(class);
+                assert!(n > 0, "an admission that admits nothing never finishes");
+                Arc::new(Semaphore::new(n))
+            }),
+            meter: Arc::default(),
+        }
+    }
+
+    /// How many more steps of `class` could start now.
+    pub fn available(&self, class: Class) -> usize {
+        self.slots[class as usize].available_permits()
+    }
+}
+
+impl Admission for Classes {
+    fn admit(&self, step: Step) -> Admitting<'_> {
+        let slots = self.slots[step.class as usize].clone();
+        let asking = self.meter.ask(step.class);
+        Box::pin(async move {
+            // The semaphore is never closed, so the acquire cannot fail.
+            let slot = slots.acquire_owned().await.expect("semaphore never closed");
+            Permit::new((asking.admitted(), slot))
+        })
+    }
+
+    fn load(&self) -> Vec<Load> {
+        self.meter.load()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -370,6 +423,39 @@ mod tests {
             let load = &admission.load()[0];
             assert_eq!((load.running, load.waiting, load.admitted), (1, 0, 1));
         });
+    }
+
+    #[test]
+    fn a_class_at_its_limit_does_not_hold_up_another() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let admission = Classes::new(|class| match class {
+            Class::Mirror => 1,
+            Class::Listing => 2,
+        });
+        rt.block_on(async {
+            let _mirror = admission.admit(step(1)).await;
+            let blocked = tokio::time::timeout(Duration::from_millis(5), admission.admit(step(1)));
+            assert!(blocked.await.is_err());
+            let listing = Step {
+                class: Class::Listing,
+                root: 0,
+            };
+            let _a = admission.admit(listing).await;
+            let _b = admission.admit(listing).await;
+            assert_eq!(admission.available(Class::Listing), 0);
+            let load = admission.load();
+            assert_eq!(load[Class::Mirror as usize].running, 1);
+            assert_eq!(load[Class::Listing as usize].running, 2);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "admits nothing")]
+    fn a_class_limit_of_nothing_is_refused() {
+        let _ = Classes::new(|class| usize::from(class == Class::Mirror));
     }
 
     #[test]
