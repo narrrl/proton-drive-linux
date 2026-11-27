@@ -324,6 +324,8 @@ impl<H: FilesHost> Files<H> {
                     base_revision_id: base.revision_id.clone(),
                     dirty: false,
                     open_count: 0,
+                    generation: 0,
+                    barrier: Default::default(),
                 }
             });
             return Ok(fh);
@@ -467,8 +469,19 @@ impl<H: FilesHost> Files<H> {
     /// upload (which offline would never finish) buys nothing the queue does
     /// not already guarantee.
     pub fn fsync(&self, fh: u64) -> Result<(), FileError<H::Error>> {
-        // Everything the durability sidecar needs, copied out so no lock is held
-        // across the sync.
+        // The handle's barrier first, and only then what it holds: whatever this
+        // fsync records is at least as new as what any fsync before it on the
+        // same file recorded, however the two were scheduled.
+        let Some(barrier) = self.state().open.by_fh(fh).map(|aw| aw.barrier.clone()) else {
+            // A handle opened for reading has nothing of its own to make
+            // durable, and POSIX allows `fsync` on it; `EBADF` failed `sync
+            // FILE` and backup tools that sync what they read (`docs/BUGS.md`
+            // B222).
+            return Ok(());
+        };
+        let mut durable = barrier.lock();
+        // Everything the durability sidecar needs, copied out so no state lock
+        // is held across the sync.
         let handle = {
             let st = self.state();
             st.open.by_fh(fh).map(|aw| {
@@ -482,14 +495,23 @@ impl<H: FilesHost> Files<H> {
                     aw.base_size,
                     aw.base_mtime,
                     aw.base_revision_id.clone(),
+                    aw.generation,
                 )
             })
         };
-        // A handle opened for reading has nothing of its own to make durable,
-        // and POSIX allows `fsync` on it; `EBADF` failed `sync FILE` and
-        // backup tools that sync what they read (`docs/BUGS.md` B222).
-        let Some((f, path, uid, dirty, written, len, base_size, base_mtime, base_revision_id)) =
-            handle
+        // Released while this waited for the barrier: the release staged it.
+        let Some((
+            f,
+            path,
+            uid,
+            dirty,
+            written,
+            len,
+            base_size,
+            base_mtime,
+            base_revision_id,
+            generation,
+        )) = handle
         else {
             return Ok(());
         };
@@ -500,6 +522,10 @@ impl<H: FilesHost> Files<H> {
         // A clean handle has nothing on it that the remote does not already
         // hold, so there is nothing for a crash to lose.
         if !dirty {
+            return Ok(());
+        }
+        // An earlier fsync already recorded this very generation.
+        if generation == *durable {
             return Ok(());
         }
         // The bytes are on stable storage, but only the scratch file knows that,
@@ -538,6 +564,7 @@ impl<H: FilesHost> Files<H> {
             }
             return Err(FileError::Io);
         }
+        *durable = generation;
         Ok(())
     }
 
@@ -721,6 +748,41 @@ mod tests {
         assert_eq!(meta.len, 5);
         assert!(meta.complete);
         assert_eq!(std::fs::read(path).unwrap(), b"hello");
+    }
+
+    /// An fsync that has to wait for an earlier one on the same file records
+    /// what the file holds once it gets its turn, not what it held when it
+    /// was called. Both used to read the handle first, so the one that
+    /// finished last could write the older sidecar over the newer.
+    #[test]
+    fn an_fsync_records_what_the_file_holds_when_its_turn_comes() {
+        let fx = Fixture::new();
+        let ino = fx.add("f", false);
+        let fh = fx.files.open(ino, true).unwrap();
+        fx.files.write(ino, fh, 0, b"one").unwrap();
+        let barrier = fx.state().open.by_fh(fh).unwrap().barrier.clone();
+        let earlier = barrier.lock();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| fx.files.fsync(fh));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            fx.files.write(ino, fh, 3, b" two").unwrap();
+            drop(earlier);
+            waiting.join().unwrap().unwrap();
+        });
+        let generation = fx.state().open.by_fh(fh).unwrap().generation;
+        assert_eq!(*barrier.lock(), generation);
+
+        let restarted = ContentCache::open(
+            fx._dir.0.join("content"),
+            fx._dir.0.join("pins"),
+            0,
+            fx.db.clone(),
+        )
+        .unwrap();
+        let recovered = restarted.recovered_writes();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].1.len, 7);
+        assert_eq!(std::fs::read(&recovered[0].0).unwrap(), b"one two");
     }
 
     #[test]

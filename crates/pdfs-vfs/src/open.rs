@@ -11,6 +11,8 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use pdfs_drive::{node_revision_id, node_size};
 use pdfs_store::cache::StagedWrite;
 use proton_drive_rs::Node;
@@ -109,6 +111,15 @@ pub struct WriteHandle {
     pub dirty: bool,
     /// Number of file handles currently sharing this scratch state.
     pub open_count: usize,
+    /// Counts the changes to what this handle holds: every write, resize,
+    /// recorded `fallocate` and rebase. An fsync records the generation it
+    /// made durable.
+    pub generation: u64,
+    /// Held across an fsync, from reading the handle to writing its sidecar,
+    /// and holding the last generation made durable. Two overlapping fsyncs
+    /// on the same file then cannot write their sidecars in reverse order and
+    /// leave the older one on disk.
+    pub barrier: Arc<Mutex<u64>>,
 }
 
 impl WriteHandle {
@@ -136,6 +147,8 @@ impl WriteHandle {
             base_revision_id: node_revision_id(node),
             dirty: false,
             open_count: 0,
+            generation: 0,
+            barrier: Arc::default(),
         }
     }
 
@@ -148,6 +161,7 @@ impl WriteHandle {
         self.base_mtime = node.modification_time;
         self.base_size = node_size(node);
         self.base_revision_id = node_revision_id(node);
+        self.generation += 1;
     }
 
     /// Resize the file to `size`, as `setattr` does through an open handle.
@@ -168,6 +182,7 @@ impl WriteHandle {
         }
         self.len = size;
         self.dirty = true;
+        self.generation += 1;
         Ok(())
     }
 
@@ -184,6 +199,9 @@ impl WriteHandle {
         if let Some(end) = grown {
             self.len = end;
             self.dirty = true;
+        }
+        if written.is_some() || grown.is_some() {
+            self.generation += 1;
         }
         grown
     }
@@ -214,6 +232,7 @@ impl WriteHandle {
         self.written.add(offset, end);
         self.len = self.len.max(end);
         self.dirty = true;
+        self.generation += 1;
     }
 }
 
@@ -787,6 +806,8 @@ mod tests {
             base_revision_id: None,
             dirty: false,
             open_count: 1,
+            generation: 0,
+            barrier: Default::default(),
         }
     }
 
@@ -873,6 +894,8 @@ mod tests {
         // As a fresh open starts it: no handle shares it yet.
         let fresh = || WriteHandle {
             open_count: 0,
+            generation: 0,
+            barrier: Default::default(),
             ..handle(0, 0)
         };
         let first = open.open_writer(2, fresh);

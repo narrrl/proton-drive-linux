@@ -2202,6 +2202,8 @@ mod tests {
             base_revision_id: None,
             dirty: false,
             open_count: 1,
+            generation: 0,
+            barrier: Default::default(),
         }
     }
 
