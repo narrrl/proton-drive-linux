@@ -51,7 +51,7 @@ graph TD
 | [`pdfs-store`](../crates/pdfs-store) | The SQLite schema and queries (`db/`), the content cache (`cache`) |
 | [`pdfs-drive`](../crates/pdfs-drive) | The `DriveApi` seam over the SDK, the call counter (`counted`), and `FakeDrive` for the simulations |
 | [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes (`mirror`), split into the walks (`mirror::walk`), applying a plan (`mirror::apply`) and the push pass (`mirror::push`), its engine thread (`mirror::engine`), its reads and writes of the local disk in one module (`mirror::local`), and the parts with no I/O: planner, pass model and pass trace. It owns its state (`SyncParts`), reads and writes its tables only through `SyncStore`, and reaches the daemon only through `SyncHost` |
-| [`pdfs-vfs`](../crates/pdfs-vfs) | The mounted-files service, with no kernel adapter: the tree (`tree`: nodes, stable inodes, per-mount roots), the reserved inodes (`ids`), and the open files (`open`: write handles and their authored ranges, released writes waiting for upload, directory handles, `fallocate` rules), and what the mount accepted but has not sent yet (`writes`: queued revisions, nodes removed here, echoes of our own changes). Errors are typed; the FUSE adapter maps them to errno |
+| [`pdfs-vfs`](../crates/pdfs-vfs) | The mounted-files service, with no kernel adapter: the tree (`tree`: nodes, stable inodes, per-mount roots), the reserved inodes (`ids`), the open files (`open`: write handles and their authored ranges, released writes waiting for upload, directory handles, `fallocate` rules), the open-file service (`files`: open, write, resize, fsync and close, behind the `FilesHost` port), and what the mount accepted but has not sent yet (`writes`: queued revisions, nodes removed here, echoes of our own changes). Errors are typed; the FUSE adapter maps them to errno |
 | [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), finding nodes (`resolve`), folder listings and file sizes (`listing`, `sizes`), reads (`reads`), queueing and the drain (`enqueue`, `queue`, `drain`, `upload`), calls sent straight to Drive (`remote`), requests by path (`requests`), startup recovery (`recovery`), pins, search, trash, the shared tree (`shared`), the link state (`link`), remote events (`background`), the daemon's side of the sync engine (`sync`, which implements `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
 | [`pdfs-daemon`](../crates/pdfs-daemon) | The daemon's composition root: waits for a session, opens the database and the content cache, resumes the session and mounts, then remounts or retries with a backoff and records each failure |
 | [`pdfs-cli`](../crates/pdfs-cli) | The `pdfs` binary. `pdfs daemon` runs `pdfs_daemon::run` in-process; every other command is a control-socket client |
@@ -853,9 +853,16 @@ stable inode, the roots of each session) and the open files (`open::OpenFiles`: 
 inode and by handle number, the inodes being released, and directory handles with their frozen
 listings). A write goes through `stage_write`, which reports a full disk as a typed error; the
 tree refuses a write to a read-only node with `NodeError`; the FUSE adapter maps both to errno.
-The crate depends on no kernel or GUI crate; `cargo tree -p pdfs-vfs` shows neither. What still
-sits in `pdfs-fuse` around the tree is the code that fills it (listings, sizes, the drain) and
-the code that reads and queues content.
+The crate depends on no kernel or GUI crate; `cargo tree -p pdfs-vfs` shows neither.
+
+The open-file service, `files::Files`, serves a file from open to close: the write open and its
+base, writes, resizes and `fallocate`, flush, the fsync barrier and the release. Each write
+handle counts its changes in a generation, and an fsync holds the handle's barrier from reading
+it to writing its sidecar, so overlapping fsyncs record in order (B301). What the service needs
+from Drive and the upload queue goes through `files::FilesHost`, which `Core` implements; the
+FUSE callbacks keep the inode translation, the choice of thread and the reply. What still sits in
+`pdfs-fuse` around the tree is the code that fills it (listings, sizes, the drain), the read
+path, and the namespace operations (create, mkdir, rename, unlink).
 
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and

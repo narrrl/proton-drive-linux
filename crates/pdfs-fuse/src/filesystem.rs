@@ -1,7 +1,8 @@
 //! Kernel-facing FUSE callback adapter.
 
 use super::*;
-use pdfs_vfs::open::{DirListing, Fallocate, Released, WriteError, dir_page};
+use pdfs_vfs::files::Files;
+use pdfs_vfs::open::{DirListing, dir_page};
 
 impl Filesystem for ProtonFs {
     /// Negotiate kernel-side behaviour once, before any other callback.
@@ -458,14 +459,7 @@ impl Filesystem for ProtonFs {
         // accepted and ignored so tools that chmod/utimes after writing succeed.
         if let Some(size) = size {
             let fh = fh.map(|f| f.0).filter(|&f| f != 0);
-            let handled = {
-                let mut st = self.core.state();
-                match st.open.writer_mut(ino.0) {
-                    Some(aw) => aw.resize(size).map(|()| true).map_err(Errno::from),
-                    None => Ok(false),
-                }
-            };
-            let handled = match handled {
+            let handled = match self.files.resize(ino.0, size).map_err(file_errno) {
                 Ok(handled) => handled,
                 Err(error) => {
                     debug!(ino = ino.0, size, ?error, "setattr resize refused");
@@ -497,7 +491,6 @@ impl Filesystem for ProtonFs {
                 });
                 return;
             }
-            self.core.state().set_size(ino.0, size);
         }
         self.reply_attr(ino.0, reply);
     }
@@ -517,53 +510,12 @@ impl Filesystem for ProtonFs {
             reply.error(error);
             return;
         }
-        let new_end = offset.saturating_add(length);
-        // Only the modes whose effect on the scratch file this handle can
-        // record. Anything else went through to the scratch file untracked:
-        // a zeroed range was refilled from the base at commit, and a collapse
-        // or insert shifted bytes that `len` and `written` did not follow
-        // (`docs/BUGS.md` B224). `EOPNOTSUPP` is also what makes glibc's
-        // `posix_fallocate` fall back to writing zeros.
-        let Some(kind) = Fallocate::from_mode(mode) else {
-            reply.error(Errno::EOPNOTSUPP);
-            return;
-        };
-        let file = {
-            let st = self.core.state();
-            match st.open.by_fh(_fh.0) {
-                Some(aw) => aw.file.clone(),
-                None => {
-                    reply.error(if st.entries.contains_key(&ino.0) {
-                        Errno::EBADF
-                    } else {
-                        Errno::ENOENT
-                    });
-                    return;
-                }
-            }
-        };
-        // The syscall can take a while on a large range; the state lock is
-        // not held across it, as `write` does not hold it across its I/O.
-        let ret = {
-            use std::os::unix::io::AsRawFd;
-            unsafe { libc::fallocate(file.as_raw_fd(), mode, offset as i64, length as i64) }
-        };
-        let res = if ret != 0 {
-            Err(Errno::from(std::io::Error::last_os_error()))
-        } else {
-            let mut st = self.core.state();
-            let grown = st
-                .open
-                .by_fh_mut(_fh.0)
-                .and_then(|aw| aw.record_fallocate(kind, offset, new_end));
-            if let Some(end) = grown {
-                st.set_size(ino.0, end);
-            }
-            Ok(())
-        };
-
-        match res {
-            Ok(_) => reply.ok(),
+        match self
+            .files
+            .fallocate(ino.0, _fh.0, offset, length, mode)
+            .map_err(file_errno)
+        {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
     }
@@ -587,27 +539,17 @@ impl Filesystem for ProtonFs {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        let file = {
-            let st = self.core.state();
-            st.open
-                .by_fh(fh.0)
-                .filter(|aw| aw.dirty)
-                .map(|aw| aw.file.clone())
-        };
-        let Some(file) = file else {
+        let Some(file) = self.files.dirty_scratch(fh.0) else {
             reply.ok();
             return;
         };
         let fs = self.clone();
-        self.core
-            .workers
-            .run(Lane::Transfer, "flush", move || match file.sync_data() {
+        self.core.workers.run(Lane::Transfer, "flush", move || {
+            match fs.files.flush(fh.0, &file) {
                 Ok(()) => reply.ok(),
-                Err(e) => {
-                    error!(fh = fh.0, error = %e, "flush of scratch file failed");
-                    reply.error(fs.scratch_sync_errno(&e));
-                }
-            });
+                Err(error) => reply.error(file_errno(error)),
+            }
+        });
     }
 
     /// Durability here means the scratch file, not the remote: a caller asking
@@ -645,18 +587,6 @@ impl Filesystem for ProtonFs {
         reply: ReplyEmpty,
     ) {
         let ino = self.tree(ino);
-        let (handle, unlinked_uid, releasing) = {
-            let mut st = self.core.state();
-            let unlinked_uid = release_unlinked_entry(&mut st, ino.0);
-            let (h, releasing) = match st.open.release(fh.0) {
-                Released::Last(h) => {
-                    let ino = h.ino;
-                    (Some(h), Some(ino))
-                }
-                Released::StillOpen { .. } | Released::NotWriting => (None, None),
-            };
-            (h, unlinked_uid, releasing)
-        };
         // Deliberately **not** handed to a worker, unlike the other slow
         // handlers here. The kernel does not wait for a `release` reply before
         // letting `close(2)` return, so the only thing sequencing this against
@@ -671,9 +601,9 @@ impl Filesystem for ProtonFs {
         // did not touch, it stages an incomplete blob and lets the drain thread
         // finish it (audit F1). What is left is a rename, two fsyncs, a database
         // insert, and at most a bounded copy out of the local cache.
-        self.finish_release(handle, unlinked_uid, reply);
-        if let Some(ino) = releasing {
-            self.core.state().open.finish_release(ino);
+        match self.files.release(ino.0, fh.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(file_errno(error)),
         }
     }
 
@@ -1006,6 +936,8 @@ impl Filesystem for ProtonFs {
 #[derive(Clone)]
 pub struct ProtonFs {
     core: Core,
+    /// The open-file service, shared with every other mount of the daemon.
+    files: Arc<Files<Core>>,
     uid: u32,
     gid: u32,
     /// The tree inode of this session's root, which the kernel knows as
@@ -1013,43 +945,10 @@ pub struct ProtonFs {
     root: u64,
 }
 
-/// How many times a write `open` will re-read its base after a `release`
-/// published a newer queued revision underneath it (`docs/BUGS.md` B32).
-///
-/// One retry covers the race, which needs a close and an open of the same file
-/// to overlap on different threads. More than that is not contention, it is a
-/// file being republished continuously, and looping on it would keep a FUSE
-/// worker busy indefinitely.
-const OPEN_BASE_ATTEMPTS: u32 = 3;
-
 /// The most one `copy_file_range` call copies; the caller loops for the rest.
 /// A local copy of this much takes milliseconds, which is how long it holds
 /// the dispatch loop.
 const COPY_RANGE_MAX: u64 = 16 * 1024 * 1024;
-
-/// One directory's entries as `readdir` reports them: `.` and `..` first, then
-/// the interned children in `children` order.
-///
-/// Split out because it is built from two places that must agree — `opendir`
-/// freezes it, and the fallback `readdir` builds it live — and a divergence
-/// between them would show up as entries appearing or vanishing depending on
-/// whether the kernel happened to send an `opendir`.
-fn build_listing(st: &State, ino: u64) -> DirListing {
-    let parent = st.entries.get(&ino).map_or(ROOT_INO, |e| e.parent);
-    // "." and ".." occupy offsets 0 and 1; real children follow.
-    let mut listing = vec![
-        (ino, true, ".".to_string()),
-        (parent, true, "..".to_string()),
-    ];
-    if let Some(kids) = st.children.get(&ino) {
-        for &kid in kids {
-            if let Some(e) = st.entries.get(&kid) {
-                listing.push((kid, e.node.is_folder(), e.node.name.clone()));
-            }
-        }
-    }
-    listing
-}
 
 /// Fill a `readdir` reply from `listing`, resuming at `offset`.
 ///
@@ -1090,6 +989,7 @@ impl ProtonFs {
         // SAFETY: geteuid/getegid are infallible and have no preconditions.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         Self {
+            files: core.files(),
             core,
             uid,
             gid,
@@ -1193,7 +1093,7 @@ impl ProtonFs {
             return;
         }
         let mut st = self.core.state();
-        let listing = build_listing(&st, ino);
+        let listing = st.listing(ino);
         // Shares the counter with write handles, so a directory handle can never
         // collide with a file handle (both are `fh` values in one kernel space).
         let fh = st.open.open_dir(listing);
@@ -1209,7 +1109,7 @@ impl ProtonFs {
             return;
         }
         let st = self.core.state();
-        let listing = build_listing(&st, ino);
+        let listing = st.listing(ino);
         drop(st);
         reply_listing(&listing, offset, self.root, reply);
     }
@@ -1248,365 +1148,27 @@ impl ProtonFs {
     /// The body of [`Filesystem::open`], run off the dispatch loop for a write
     /// open.
     fn serve_open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let write_requested = flags.acc_mode() != OpenAccMode::O_RDONLY;
-        let (uid, mut base_mtime, mut base_size, mut provisional, mut base_revision_id) = {
-            let mut st = self.core.state();
-            match st.entries.get_mut(&ino.0) {
-                Some(e) if e.node.is_file() => {
-                    if write_requested && !e.writable() {
-                        reply.error(Errno::EACCES);
-                        return;
-                    }
-                    e.open_count = e.open_count.saturating_add(1);
-                    (
-                        e.uid.clone(),
-                        e.node.modification_time,
-                        node_size(&e.node),
-                        // Still the cheap enumeration's ciphertext size (B12).
-                        matches!(
-                            &e.node.kind,
-                            NodeKind::File {
-                                claimed_size: None,
-                                ..
-                            }
-                        ),
-                        node_revision_id(&e.node),
-                    )
-                }
-                Some(_) => {
-                    reply.error(Errno::EISDIR);
-                    return;
-                }
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
-        };
-        debug!(ino = ino.0, ?flags, base_size, base_mtime, "open");
-        // Read-only opens stay stateless (fh 0). A write open allocates a
-        // disk-backed handle; bytes are authored into a scratch file and the
-        // untouched remainder is pulled from the base lazily (on read / commit).
-        if flags.acc_mode() == OpenAccMode::O_RDONLY {
-            reply.opened(FileHandle(0), FopenFlags::empty());
-            return;
-        }
-        // A previous close may already have newer bytes queued locally while
-        // the server still holds the older revision. That staged blob, not the
-        // remote, is the base for this handle. In particular, `truncate file`
-        // opens for writing and then shrinks via setattr; starting its scratch
-        // as a sparse zero file would turn the preserved prefix into zeros.
-        //
-        // Complete pending blobs are the common case and can be copied without
-        // any network access. An incomplete blob still has gaps referring to
-        // the remote base, and stacking another write on it cannot be
-        // represented by WriteHandle, so the copy's gaps are filled from that
-        // base first, as the drain fills them before an upload. Only when that
-        // fails (offline, or the base is gone) does the open fail: refusing
-        // every such open failed a create over a file whose partial edit had
-        // not drained yet (`docs/BUGS.md` B204).
-        //
-        // Reading that blob and installing the handle cannot be done under one
-        // lock — the copy is the size of the file — so the base is re-checked at
-        // the moment the handle goes in, and a `release` that published a newer
-        // revision in between sends this around again. Without the re-check the
-        // new handle carried the *older* base, and its own release published
-        // content that silently discarded the revision closed a moment earlier
-        // (`docs/BUGS.md` B32). A second attempt is already unlikely and a third would
-        // mean something is republishing continuously, so give up rather than
-        // spin: the caller's `open` fails instead of its data being lost.
-        //
-        // `reply` is consumed by whichever arm answers, so the loop yields an
-        // outcome and the answer is sent once, after it.
-        let outcome = 'install: {
-            for attempt in 0..OPEN_BASE_ATTEMPTS {
-                // The handle starts at the base's size. A provisional one is the
-                // ciphertext size, so the file would grow by the encryption
-                // overhead and reading the base would fail (`docs/BUGS.md` B100). A
-                // queued revision stamps a real size, so this only goes to the
-                // network for a file the listing has not sized yet.
-                if provisional && self.core.pending_blob(&uid).is_none() {
-                    match self.core.resolve_provisional_size(ino.0, &uid) {
-                        Some(size) => {
-                            base_size = size;
-                            provisional = false;
-                        }
-                        None => {
-                            error!(%uid, "could not settle the size of the base for a write open");
-                            break 'install Err(Errno::EIO);
-                        }
-                    }
-                }
-                let pending_base = self.core.writes.queued(&uid);
-                let (file, path) = match self.core.cache.create_scratch() {
-                    Ok(x) => x,
-                    Err(e) => {
-                        error!(%uid, error = %e, "create scratch file failed");
-                        break 'install Err(Errno::EIO);
-                    }
-                };
-                let mut initial_written = Intervals::default();
-                if let Some(pending) = &pending_base {
-                    // Reflink where the filesystem can: this blob is the whole
-                    // file, and a byte-for-byte copy of a multi-GB pending
-                    // revision is the kind of work `open` must not do
-                    // (`ContentCache::clone_or_copy`).
-                    if let Err(e) = ContentCache::clone_or_copy(&pending.path, &path) {
-                        let _ = std::fs::remove_file(&path);
-                        // The drain lets go of the pending entry before it
-                        // discards the blob, so a blob that went away under the
-                        // copy is a revision that landed or was replaced: the
-                        // same race the re-check below catches, only earlier.
-                        if self.core.pending_blob(&uid).as_ref() != Some(&pending.path) {
-                            warn!(%uid, attempt, "queued revision went away while opening for write; retrying");
-                            continue;
-                        }
-                        error!(%uid, source = %pending.path.display(), error = %e,
-                            "copy queued revision into write scratch failed");
-                        break 'install Err(Errno::EIO);
-                    }
-                    if !pending.meta.complete {
-                        let mut authored = Intervals::default();
-                        for &(s, e) in &pending.meta.authored {
-                            authored.add(s, e);
-                        }
-                        if let Err(error) = self.core.fill_gaps(
-                            &uid,
-                            &file,
-                            pending.meta.len,
-                            pending.meta.base_mtime,
-                            pending.meta.base_size,
-                            &authored,
-                        ) {
-                            let _ = std::fs::remove_file(&path);
-                            error!(%uid, ?error, "cannot complete the queued revision a write open is based on");
-                            break 'install Err(error);
-                        }
-                        debug!(%uid, "write open completed an incomplete queued revision");
-                    }
-                    initial_written.add(0, pending.meta.len);
-                }
-                // Sampled *before* the state lock, never under it: no site in
-                // the daemon holds `pending` and `state` at once (see
-                // `stamp_pending_sizes`) and this must not become the first.
-                // What that costs is a window of a few instructions instead of
-                // a lock-tight comparison — against the multi-gigabyte copy
-                // above, which is the window that actually loses data.
-                let current = self.core.pending_blob(&uid);
-                let landed = self.core.drain.landed.lock().get(&uid).cloned();
-                let mut st = self.core.state();
-                // Only a handle this open is about to *create* can carry a stale
-                // base; if one already exists, that handle is authoritative and
-                // the scratch prepared above is discarded either way.
-                let creating = !st.open.is_writing(ino.0);
-                if creating && current.as_ref() != pending_base.as_ref().map(|p| &p.path) {
-                    drop(st);
-                    let _ = std::fs::remove_file(&path);
-                    warn!(%uid, attempt, "queued revision changed while opening for write; retrying");
-                    continue;
-                }
-                // With no queued revision, the base's bytes come from the cache,
-                // keyed by the base's mtime and size. The ones sampled above can
-                // name a revision this daemon has since replaced: an upload that
-                // lands lets go of its blob before the tree has its node, and
-                // the cache holds its bytes under the node only. So the base is
-                // the landing node while there is one, and the tree's otherwise
-                // (docs/BUGS.md B170).
-                if creating && pending_base.is_none() {
-                    let now = landed.or_else(|| st.entries.get(&ino.0).map(|e| e.node.clone()));
-                    if let Some(node) = now
-                        && (node.modification_time != base_mtime
-                            || node_revision_id(&node) != base_revision_id)
-                    {
-                        base_mtime = node.modification_time;
-                        base_size = node_size(&node);
-                        base_revision_id = node_revision_id(&node);
-                        provisional = matches!(
-                            &node.kind,
-                            NodeKind::File {
-                                claimed_size: None,
-                                ..
-                            }
-                        );
-                        debug!(%uid, base_mtime, base_size, "write open took the base the file has now");
-                        if provisional {
-                            drop(st);
-                            let _ = std::fs::remove_file(&path);
-                            continue;
-                        }
-                    }
-                }
-                let fh = st.open.open_writer(ino.0, || {
-                    WriteHandle {
-                        ino: ino.0,
-                        uid: uid.clone(),
-                        file: Arc::new(file),
-                        path,
-                        written: initial_written,
-                        // Starts at the current size; reads in [0, base_size)
-                        // come from the base until overwritten.
-                        len: base_size,
-                        base_size,
-                        base_mtime,
-                        base_revision_id,
-                        dirty: false,
-                        open_count: 0,
-                    }
-                });
-                break 'install Ok(fh);
-            }
-            error!(%uid, "queued revision kept changing while opening for write");
-            Err(Errno::EIO)
-        };
-        match outcome {
+        let write = flags.acc_mode() != OpenAccMode::O_RDONLY;
+        match self.files.open(ino.0, write) {
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
-            Err(error) => {
-                // The lookup count was raised before any of this could fail.
-                if let Some(entry) = self.core.state().entries.get_mut(&ino.0) {
-                    entry.open_count = entry.open_count.saturating_sub(1);
-                }
-                reply.error(error);
-            }
+            Err(error) => reply.error(file_errno(error)),
         }
     }
 
     /// The body of [`Filesystem::fsync`], run off the dispatch loop.
-    /// The errno to give a program for a failed sync of a scratch file.
-    /// Delayed allocation means a full disk usually surfaces at the sync
-    /// rather than at `write(2)`, and `ENOSPC` is what a program checks for.
-    fn scratch_sync_errno(&self, e: &std::io::Error) -> Errno {
-        match e.raw_os_error() {
-            Some(libc::ENOSPC) => {
-                self.core.cache.emergency_evict();
-                Errno::ENOSPC
-            }
-            Some(libc::EDQUOT) => Errno::EDQUOT,
-            _ => Errno::EIO,
+    fn serve_fsync(&self, fh: FileHandle, reply: ReplyEmpty) {
+        match self.files.fsync(fh.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(file_errno(error)),
         }
     }
 
-    fn serve_fsync(&self, fh: FileHandle, reply: ReplyEmpty) {
-        // Everything the durability sidecar needs, copied out so no lock is held
-        // across the sync.
-        let handle = {
-            let st = self.core.state();
-            st.open.by_fh(fh.0).map(|aw| {
-                (
-                    aw.file.clone(),
-                    aw.path.clone(),
-                    aw.uid.clone(),
-                    aw.dirty,
-                    aw.written.clone(),
-                    aw.len,
-                    aw.base_size,
-                    aw.base_mtime,
-                    aw.base_revision_id.clone(),
-                )
-            })
-        };
-        // A handle opened for reading has nothing of its own to make durable,
-        // and POSIX allows `fsync` on it; `EBADF` failed `sync FILE` and
-        // backup tools that sync what they read (`docs/BUGS.md` B222).
-        let Some((f, path, uid, dirty, written, len, base_size, base_mtime, base_revision_id)) =
-            handle
-        else {
-            reply.ok();
-            return;
-        };
-        if let Err(e) = f.sync_all() {
-            error!(fh = fh.0, error = %e, "fsync of scratch file failed");
-            reply.error(self.scratch_sync_errno(&e));
-            return;
-        }
-        // A clean handle has nothing on it that the remote does not already
-        // hold, so there is nothing for a crash to lose.
-        if !dirty {
-            reply.ok();
-            return;
-        }
-        // The bytes are on stable storage, but only the scratch file knows that,
-        // and the scratch directory is cleared at open. Record what the blob is
-        // so a restart can hand it to the upload queue instead of deleting it.
-        //
-        // Deliberately *not* the full release path: staging the blob here would
-        // move the file out from under a handle the application still has open,
-        // and queueing an upload per `fsync` would push a revision for every
-        // barrier in a write loop. This only makes the existing file findable.
-        let authored: Vec<(u64, u64)> = written
-            .segments(0, len)
-            .into_iter()
-            .filter(|&(_, _, authored)| authored)
-            .map(|(s, e, _)| (s, e))
-            .collect();
-        let meta = StagedWrite {
-            uid: uid.to_string(),
-            len,
-            base_size,
-            base_mtime,
-            complete: StagedWrite::covers(&authored, len),
-            authored,
-            based_on: self
-                .core
-                .remote_baseline(&uid, base_mtime, base_size, base_revision_id),
-        };
-        // A failed sidecar means the write is not durable, and `fsync` promising
-        // otherwise is the defect this exists to fix — so it is an error, not a
-        // warning.
-        if let Err(e) = self.core.cache.mark_scratch_durable(&path, &meta) {
-            error!(%uid, error = %e, "recording fsync durability failed");
-            if e.is_disk_full() {
-                self.core.cache.emergency_evict();
-                reply.error(Errno::ENOSPC);
-            } else {
-                reply.error(Errno::EIO);
-            }
-            return;
-        }
-        reply.ok();
+    /// Stage `data` at `offset` of the write handle `fh` on `ino`.
+    fn stage_write(&self, ino: u64, fh: u64, offset: u64, data: &[u8]) -> Result<(), Errno> {
+        self.files.write(ino, fh, offset, data).map_err(file_errno)
     }
 
     /// The body of [`Filesystem::create`], run off the dispatch loop.
-    /// Stage `data` at `offset` of the write handle `fh` on `ino`, straight into
-    /// its scratch file (no base download): only the untouched remainder is
-    /// pulled from the remote, and only at commit.
-    fn stage_write(&self, ino: u64, fh: u64, offset: u64, data: &[u8]) -> Result<(), Errno> {
-        let file = {
-            let st = self.core.state();
-            match st.open.by_fh(fh) {
-                Some(aw) => aw.file.clone(),
-                None => return Err(Errno::EBADF),
-            }
-        };
-        match pdfs_vfs::open::stage_write(&file, offset, data) {
-            Ok(()) => {}
-            // A full local disk is not a broken file: answer `ENOSPC` so the
-            // application can say so (and so `cp`/editors take their own
-            // out-of-space path), and free what the cache is holding — the
-            // scratch file the next write goes to shares that filesystem.
-            Err(WriteError::NoSpace) => {
-                error!(ino, fh, "scratch write failed: no space");
-                self.core.cache.emergency_evict();
-                return Err(Errno::ENOSPC);
-            }
-            Err(WriteError::Io(e)) => {
-                error!(ino, fh, error = %e, "scratch write failed");
-                return Err(Errno::EIO);
-            }
-        }
-        let new_len = {
-            let mut st = self.core.state();
-            let Some(aw) = st.open.by_fh_mut(fh) else {
-                return Err(Errno::EBADF);
-            };
-            aw.record_write(offset, offset + data.len() as u64);
-            let len = aw.len;
-            st.set_size(ino, len);
-            len
-        };
-        debug!(ino, fh, offset, len = data.len(), new_len, "staged write");
-        Ok(())
-    }
-
     fn serve_create(&self, parent: u64, name: &str, reply: ReplyCreate) {
         if let Err(error) = self.core.require_writable(parent) {
             reply.error(error);
@@ -1856,61 +1418,6 @@ impl ProtonFs {
             }
         }
         self.trash_child(parent, name_str, reply);
-    }
-
-    /// The tail of [`Filesystem::release`], run off the dispatch loop: retire
-    /// what the closed handle leaves behind.
-    fn finish_release(
-        &self,
-        handle: Option<WriteHandle>,
-        unlinked_uid: Option<NodeUid>,
-        reply: ReplyEmpty,
-    ) {
-        let was_unlinked = unlinked_uid.is_some();
-        if let Some(uid) = unlinked_uid
-            && release_can_discard_unlinked(&self.core.db, &uid)
-        {
-            // Ops withdrawn at unlink left the bytes this handle read behind,
-            // owned by no op any more; they go with the last handle.
-            let withdrawn = self.core.pending_blob(&uid);
-            if let Err(error) = self.core.discard_queued_ops(&uid) {
-                warn!(%uid, ?error, "queued-op cleanup failed; retaining unlinked state");
-            } else {
-                if let Err(error) = self.core.db.delete_node(&uid) {
-                    warn!(%uid, %error, "deleting released unlinked node state failed");
-                }
-                if let Some(blob) = withdrawn {
-                    self.core.cache.discard_staged(&blob);
-                }
-                self.core.cache.evict(&uid);
-                self.core.evict_reader(&uid);
-            }
-        }
-        // Hand the bytes to the queue rather than uploading them here: the
-        // scratch file is the only copy of what was just written, and blocking
-        // the caller on the network is what made a copy into the mount run at
-        // upload speed (and fail outright offline).
-        match (handle, was_unlinked) {
-            (Some(h), true) => {
-                // POSIX keeps an unlinked file usable until the last close, but
-                // closing it must not resurrect those bytes as a new revision.
-                if let Err(e) = std::fs::remove_file(&h.path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!(path = %h.path.display(), error = %e, "discarding unlinked scratch file failed");
-                }
-                self.core.cache.clear_scratch_durable(&h.path);
-                reply.ok();
-            }
-            (Some(mut h), false) => {
-                self.core.follow_landed_create(&mut h);
-                match self.core.queue_revision(&mut h) {
-                    Ok(()) => reply.ok(),
-                    Err(e) => reply.error(e),
-                }
-            }
-            (None, _) => reply.ok(),
-        }
     }
 
     /// The body of [`Filesystem::rename`], run off the dispatch loop.

@@ -96,7 +96,7 @@ impl Core {
         st.hydrate_access();
 
         // Pass 3: rebuild child listings for fully-enumerated folders.
-        let listings = listed_children(&st.entries, listed_dirs);
+        let listings = crate::state::listed_children(&st.entries, listed_dirs);
         st.children.extend(listings);
         info!(nodes = st.entries.len(), "hydrated metadata cache from db");
     }

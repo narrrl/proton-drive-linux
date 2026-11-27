@@ -10,10 +10,14 @@
 //! stable inode numbers, and the per-mount roots; and the open files
 //! ([`open`]): the scratch file a handle writes into, which bytes of it are
 //! authored, the released write that waits for its upload, and directory
-//! handles; and what the mount accepted but has not sent to Drive yet
-//! ([`writes`]).
+//! handles; what the mount accepted but has not sent to Drive yet
+//! ([`writes`]); the POSIX rules on names and on what a rename may replace
+//! ([`names`]); and which nodes a folder lists ([`nodes`]).
 
+pub mod files;
 pub mod ids;
+pub mod names;
+pub mod nodes;
 pub mod open;
 pub mod tree;
 pub mod writes;

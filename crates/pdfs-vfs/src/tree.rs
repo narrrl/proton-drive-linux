@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::open::OpenFiles;
+use crate::open::{DirListing, OpenFiles};
 use pdfs_core::{Access, access_for};
 use pdfs_store::db::Db;
 #[cfg(any(test, feature = "test-support"))]
@@ -216,6 +216,20 @@ impl Drop for StateGuard<'_> {
 }
 
 impl State {
+    /// Retire the last resident reference to an unlinked inode without touching its
+    /// persisted node row. The namespace path already chose whether that row is
+    /// disposable or retained as queued-trash authority.
+    pub fn release_unlinked(&mut self, ino: u64) -> Option<NodeUid> {
+        let entry = self.entries.get_mut(&ino)?;
+        entry.open_count = entry.open_count.saturating_sub(1);
+        if entry.open_count != 0 || !entry.unlinked {
+            return None;
+        }
+        let uid = entry.uid.clone();
+        self.forget_mem(&uid);
+        Some(uid)
+    }
+
     /// A fresh, empty inode space over `db`.
     ///
     /// Apply the write-throughs this state owes SQLite, here and now.
@@ -352,6 +366,33 @@ impl State {
             }
             current = parent;
         }
+    }
+
+    /// One directory's entries as `readdir` reports them: `.` and `..` first, then
+    /// the interned children in `children` order.
+    ///
+    /// Split out because it is built from two places that must agree — `opendir`
+    /// freezes it, and the fallback `readdir` builds it live — and a divergence
+    /// between them would show up as entries appearing or vanishing depending on
+    /// whether the kernel happened to send an `opendir`.
+    pub fn listing(&self, ino: u64) -> DirListing {
+        let parent = self
+            .entries
+            .get(&ino)
+            .map_or(crate::ids::ROOT_INO, |e| e.parent);
+        // "." and ".." occupy offsets 0 and 1; real children follow.
+        let mut listing = vec![
+            (ino, true, ".".to_string()),
+            (parent, true, "..".to_string()),
+        ];
+        if let Some(kids) = self.children.get(&ino) {
+            for &kid in kids {
+                if let Some(e) = self.entries.get(&kid) {
+                    listing.push((kid, e.node.is_folder(), e.node.name.clone()));
+                }
+            }
+        }
+        listing
     }
 
     /// Whether the node at `ino` may be written.
@@ -1193,6 +1234,29 @@ impl State {
         self.touch_mtime(ino, mtime);
         self.entries.get(&ino).map(|e| e.node.clone())
     }
+}
+
+/// The children `entries` hold for each folder in `listed`, gathered in one
+/// pass over them.
+///
+/// The root is its own parent (that is what `..` resolves to), so it would
+/// count as its own child; a directory listed inside itself makes the kernel
+/// fail the lookup with EIO, taking the whole listing down with it.
+///
+/// A pass per listed folder took 1.7 s on a tree of 37,000 nodes with 4,600 of
+/// them listed, at every start before the mount came up (`docs/BUGS.md` B167).
+pub fn listed_children(entries: &HashMap<u64, Entry>, listed: Vec<u64>) -> HashMap<u64, Vec<u64>> {
+    let mut children: HashMap<u64, Vec<u64>> =
+        listed.into_iter().map(|ino| (ino, Vec::new())).collect();
+    for (&ino, entry) in entries {
+        if ino != entry.parent
+            && !entry.node.trashed
+            && let Some(kids) = children.get_mut(&entry.parent)
+        {
+            kids.push(ino);
+        }
+    }
+    children
 }
 
 #[cfg(test)]
@@ -2138,6 +2202,8 @@ mod tests {
             base_revision_id: None,
             dirty: false,
             open_count: 1,
+            generation: 0,
+            barrier: Default::default(),
         }
     }
 

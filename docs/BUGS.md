@@ -108,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B301](#b301--two-overlapping-fsyncs-can-leave-the-older-ones-record-on-disk) | Two overlapping fsyncs can leave the older one's record on disk |
 | [B300](#b300--a-read-during-a-release-can-be-served-the-revision-the-write-replaced) | A read during a release can be served the revision the write replaced |
 | [B299](#b299--a-synced-folder-in-the-trash-blocks-attaching-any-other-folder) | A synced folder in the trash blocks attaching any other folder |
 | [B298](#b298--a-synced-folder-edit-whose-upload-lost-its-answer-is-kept-as-a-conflict-copy-of-itself) | A synced-folder edit whose upload lost its answer is kept as a conflict copy of itself |
@@ -402,6 +403,34 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B301 — Two overlapping fsyncs can leave the older one's record on disk
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-27, from the review of the mounted filesystem in `FUSE.md`, while moving the
+fsync into `pdfs-vfs` (step 5 of `docs/ARCHITECTURE.md`). It was not seen in a run.
+**Where:** `Files::fsync` in `crates/pdfs-vfs/src/files.rs`; `WriteHandle::generation` and
+`WriteHandle::barrier` in `crates/pdfs-vfs/src/open.rs`
+
+**Repro:** Write a file and call `fsync` from two threads on the same open file, with a write in
+between. Each fsync runs on a worker. If the first one finishes after the second, its record of the
+file goes to disk last. Kill the daemon before the file is closed. The restart recovers the file
+as the first fsync saw it and loses the bytes the second one had made durable.
+
+**Cause.** An fsync copied what the handle held (length, written ranges, base), synced the scratch
+file and then wrote that copy as the sidecar a restart recovers from. Nothing ordered two of these
+on the same file, so the copy that was written last was not always the newest.
+
+**Fix.** Each write handle counts its changes in `generation` and carries a `barrier` lock. An
+fsync takes the barrier before it reads the handle and holds it until the sidecar is written, so a
+later fsync records at least what an earlier one did. The barrier also keeps the generation last
+made durable, and an fsync with nothing new since then skips the sidecar.
+
+**Verified:** `an_fsync_records_what_the_file_holds_when_its_turn_comes` holds the barrier, writes
+while an fsync waits for it, and checks that a restart recovers the later bytes. No test drives
+this through a mount.
+
+---
 
 ### B300 — A read during a release can be served the revision the write replaced
 

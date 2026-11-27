@@ -19,3 +19,9 @@ pub const VIRTUAL_VOLUME: &str = "virtual";
 pub fn is_virtual_uid(uid: &NodeUid) -> bool {
     uid.volume_id.as_str() == VIRTUAL_VOLUME
 }
+
+/// Whether this node exists only on this machine, so far. Such a uid is
+/// meaningless to the API and must never be sent to it.
+pub fn is_local_uid(uid: &NodeUid) -> bool {
+    uid.volume_id.as_str() == pdfs_store::db::LOCAL_VOLUME
+}
