@@ -5,6 +5,7 @@
 //! from the remote base. On release the handle becomes a [`PendingRevision`]:
 //! the staged blob and what its gaps refer to.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -183,6 +184,156 @@ impl WriteHandle {
         self.written.add(offset, end);
         self.len = self.len.max(end);
         self.dirty = true;
+    }
+}
+
+/// The files open through one tree: write handles by inode, file handles
+/// by `fh`, and the inodes whose last handle is being released.
+///
+/// One `fh` counter serves file and directory handles, so the two never
+/// collide in the kernel's one space of handle numbers.
+pub struct OpenFiles {
+    /// Write state by inode. Concurrent writers share the scratch file.
+    writes: HashMap<u64, WriteHandle>,
+    /// Inodes whose last write handle a release has taken out of
+    /// [`OpenFiles::writes`] and is still queueing. `close(2)` returns before
+    /// that, and in between the edit is in neither the handles nor the queue,
+    /// so a check for changes not on Drive yet looks here too.
+    releasing: HashSet<u64>,
+    /// The inode each write `fh` is open on. Read-only opens use `fh` 0 and
+    /// have no entry.
+    handles: HashMap<u64, u64>,
+    next_fh: u64,
+}
+
+impl Default for OpenFiles {
+    fn default() -> Self {
+        Self {
+            writes: HashMap::new(),
+            releasing: HashSet::new(),
+            handles: HashMap::new(),
+            next_fh: 1,
+        }
+    }
+}
+
+/// What a release of one file handle left behind.
+pub enum Released {
+    /// The handle was not a write handle, or was already gone.
+    NotWriting,
+    /// Other handles still share the inode's write state.
+    StillOpen { ino: u64 },
+    /// The last handle: the write state, now the caller's to queue. The inode
+    /// stays [releasing](OpenFiles::is_owed) until
+    /// [`OpenFiles::finish_release`].
+    Last(WriteHandle),
+}
+
+impl OpenFiles {
+    /// A new handle number, for a file or a directory.
+    pub fn next_fh(&mut self) -> u64 {
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        fh
+    }
+
+    /// Open a write handle on `ino`: share the inode's write state, or start
+    /// it with `start`. Returns the handle number.
+    pub fn open_writer(&mut self, ino: u64, start: impl FnOnce() -> WriteHandle) -> u64 {
+        let fh = self.next_fh();
+        self.writes.entry(ino).or_insert_with(start).open_count += 1;
+        self.handles.insert(fh, ino);
+        fh
+    }
+
+    /// The write state of `ino`, if a handle has it open for writing.
+    pub fn writer(&self, ino: u64) -> Option<&WriteHandle> {
+        self.writes.get(&ino)
+    }
+
+    pub fn writer_mut(&mut self, ino: u64) -> Option<&mut WriteHandle> {
+        self.writes.get_mut(&ino)
+    }
+
+    /// The inode write handle `fh` is open on.
+    pub fn ino_of(&self, fh: u64) -> Option<u64> {
+        self.handles.get(&fh).copied()
+    }
+
+    /// The write state behind file handle `fh`.
+    pub fn by_fh(&self, fh: u64) -> Option<&WriteHandle> {
+        self.writes.get(&self.ino_of(fh)?)
+    }
+
+    pub fn by_fh_mut(&mut self, fh: u64) -> Option<&mut WriteHandle> {
+        let ino = self.ino_of(fh)?;
+        self.writes.get_mut(&ino)
+    }
+
+    /// Whether `ino` is open for writing.
+    pub fn is_writing(&self, ino: u64) -> bool {
+        self.writes.contains_key(&ino)
+    }
+
+    /// Whether `ino` is being written or held by a write handle.
+    pub fn is_busy(&self, ino: u64) -> bool {
+        self.is_writing(ino) || self.handles.values().any(|&held| held == ino)
+    }
+
+    /// Every inode with changes that may not be queued yet: open for writing,
+    /// or released and still queueing. `dirty_only` leaves out write handles
+    /// that changed nothing.
+    pub fn owed(&self, dirty_only: bool) -> impl Iterator<Item = u64> + '_ {
+        self.writes
+            .iter()
+            .filter(move |(_, w)| !dirty_only || w.dirty)
+            .map(|(&ino, _)| ino)
+            .chain(self.releasing.iter().copied())
+    }
+
+    /// Every write state, to rebase or inspect in place.
+    pub fn writers_mut(&mut self) -> impl Iterator<Item = &mut WriteHandle> {
+        self.writes.values_mut()
+    }
+
+    /// Release file handle `fh`. On the last handle of an inode, the write
+    /// state is handed back and the inode is marked as releasing.
+    pub fn release(&mut self, fh: u64) -> Released {
+        let Some(ino) = self.handles.remove(&fh) else {
+            return Released::NotWriting;
+        };
+        let Some(writer) = self.writes.get_mut(&ino) else {
+            return Released::NotWriting;
+        };
+        writer.open_count = writer.open_count.saturating_sub(1);
+        if writer.open_count > 0 {
+            return Released::StillOpen { ino };
+        }
+        let writer = self.writes.remove(&ino).expect("looked up above");
+        self.releasing.insert(ino);
+        Released::Last(writer)
+    }
+
+    /// The release of `ino` has queued what it wrote.
+    pub fn finish_release(&mut self, ino: u64) {
+        self.releasing.remove(&ino);
+    }
+
+    /// Take every write state, for a stop that queues what open handles
+    /// wrote. Forgets every handle.
+    pub fn take_all(&mut self) -> Vec<WriteHandle> {
+        self.handles.clear();
+        self.writes.drain().map(|(_, writer)| writer).collect()
+    }
+
+    /// Put write state in place directly, for tests that build a tree.
+    pub fn insert_writer(&mut self, writer: WriteHandle) {
+        self.writes.insert(writer.ino, writer);
+    }
+
+    /// Drop the write state of `ino` without queueing it, for tests.
+    pub fn remove_writer(&mut self, ino: u64) -> Option<WriteHandle> {
+        self.writes.remove(&ino)
     }
 }
 
@@ -442,5 +593,45 @@ mod tests {
             stage_write(&full, 0, b"bytes"),
             Err(WriteError::NoSpace)
         ));
+    }
+
+    #[test]
+    fn the_last_release_hands_back_the_write_and_marks_it_releasing() {
+        let mut open = OpenFiles::default();
+        // As a fresh open starts it: no handle shares it yet.
+        let fresh = || WriteHandle {
+            open_count: 0,
+            ..handle(0, 0)
+        };
+        let first = open.open_writer(2, fresh);
+        let second = open.open_writer(2, || unreachable!("the state is shared"));
+        assert_ne!(first, second);
+        assert!(open.is_busy(2));
+
+        assert!(matches!(
+            open.release(first),
+            Released::StillOpen { ino: 2 }
+        ));
+        assert!(open.is_writing(2));
+        let Released::Last(writer) = open.release(second) else {
+            panic!("the second release is the last");
+        };
+        assert_eq!(writer.ino, 2);
+        assert!(!open.is_writing(2));
+        assert_eq!(open.owed(false).collect::<Vec<_>>(), [2]);
+
+        open.finish_release(2);
+        assert_eq!(open.owed(false).count(), 0);
+        assert!(matches!(open.release(second), Released::NotWriting));
+    }
+
+    #[test]
+    fn a_directory_handle_never_takes_a_file_handle_number() {
+        let mut open = OpenFiles::default();
+        let dir = open.next_fh();
+        let file = open.open_writer(2, || handle(0, 0));
+        assert_ne!(dir, file);
+        assert_eq!(open.ino_of(file), Some(2));
+        assert_eq!(open.ino_of(dir), None);
     }
 }

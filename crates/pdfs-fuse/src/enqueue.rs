@@ -15,12 +15,12 @@ impl Core {
     pub(crate) fn queue_unreleased_writes(&self) {
         let handles: Vec<(WriteHandle, bool)> = {
             let mut st = self.state();
-            st.handles.clear();
-            let inos: Vec<u64> = st.active_writes.keys().copied().collect();
-            inos.into_iter()
-                .filter_map(|ino| {
-                    let unlinked = st.entries.get(&ino).is_some_and(|e| e.unlinked);
-                    st.active_writes.remove(&ino).map(|h| (h, unlinked))
+            let writers = st.open.take_all();
+            writers
+                .into_iter()
+                .map(|h| {
+                    let unlinked = st.entries.get(&h.ino).is_some_and(|e| e.unlinked);
+                    (h, unlinked)
                 })
                 .collect()
         };

@@ -647,7 +647,7 @@ impl Core {
     /// daemon has just put there itself (`WriteHandle::rebase_onto`).
     pub(crate) fn rebase_open_writes(&self, uid: &NodeUid, node: &Node) {
         self.for_each_state(|st| {
-            for aw in st.active_writes.values_mut() {
+            for aw in st.open.writers_mut() {
                 if aw.uid == *uid {
                     aw.rebase_onto(node);
                     debug!(%uid, mtime = aw.base_mtime, size = aw.base_size,

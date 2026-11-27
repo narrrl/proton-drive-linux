@@ -1094,7 +1094,7 @@ impl Core {
         offset: u64,
         size: u64,
     ) -> Result<Option<Vec<u8>>, Errno> {
-        let handle = self.state().active_writes.get(&ino).map(|h| {
+        let handle = self.state().open.writer(ino).map(|h| {
             (
                 h.file.clone(),
                 h.len,

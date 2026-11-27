@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use pdfs_core::{Access, access_for};
 use pdfs_store::db::Db;
-use pdfs_vfs::open::WriteHandle;
+use pdfs_vfs::open::OpenFiles;
 #[cfg(test)]
 use proton_drive_rs::MemberRole;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -99,17 +99,8 @@ pub(crate) struct State {
     /// The next inode for a node the database could not give a local id, from
     /// a range lids never reach ([`FALLBACK_INO`]).
     pub(crate) next_ino: u64,
-    /// Shared write state keyed by inode. Concurrent writers share the scratch file.
-    pub(crate) active_writes: HashMap<u64, WriteHandle>,
-    /// Inodes whose last write handle `release` has taken out of
-    /// [`State::active_writes`] and is still queueing. `close(2)` returns
-    /// before that, and in between the edit is in neither the handles nor the
-    /// queue, so a check for changes not on Drive yet looks here too.
-    pub(crate) releasing: HashSet<u64>,
-    /// Maps file handle id (fh) to inode (ino). Read-only opens use fh 0 and
-    /// have no entry here.
-    pub(crate) handles: HashMap<u64, u64>,
-    pub(crate) next_fh: u64,
+    /// The files open for writing, their handles and their releases.
+    pub(crate) open: OpenFiles,
     /// One frozen listing per open directory handle, taken at `opendir`.
     ///
     /// `readdir` resumes from a byte offset into the listing it is walking, so
@@ -267,10 +258,7 @@ impl State {
             children: HashMap::new(),
             roots: HashSet::new(),
             next_ino: FALLBACK_INO,
-            active_writes: HashMap::new(),
-            releasing: HashSet::new(),
-            handles: HashMap::new(),
-            next_fh: 1,
+            open: OpenFiles::default(),
             dir_snapshots: HashMap::new(),
             access_changes: HashSet::new(),
             share_access,
@@ -922,7 +910,7 @@ impl State {
     /// create while SQLite held it open, and the kernel then capped every read
     /// at that size (docs/BUGS.md B109).
     pub(crate) fn keep_open_write_size(&self, ino: u64, node: &mut Node) {
-        let (Some(aw), Some(entry)) = (self.active_writes.get(&ino), self.entries.get(&ino)) else {
+        let (Some(aw), Some(entry)) = (self.open.writer(ino), self.entries.get(&ino)) else {
             return;
         };
         if let NodeKind::File { claimed_size, .. } = &mut node.kind {
@@ -1220,7 +1208,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfs_vfs::open::Intervals;
+    use pdfs_vfs::open::{Intervals, WriteHandle};
     use proton_drive_rs::ShareMembership;
     use proton_drive_rs::proton_sdk::ids::{LinkId, ShareId, ShareMembershipId, VolumeId};
     use std::fs::File;
@@ -2148,7 +2136,7 @@ mod tests {
         let ino = st.intern(0, node("file", "root", "workload.db", false));
         let mut h = handle(16384, 0);
         h.ino = ino;
-        st.active_writes.insert(ino, h);
+        st.open.insert_writer(h);
         st.set_size(ino, 16384);
         st.touch_mtime(ino, 500);
 
@@ -2158,7 +2146,7 @@ mod tests {
         assert_eq!(st.entries[&ino].node.modification_time, 500);
 
         // Once the handle is gone the remote is authoritative again.
-        st.active_writes.remove(&ino);
+        st.open.remove_writer(ino);
         st.intern(0, node("file", "root", "workload.db", false));
         assert_eq!(crate::node_size(&st.entries[&ino].node), 0);
     }

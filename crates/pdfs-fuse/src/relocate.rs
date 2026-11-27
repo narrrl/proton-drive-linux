@@ -453,11 +453,7 @@ impl Core {
         // longer has that uid, so the move went ahead under an open write.
         let mut writing = false;
         self.for_each_state(|st| {
-            writing = st
-                .active_writes
-                .keys()
-                .chain(&st.releasing)
-                .any(|&open| ino_is_under(st, open, ino));
+            writing = st.open.owed(false).any(|open| ino_is_under(st, open, ino));
         });
         Ok(writing)
     }

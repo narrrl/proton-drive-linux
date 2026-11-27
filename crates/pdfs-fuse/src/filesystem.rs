@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::state::DirListing;
-use pdfs_vfs::open::WriteError;
+use pdfs_vfs::open::{Released, WriteError};
 
 impl Filesystem for ProtonFs {
     /// Negotiate kernel-side behaviour once, before any other callback.
@@ -271,7 +271,7 @@ impl Filesystem for ProtonFs {
         // request of the mount (`docs/BUGS.md` B227).
         let handle = {
             let st = self.core.state();
-            st.active_writes.get(&ino.0).map(|h| {
+            st.open.writer(ino.0).map(|h| {
                 (
                     h.file.clone(),
                     h.len,
@@ -467,7 +467,7 @@ impl Filesystem for ProtonFs {
             let fh = fh.map(|f| f.0).filter(|&f| f != 0);
             let handled = {
                 let mut st = self.core.state();
-                match st.active_writes.get_mut(&ino.0) {
+                match st.open.writer_mut(ino.0) {
                     Some(aw) => aw.resize(size).map(|()| true).map_err(Errno::from),
                     None => Ok(false),
                 }
@@ -537,7 +537,7 @@ impl Filesystem for ProtonFs {
         };
         let file = {
             let st = self.core.state();
-            match st.handles.get(&_fh.0).and_then(|i| st.active_writes.get(i)) {
+            match st.open.by_fh(_fh.0) {
                 Some(aw) => aw.file.clone(),
                 None => {
                     reply.error(if st.entries.contains_key(&ino.0) {
@@ -559,12 +559,7 @@ impl Filesystem for ProtonFs {
             Err(Errno::from(std::io::Error::last_os_error()))
         } else {
             let mut st = self.core.state();
-            if let Some(aw) = st
-                .handles
-                .get(&_fh.0)
-                .copied()
-                .and_then(|i| st.active_writes.get_mut(&i))
-            {
+            if let Some(aw) = st.open.by_fh_mut(_fh.0) {
                 let len = aw.len;
                 let (authored, grown) = kind.effect(offset, new_end, len);
                 if let Some((from, to)) = authored {
@@ -610,9 +605,8 @@ impl Filesystem for ProtonFs {
     ) {
         let file = {
             let st = self.core.state();
-            st.handles
-                .get(&fh.0)
-                .and_then(|ino| st.active_writes.get(ino))
+            st.open
+                .by_fh(fh.0)
                 .filter(|aw| aw.dirty)
                 .map(|aw| aw.file.clone())
         };
@@ -670,20 +664,13 @@ impl Filesystem for ProtonFs {
         let (handle, unlinked_uid, releasing) = {
             let mut st = self.core.state();
             let unlinked_uid = release_unlinked_entry(&mut st, ino.0);
-            let ino = st.handles.remove(&fh.0);
-            let h = ino.and_then(|i| {
-                let aw = st.active_writes.get_mut(&i)?;
-                aw.open_count = aw.open_count.saturating_sub(1);
-                if aw.open_count == 0 {
-                    st.active_writes.remove(&i)
-                } else {
-                    None
+            let (h, releasing) = match st.open.release(fh.0) {
+                Released::Last(h) => {
+                    let ino = h.ino;
+                    (Some(h), Some(ino))
                 }
-            });
-            let releasing = ino.filter(|_| h.is_some());
-            if let Some(ino) = releasing {
-                st.releasing.insert(ino);
-            }
+                Released::StillOpen { .. } | Released::NotWriting => (None, None),
+            };
             (h, unlinked_uid, releasing)
         };
         // Deliberately **not** handed to a worker, unlike the other slow
@@ -702,7 +689,7 @@ impl Filesystem for ProtonFs {
         // insert, and at most a bounded copy out of the local cache.
         self.finish_release(handle, unlinked_uid, reply);
         if let Some(ino) = releasing {
-            self.core.state().releasing.remove(&ino);
+            self.core.state().open.finish_release(ino);
         }
     }
 
@@ -1271,8 +1258,7 @@ impl ProtonFs {
         let listing = Arc::new(build_listing(&st, ino));
         // Shares the counter with write handles, so a directory handle can never
         // collide with a file handle (both are `fh` values in one kernel space).
-        let fh = st.next_fh;
-        st.next_fh += 1;
+        let fh = st.open.next_fh();
         st.dir_snapshots.insert(fh, listing);
         drop(st);
         reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -1475,7 +1461,7 @@ impl ProtonFs {
                 // Only a handle this open is about to *create* can carry a stale
                 // base; if one already exists, that handle is authoritative and
                 // the scratch prepared above is discarded either way.
-                let creating = !st.active_writes.contains_key(&ino.0);
+                let creating = !st.open.is_writing(ino.0);
                 if creating && current.as_ref() != pending_base.as_ref().map(|p| &p.path) {
                     drop(st);
                     let _ = std::fs::remove_file(&path);
@@ -1513,9 +1499,7 @@ impl ProtonFs {
                         }
                     }
                 }
-                let fh = st.next_fh;
-                st.next_fh += 1;
-                let aw = st.active_writes.entry(ino.0).or_insert_with(|| {
+                let fh = st.open.open_writer(ino.0, || {
                     WriteHandle {
                         ino: ino.0,
                         uid: uid.clone(),
@@ -1532,8 +1516,6 @@ impl ProtonFs {
                         open_count: 0,
                     }
                 });
-                aw.open_count += 1;
-                st.handles.insert(fh, ino.0);
                 break 'install Ok(fh);
             }
             error!(%uid, "queued revision kept changing while opening for write");
@@ -1571,8 +1553,7 @@ impl ProtonFs {
         // across the sync.
         let handle = {
             let st = self.core.state();
-            let ino = st.handles.get(&fh.0).copied();
-            ino.and_then(|i| st.active_writes.get(&i)).map(|aw| {
+            st.open.by_fh(fh.0).map(|aw| {
                 (
                     aw.file.clone(),
                     aw.path.clone(),
@@ -1654,7 +1635,7 @@ impl ProtonFs {
     fn stage_write(&self, ino: u64, fh: u64, offset: u64, data: &[u8]) -> Result<(), Errno> {
         let file = {
             let st = self.core.state();
-            match st.handles.get(&fh).and_then(|&i| st.active_writes.get(&i)) {
+            match st.open.by_fh(fh) {
                 Some(aw) => aw.file.clone(),
                 None => return Err(Errno::EBADF),
             }
@@ -1677,12 +1658,7 @@ impl ProtonFs {
         }
         let new_len = {
             let mut st = self.core.state();
-            let Some(aw) = st
-                .handles
-                .get(&fh)
-                .copied()
-                .and_then(|i| st.active_writes.get_mut(&i))
-            else {
+            let Some(aw) = st.open.by_fh_mut(fh) else {
                 return Err(Errno::EBADF);
             };
             aw.record_write(offset, offset + data.len() as u64);
@@ -1797,14 +1773,9 @@ impl ProtonFs {
         {
             kids.push(ino);
         }
-        let fh = st.next_fh;
-        st.next_fh += 1;
-        let aw = st
-            .active_writes
-            .entry(ino)
-            .or_insert_with(|| WriteHandle::created(ino, &node, file, path));
-        aw.open_count += 1;
-        st.handles.insert(fh, ino);
+        let fh = st
+            .open
+            .open_writer(ino, || WriteHandle::created(ino, &node, file, path));
         let entry = st.entries.get(&ino).unwrap();
         let attr = self.attr(ino, &entry.node, entry.access);
         drop(st);
