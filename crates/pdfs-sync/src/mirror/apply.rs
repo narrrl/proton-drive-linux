@@ -194,6 +194,47 @@ impl Syncer {
         }
     }
 
+    /// Note that an upload of `rel` streamed bytes with SHA-1 `sha1` and did
+    /// not hear a success back. They may have landed all the same.
+    fn note_sent(&self, folder_id: i64, rel: &str, kind: &str, sha1: &str) {
+        if let Err(error) = self.store.sync_intent_sent(folder_id, rel, kind, sha1) {
+            debug!(rel, error = ?error, "sync: cannot note what an upload sent");
+        }
+    }
+
+    /// Whether the file Drive holds at `rel`, with SHA-1 `remote_sha1`, is one
+    /// of this daemon's own uploads whose answer never came: an upload of
+    /// `rel` not yet settled streamed exactly those bytes.
+    ///
+    /// Then the file is ours, not another computer's, and a newer local edit
+    /// is not a conflict with it: it goes up as a revision. A file that only
+    /// happens to hold the same bytes loses nothing by that either.
+    pub(super) fn landed_unanswered(
+        &self,
+        folder_id: i64,
+        rel: &str,
+        remote_sha1: Option<&str>,
+    ) -> bool {
+        let Some(remote_sha1) = remote_sha1 else {
+            return false;
+        };
+        let intents = match self.store.sync_intents(Some(folder_id)) {
+            Ok(intents) => intents,
+            Err(error) => {
+                debug!(rel, error = ?error, "sync: cannot read the effect intents");
+                return false;
+            }
+        };
+        intents.iter().any(|intent| {
+            intent.rel_path == rel
+                && matches!(intent.kind.as_str(), "upload" | "upload-revision")
+                && intent
+                    .sent_sha1s
+                    .iter()
+                    .any(|sent| sent.eq_ignore_ascii_case(remote_sha1))
+        })
+    }
+
     /// Settle the intents of `folder_id` that a pass begun at `began` did
     /// not send again, though it looked at every path: what they were for has
     /// changed, or is done.
@@ -323,6 +364,15 @@ impl Syncer {
                     return Ok(Applied::Vanished);
                 }
                 if !digest.eq_ignore_ascii_case(sha1) {
+                    if self.landed_unanswered(folder_id, rel, Some(sha1)) {
+                        info!(
+                            rel,
+                            "sync: the file on Drive is an upload of ours that went unanswered; sending the newer local bytes as a revision of it"
+                        );
+                        return self
+                            .upload_revision(folder_id, local_root, rel, uid, remote)
+                            .await;
+                    }
                     info!(
                         rel,
                         "sync: same size as on Drive but different content; keeping a conflict copy"
@@ -444,8 +494,14 @@ impl Syncer {
                 Some(mtime),
                 false,
             )
-            .await
-            .map_err(|e| format!("upload {rel}: {e}"))?;
+            .await;
+        let uid = match uid {
+            Ok(uid) => uid,
+            Err(e) => {
+                self.note_sent(folder_id, rel, "upload", &sent.digest());
+                return Err(format!("upload {rel}: {e}"));
+            }
+        };
         // The parent has gained a child that no cached listing of it knows
         // about. Without this, a folder later switched to on-demand serves a
         // snapshot that predates this upload (B86).
@@ -513,10 +569,14 @@ impl Syncer {
                 meta.len(),
             ),
         ));
-        self.drive
+        if let Err(e) = self
+            .drive
             .upload_new_revision_from(uid, reader, meta.len() as i64, thumbnails, Some(mtime))
             .await
-            .map_err(|e| format!("upload revision {rel}: {e}"))?;
+        {
+            self.note_sent(folder_id, rel, "upload-revision", &sent.digest());
+            return Err(format!("upload revision {rel}: {e}"));
+        }
         warn_if_torn(rel, &path, streamed);
         let remote = self
             .landed_as_sent(rel, uid, &sent.digest(), streamed)

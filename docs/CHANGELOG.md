@@ -11,10 +11,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **51**. New tables save a mirror folder's walk of Proton Drive (48). A finished walk is
+Schema: **52**. New tables save a mirror folder's walk of Proton Drive (48). A finished walk is
 kept, with a list of the folders that changed on Proton Drive since (49). Each mirror folder
 counts the deletions it made in the last day (50). Each upload, download or folder a mirror pass
-sends is recorded until its result is in (51).
+sends is recorded until its result is in (51), and an upload that heard no answer keeps the
+digest of what it sent (52).
 
 ### Added
 - **`small_uploads` in `config.json` turns off the one-request upload for small files.** It is
@@ -75,6 +76,12 @@ sends is recorded until its result is in (51).
   first pass, and whenever the change feed lost track (#53).
 
 ### Fixed
+- **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
+  edit.** Proton Drive can make a file and lose the answer. If the file was then written again
+  before the next sync, for example while the daemon was stopped, that sync saw two different
+  files under one name. It kept this computer's newer edit as a conflict copy next to its own
+  first upload. Now an upload that hears no answer keeps the digest of the bytes it sent. When
+  Proton Drive holds exactly those bytes, the newer edit goes up as a new version of that file.
 - **A stop ends the loops that follow Proton Drive's change feed before the daemon exits.**
   The loops that read the Drive and photos event streams, and the gallery refresh, kept
   running after every other service had stopped, and could still write to the database while

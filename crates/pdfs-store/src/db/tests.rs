@@ -8457,6 +8457,33 @@ fn a_deletion_window_is_kept_per_folder_until_the_folder_changes() {
 /// attempt and says what state it was left in. It goes once settled, and with
 /// the folder.
 #[test]
+fn an_upload_notes_each_digest_it_sent_once() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    // Nothing to note without an intent.
+    db.sync_intent_sent(id, "a.txt", "upload", "AA").unwrap();
+    assert!(db.sync_intents(Some(id)).unwrap().is_empty());
+
+    db.sync_intent_issue(id, "a.txt", "upload", 10).unwrap();
+    db.sync_intent_sent(id, "a.txt", "upload", "AA").unwrap();
+    db.sync_intent_sent(id, "a.txt", "upload", "aa").unwrap();
+    // Sent again with other bytes: both may have landed.
+    db.sync_intent_issue(id, "a.txt", "upload", 20).unwrap();
+    db.sync_intent_sent(id, "a.txt", "upload", "bb").unwrap();
+    // Another kind of the same path keeps its own.
+    db.sync_intent_issue(id, "a.txt", "upload-revision", 21)
+        .unwrap();
+    let intents = db.sync_intents(Some(id)).unwrap();
+    let upload = intents.iter().find(|i| i.kind == "upload").unwrap();
+    assert_eq!(upload.sent_sha1s, ["aa", "bb"]);
+    let revision = intents
+        .iter()
+        .find(|i| i.kind == "upload-revision")
+        .unwrap();
+    assert!(revision.sent_sha1s.is_empty());
+}
+
+#[test]
 fn an_effect_intent_is_kept_until_it_is_settled_or_its_folder_changes() {
     let db = Db::open_in_memory().unwrap();
     let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();

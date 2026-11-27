@@ -108,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B305](#b305--a-mirrored-file-whose-upload-went-unanswered-gets-a-conflict-copy-of-its-own-edit) | A mirrored file whose upload went unanswered gets a conflict copy of its own edit |
 | [B304](#b304--a-write-released-while-its-files-create-lands-is-kept-as-a-conflict-copy) | A write released while its file's create lands is kept as a conflict copy |
 | [B303](#b303--a-file-made-where-a-withdrawn-create-was-listed-refuses-every-write) | A file made where a withdrawn create was listed refuses every write |
 | [B302](#b302--a-stop-during-a-replacing-rename-leaves-the-replaced-file-in-the-trash) | A stop during a replacing rename leaves the replaced file in the trash |
@@ -406,6 +407,36 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B305 — A mirrored file whose upload went unanswered gets a conflict copy of its own edit
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-27, writing the simulation for the case the effect reducer is meant to handle
+(`FURTHER_IMPROVEMENTS.md`): a create accepted by Drive, the reply lost, a restart, and a newer
+local edit. The simulation failed on the first run. Drive held `new.txt` with the first bytes and
+`new (sync-conflict …).txt` with the edit.
+**Where:** the `FilePlan::Conflict` arm of the plan in `crates/pdfs-sync/src/mirror.rs`, and
+`Pending::Adopt` in `crates/pdfs-sync/src/mirror/apply.rs`
+
+**Repro:** In a mirror folder, write a new file. Lose the answer to its upload after Drive has
+made the file. Stop the daemon, write the file again, and start the daemon.
+
+**Cause.** The upload failed as far as the daemon knew, so no baseline was recorded. The next pass
+found the path on both sides with no baseline and different bytes, which is what two computers
+writing one new file look like, so it kept the local copy as a conflict copy. The edit itself is
+not lost. The one-request small upload makes this ending of a lost reply the usual one: it
+leaves a whole file, never a draft for the next attempt to replace.
+
+**Fix.** An upload that hears no success back notes the SHA-1 of the bytes it streamed in its
+effect intent (`sent_sha1s`, schema 52). Before keeping a conflict copy, the plan checks the
+intents. If Drive's file holds exactly bytes an unsettled upload of that path sent, the file is
+this daemon's own. The local bytes then go up as a revision of it. A first-sync adopt of a
+same-size file with other bytes does the same. A file that holds those bytes by chance loses
+nothing either: they are what this computer sent.
+
+**Verified:** `a_mirror_create_whose_reply_was_lost_is_adopted_after_a_restart_and_its_edit_lands`
+fails without the fix and passes with it. `an_upload_notes_each_digest_it_sent_once` covers the
+store.
 
 ### B304 — A write released while its file's create lands is kept as a conflict copy
 

@@ -34,6 +34,9 @@ pub struct StoredIntent {
     /// When it was last sent, in seconds since the epoch.
     pub issued_at: i64,
     pub last_error: Option<String>,
+    /// For an upload: the SHA-1s of the bytes its attempts streamed without
+    /// hearing a success back, lowercase. One of them may have landed.
+    pub sent_sha1s: Vec<String>,
 }
 
 /// What a mirror pass has walked of Drive, saved so a pass cut short
@@ -901,6 +904,29 @@ impl Db {
         Ok(())
     }
 
+    /// Note that the upload `kind` of `rel_path` streamed bytes with SHA-1
+    /// `sha1` and heard no success back. Nothing happens without an intent for
+    /// it. A digest already noted is not added again.
+    pub fn sync_intent_sent(
+        &self,
+        folder_id: i64,
+        rel_path: &str,
+        kind: &str,
+        sha1: &str,
+    ) -> Result<()> {
+        let sha1 = sha1.to_ascii_lowercase();
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE sync_intent SET sent_sha1s = CASE
+               WHEN sent_sha1s IS NULL OR sent_sha1s = '' THEN ?4
+               WHEN instr(' ' || sent_sha1s || ' ', ' ' || ?4 || ' ') > 0 THEN sent_sha1s
+               ELSE sent_sha1s || ' ' || ?4 END
+             WHERE folder_id = ?1 AND rel_path = ?2 AND kind = ?3",
+            params![folder_id, rel_path, kind, sha1],
+        )?;
+        Ok(())
+    }
+
     /// Every intent not settled, oldest first; only `folder_id`'s when given.
     pub fn sync_intents(&self, folder_id: Option<i64>) -> Result<Vec<StoredIntent>> {
         let conn = self.read()?;
@@ -970,7 +996,7 @@ impl Db {
 }
 
 const INTENT_COLUMNS: &str =
-    "id, folder_id, rel_path, kind, state, attempts, issued_at, last_error";
+    "id, folder_id, rel_path, kind, state, attempts, issued_at, last_error, sent_sha1s";
 
 fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIntent> {
     Ok(StoredIntent {
@@ -982,6 +1008,10 @@ fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIntent> {
         attempts: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(u32::MAX),
         issued_at: row.get(6)?,
         last_error: row.get(7)?,
+        sent_sha1s: row
+            .get::<_, Option<String>>(8)?
+            .map(|s| s.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default(),
     })
 }
 

@@ -282,14 +282,38 @@ decides what happens next:
   is logged at info.
 - A change to what the folder is, or its removal, drops its rows.
 
-The intents are kept in shadow for now: nothing reads them to decide what to send. The apply
-step's own checks still decide whether an effect that may have landed is sent again (B266 for a
-create, B39 for a download). Deletions on either side are not recorded yet. Trace counts:
-`unsure resent`, `retried`, `superseded`.
+The intents decide one thing so far: whether a file on Drive is an upload of this daemon's
+that went unanswered.
+- An upload that does not hear a success back notes the SHA-1 of the bytes it streamed in its
+  intent (`sent_sha1s`, schema 52). Each attempt adds its digest.
+- When a later pass would keep a conflict copy, it checks the intent first. The path may be new
+  on both sides, or changed on both sides since the baseline. If Drive's file holds exactly
+  bytes an unsettled upload of that path sent, the file is ours. The newer local bytes then go up
+  as a revision of it, with no conflict copy. The same holds for a first-sync adopt of a
+  same-size file whose bytes differ.
+- This is the usual end of a lost reply to a one-request small upload. Such an upload leaves a
+  whole file, never a draft. If the file was written again before the next pass, for example
+  while the daemon was stopped, the next pass used to see two different files and fork a
+  conflict copy of this computer's own edit.
+- A file that only happens to hold the same bytes loses nothing either: its content is what
+  this computer sent.
+- A daemon killed in the middle of an upload notes no digest, so that case still ends in a
+  conflict copy when the file is edited before the next pass. It is kept, and nothing is lost.
 
-**Tests:** the `effect::tests` unit tests, `an_effect_intent_is_kept_until_it_is_settled_or_its_folder_changes`
-(DB), and `an_effect_left_unsure_by_a_stop_is_sent_again_or_settled` (sim: of two uploads a
-stopped daemon left unsure, the one still needed is sent again and the other is settled).
+Otherwise nothing reads the intents to decide what to send. The apply step's own checks still
+decide whether an effect that may have landed is sent again (B266 for a create, B39 for a
+download). Deletions on either side are not recorded yet. Trace counts: `unsure resent`,
+`retried`, `superseded`.
+
+**Tests:**
+- the `effect::tests` unit tests;
+- DB: `an_effect_intent_is_kept_until_it_is_settled_or_its_folder_changes`, and
+  `an_upload_notes_each_digest_it_sent_once`;
+- sim `an_effect_left_unsure_by_a_stop_is_sent_again_or_settled`: of two uploads a stopped daemon
+  left unsure, the one still needed is sent again and the other is settled;
+- sim `a_mirror_create_whose_reply_was_lost_is_adopted_after_a_restart_and_its_edit_lands`:
+  Drive makes the file and the answer is lost, then the daemon stops and the file is written
+  again. After the start there is one file, holding the newer bytes, and no conflict copy.
 
 ## Plan of work (separate PRs)
 
