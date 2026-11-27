@@ -2877,6 +2877,67 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_listing_taken_while_a_withdrawn_create_lands_does_not_keep_it() {
+        // A file deleted while its create was on the wire. Drive made the node
+        // and listed it before the drain had its answer, and a refresh then put
+        // it in the tree. The drain hid it and trashed it, but the entry stayed:
+        // a new file made under the name opened the trashed node, and every
+        // write and rename of it was refused with EACCES (B303).
+        let drive = FakeDrive::new();
+        let dir = scratch("withdrawn-create-listed");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        let held = daemon.client.hold_reply_to_next_create();
+        daemon.write_new(&mnt.join("d"), b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || held.reached()));
+        std::fs::remove_file(mnt.join("d")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().get("d").cloned() == file(b"first")
+        }));
+        // Past the listing lag, so the refresh finds the node Drive made.
+        std::thread::sleep(Duration::from_millis(300));
+        let refresh = Request::Refresh {
+            scope: RefreshScope::Dir {
+                path: mnt.to_string_lossy().into_owned(),
+            },
+        };
+        assert!(matches!(daemon.request(&refresh), Ok(Response::Ok { .. })));
+        let _ = std::fs::read_dir(&mnt).unwrap().count();
+        drop(held);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && !drive.tree().contains_key("d")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert!(
+            !mnt.join("d").exists(),
+            "the trashed create is still listed"
+        );
+
+        std::fs::write(mnt.join("d"), b"second").unwrap();
+        std::fs::rename(mnt.join("d"), mnt.join("c.bin")).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("c.bin").cloned() == file(b"second")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_made_under_the_name_of_a_create_on_the_wire_waits_for_it() {
         // A file renamed while its create was on the wire, and a new one made
         // under its old name. The new file's create found the name held by the

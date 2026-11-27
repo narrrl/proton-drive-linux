@@ -19,7 +19,7 @@ impl Core {
         if is_local_uid_str(&op.uid) {
             match self.withdrawn_twin(op)? {
                 Some(twin) => {
-                    self.writes.hide(&twin);
+                    self.withdraw_landed(&twin);
                     match self
                         .block_on_bounded(self.drive.trash_nodes(std::slice::from_ref(&twin)))
                         .and_then(batch::into_unit)
@@ -65,6 +65,21 @@ impl Core {
         self.log_activity(ActivityKind::Trash, &name, "trashed", true);
         info!(%uid, name, "pending trash landed");
         Ok(())
+    }
+
+    /// Take a node a withdrawn create made on Drive out of every listing.
+    ///
+    /// Hiding keeps it out of listings from now on, not out of one taken while
+    /// Drive listed it and the drain still waited for the answer. A file made
+    /// under the name then opened the node being trashed, and every write to
+    /// it was refused with EACCES (`docs/BUGS.md` B303).
+    fn withdraw_landed(&self, uid: &NodeUid) {
+        self.writes.hide(uid);
+        self.for_each_mount(|st, notify| {
+            if let Some((parent, name)) = st.forget_or_unlink(uid) {
+                notify.inval_entry(parent, name);
+            }
+        });
     }
 
     /// Remove a trash op that landed, and the blob of a create it withdrew.
@@ -191,7 +206,7 @@ impl Core {
         real: &NodeUid,
         name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.writes.hide(real);
+        self.withdraw_landed(real);
         self.note_self_change(real);
         let trash = PendingOp {
             id: trash,
