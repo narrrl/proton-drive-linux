@@ -482,6 +482,55 @@ pub struct ReadView {
     pub written: Intervals,
 }
 
+/// The bytes `[offset, offset + size)` of a file open for writing: authored
+/// ranges from its scratch `file`, the rest from its base through `base`,
+/// and zeros past the base. `Ok(None)` when `base` says it cannot answer.
+/// `base` gets `(offset, len)` of a range below the base size.
+pub fn assemble_open_read<E>(
+    file: &File,
+    len: u64,
+    base_size: u64,
+    written: &Intervals,
+    offset: u64,
+    size: u64,
+    mut base: impl FnMut(u64, u64) -> Result<Option<Vec<u8>>, E>,
+) -> Result<Option<Vec<u8>>, ReadFailure<E>> {
+    if offset >= len || size == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let end = offset.saturating_add(size).min(len);
+    let mut out = Vec::with_capacity((end - offset) as usize);
+    for (s, e, authored) in written.segments(offset, end) {
+        if authored {
+            let mut buf = vec![0u8; (e - s) as usize];
+            file.read_exact_at(&mut buf, s)
+                .map_err(ReadFailure::Scratch)?;
+            out.extend_from_slice(&buf);
+        } else {
+            let bend = e.min(base_size);
+            if s < bend {
+                match base(s, bend - s).map_err(ReadFailure::Base)? {
+                    Some(bytes) => out.extend_from_slice(&bytes),
+                    None => return Ok(None),
+                }
+            }
+            // Anything past the base is a hole: zero-fill.
+            let zeros = e.saturating_sub(s.max(base_size));
+            out.resize(out.len() + zeros as usize, 0);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Why [`assemble_open_read`] failed.
+#[derive(Debug)]
+pub enum ReadFailure<E> {
+    /// Reading the scratch file failed.
+    Scratch(std::io::Error),
+    /// Reading the base failed, with the caller's own error.
+    Base(E),
+}
+
 /// Why staging a write failed.
 #[derive(Debug)]
 pub enum WriteError {
@@ -535,6 +584,7 @@ mod tests {
     use super::*;
     use proton_drive_rs::NodeKind;
     use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+    use std::io::Write;
 
     /// Flatten `segments` into a readable form for assertions.
     fn segs(iv: &Intervals, start: u64, end: u64) -> Vec<(u64, u64, bool)> {
@@ -869,5 +919,49 @@ mod tests {
         assert_eq!(rest, [(4, 6)]);
         open.close_dir(fh);
         assert!(open.dir(fh).is_none());
+    }
+
+    fn scratch(bytes: &[u8]) -> (File, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "pdfs-open-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        (file, path)
+    }
+
+    /// The dispatch loop answers from what is on this machine and says so
+    /// when the base would have to be downloaded, for a worker to do it
+    /// (`docs/BUGS.md` B227).
+    #[test]
+    fn a_read_needing_the_base_says_so_instead_of_fetching() {
+        let (file, path) = scratch(b"ABCDEFGH");
+        let mut written = Intervals::default();
+        written.add(0, 4);
+
+        let authored = assemble_open_read::<()>(&file, 8, 8, &written, 0, 4, |_, _| {
+            panic!("an authored range never asks the base")
+        });
+        assert_eq!(authored.unwrap().as_deref(), Some(&b"ABCD"[..]));
+
+        let missing = assemble_open_read::<()>(&file, 8, 8, &written, 2, 6, |_, _| Ok(None));
+        assert_eq!(missing.unwrap(), None);
+
+        let base = assemble_open_read::<()>(&file, 10, 8, &written, 2, 8, |s, n| {
+            assert_eq!((s, n), (4, 4));
+            Ok(Some(b"efgh".to_vec()))
+        });
+        assert_eq!(base.unwrap().as_deref(), Some(&b"CDefgh\0\0"[..]));
+        let _ = std::fs::remove_file(path);
     }
 }

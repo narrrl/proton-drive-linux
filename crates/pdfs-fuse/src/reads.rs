@@ -1,6 +1,7 @@
 //! Revision-reader cache and streamed range-read subsystem.
 
 use super::*;
+use pdfs_vfs::open::{ReadFailure, assemble_open_read};
 
 /// A read of an unpinned video at least this large streams *without* persisting
 /// its blocks to the on-disk cache. Playing a 2 GB film would otherwise pour it
@@ -1049,10 +1050,11 @@ impl Core {
         offset: u64,
         size: u64,
     ) -> Result<Vec<u8>, Errno> {
-        let read = assemble_open_read(file, len, uid, base_size, written, offset, size, |s, n| {
+        let read = assemble_open_read(file, len, base_size, written, offset, size, |s, n| {
             self.read_range(uid, base_mtime, base_size, s, n, true)
                 .map(Some)
-        })?;
+        })
+        .map_err(|failure| open_read_errno(uid, failure))?;
         Ok(read.unwrap_or_default())
     }
 
@@ -1075,9 +1077,10 @@ impl Core {
         offset: u64,
         size: u64,
     ) -> Result<Option<Vec<u8>>, Errno> {
-        assemble_open_read(file, len, uid, base_size, written, offset, size, |s, n| {
+        assemble_open_read(file, len, base_size, written, offset, size, |s, n| {
             Ok(self.cached_range(uid, base_mtime, base_size, s, n))
         })
+        .map_err(|failure| open_read_errno(uid, failure))
     }
 
     /// Bytes `[offset, offset + size)` of file `ino` as `read` would serve
@@ -1301,47 +1304,16 @@ impl Core {
     }
 }
 
-/// The bytes `[offset, offset + size)` of a file open for writing: authored
-/// ranges from its scratch `file`, the rest from its base through `base`,
-/// and zeros past the base. `Ok(None)` when `base` says it cannot answer.
-#[allow(clippy::too_many_arguments)]
-fn assemble_open_read(
-    file: &File,
-    len: u64,
-    uid: &NodeUid,
-    base_size: u64,
-    written: &Intervals,
-    offset: u64,
-    size: u64,
-    mut base: impl FnMut(u64, u64) -> Result<Option<Vec<u8>>, Errno>,
-) -> Result<Option<Vec<u8>>, Errno> {
-    if offset >= len || size == 0 {
-        return Ok(Some(Vec::new()));
-    }
-    let end = offset.saturating_add(size).min(len);
-    let mut out = Vec::with_capacity((end - offset) as usize);
-    for (s, e, authored) in written.segments(offset, end) {
-        if authored {
-            let mut buf = vec![0u8; (e - s) as usize];
-            file.read_exact_at(&mut buf, s).map_err(|err| {
-                warn!(%uid, error = %err, "scratch read failed");
-                Errno::EIO
-            })?;
-            out.extend_from_slice(&buf);
-        } else {
-            let bend = e.min(base_size);
-            if s < bend {
-                match base(s, bend - s)? {
-                    Some(bytes) => out.extend_from_slice(&bytes),
-                    None => return Ok(None),
-                }
-            }
-            // Anything past the base is a hole: zero-fill.
-            let zeros = e.saturating_sub(s.max(base_size));
-            out.resize(out.len() + zeros as usize, 0);
+/// The errno for a read of an open file that failed: the base's own, or
+/// `EIO` for the scratch file.
+fn open_read_errno(uid: &NodeUid, failure: ReadFailure<Errno>) -> Errno {
+    match failure {
+        ReadFailure::Base(errno) => errno,
+        ReadFailure::Scratch(error) => {
+            warn!(%uid, %error, "scratch read failed");
+            Errno::EIO
         }
     }
-    Ok(Some(out))
 }
 
 #[cfg(test)]
@@ -1494,56 +1466,5 @@ mod prefetch_tests {
             prefetch.window(&uid(&n.to_string()), 0, 0);
         }
         assert!(prefetch.streams.lock().len() <= MAX_PREFETCH_STREAMS + 1);
-    }
-}
-
-#[cfg(test)]
-mod open_read_tests {
-    use super::*;
-    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
-
-    fn scratch(bytes: &[u8]) -> (File, PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "pdfs-open-read-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut file = File::options()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        file.write_all(bytes).unwrap();
-        (file, path)
-    }
-
-    /// The dispatch loop answers from what is on this machine and says so
-    /// when the base would have to be downloaded, for a worker to do it
-    /// (`docs/BUGS.md` B227).
-    #[test]
-    fn a_read_needing_the_base_says_so_instead_of_fetching() {
-        let uid = NodeUid::new(VolumeId::from("v"), LinkId::from("f"));
-        let (file, path) = scratch(b"ABCDEFGH");
-        let mut written = Intervals::default();
-        written.add(0, 4);
-
-        let authored = assemble_open_read(&file, 8, &uid, 8, &written, 0, 4, |_, _| {
-            panic!("an authored range never asks the base")
-        });
-        assert_eq!(authored.unwrap().as_deref(), Some(&b"ABCD"[..]));
-
-        let missing = assemble_open_read(&file, 8, &uid, 8, &written, 2, 6, |_, _| Ok(None));
-        assert_eq!(missing.unwrap(), None);
-
-        let base = assemble_open_read(&file, 10, &uid, 8, &written, 2, 8, |s, n| {
-            assert_eq!((s, n), (4, 4));
-            Ok(Some(b"efgh".to_vec()))
-        });
-        assert_eq!(base.unwrap().as_deref(), Some(&b"CDefgh\0\0"[..]));
-        let _ = std::fs::remove_file(path);
     }
 }
