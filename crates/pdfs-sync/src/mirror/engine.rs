@@ -540,12 +540,14 @@ pub(super) fn mark_dirty(dirty: &LocalDirty, watched: &[(PathBuf, i64)], paths: 
         let Ok(rel) = path.strip_prefix(root) else {
             continue;
         };
-        // The walk leaves out a name that is not UTF-8, so there is nothing
-        // to mark for one.
-        let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
-        if let Some(parts) = parts {
-            dirty.mark(*id, &parts.join("/"));
-        }
+        // A name that is not UTF-8 cannot be keyed: the folder that holds
+        // it is marked instead, so the walk of it reports the name it leaves
+        // out.
+        let parts: Vec<&str> = rel
+            .components()
+            .map_while(|c| c.as_os_str().to_str())
+            .collect();
+        dirty.mark(*id, &parts.join("/"));
     }
 }
 

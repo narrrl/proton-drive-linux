@@ -18,10 +18,11 @@
 //! - **Draining**: a switch to on-demand is queued; passes only push.
 //! - **HandedOff**: the folder is on-demand.
 //!
-//! For now the reducer is run alongside the engine and acted on by nothing:
-//! every pass still covers the whole folder. Its transitions are logged, so
-//! they can be compared with what the engine did before anything relies on
-//! them.
+//! For now the reducer is run alongside the engine and acted on by nothing.
+//! What a pass reads on disk is decided apart from it: a pass brings the last
+//! walk up to date from the local dirty set while the watch is trusted, and
+//! walks the whole folder otherwise. Its transitions are logged, so they can
+//! be compared with what the engine did before anything relies on them.
 
 use std::collections::HashMap;
 use std::fmt;

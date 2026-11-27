@@ -39,7 +39,7 @@ use sha1::{Digest as _, Sha1};
 use tracing::{debug, info, warn};
 
 use crate::evidence::{Evidence, RemoteEvidence, Side};
-use crate::local_dirty::Claim;
+use crate::local_dirty::{Claim, LocalWalk};
 use crate::planner::HasKind;
 use crate::root::{RootInput, Suspension};
 use pdfs_core::batch;
@@ -512,26 +512,57 @@ impl Syncer {
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
         let mut unscanned = Unscanned::default();
+        // What the watcher reported since the last pass (`local_dirty`).
+        // Claimed before the walk: a change made while it runs is newer than
+        // the claim, and stays marked for the next pass.
+        let claim = self.local_dirty.claim(folder_id);
+        // The last pass's walk, when the claim can bring it up to date: the
+        // watch was live since that pass claimed, the ignore rules are the
+        // same, and the folder was walked in full lately.
+        let kept = self.local_dirty.take_walk(folder_id).filter(|kept| {
+            claim.trusted
+                && kept.rules == rules.source()
+                && kept.walked_at.elapsed() < LOCAL_AUDIT_INTERVAL
+        });
         let step = Instant::now();
         let writing = open_for_write_set(local_root);
-        self.walk_local(
-            folder_id,
-            local_root,
-            rules,
-            &writing,
-            &mut local,
-            &mut unscanned,
-        )?;
+        let (walked_at, walked_in_full) = match kept {
+            Some(kept) => {
+                local = kept.items;
+                self.trace_count(Count::LocalReused, local.len());
+                // What is taken from the kept walk counts as scanned at once.
+                self.progress_scanned_many(folder_id, local.len());
+                rewalk_local_tree(
+                    local_root,
+                    rules,
+                    &writing,
+                    &claim,
+                    &mut local,
+                    &mut unscanned,
+                    &mut |rel| self.progress_scanned(folder_id, base_name(rel)),
+                )?;
+                (kept.walked_at, false)
+            }
+            None => {
+                self.walk_local(
+                    folder_id,
+                    local_root,
+                    rules,
+                    &writing,
+                    &mut local,
+                    &mut unscanned,
+                )?;
+                (step, true)
+            }
+        };
         self.trace_phase(Phase::LocalWalk, step.elapsed());
         self.trace_count(Count::LocalEntries, local.len());
         // See `push_pass`: the guard must not count excluded paths as lost.
         guard_local_wipe(&tracked_baseline(&baseline, rules, &unscanned), &local)?;
-        // What the watcher reported since the last pass, checked against what
-        // the walk found (`local_dirty`).
-        let claim = self.local_dirty.claim(folder_id);
         self.check_local_dirty(
             folder_id,
             &claim,
+            walked_in_full,
             &tracked_baseline(&baseline, rules, &unscanned),
             &local,
         );
@@ -672,6 +703,7 @@ impl Syncer {
                     }
                     (false, true) if !in_base => {
                         // New remote folder → create locally (cheap, inline).
+                        outcome.local_changes += 1;
                         if let Err(e) = std::fs::create_dir_all(local_root.join(rel_to_path(rel)))
                             .map_err(|e| format!("mkdir {rel}: {e}"))
                             .and_then(|()| self.baseline_dir(folder_id, rel, &remote[rel].uid))
@@ -798,6 +830,7 @@ impl Syncer {
                         outcome.deferred += 1;
                         continue;
                     }
+                    outcome.local_changes += 1;
                     if let Err(e) = removed_locally(std::fs::remove_file(&path)) {
                         warn!(rel, error = %e, "sync: remove local file failed");
                         self.log_activity(
@@ -877,6 +910,7 @@ impl Syncer {
                 .sync_entries(folder_id)
                 .map_err(|e| format!("reload baseline: {e:?}"))?;
             for removal in remove_local_dirs(local_root, delete_local_dirs, &mut current) {
+                outcome.local_changes += 1;
                 match removal {
                     DirRemoval::Removed(rel) => {
                         let _ = self.store.sync_entry_remove(folder_id, &rel);
@@ -964,23 +998,47 @@ impl Syncer {
             &claim,
             outcome.errors == 0 && outcome.deferred == 0,
         );
+        // The walk is kept for the next pass only when the pass changed
+        // nothing on disk itself and could read everything. A change of its
+        // own is marked only once the watcher reports it, which may come
+        // after the next pass claims, and a path left out has to be looked
+        // at again anyway.
+        if outcome.local_changes == 0
+            && outcome.errors == 0
+            && outcome.deferred == 0
+            && unscanned.is_empty()
+        {
+            self.local_dirty.keep_walk(
+                folder_id,
+                LocalWalk {
+                    items: local,
+                    rules: rules.source(),
+                    walked_at,
+                },
+            );
+        }
 
         Ok(outcome)
     }
 
-    /// Count the claimed marks of the local dirty set, and, when the claim is
-    /// trusted, the local changes the walk found that it did not cover. Acts
-    /// on nothing: the walk is still what the pass plans from.
+    /// Count the claimed marks of the local dirty set, and, after a walk of
+    /// the whole folder with a trusted claim, the local changes the walk
+    /// found that the claim did not cover. Those are changes a pass that
+    /// trusted the claim would have missed until the next full walk.
     fn check_local_dirty(
         &self,
         folder_id: i64,
         claim: &Claim,
+        walked_in_full: bool,
         tracked: &HashMap<String, &StoredSyncEntry>,
         local: &HashMap<String, LocalItem>,
     ) {
         self.trace_count(Count::LocalDirty, claim.len());
         if !claim.trusted {
             self.trace_count(Count::LocalUntrusted, 1);
+            return;
+        }
+        if !walked_in_full {
             return;
         }
         let missed = missed_local(claim, tracked, local);
@@ -1189,6 +1247,11 @@ fn dir_row(rel: &str, uid: &NodeUid) -> StoredSyncEntry {
 /// of Drive again. Between full walks, a pass lists only the folders the event
 /// stream marked dirty; this full walk catches what the stream may have missed.
 const AUDIT_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+/// How long a pass may bring the last local walk up to date from the local
+/// dirty set before it walks the whole folder again. The full walk is what
+/// checks the set: it counts what the set missed.
+const LOCAL_AUDIT_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// How lately Drive's event stream must have been read for a pass to rely on
 /// it. A few polls' worth.
@@ -2867,5 +2930,142 @@ mod tests {
         assert!(o.is_empty());
         o.deferred = 1;
         assert!(!o.is_empty());
+    }
+
+    /// What a walk found, comparable: kind, mtime and size by path.
+    fn shape(items: &HashMap<String, LocalItem>) -> Vec<(String, bool, i64, i64)> {
+        let mut shape: Vec<_> = items
+            .iter()
+            .map(|(rel, item)| (rel.clone(), item.is_dir, item.mtime, item.size))
+            .collect();
+        shape.sort();
+        shape
+    }
+
+    /// Bring `kept` up to date with what `dirty` marked for folder 1.
+    fn rewalk(
+        root: &Path,
+        rules: &IgnoreRules,
+        dirty: &crate::local_dirty::LocalDirty,
+        kept: &mut HashMap<String, LocalItem>,
+    ) -> Unscanned {
+        let mut unscanned = Unscanned::default();
+        rewalk_local_tree(
+            root,
+            rules,
+            &HashSet::new(),
+            &dirty.claim(1),
+            kept,
+            &mut unscanned,
+            &mut no_progress(),
+        )
+        .unwrap();
+        unscanned
+    }
+
+    #[test]
+    fn a_rewalk_of_the_marked_paths_finds_what_a_full_walk_finds() {
+        let root = sync_test_dir("rewalk");
+        std::fs::create_dir_all(root.join("docs/old")).unwrap();
+        std::fs::create_dir_all(root.join("quiet/deep")).unwrap();
+        std::fs::write(root.join("docs/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        std::fs::write(root.join("docs/old/x.txt"), b"x").unwrap();
+        std::fs::write(root.join("quiet/deep/q.txt"), b"q").unwrap();
+        let (mut kept, _) = scan(&root).unwrap();
+
+        // Each kind of change, marked as the watcher reports it.
+        let dirty = crate::local_dirty::LocalDirty::default();
+        std::fs::write(root.join("docs/a.txt"), b"edited, and longer").unwrap();
+        dirty.mark(1, "docs/a.txt");
+        std::fs::remove_file(root.join("docs/b.txt")).unwrap();
+        dirty.mark(1, "docs/b.txt");
+        std::fs::write(root.join("docs/new.txt"), b"new").unwrap();
+        dirty.mark(1, "docs/new.txt");
+        std::fs::remove_dir_all(root.join("docs/old")).unwrap();
+        dirty.mark(1, "docs/old");
+        // A folder moved in: one event, for the folder only.
+        let outside = sync_test_dir("rewalk-outside");
+        std::fs::create_dir_all(outside.join("moved/sub")).unwrap();
+        std::fs::write(outside.join("moved/sub/m.txt"), b"m").unwrap();
+        std::fs::rename(outside.join("moved"), root.join("moved")).unwrap();
+        dirty.mark(1, "moved");
+
+        let unscanned = rewalk(&root, &rules_for(&[]), &dirty, &mut kept);
+        assert!(unscanned.is_empty());
+        let (full, _) = scan(&root).unwrap();
+        assert_eq!(shape(&kept), shape(&full));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn a_rewalk_takes_what_nothing_marked_from_the_kept_walk() {
+        let root = sync_test_dir("rewalk-kept");
+        std::fs::create_dir_all(root.join("quiet")).unwrap();
+        std::fs::write(root.join("quiet/q.txt"), b"q").unwrap();
+        let (mut kept, _) = scan(&root).unwrap();
+        // Changed with no mark: the rewalk does not look, which is why only
+        // a trusted claim may stand in for the walk.
+        std::fs::write(root.join("quiet/q.txt"), b"changed unseen").unwrap();
+        let before = shape(&kept);
+        rewalk(
+            &root,
+            &rules_for(&[]),
+            &crate::local_dirty::LocalDirty::default(),
+            &mut kept,
+        );
+        assert_eq!(shape(&kept), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rewalk_leaves_ignored_folders_out_and_walks_from_a_known_folder() {
+        let root = sync_test_dir("rewalk-ignored");
+        let rules = rules_for(&["build/"]);
+        let (mut kept, _) = scan(&root).unwrap();
+        let dirty = crate::local_dirty::LocalDirty::default();
+        std::fs::create_dir_all(root.join("build/out")).unwrap();
+        std::fs::write(root.join("build/out/o.bin"), b"o").unwrap();
+        dirty.mark(1, "build/out/o.bin");
+        // A file in a folder whose own mark never came.
+        std::fs::create_dir_all(root.join("src/mod")).unwrap();
+        std::fs::write(root.join("src/mod/s.rs"), b"s").unwrap();
+        dirty.mark(1, "src/mod/s.rs");
+        rewalk(&root, &rules, &dirty, &mut kept);
+        let found: Vec<String> = shape(&kept).into_iter().map(|(rel, ..)| rel).collect();
+        assert_eq!(found, ["src", "src/mod", "src/mod/s.rs"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rewalk_reads_again_a_file_that_was_open_for_writing() {
+        let root = sync_test_dir("rewalk-open");
+        std::fs::write(root.join("log.txt"), b"one").unwrap();
+        let (mut kept, _) = scan(&root).unwrap();
+        kept.get_mut("log.txt").unwrap().open_for_write = true;
+        std::fs::write(root.join("log.txt"), b"one and two").unwrap();
+        rewalk(
+            &root,
+            &rules_for(&[]),
+            &crate::local_dirty::LocalDirty::default(),
+            &mut kept,
+        );
+        let item = &kept["log.txt"];
+        assert_eq!(item.size, 11);
+        assert!(!item.open_for_write, "closed now");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_mark_on_the_root_walks_everything() {
+        let root = sync_test_dir("rewalk-root");
+        let (mut kept, _) = scan(&root).unwrap();
+        std::fs::write(root.join("top.txt"), b"t").unwrap();
+        let dirty = crate::local_dirty::LocalDirty::default();
+        dirty.mark(1, "");
+        rewalk(&root, &rules_for(&[]), &dirty, &mut kept);
+        assert!(kept.contains_key("top.txt"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -363,6 +363,19 @@ pub enum Verdict {
 /// Compiled ignore rules for one synced folder.
 pub struct IgnoreRules {
     matcher: Option<Gitignore>,
+    /// A hash of the patterns the rules were built from, so a caller can tell
+    /// whether they changed.
+    source: u64,
+}
+
+/// A hash of `globals` and the folder's ignore file, `file` (its name and
+/// text), in the order [`IgnoreRules::load`] reads them.
+fn rules_source(globals: &[String], file: Option<(&str, &[u8])>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    globals.hash(&mut hasher);
+    file.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl IgnoreRules {
@@ -382,6 +395,7 @@ impl IgnoreRules {
             }
         }
 
+        let mut file = None;
         for name in IGNORE_FILE_NAMES {
             let path = root.join(name);
             if !path.is_file() {
@@ -390,15 +404,24 @@ impl IgnoreRules {
             // `add` returns the first parse error but still takes the lines it
             // could read, so a bad line costs that line and nothing more.
             let _ = builder.add(&path);
+            file = Some((*name, std::fs::read(&path).unwrap_or_default()));
             any = true;
             break;
         }
+        let source = rules_source(
+            globals,
+            file.as_ref().map(|(name, text)| (*name, text.as_slice())),
+        );
 
         if !any {
-            return Self { matcher: None };
+            return Self {
+                matcher: None,
+                source,
+            };
         }
         Self {
             matcher: builder.build().ok(),
+            source,
         }
     }
 
@@ -415,17 +438,32 @@ impl IgnoreRules {
         for line in text.lines() {
             any |= builder.add_line(Some(file.clone()), line).is_ok();
         }
+        let source = rules_source(globals, Some((IGNORE_FILE_NAMES[0], text.as_bytes())));
         if !any {
-            return Self { matcher: None };
+            return Self {
+                matcher: None,
+                source,
+            };
         }
         Self {
             matcher: builder.build().ok(),
+            source,
         }
     }
 
     /// Rules matching nothing, for callers with no folder context.
     pub fn empty() -> Self {
-        Self { matcher: None }
+        Self {
+            matcher: None,
+            source: rules_source(&[], None),
+        }
+    }
+
+    /// Identifies the patterns these rules were built from: rules loaded
+    /// again from the same globals and the same ignore file give the same
+    /// value. Only for comparing within one run of the daemon.
+    pub fn source(&self) -> u64 {
+        self.source
     }
 
     /// Whether any rule is loaded. When false, [`is_ignored`](Self::is_ignored)

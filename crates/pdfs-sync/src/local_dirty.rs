@@ -11,13 +11,19 @@
 //! error, an overflowed queue or a restart breaks that, and the next pass has
 //! nothing to trust until a pass claims again with the watch live throughout.
 //!
-//! For now the set is checked, not used: a pass still walks the whole folder,
-//! and counts the changes it finds that a trusted claim did not cover. Once
-//! those stay at zero, a trusted claim can stand in for the walk.
+//! A trusted claim stands in for most of the local walk. The set keeps the
+//! last walk of each folder ([`LocalWalk`]), and a pass with a trusted claim
+//! reads again only what the claim covers and takes the rest from that walk.
+//! A walk is only kept after a pass that changed nothing on disk itself, and
+//! a full walk still runs now and then: it checks the set, counting the
+//! changes it finds that a trusted claim did not cover.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use parking_lot::Mutex;
+
+use crate::model::LocalItem;
 
 /// The dirty marks of every mirror folder, by folder id.
 #[derive(Default)]
@@ -56,6 +62,20 @@ struct Marks {
     live_since: Option<u64>,
     /// The generation the last pass claimed through.
     claimed: Option<u64>,
+    /// What the last pass found on disk, when it may stand in for a walk.
+    walk: Option<LocalWalk>,
+}
+
+/// What a pass found on disk, kept for the next pass to start from.
+pub struct LocalWalk {
+    /// Every path the walk found, as a walk returns them.
+    pub items: HashMap<String, LocalItem>,
+    /// [`IgnoreRules::source`](pdfs_core::syncignore::IgnoreRules::source)
+    /// of the rules it was walked with: other rules would have found other
+    /// paths.
+    pub rules: u64,
+    /// When the folder was last walked in full.
+    pub walked_at: Instant,
 }
 
 /// The marks a pass claimed: what the watcher reported up to `through`.
@@ -86,6 +106,16 @@ impl Claim {
             }
             at = parent(at);
         }
+    }
+
+    /// The folders whose direct children changed.
+    pub fn shallow(&self) -> impl Iterator<Item = &str> {
+        self.shallow.iter().map(String::as_str)
+    }
+
+    /// The paths that changed with whatever is below them.
+    pub fn deep(&self) -> impl Iterator<Item = &str> {
+        self.deep.iter().map(String::as_str)
     }
 
     /// How many marks the claim holds.
@@ -175,6 +205,22 @@ impl LocalDirty {
             marks.deep.retain(|_, g| *g > claim.through);
         }
         marks.claimed = Some(claim.through);
+    }
+
+    /// Take the walk the last pass kept for `folder`. Taken, not read: a pass
+    /// that does not keep a walk again leaves the next one nothing to start
+    /// from.
+    pub fn take_walk(&self, folder: i64) -> Option<LocalWalk> {
+        self.inner
+            .lock()
+            .folders
+            .get_mut(&folder)
+            .and_then(|marks| marks.walk.take())
+    }
+
+    /// Keep what a pass found on disk for the next pass on `folder`.
+    pub fn keep_walk(&self, folder: i64, walk: LocalWalk) {
+        self.inner.lock().folders.entry(folder).or_default().walk = Some(walk);
     }
 
     /// Forget a folder that is no longer synced.

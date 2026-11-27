@@ -318,8 +318,12 @@ What the parts mean:
   then: after a start, a watch that failed, or an overflowed event queue. **`missed local
   changes`** counts changes the pass found on disk that a trusted watch did not report. It
   should stay at zero; the journal then has a `sync: the local dirty set missed changes the walk
-  found` line naming the first one. For now these only check the watcher: every pass still
-  walks the whole folder.
+  found` line naming the first one. **`local reused`** counts the paths on disk a pass took from
+  the last pass's walk instead of walking the folder again: it then read only what the watcher
+  reported. A pass with no `local reused` count walked the whole folder. That happens on the
+  first pass, at least once an hour, after the pass before it changed files on disk itself,
+  and after anything that breaks trust in the watch. Only those passes count `missed local
+  changes`.
 
 Please include these lines when you report a slow folder.
 

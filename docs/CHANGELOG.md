@@ -45,6 +45,12 @@ counts the deletions it made in the last day (50).
   any more.
 
 ### Changed
+- **A sync pass over a quiet folder no longer reads the whole folder on disk.** While the
+  filesystem watcher has been running without a break, a pass reads again only the folders and
+  files it reported changed, and takes the rest from the pass before. The whole folder is still
+  read at least once an hour, after a start, after a pass that downloaded or removed files, and
+  whenever the watcher may have lost a change. `pdfs diagnostics` shows how many paths a pass
+  took over as `local reused`.
 - **Deletions in a mirror folder add up across passes.** A sync pass already refuses to delete
   nearly every file of a folder at once. Now a folder lost a little at a time is stopped too:
   once nine in ten of its synced files would have been deleted within a day, on either side,

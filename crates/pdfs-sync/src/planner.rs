@@ -126,6 +126,11 @@ impl Unscanned {
             .insert(rel, crate::evidence::Unknown::Unreadable);
     }
 
+    /// Whether nothing was left out.
+    pub fn is_empty(&self) -> bool {
+        self.covered.is_empty()
+    }
+
     /// Whether `rel` is a left-out path or lies under one.
     pub fn covers(&self, rel: &str) -> bool {
         self.why(rel).is_some()

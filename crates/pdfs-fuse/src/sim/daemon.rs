@@ -1963,12 +1963,13 @@ mod tests {
             .map_or(0, |c| c.value)
     }
 
-    /// What the watcher reports covers every change a pass then finds on
-    /// disk: an edit, a new folder with a file in it, a deletion, and a folder
-    /// moved in from outside with a folder and a file in it (`local_dirty`).
+    /// Once the watch has been live for a pass, a pass reads again only what
+    /// the watcher reported, and that is enough to find every change: an
+    /// edit, a new folder with a file in it, a deletion, and a folder moved in
+    /// from outside with a folder and a file in it (`local_dirty`).
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
-    fn the_local_dirty_set_covers_what_the_walk_finds() {
+    fn a_trusted_local_dirty_set_stands_in_for_the_walk() {
         // The log is shared by every test in the process: drop what earlier
         // tests left in it, so only this daemon's lines are counted.
         take_logged();
@@ -1981,6 +1982,7 @@ mod tests {
         quiet_pass(&daemon, folder).expect("a quiet pass is traced");
         let settled = quiet_pass(&daemon, folder).expect("a quiet pass is traced");
         assert_eq!(counted(&settled, "local dirty untrusted"), 0, "{settled}");
+        assert!(counted(&settled, "local reused") > 0, "{settled}");
 
         let local = dir.join("local");
         let outside = dir.join("outside");
@@ -1998,6 +2000,9 @@ mod tests {
         }));
         let after = quiet_pass(&daemon, folder).expect("a quiet pass is traced");
         assert_eq!(counted(&after, "local dirty untrusted"), 0, "{after}");
+        // Still taken from the last pass's walk: none of the passes since
+        // changed anything on disk, so each kept its walk for the next.
+        assert!(counted(&after, "local reused") > 0, "{after}");
         let logged = take_logged();
         let missed: Vec<&String> = logged
             .iter()

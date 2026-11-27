@@ -145,10 +145,13 @@ pub enum Count {
     /// Local changes the pass found that a trusted claim of the local dirty
     /// set did not cover. Should stay zero; see `local_dirty`.
     MissedLocal,
+    /// Paths on disk taken from the last pass's walk, which a trusted claim
+    /// of the local dirty set keeps up to date, instead of walked again.
+    LocalReused,
 }
 
 impl Count {
-    const ALL: [Count; 13] = [
+    const ALL: [Count; 14] = [
         Count::LocalEntries,
         Count::RemoteFolders,
         Count::Nodes,
@@ -162,6 +165,7 @@ impl Count {
         Count::LocalDirty,
         Count::LocalUntrusted,
         Count::MissedLocal,
+        Count::LocalReused,
     ];
 
     fn name(self) -> &'static str {
@@ -179,6 +183,7 @@ impl Count {
             Count::LocalDirty => "local dirty",
             Count::LocalUntrusted => "local dirty untrusted",
             Count::MissedLocal => "missed local changes",
+            Count::LocalReused => "local reused",
         }
     }
 }
