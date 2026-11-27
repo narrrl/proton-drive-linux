@@ -5,7 +5,7 @@
 //! from the remote base. On release the handle becomes a [`PendingRevision`]:
 //! the staged blob and what its gaps refer to.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -188,6 +188,19 @@ impl WriteHandle {
         grown
     }
 
+    /// What a read needs of this handle, copied out so no lock is held
+    /// across the read.
+    pub fn read_view(&self) -> ReadView {
+        ReadView {
+            file: self.file.clone(),
+            len: self.len,
+            uid: self.uid.clone(),
+            base_mtime: self.base_mtime,
+            base_size: self.base_size,
+            written: self.written.clone(),
+        }
+    }
+
     /// Account for `[offset, end)` having been written through this handle.
     ///
     /// A write past the end leaves a hole that reads as zeros, exactly like a
@@ -213,10 +226,12 @@ pub struct OpenFiles {
     /// Write state by inode. Concurrent writers share the scratch file.
     writes: HashMap<u64, WriteHandle>,
     /// Inodes whose last write handle a release has taken out of
-    /// [`OpenFiles::writes`] and is still queueing. `close(2)` returns before
-    /// that, and in between the edit is in neither the handles nor the queue,
-    /// so a check for changes not on Drive yet looks here too.
-    releasing: HashSet<u64>,
+    /// [`OpenFiles::writes`] and is still queueing, with a read view of what
+    /// they held. `close(2)` returns before the queueing ends, and in between
+    /// the edit is in neither the handles nor the queue. A check for changes
+    /// not on Drive yet looks here, and so does a read: without the view, a
+    /// read on a worker in that window was served Drive's older revision.
+    retiring: HashMap<u64, ReadView>,
     /// The inode each write `fh` is open on. Read-only opens use `fh` 0 and
     /// have no entry.
     handles: HashMap<u64, u64>,
@@ -252,7 +267,7 @@ impl Default for OpenFiles {
     fn default() -> Self {
         Self {
             writes: HashMap::new(),
-            releasing: HashSet::new(),
+            retiring: HashMap::new(),
             handles: HashMap::new(),
             dirs: HashMap::new(),
             next_fh: 1,
@@ -267,7 +282,7 @@ pub enum Released {
     /// Other handles still share the inode's write state.
     StillOpen { ino: u64 },
     /// The last handle: the write state, now the caller's to queue. The inode
-    /// stays [releasing](OpenFiles::is_owed) until
+    /// stays [releasing](OpenFiles::owed) until
     /// [`OpenFiles::finish_release`].
     Last(WriteHandle),
 }
@@ -316,6 +331,15 @@ impl OpenFiles {
         self.writes.get_mut(&ino)
     }
 
+    /// What a read of `ino` serves from instead of Drive: an open writer's
+    /// scratch file, or one a release is still queueing.
+    pub fn reader(&self, ino: u64) -> Option<ReadView> {
+        match self.writes.get(&ino) {
+            Some(writer) => Some(writer.read_view()),
+            None => self.retiring.get(&ino).cloned(),
+        }
+    }
+
     /// The inode write handle `fh` is open on.
     pub fn ino_of(&self, fh: u64) -> Option<u64> {
         self.handles.get(&fh).copied()
@@ -349,7 +373,7 @@ impl OpenFiles {
             .iter()
             .filter(move |(_, w)| !dirty_only || w.dirty)
             .map(|(&ino, _)| ino)
-            .chain(self.releasing.iter().copied())
+            .chain(self.retiring.keys().copied())
     }
 
     /// Every write state, to rebase or inspect in place.
@@ -371,13 +395,13 @@ impl OpenFiles {
             return Released::StillOpen { ino };
         }
         let writer = self.writes.remove(&ino).expect("looked up above");
-        self.releasing.insert(ino);
+        self.retiring.insert(ino, writer.read_view());
         Released::Last(writer)
     }
 
     /// The release of `ino` has queued what it wrote.
     pub fn finish_release(&mut self, ino: u64) {
-        self.releasing.remove(&ino);
+        self.retiring.remove(&ino);
     }
 
     /// Take every write state, for a stop that queues what open handles
@@ -443,6 +467,19 @@ impl Fallocate {
             }
         }
     }
+}
+
+/// What a read of a file open for writing, or just released, serves from:
+/// the authored ranges of the scratch file, and the remote base for the
+/// rest.
+#[derive(Clone)]
+pub struct ReadView {
+    pub file: Arc<File>,
+    pub len: u64,
+    pub uid: NodeUid,
+    pub base_mtime: i64,
+    pub base_size: u64,
+    pub written: Intervals,
 }
 
 /// Why staging a write failed.
@@ -727,9 +764,12 @@ mod tests {
         assert_eq!(writer.ino, 2);
         assert!(!open.is_writing(2));
         assert_eq!(open.owed(false).collect::<Vec<_>>(), [2]);
+        // Until the release has queued it, a read still finds what it wrote.
+        assert!(open.reader(2).is_some());
 
         open.finish_release(2);
         assert_eq!(open.owed(false).count(), 0);
+        assert!(open.reader(2).is_none());
         assert!(matches!(open.release(second), Released::NotWriting));
     }
 

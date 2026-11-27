@@ -1094,16 +1094,12 @@ impl Core {
         offset: u64,
         size: u64,
     ) -> Result<Option<Vec<u8>>, Errno> {
-        let handle = self.state().open.writer(ino).map(|h| {
-            (
-                h.file.clone(),
-                h.len,
-                h.uid.clone(),
-                h.base_mtime,
-                h.base_size,
-                h.written.clone(),
-            )
-        });
+        // A writer still open, or one whose release is still queueing it.
+        let handle = self
+            .state()
+            .open
+            .reader(ino)
+            .map(|v| (v.file, v.len, v.uid, v.base_mtime, v.base_size, v.written));
         if let Some((file, len, uid, base_mtime, base_size, written)) = handle {
             return self.serve_open_read_local(
                 &file, len, &uid, base_mtime, base_size, &written, offset, size,

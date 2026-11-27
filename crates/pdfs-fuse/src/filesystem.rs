@@ -268,19 +268,13 @@ impl Filesystem for ProtonFs {
         // issued the read before any write that comes after it, so that is
         // the content it asked for. On the loop, the download held every
         // request of the mount (`docs/BUGS.md` B227).
-        let handle = {
-            let st = self.core.state();
-            st.open.writer(ino.0).map(|h| {
-                (
-                    h.file.clone(),
-                    h.len,
-                    h.uid.clone(),
-                    h.base_mtime,
-                    h.base_size,
-                    h.written.clone(),
-                )
-            })
-        };
+        // A writer still open, or one whose release is still queueing it.
+        let handle = self
+            .core
+            .state()
+            .open
+            .reader(ino.0)
+            .map(|v| (v.file, v.len, v.uid, v.base_mtime, v.base_size, v.written));
         if let Some((file, len, uid, base_mtime, base_size, written)) = handle {
             match self.core.serve_open_read_local(
                 &file,
