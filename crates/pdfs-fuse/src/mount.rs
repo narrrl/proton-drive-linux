@@ -520,6 +520,7 @@ pub(crate) fn mount_with(
         unscanned: Arc::default(),
         abandon: Arc::default(),
         events_read_at: Arc::new(AtomicI64::new(0)),
+        local_dirty: Arc::default(),
     };
     let state = Arc::new(Ranked::new(
         Rank::State,

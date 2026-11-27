@@ -210,7 +210,14 @@ local walk. The local dirty set removes the local walk.
    - Left: per-subtree apply, once a round-level guard exists. A resumable local walk matters
      less now that the local walk is the only full walk left, and is cheap next to Drive.
 2. **Remote dirty set.** Done, described above.
-3. **Local dirty set.** `SyncMsg::Dirty`, the `sync_dirty` table, overflow leading to FullCheck.
+3. **Local dirty set.**
+   - Done, as a check: the watcher marks each path an event names in `LocalDirty` (in memory).
+     A pass claims the marks, and retires them once it applied everything it found. A claim is
+     trusted when the watch was live since the last pass claimed; a watcher error, an overflow or
+     a restart breaks that. Each pass still walks the whole folder, and counts the changes it
+     found that a trusted claim did not cover (`missed local changes` in the trace).
+   - Left: once that count stays at zero, a trusted claim stands in for the local walk, and
+     only the marked folders are read.
 4. **Step scheduler.** Replace `run_burst` and the per-pass lock with steps and priorities.
 5. **Drop the 120 s poll** for the daily audit, once 2 and 3 have run for a release with the
    poll still on, and traces show the dirty sets catch everything the poll finds.

@@ -21,6 +21,7 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 
 pub mod evidence;
+pub mod local_dirty;
 pub mod mirror;
 pub mod model;
 pub mod naming;

@@ -131,10 +131,18 @@ pub enum Count {
     /// did not make: the path was not proven gone on the side the deletion is
     /// based on. Should stay zero; see `evidence`.
     UnprovenDeletions,
+    /// Marks of the local dirty set the pass claimed.
+    LocalDirty,
+    /// One when the pass's claim of the local dirty set was not trusted: the
+    /// watch was not live throughout since the last pass claimed.
+    LocalUntrusted,
+    /// Local changes the pass found that a trusted claim of the local dirty
+    /// set did not cover. Should stay zero; see `local_dirty`.
+    MissedLocal,
 }
 
 impl Count {
-    const ALL: [Count; 10] = [
+    const ALL: [Count; 13] = [
         Count::LocalEntries,
         Count::RemoteFolders,
         Count::Nodes,
@@ -145,6 +153,9 @@ impl Count {
         Count::Reused,
         Count::Dirty,
         Count::UnprovenDeletions,
+        Count::LocalDirty,
+        Count::LocalUntrusted,
+        Count::MissedLocal,
     ];
 
     fn name(self) -> &'static str {
@@ -159,6 +170,9 @@ impl Count {
             Count::Reused => "reused",
             Count::Dirty => "dirty folders",
             Count::UnprovenDeletions => "unproven deletions",
+            Count::LocalDirty => "local dirty",
+            Count::LocalUntrusted => "local dirty untrusted",
+            Count::MissedLocal => "missed local changes",
         }
     }
 }

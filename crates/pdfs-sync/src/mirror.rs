@@ -39,6 +39,7 @@ use sha1::{Digest as _, Sha1};
 use tracing::{debug, info, warn};
 
 use crate::evidence::{Evidence, RemoteEvidence, Side};
+use crate::local_dirty::Claim;
 use crate::planner::HasKind;
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
@@ -505,6 +506,15 @@ impl Syncer {
         self.trace_count(Count::LocalEntries, local.len());
         // See `push_pass`: the guard must not count excluded paths as lost.
         guard_local_wipe(&tracked_baseline(&baseline, rules, &unscanned), &local)?;
+        // What the watcher reported since the last pass, checked against what
+        // the walk found (`local_dirty`).
+        let claim = self.local_dirty.claim(folder_id);
+        self.check_local_dirty(
+            folder_id,
+            &claim,
+            &tracked_baseline(&baseline, rules, &unscanned),
+            &local,
+        );
 
         let mut remote: HashMap<String, RemoteItem> = HashMap::new();
         let mut remote_dirs: HashMap<String, NodeUid> = HashMap::new();
@@ -928,8 +938,48 @@ impl Syncer {
         }
         self.trace_phase(Phase::Cleanup, cleanup.elapsed());
         self.settle_deletions(folder_id, window, outcome.deleted);
+        // A change the pass could not apply stays dirty for the next one.
+        self.local_dirty.looked(
+            folder_id,
+            &claim,
+            outcome.errors == 0 && outcome.deferred == 0,
+        );
 
         Ok(outcome)
+    }
+
+    /// Count the claimed marks of the local dirty set, and, when the claim is
+    /// trusted, the local changes the walk found that it did not cover. Acts
+    /// on nothing: the walk is still what the pass plans from.
+    fn check_local_dirty(
+        &self,
+        folder_id: i64,
+        claim: &Claim,
+        tracked: &HashMap<String, &StoredSyncEntry>,
+        local: &HashMap<String, LocalItem>,
+    ) {
+        self.trace_count(Count::LocalDirty, claim.len());
+        if !claim.trusted {
+            self.trace_count(Count::LocalUntrusted, 1);
+            return;
+        }
+        let missed = missed_local(claim, tracked, local);
+        if missed.is_empty() {
+            return;
+        }
+        for rel in &missed {
+            debug!(
+                id = folder_id,
+                rel, "sync: a local change the watcher did not report"
+            );
+        }
+        info!(
+            id = folder_id,
+            missed = missed.len(),
+            first = %missed[0],
+            "sync: the local dirty set missed changes the walk found"
+        );
+        self.trace_count(Count::MissedLocal, missed.len());
     }
 
     /// Open or continue the folder's deletion window for a pass that plans
@@ -982,6 +1032,33 @@ impl Syncer {
             debug!(id = folder_id, error = ?e, "sync: cannot settle the deletion window");
         }
     }
+}
+
+/// The local changes the walk found since the baseline that `claim` does not
+/// cover: paths new on disk, files whose size or mtime moved, and tracked
+/// paths gone. Sorted, for a stable log.
+fn missed_local(
+    claim: &Claim,
+    tracked: &HashMap<String, &StoredSyncEntry>,
+    local: &HashMap<String, LocalItem>,
+) -> Vec<String> {
+    let changed = local.iter().filter_map(|(rel, item)| {
+        let moved = match tracked.get(rel) {
+            None => true,
+            Some(base) => {
+                !item.is_dir && (base.local_mtime != item.mtime || base.local_size != item.size)
+            }
+        };
+        moved.then_some(rel)
+    });
+    let gone = tracked.keys().filter(|rel| !local.contains_key(*rel));
+    let mut missed: Vec<String> = changed
+        .chain(gone)
+        .filter(|rel| !claim.covers(rel))
+        .cloned()
+        .collect();
+    missed.sort();
+    missed
 }
 
 /// A [`Read`] that hashes what an upload reads through it, so the digest Drive
@@ -1809,6 +1886,59 @@ mod tests {
                 remote_revision_id: None,
             },
         )])
+    }
+
+    /// A walk's changes that a claim of the local dirty set did not cover:
+    /// one next to a reported change is covered, the rest are missed.
+    #[test]
+    fn missed_local_lists_the_changes_a_claim_does_not_cover() {
+        use crate::local_dirty::LocalDirty;
+        let row = |rel: &str, mtime: i64| StoredSyncEntry {
+            rel_path: rel.to_string(),
+            remote_uid: Some("v~l".into()),
+            local_mtime: mtime,
+            local_size: 1,
+            local_mtime_ns: None,
+            remote_rev: None,
+            remote_hash: None,
+            remote_revision_id: None,
+        };
+        let rows: HashMap<String, StoredSyncEntry> = [
+            ("docs", 0),
+            ("docs/a.txt", 1),
+            ("same.txt", 1),
+            ("top.txt", 1),
+            ("old/x.txt", 1),
+        ]
+        .into_iter()
+        .map(|(rel, mtime)| (rel.to_string(), row(rel, mtime)))
+        .collect();
+        let tracked: HashMap<String, &StoredSyncEntry> =
+            rows.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let item = |is_dir: bool, mtime: i64| LocalItem {
+            mtime_ns: None,
+            is_dir,
+            mtime,
+            size: 1,
+            open_for_write: false,
+        };
+        let local: HashMap<String, LocalItem> = [
+            ("docs", item(true, 9)),
+            ("docs/a.txt", item(false, 2)),
+            ("docs/new.txt", item(false, 1)),
+            ("same.txt", item(false, 1)),
+            ("top.txt", item(false, 2)),
+        ]
+        .into_iter()
+        .map(|(rel, item)| (rel.to_string(), item))
+        .collect();
+        let dirty = LocalDirty::default();
+        dirty.mark(1, "docs/a.txt");
+        let claim = dirty.claim(1);
+        assert_eq!(
+            missed_local(&claim, &tracked, &local),
+            vec!["old/x.txt".to_string(), "top.txt".to_string()]
+        );
     }
 
     #[test]
