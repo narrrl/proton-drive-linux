@@ -651,6 +651,9 @@ impl Core {
         // B123).
         let remote = node.clone();
         self.stamp_pending_sizes(std::slice::from_mut(&mut node));
+        // The placeholder as the tree has it, before the landed node replaces
+        // it: the base of a write that opened over it (`placeholder_base`).
+        let mut placeholder = None;
         // The rows and queued ops already follow the node: `retire_create`
         // moved its row to the real uid, and ops find it by local id.
 
@@ -673,6 +676,11 @@ impl Core {
                 node.parent_uid = e.node.parent_uid.clone();
             }
             st.write_through(node.clone());
+            if let Some(e) = st.entries.get(&ino)
+                && node_revision_id(&e.node).is_none()
+            {
+                placeholder.get_or_insert((e.node.modification_time, node_size(&e.node)));
+            }
             let mut landed = node.clone();
             st.keep_open_write_size(ino, &mut landed);
             if let Some(e) = st.entries.get_mut(&ino) {
@@ -718,6 +726,25 @@ impl Core {
                 .set_own_sealed_rev(&real.to_string(), &rev, now_millis())
         {
             warn!(%real, error = %e, "persisting our sealed revision failed");
+        }
+        // A release that took its handle out of the tree before the rebase
+        // below and queues after `rebaseline_pending` is caught by neither,
+        // and an incomplete write does not chain onto our own revision. Its
+        // base is the placeholder, whose bytes the create sent.
+        if let Some((mtime, size)) = placeholder
+            && mtime != remote.modification_time
+            && size == node_size(&remote)
+            && let Some(rev) = node_revision_id(&remote)
+        {
+            self.drain.placeholders.lock().insert(
+                real.clone(),
+                Baseline {
+                    mtime,
+                    size,
+                    hash: None,
+                    revision_id: Some(rev),
+                },
+            );
         }
         self.rebase_open_writes(real, &remote);
         // A write carried over from the create was made against no revision at

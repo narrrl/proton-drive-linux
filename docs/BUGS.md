@@ -108,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B304](#b304--a-write-released-while-its-files-create-lands-is-kept-as-a-conflict-copy) | A write released while its file's create lands is kept as a conflict copy |
 | [B303](#b303--a-file-made-where-a-withdrawn-create-was-listed-refuses-every-write) | A file made where a withdrawn create was listed refuses every write |
 | [B302](#b302--a-stop-during-a-replacing-rename-leaves-the-replaced-file-in-the-trash) | A stop during a replacing rename leaves the replaced file in the trash |
 | [B301](#b301--two-overlapping-fsyncs-can-leave-the-older-ones-record-on-disk) | Two overlapping fsyncs can leave the older one's record on disk |
@@ -405,6 +406,36 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B304 — A write released while its file's create lands is kept as a conflict copy
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-27, from a CI failure of the `one_client_with_stale_hashes_and_reordered_echoes`
+simulation (seed 5): the queues did not drain in time, and Drive held a conflict copy of `e.md`.
+The daemon log said "the remote revision changed under the queued write (expected 28 bytes at
+mtime 1795799834, found 28 at 1795799835)".
+**Where:** `Core::adopt_real_uid` in `crates/pdfs-fuse/src/drain/create.rs` and
+`Core::revision_conflict` in `crates/pdfs-fuse/src/drain/revision.rs`
+
+**Repro:** Make a file with some content, and let its create reach Drive in a later second than
+the file was made locally. As the create lands, write part of the file and close it. Rare: the
+close has to fall in a window of a few milliseconds.
+
+**Cause.** The write opened over the create's placeholder, whose base is the local mtime and no
+revision id. Landing the create rebases the handles open on the file and the writes queued for
+it onto the node Drive made. A release takes its handle out of the tree before it queues the
+write, so a release that started before the rebase and queued after it was caught by neither.
+The drain then had no revision id to compare and fell back to the mtime, which Drive had stamped
+a second later. The write was not complete, so the check that chains a write onto a revision this
+daemon sealed did not apply either, and the write went up as a conflict copy of the file's own
+create.
+
+**Fix.** Landing a create remembers the placeholder's mtime and size with the revision the create
+sealed. A base with no revision id and that stamp is read as that revision: its bytes are the ones
+the create sent. The record goes once a later upload of the file lands, or the file is trashed.
+
+**Verified:** `a_write_based_on_a_landed_create_placeholder_is_not_a_conflict` checks the
+comparison. The race itself is not reproduced on demand; 40 local replays of the seed passed.
 
 ### B303 — A file made where a withdrawn create was listed refuses every write
 

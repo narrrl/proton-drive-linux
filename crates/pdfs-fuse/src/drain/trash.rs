@@ -61,6 +61,7 @@ impl Core {
         if let Err(e) = self.db.clear_own_sealed_rev(&uid.to_string()) {
             debug!(%uid, error = %e, "clearing the sealed-revision record failed");
         }
+        self.drain.placeholders.lock().remove(&uid);
         self.invalidate_trash();
         self.log_activity(ActivityKind::Trash, &name, "trashed", true);
         info!(%uid, name, "pending trash landed");
