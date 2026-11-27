@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::open::OpenFiles;
+use crate::open::{DirListing, OpenFiles};
 use pdfs_core::{Access, access_for};
 use pdfs_store::db::Db;
 #[cfg(any(test, feature = "test-support"))]
@@ -352,6 +352,33 @@ impl State {
             }
             current = parent;
         }
+    }
+
+    /// One directory's entries as `readdir` reports them: `.` and `..` first, then
+    /// the interned children in `children` order.
+    ///
+    /// Split out because it is built from two places that must agree — `opendir`
+    /// freezes it, and the fallback `readdir` builds it live — and a divergence
+    /// between them would show up as entries appearing or vanishing depending on
+    /// whether the kernel happened to send an `opendir`.
+    pub fn listing(&self, ino: u64) -> DirListing {
+        let parent = self
+            .entries
+            .get(&ino)
+            .map_or(crate::ids::ROOT_INO, |e| e.parent);
+        // "." and ".." occupy offsets 0 and 1; real children follow.
+        let mut listing = vec![
+            (ino, true, ".".to_string()),
+            (parent, true, "..".to_string()),
+        ];
+        if let Some(kids) = self.children.get(&ino) {
+            for &kid in kids {
+                if let Some(e) = self.entries.get(&kid) {
+                    listing.push((kid, e.node.is_folder(), e.node.name.clone()));
+                }
+            }
+        }
+        listing
     }
 
     /// Whether the node at `ino` may be written.

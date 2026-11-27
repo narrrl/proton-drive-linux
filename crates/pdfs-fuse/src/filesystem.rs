@@ -1027,30 +1027,6 @@ const OPEN_BASE_ATTEMPTS: u32 = 3;
 /// the dispatch loop.
 const COPY_RANGE_MAX: u64 = 16 * 1024 * 1024;
 
-/// One directory's entries as `readdir` reports them: `.` and `..` first, then
-/// the interned children in `children` order.
-///
-/// Split out because it is built from two places that must agree — `opendir`
-/// freezes it, and the fallback `readdir` builds it live — and a divergence
-/// between them would show up as entries appearing or vanishing depending on
-/// whether the kernel happened to send an `opendir`.
-fn build_listing(st: &State, ino: u64) -> DirListing {
-    let parent = st.entries.get(&ino).map_or(ROOT_INO, |e| e.parent);
-    // "." and ".." occupy offsets 0 and 1; real children follow.
-    let mut listing = vec![
-        (ino, true, ".".to_string()),
-        (parent, true, "..".to_string()),
-    ];
-    if let Some(kids) = st.children.get(&ino) {
-        for &kid in kids {
-            if let Some(e) = st.entries.get(&kid) {
-                listing.push((kid, e.node.is_folder(), e.node.name.clone()));
-            }
-        }
-    }
-    listing
-}
-
 /// Fill a `readdir` reply from `listing`, resuming at `offset`.
 ///
 /// The cookie handed back is the index of the *next* entry, so a resumed call
@@ -1193,7 +1169,7 @@ impl ProtonFs {
             return;
         }
         let mut st = self.core.state();
-        let listing = build_listing(&st, ino);
+        let listing = st.listing(ino);
         // Shares the counter with write handles, so a directory handle can never
         // collide with a file handle (both are `fh` values in one kernel space).
         let fh = st.open.open_dir(listing);
@@ -1209,7 +1185,7 @@ impl ProtonFs {
             return;
         }
         let st = self.core.state();
-        let listing = build_listing(&st, ino);
+        let listing = st.listing(ino);
         drop(st);
         reply_listing(&listing, offset, self.root, reply);
     }
