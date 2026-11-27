@@ -205,23 +205,54 @@ dirty set takes the place of the local walk, as described below.
 
 ## Root reducer as built
 
-The states above are first built as a check. `pdfs_sync::root` holds one reducer per mirror
-folder. `step(state, input)` is pure: the passes, the watcher, the event stream and pause are
-inputs, so a sequence of inputs replays exactly.
+`pdfs_sync::root` holds one reducer per mirror folder. `step(state, input)` is pure: the passes,
+the watcher, the event stream and pause are inputs, so a sequence of inputs replays exactly.
 
-| State | Meaning |
+| Phase | Meaning |
 |---|---|
 | Discovering | No pass over the folder has finished yet. |
-| Following | A pass covered the whole folder, and nothing since says a change went unreported. |
-| Auditing | A doubt arrived: a watcher error, an overflowed queue, a gap in Drive's event stream, a restart or a suspension. Only a pass over the whole folder ends it. |
+| Following | Passes covered the whole folder, and nothing since says a change went unreported. |
+| Auditing | A doubt arrived, and the side it is about has not been walked in full since. |
 | Suspended | The local root is missing, or the folder is paused. |
 | Draining | A switch to on-demand is queued, and passes only push. |
 | HandedOff | The folder is on-demand. Going back to a mirror starts discovery again. |
 
-Nothing acts on the state yet: every pass still covers the whole folder, so a finished pass
-always returns the folder to Following. The engine logs each transition as `sync: root state`,
-so the reducer can be compared with what the engine did. Once a Following folder plans from its
-dirty sets alone, the state decides which passes must walk everything.
+A doubt is about one side, since the disk and Drive are followed by different things that fail
+on their own. The state keeps, for each side, the first doubt not yet answered (`Owed`):
+
+| Doubt | Side | Where it comes from |
+|---|---|---|
+| FirstSync | both | A folder no pass has walked, or one that is a mirror again. |
+| Restart | disk | The daemon started: nothing watched the disk while it was down. Drive's event stream resumes from its cursor. |
+| WatchLost | disk | A watcher error, or a root that went missing and took its watch with it. |
+| Overflow | disk | The watcher's queue overflowed. |
+| EventGap | Drive | The event stream reported `ContinuityLost`. |
+| Pushed | Drive | A switch to on-demand was called off; the push passes dropped the picture of Drive. |
+
+A pause owes nothing by itself: the watcher and the event stream keep running for a paused
+folder. A doubt that arrives while a folder is suspended is kept for when it comes back.
+
+**Acted on:** a pass asks the state what it owes before it walks. A side that is owed is walked
+in full: the disk without the kept walk, and Drive without the saved picture (a walk an earlier
+pass cut short still resumes). The pass reports which sides it walked in full
+(`Outcome::walked_in_full`), and only those answer a doubt. A pass from the dirty sets keeps a
+Following folder Following.
+
+The checks a pass made before (a trusted claim, a fresh event stream, the audit intervals) still
+apply on top: the state can make a pass walk more, never less. Today each doubt also breaks one
+of those checks, so the state adds no full walks except after a missing root. When the state is
+what forces a walk, the journal says `the root state asks for a walk of the whole disk` or `of
+all of Drive`.
+
+A root that goes missing loses its watch, and one made again in its place is a new folder the
+old watch does not see. The engine drops the watch when it finds the root missing, and sets it
+up again on the first pass that finds the root back. Until then the disk is owed a full walk.
+
+**Tests:** the `root::tests` unit tests (a doubt per side, a restart, a suspension, a handoff),
+`a_restart_walks_the_disk_in_full_and_not_drive` (sim: the first pass after a restart walks the
+disk and reuses the picture of Drive), and `a_root_made_again_is_watched_again` (sim: a file
+written in a root moved away and made again reaches Drive within a minute; it fails without the
+new watch).
 
 ## Plan of work (separate PRs)
 

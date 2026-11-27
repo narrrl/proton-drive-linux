@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 use crate::evidence::{Evidence, RemoteEvidence, Side};
 use crate::local_dirty::{Claim, LocalWalk};
 use crate::planner::HasKind;
-use crate::root::{RootInput, Suspension};
+use crate::root::{Doubt, Phase as RootPhase, RootInput, Suspension};
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::syncignore::IgnoreRules;
@@ -159,7 +159,23 @@ impl Syncer {
                 .sync_folder_set_state(folder.id, "error", now_secs());
             self.roots
                 .input(folder.id, RootInput::Suspended(Suspension::RootMissing));
+            // A root removed takes its watch with it, and one made again in
+            // its place is not watched until the watches are set up again.
+            // Until then the disk is walked in full.
+            self.local_dirty.unwatched(folder.id);
+            self.roots
+                .input(folder.id, RootInput::Doubted(Doubt::WatchLost));
+            let _ = self.tx.send(SyncMsg::Rewatch);
             return;
+        }
+        // Back after it was missing: watch it again. This pass walks the disk
+        // in full, as the root state owes it.
+        if self
+            .roots
+            .state(folder.id)
+            .is_some_and(|state| state.phase == RootPhase::Suspended(Suspension::RootMissing))
+        {
+            let _ = self.tx.send(SyncMsg::Rewatch);
         }
         self.roots.input(
             folder.id,
@@ -229,8 +245,12 @@ impl Syncer {
         let progress = self.progress.lock().get(&folder.id).cloned();
         self.progress_end(folder.id);
         self.log_trace(folder, &result, started.elapsed());
-        if result.is_ok() && !push_only {
-            self.roots.input(folder.id, RootInput::Covered);
+        if let Ok(outcome) = &result
+            && !push_only
+        {
+            let (local, remote) = outcome.walked_in_full;
+            self.roots
+                .input(folder.id, RootInput::Covered { local, remote });
         }
         match result {
             Ok(outcome) => {
@@ -516,14 +536,28 @@ impl Syncer {
         // Claimed before the walk: a change made while it runs is newer than
         // the claim, and stays marked for the next pass.
         let claim = self.local_dirty.claim(folder_id);
+        // What the root state says this pass must walk in full (`root`).
+        let owed = self.roots.owed(folder_id);
         // The last pass's walk, when the claim can bring it up to date: the
         // watch was live since that pass claimed, the ignore rules are the
-        // same, and the folder was walked in full lately.
+        // same, the folder was walked in full lately, and the root state owes
+        // the disk nothing.
         let kept = self.local_dirty.take_walk(folder_id).filter(|kept| {
             claim.trusted
                 && kept.rules == rules.source()
                 && kept.walked_at.elapsed() < LOCAL_AUDIT_INTERVAL
         });
+        let kept = match (kept, owed.local) {
+            (Some(_), Some(doubt)) => {
+                info!(
+                    id = folder_id,
+                    ?doubt,
+                    "sync: the root state asks for a walk of the whole disk"
+                );
+                None
+            }
+            (kept, _) => kept,
+        };
         let step = Instant::now();
         let writing = open_for_write_set(local_root);
         let (walked_at, walked_in_full) = match kept {
@@ -581,11 +615,12 @@ impl Syncer {
                 gaps: &mut gaps,
             },
             &baseline,
+            owed.remote.is_none(),
         );
         // Timed even when cut short: a walk that never ends is the case the
         // trace exists for.
         self.trace_phase(Phase::RemoteWalk, step.elapsed());
-        walked?;
+        let remote_in_full = walked?;
         guard_remote_wipe(&tracked_baseline(&baseline, rules, &unscanned), &remote)?;
 
         let mut order = classification_order(&local, &remote, &baseline, rules);
@@ -611,6 +646,7 @@ impl Syncer {
         unscanned_report.extend(gaps.report());
         let mut outcome = Outcome {
             unscanned: unscanned_report,
+            walked_in_full: (walked_in_full, remote_in_full),
             ..Default::default()
         };
         // Folders to delete, collected here and removed deepest-first at the end

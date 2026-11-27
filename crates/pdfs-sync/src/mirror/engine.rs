@@ -584,6 +584,16 @@ fn rewatch(
             core.roots.forget(*id);
         }
     }
+    // A root that is gone took its watch with it: drop it, so the root is
+    // watched again once it is back (below).
+    have.retain(|(path, id)| {
+        let here = path.is_dir();
+        if !here {
+            let _ = watcher.unwatch(path);
+            core.local_dirty.unwatched(*id);
+        }
+        here
+    });
     // Add newly wanted watches.
     let mut failed = false;
     for (path, id) in &want {

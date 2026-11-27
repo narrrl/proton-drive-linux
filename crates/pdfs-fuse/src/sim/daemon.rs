@@ -2023,6 +2023,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A sync root moved away and made again in its place is a new folder
+    /// on disk, which the old watch does not see. The engine watches it again
+    /// once it is back, so a file written in it later still reaches Drive
+    /// without waiting for the hourly walk (`root`).
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_root_made_again_is_watched_again() {
+        take_logged();
+        let drive = FakeDrive::new();
+        let dir = scratch("root-again");
+        let (daemon, folder, _client) =
+            start_mirror(&drive, &dir, &[("a.txt", b"one"), ("b.txt", b"two")]);
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        let local = dir.join("local");
+        let away = dir.join("away");
+        std::fs::rename(&local, &away).unwrap();
+        let _ = daemon.request(&Request::SyncNow { id: Some(folder) });
+        assert!(wait_until(Duration::from_secs(30), || {
+            take_logged()
+                .iter()
+                .any(|line| line.contains("to=suspended (RootMissing)"))
+        }));
+        // A new folder in the old one's place, with the same files.
+        std::fs::create_dir(&local).unwrap();
+        for name in ["a.txt", "b.txt"] {
+            std::fs::copy(away.join(name), local.join(name)).unwrap();
+        }
+        let _ = daemon.request(&Request::SyncNow { id: Some(folder) });
+        // The pass that finds it back walks it in full, and the watches are
+        // set up again after it.
+        assert!(wait_until(Duration::from_secs(30), || {
+            take_logged().iter().any(|line| {
+                line.contains("from=suspended (RootMissing)") && line.contains("to=following")
+            })
+        }));
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        std::fs::write(local.join("c.txt"), b"three").unwrap();
+        // Only the watch can bring this pass about: the poll is two minutes
+        // off.
+        assert!(
+            wait_until(Duration::from_secs(60), || drive
+                .lookup("mirrored/c.txt")
+                .is_some()),
+            "a file written in the root made again reaches Drive"
+        );
+        assert!(drive.lookup("mirrored/a.txt").is_some());
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restart owes the disk a walk in full, since nothing watched it
+    /// meanwhile, and owes Drive nothing: its event stream resumes from the
+    /// cursor (`root`).
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_restart_walks_the_disk_in_full_and_not_drive() {
+        take_logged();
+        let drive = FakeDrive::new();
+        let dir = scratch("restart-owes");
+        let (daemon, folder, _client) =
+            start_mirror(&drive, &dir, &[("a.txt", b"one"), ("b.txt", b"two")]);
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        take_logged();
+        let daemon = daemon.restart().unwrap();
+        let quiet = quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        let logged = take_logged();
+        let roots: Vec<&String> = logged
+            .iter()
+            .filter(|line| line.contains("sync: root state"))
+            .collect();
+        assert!(
+            roots.len() == 1
+                && roots[0].contains("from=auditing (local: Restart)")
+                && roots[0].contains("to=following")
+                && roots[0].contains("Covered { local: true, remote: false }"),
+            "{roots:?}"
+        );
+        assert!(
+            !logged
+                .iter()
+                .any(|line| line.contains("the root state asks for a walk of all of Drive")),
+            "a restart owes Drive nothing"
+        );
+        assert!(counted(&quiet, "reused") > 0, "{quiet}");
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_mirror_pass_reports_where_its_time_went() {

@@ -151,6 +151,10 @@ pub struct Outcome {
     /// the summary, which counts them by kind; a pass that made any does not
     /// keep its walk for the next one (`local_dirty`).
     pub local_changes: usize,
+    /// Which sides the pass walked in full, rather than bringing the last
+    /// walk up to date from the dirty set: the disk, and Drive. The root
+    /// state counts a side covered only after a walk in full (`root`).
+    pub walked_in_full: (bool, bool),
 }
 
 impl Outcome {

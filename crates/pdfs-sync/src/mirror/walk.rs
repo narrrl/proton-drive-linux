@@ -79,18 +79,25 @@ impl Syncer {
     /// folder's baseline changes, so a resumed walk never meets a baseline
     /// newer than its listings; it is as old as a long walk's first listings
     /// would be, and the apply step checks each file again before it acts.
+    ///
+    /// With `reuse` false, a complete saved walk is not used: the root state
+    /// owes Drive a walk in full. Returns whether the walk covered all of
+    /// Drive's side, rather than only the folders marked dirty.
     pub(super) fn walk_remote(
         &self,
         folder_id: i64,
         root: &NodeUid,
         walk: &mut RemoteWalk<'_>,
         baseline: &HashMap<String, StoredSyncEntry>,
-    ) -> Result<(), PassAbort> {
+        reuse: bool,
+    ) -> Result<bool, PassAbort> {
         let WalkStart {
             mut todo,
             mut children,
             dirty_upto,
-        } = self.start_walk(folder_id, root, walk);
+        } = self.start_walk(folder_id, root, walk, reuse);
+        // Started from the saved picture, the walk lists only what changed.
+        let in_full = children.is_none();
         // Folders to list again next pass: their listing failed or came back
         // short this time.
         let mut again: Vec<String> = Vec::new();
@@ -221,7 +228,8 @@ impl Syncer {
             return Err(PassAbort::Stopped);
         }
         self.finish_walk(folder_id, dirty_upto, &again)
-            .map_err(|e| PassAbort::from(format!("save the walk of Drive: {e:?}")))
+            .map_err(|e| PassAbort::from(format!("save the walk of Drive: {e:?}")))?;
+        Ok(in_full)
     }
 
     /// Keep a walk that reached its end as the next pass's picture of Drive.
@@ -264,6 +272,7 @@ impl Syncer {
         folder_id: i64,
         root: &NodeUid,
         walk: &mut RemoteWalk<'_>,
+        reuse: bool,
     ) -> WalkStart {
         let root_uid = root.to_string();
         let saved = match self.store.sync_walk_load(folder_id) {
@@ -277,9 +286,17 @@ impl Syncer {
             && saved.root_uid == root_uid
         {
             let age = now_secs().saturating_sub(saved.started);
-            if saved.complete
+            let fresh = saved.complete
                 && age < AUDIT_INTERVAL.as_secs() as i64
-                && self.events_trusted(root)
+                && self.events_trusted(root);
+            if fresh && !reuse {
+                info!(
+                    id = folder_id,
+                    "sync: the root state asks for a walk of all of Drive"
+                );
+            }
+            if fresh
+                && reuse
                 && let Some(start) = self.walk_dirty(folder_id, &saved, walk)
             {
                 return start;

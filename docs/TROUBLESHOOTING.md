@@ -324,6 +324,9 @@ What the parts mean:
   first pass, at least once an hour, after the pass before it changed files on disk itself,
   and after anything that breaks trust in the watch. Only those passes count `missed local
   changes`.
+  A `sync: root state` line in the journal says when a folder's state changes, for example
+  `from=following to=auditing (local: Overflow)`: the side named is walked in full by the next
+  pass, which takes the folder back to `following`.
 
 Please include these lines when you report a slow folder.
 
