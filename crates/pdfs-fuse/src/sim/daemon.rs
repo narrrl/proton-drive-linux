@@ -1969,6 +1969,9 @@ mod tests {
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn the_local_dirty_set_covers_what_the_walk_finds() {
+        // The log is shared by every test in the process: drop what earlier
+        // tests left in it, so only this daemon's lines are counted.
+        take_logged();
         let drive = FakeDrive::new();
         let dir = scratch("local-dirty");
         let (daemon, folder, _client) =
