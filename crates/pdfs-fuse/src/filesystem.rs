@@ -2,6 +2,7 @@
 
 use super::*;
 use pdfs_vfs::files::Files;
+use pdfs_vfs::namespace::Namespace;
 use pdfs_vfs::open::{DirListing, dir_page};
 
 impl Filesystem for ProtonFs {
@@ -938,6 +939,7 @@ pub struct ProtonFs {
     core: Core,
     /// The open-file service, shared with every other mount of the daemon.
     files: Arc<Files<Core>>,
+    namespace: Arc<Namespace<Core>>,
     uid: u32,
     gid: u32,
     /// The tree inode of this session's root, which the kernel knows as
@@ -990,6 +992,7 @@ impl ProtonFs {
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         Self {
             files: core.files(),
+            namespace: core.namespace(),
             core,
             uid,
             gid,
@@ -1170,254 +1173,46 @@ impl ProtonFs {
 
     /// The body of [`Filesystem::create`], run off the dispatch loop.
     fn serve_create(&self, parent: u64, name: &str, reply: ReplyCreate) {
-        if let Err(error) = self.core.require_writable(parent) {
-            reply.error(error);
-            return;
+        match self.namespace.create(parent, name) {
+            Ok(made) => {
+                let attr = self.attr(made.ino, &made.node, made.access);
+                reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(made.fh),
+                    FopenFlags::empty(),
+                );
+            }
+            Err(error) => reply.error(namespace_errno(error)),
         }
-        if let Err(e) = self.core.ensure_children(parent) {
-            // The parent was looked up a moment ago, so ENOENT here means it
-            // left the tree in between. Log it: the caller only sees "no such
-            // file" on a create.
-            if e == Errno::ENOENT {
-                warn!(parent, name, "create: the parent folder is no longer known");
-            }
-            reply.error(e);
-            return;
-        }
-        let parent_uid = {
-            let st = self.core.state();
-            match st.entries.get(&parent) {
-                Some(e) => e.uid.clone(),
-                None => {
-                    warn!(
-                        parent,
-                        name, "create: the parent folder left the tree during its listing"
-                    );
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
-        };
-        // A transient scratch name — a browser's in-flight `*.crdownload`, an
-        // editor's `*.swp` — is kept purely local and *parked*: no remote node is
-        // minted and its bytes never upload while it wears that name. The app
-        // renames the finished file to its real name, and that rename un-parks the
-        // create so only the completed file reaches Drive. Minting an empty remote
-        // node here instead is what let a stalled+resumed download fork a
-        // `(sync-conflict)` copy (docs/BUGS.md B70).
-        let transient = is_transient_name(name);
-        // Offline the server cannot mint a uid, so invent one and queue the
-        // create. The file is real to the caller either way; only its identity is
-        // provisional until the drain.
-        //
-        // A parent that is itself still queued forces the same path even when we
-        // are online: the API has no folder to put this in yet.
-        //
-        // A create that set out online and lost the network on the way lands in
-        // the queue too, so a Wi-Fi drop costs the caller a wait, never an EIO.
-        let minted = if !transient && self.core.sends_inline() && !is_local_uid(&parent_uid) {
-            if let Err(error) = self.core.require_uid_writable(&parent_uid) {
-                reply.error(error);
-                return;
-            }
-            // Create an empty file on the remote so it has a real uid immediately;
-            // written bytes are buffered and sealed as a new revision on close.
-            match self.core.block_on_bounded(self.core.drive.upload_file(
-                &parent_uid,
-                name,
-                media_type_for(name),
-                b"",
-            )) {
-                // A file that exists remotely but could not be read back is
-                // queued, and the queued create finds it by name and adopts it.
-                Ok(new_uid) => self.core.fetch_minted_node(&new_uid, name),
-                Err(e) if self.core.lost_link(&e, "create") => None,
-                Err(e) => {
-                    error!(%parent_uid, name, error = %e, "create file failed");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let node = match minted {
-            Some(node) => node,
-            None => match self
-                .core
-                .queue_local_node(&parent_uid, name, false, transient)
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    reply.error(e);
-                    return;
-                }
-            },
-        };
-        let (file, path) = match self.core.cache.create_scratch() {
-            Ok(x) => x,
-            Err(e) => {
-                error!(uid = %node.uid, error = %e, "create scratch file failed");
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-        let mut st = self.core.state();
-        let ino = st.intern(parent, node.clone());
-        if let Some(entry) = st.entries.get_mut(&ino) {
-            entry.open_count = entry.open_count.saturating_add(1);
-        }
-        if let Some(kids) = st.children.get_mut(&parent)
-            && !kids.contains(&ino)
-        {
-            kids.push(ino);
-        }
-        let fh = st
-            .open
-            .open_writer(ino, || WriteHandle::created(ino, &node, file, path));
-        let entry = st.entries.get(&ino).unwrap();
-        let attr = self.attr(ino, &entry.node, entry.access);
-        drop(st);
-        self.core.flush_access_changes();
-        reply.created(
-            &TTL,
-            &attr,
-            Generation(0),
-            FileHandle(fh),
-            FopenFlags::empty(),
-        );
     }
 
     /// The body of [`Filesystem::mkdir`], run off the dispatch loop.
     fn serve_mkdir(&self, parent: u64, name: &str, reply: ReplyEntry) {
-        if let Err(error) = self.core.require_writable(parent) {
-            reply.error(error);
-            return;
-        }
-        if let Err(e) = self.core.ensure_children(parent) {
-            reply.error(e);
-            return;
-        }
-        let parent_uid = {
-            let st = self.core.state();
-            match st.entries.get(&parent) {
-                Some(e) => e.uid.clone(),
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
+        match self.namespace.mkdir(parent, name) {
+            Ok(made) => {
+                let attr = self.attr(made.ino, &made.node, made.access);
+                reply.entry(&TTL, &attr, Generation(0));
             }
-        };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .ok();
-        // As in `create`: offline — or under a parent that is itself still
-        // queued — the folder becomes a placeholder that the drain turns into a
-        // real one.
-        // Losing the network on the way queues it the same way.
-        let minted = if self.core.sends_inline() && !is_local_uid(&parent_uid) {
-            if let Err(error) = self.core.require_uid_writable(&parent_uid) {
-                reply.error(error);
-                return;
-            }
-            match self
-                .core
-                .block_on_bounded(self.core.drive.create_folder(&parent_uid, name, now))
-            {
-                Ok(new_uid) => self.core.fetch_minted_node(&new_uid, name),
-                Err(e) if self.core.lost_link(&e, "mkdir") => None,
-                Err(e) => {
-                    error!(%parent_uid, name, error = %e, "create folder failed");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let node = match minted {
-            Some(node) => node,
-            None => match self.core.queue_local_node(&parent_uid, name, true, false) {
-                Ok(n) => n,
-                Err(e) => {
-                    reply.error(e);
-                    return;
-                }
-            },
-        };
-        let mut st = self.core.state();
-        let local = is_local_uid(&node.uid);
-        let uid = node.uid.clone();
-        let ino = st.intern(parent, node);
-        if let Some(kids) = st.children.get_mut(&parent)
-            && !kids.contains(&ino)
-        {
-            kids.push(ino);
+            Err(error) => reply.error(namespace_errno(error)),
         }
-        // A folder that exists only here has nothing to enumerate, and asking the
-        // API to enumerate a `local~` uid would 404. Record it as fully listed and
-        // empty, which it is, so reads stay offline-clean across a restart too.
-        if local {
-            st.children.insert(ino, Vec::new());
-            st.record_listed(uid);
-        }
-        let entry = st.entries.get(&ino).unwrap();
-        let attr = self.attr(ino, &entry.node, entry.access);
-        drop(st);
-        self.core.flush_access_changes();
-        reply.entry(&TTL, &attr, Generation(0));
     }
 
     /// The body of [`Filesystem::unlink`], run off the dispatch loop.
-    fn serve_unlink(&self, parent: u64, name_str: &str, reply: ReplyEmpty) {
-        if let Err(error) = self.core.require_writable(parent) {
-            reply.error(error);
-            return;
+    fn serve_unlink(&self, parent: u64, name: &str, reply: ReplyEmpty) {
+        match self.namespace.unlink(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(namespace_errno(error)),
         }
-        if let Ok((ino, _)) = self.core.lookup_child(parent, name_str) {
-            let st = self.core.state();
-            if let Some(entry) = st.entries.get(&ino)
-                && entry.node.is_folder()
-            {
-                reply.error(Errno::EISDIR);
-                return;
-            }
-        }
-        self.trash_child(parent, name_str, reply);
     }
 
     /// The body of [`Filesystem::rmdir`], run off the dispatch loop.
-    fn serve_rmdir(&self, parent: u64, name_str: &str, reply: ReplyEmpty) {
-        if let Err(error) = self.core.require_writable(parent) {
-            reply.error(error);
-            return;
+    fn serve_rmdir(&self, parent: u64, name: &str, reply: ReplyEmpty) {
+        match self.namespace.rmdir(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(namespace_errno(error)),
         }
-        if let Ok((ino, _)) = self.core.lookup_child(parent, name_str) {
-            {
-                let st = self.core.state();
-                if st
-                    .entries
-                    .get(&ino)
-                    .is_some_and(|entry| !entry.node.is_folder())
-                {
-                    reply.error(Errno::ENOTDIR);
-                    return;
-                }
-            }
-            // A missing cached listing says "unknown", not "empty". Proton's
-            // trash call is recursive, so enumerate before applying rmdir's
-            // POSIX emptiness rule.
-            if let Err(e) = self.core.ensure_children(ino) {
-                reply.error(e);
-                return;
-            }
-            if self.core.state().has_children(ino) {
-                reply.error(Errno::ENOTEMPTY);
-                return;
-            }
-        }
-        self.trash_child(parent, name_str, reply);
     }
 
     /// The body of [`Filesystem::rename`], run off the dispatch loop.
@@ -1734,9 +1529,6 @@ impl ProtonFs {
         reply.ok();
     }
 
-    /// Expose a file's server-side thumbnail/preview as an extended attribute, so
-    /// a previewing client can fetch it without downloading the whole file. The
-    /// bytes are fetched on demand and cached; absence yields `ENODATA`.
     /// Answer with an inode's current attributes, or `ENOENT` if it went away
     /// while the caller was doing something slower.
     fn reply_attr(&self, ino: u64, reply: ReplyAttr) {
@@ -1748,113 +1540,6 @@ impl ProtonFs {
             }
             None => reply.error(Errno::ENOENT),
         }
-    }
-
-    fn trash_child(&self, parent: u64, name: &str, reply: ReplyEmpty) {
-        if let Err(error) = self.core.require_writable(parent) {
-            reply.error(error);
-            return;
-        }
-        let (ino, mut uid) = match self.core.lookup_child(parent, name) {
-            Ok(x) => x,
-            Err(e) => {
-                reply.error(e);
-                return;
-            }
-        };
-        let open_now = self
-            .core
-            .state
-            .lock()
-            .entries
-            .get(&ino)
-            .is_some_and(|e| e.open_count > 0);
-        // A node the server has never heard of cannot be trashed there; deleting
-        // it just means its queued creation is no longer wanted. This works
-        // offline, which the remote path below cannot.
-        if is_local_uid(&uid) {
-            let dropped = if open_now {
-                self.core.withdraw_queued_ops(&uid)
-            } else {
-                self.core.discard_queued_ops(&uid)
-            };
-            if let Err(error) = dropped {
-                reply.error(error);
-                return;
-            }
-            self.core.state().forget_or_unlink(&uid);
-            // A create that landed before the ops were dropped left none: Drive
-            // has the node, and the tree had not taken its uid yet. It is
-            // trashed there like any other (docs/BUGS.md B173).
-            match self.core.landed_row_uid(ino) {
-                Some(real) => {
-                    debug!(local = %uid, %real, name, "create landed under a delete");
-                    uid = real;
-                }
-                None => {
-                    debug!(%uid, name, "deleted a node that had not been created remotely yet");
-                    reply.ok();
-                    return;
-                }
-            }
-        }
-        // Queue a folder trash while Drive still holds children that were moved
-        // out locally. The drain waits for those moves before sending it.
-        let queue_it = |reply: ReplyEmpty| match self.core.queue_trash(&uid, name, open_now) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        };
-        if !self.core.sends_inline() {
-            return queue_it(reply);
-        }
-        match self.core.has_pending_moves_out_of(&uid) {
-            Ok(false) => {}
-            Ok(true) => return queue_it(reply),
-            Err(error) => return reply.error(error),
-        }
-        if let Err(e) = self.core.require_uid_writable(&uid) {
-            reply.error(e);
-            return;
-        }
-        if let Err(e) = self
-            .core
-            .block_on_bounded(self.core.drive.trash_nodes(std::slice::from_ref(&uid)))
-            .and_then(batch::into_unit)
-        {
-            if self.core.lost_link(&e, "trash") {
-                queue_it(reply);
-                return;
-            }
-            error!(%uid, error = %e, "trash failed");
-            self.core
-                .log_activity(ActivityKind::Trash, name, e.to_string(), false);
-            reply.error(Errno::EIO);
-            return;
-        }
-        // Only remove the namespace entry after Drive accepted the mutation.
-        // Otherwise an EIO response still made the path disappear locally.
-        self.core.writes.hide(&uid);
-        self.core.state().forget_or_unlink(&uid);
-        if open_now {
-            // The open handle keeps the staged bytes; the drain must not send
-            // them to a node that is already in the trash (docs/BUGS.md B106).
-            if let Err(error) = self.core.withdraw_queued_ops(&uid) {
-                warn!(%uid, ?error, "remote trash landed but queued-op cleanup failed");
-            }
-        } else {
-            if let Err(error) = self.core.discard_queued_ops(&uid) {
-                warn!(%uid, ?error, "remote trash landed but queued-op cleanup failed");
-            }
-            self.core.cache.evict(&uid);
-            self.core.evict_reader(&uid);
-        }
-        self.core.invalidate_trash();
-        // Every other trash site records itself; this one did not, which made a
-        // file found in the trash impossible to attribute after the fact — the
-        // activity log was the only record and it showed nothing (`docs/BUGS.md` B2).
-        self.core
-            .log_activity(ActivityKind::Trash, name, "trashed from the mount", true);
-        reply.ok();
     }
 }
 
