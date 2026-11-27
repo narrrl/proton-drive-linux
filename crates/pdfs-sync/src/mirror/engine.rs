@@ -31,7 +31,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(120);
 /// How many uploads/downloads/folder-creations a reconcile runs at once. The
 /// per-item work is a network round-trip, so a folder with thousands of files is
 /// unusable done one-at-a-time; this bounds concurrency like the bulk-upload
-/// engine does.
+/// engine does. The daemon's admission (`SyncParts::admission`) enforces it.
 pub const SYNC_CONCURRENCY: usize = 8;
 /// How long after a failed watch the engine tries the watches again. Each try
 /// walks the folder's whole tree, so not on every burst.

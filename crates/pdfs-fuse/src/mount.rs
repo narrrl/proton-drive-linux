@@ -521,6 +521,10 @@ pub(crate) fn mount_with(
         abandon: Arc::default(),
         events_read_at: Arc::new(AtomicI64::new(0)),
         local_dirty: Arc::default(),
+        admission: Arc::new(pdfs_sched::Classes::new(|class| match class {
+            pdfs_sched::Class::Mirror => sync::SYNC_CONCURRENCY,
+            pdfs_sched::Class::Listing => super::listing::COLD_LISTINGS,
+        })),
     };
     let state = Arc::new(Ranked::new(
         Rank::State,
@@ -572,6 +576,7 @@ pub(crate) fn mount_with(
         events,
         indexing: Arc::new(AtomicBool::new(false)),
         pending_probe: Arc::default(),
+        listing_flights: Arc::default(),
         mounts: Arc::new(Mutex::new(SecondaryMountRegistry::default())),
         states: Arc::new(StateRegistry::default()),
     };

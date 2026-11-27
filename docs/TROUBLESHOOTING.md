@@ -298,6 +298,11 @@ What the parts mean:
   recorded. A high count here on a folder that has not changed is the slow case from B294. Each
   pass records what it read, so the count falls on the next pass even if this one is cut short.
 - **`slowest listing`** names the folder on Proton Drive that took longest to list.
+- **`admission wait`** is the time uploads, downloads and folder creations spent waiting for
+  their turn before they started. The service runs at most 8 of them at once. A large
+  `admission wait` next to a small `upload` total means the work queued inside the service and
+  did not wait on Proton Drive. The `admission of background steps` lines in `pdfs diagnostics`
+  show how many steps run and wait right now, and how long the oldest one has waited.
 - **`reused`** and **`dirty folders`:** once a pass has listed the whole folder on Proton Drive,
   later passes start from that listing (`reused` paths) and list only the folders Proton Drive
   reported a change in (`dirty folders`). A pass with no `reused` count listed everything. That

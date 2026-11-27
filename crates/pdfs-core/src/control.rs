@@ -2382,6 +2382,31 @@ pub struct Diagnostics {
     /// folder pin, oldest first. Empty from a daemon that predates the field.
     #[serde(default)]
     pub jobs: Vec<ServiceState>,
+    /// What the admission of background work is doing, per class of step.
+    /// Empty from a daemon that predates the field.
+    #[serde(default)]
+    pub admission: Vec<AdmissionLoad>,
+}
+
+/// One class of background step in the daemon's admission, in
+/// [`Diagnostics::admission`]. Steps waiting here have not reached the
+/// network yet, so a stall with steps waiting and none running is in the
+/// daemon, not at Proton.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdmissionLoad {
+    /// The class of step, such as `mirror`.
+    pub class: String,
+    /// Steps admitted and still running.
+    pub running: usize,
+    /// Steps waiting to be admitted.
+    pub waiting: usize,
+    /// How long the step that has waited longest has waited so far, in ms.
+    pub oldest_wait_ms: Option<u64>,
+    /// Steps admitted since start.
+    pub admitted: u64,
+    /// The time those steps spent waiting, in total and at most, in ms.
+    pub waited_ms: u64,
+    pub longest_wait_ms: u64,
 }
 
 /// One long-lived daemon thread, in [`Diagnostics::services`], or one

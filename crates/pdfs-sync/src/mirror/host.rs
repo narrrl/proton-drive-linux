@@ -89,6 +89,9 @@ pub struct SyncParts {
     /// Where each mirror folder changed on disk since a pass last looked,
     /// as the filesystem watcher reports it.
     pub local_dirty: Arc<crate::local_dirty::LocalDirty>,
+    /// When each step of a pass may start: its uploads, downloads and folder
+    /// creations.
+    pub admission: Arc<dyn pdfs_sched::Admission>,
 }
 
 impl SyncParts {

@@ -58,6 +58,10 @@ impl Phase {
 /// A kind of call to Drive, or of work applied for one path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Call {
+    /// Waiting for the daemon's admission before an upload, download or
+    /// folder creation could start. Time here is time in line, not on the
+    /// network.
+    Admission,
     /// The child uids of one folder.
     ListChildren,
     /// Names and kinds of one folder's children, without unlocking file keys.
@@ -76,7 +80,8 @@ pub enum Call {
 }
 
 impl Call {
-    const ALL: [Call; 10] = [
+    const ALL: [Call; 11] = [
+        Call::Admission,
         Call::ListChildren,
         Call::ReadNodes,
         Call::ReadNodesFull,
@@ -91,6 +96,7 @@ impl Call {
 
     fn name(self) -> &'static str {
         match self {
+            Call::Admission => "admission wait",
             Call::ListChildren => "list children",
             Call::ReadNodes => "read nodes",
             Call::ReadNodesFull => "read nodes full",
