@@ -3,6 +3,7 @@
 use super::*;
 use crate::shutdown::Shutdown;
 use pdfs_core::error::session_revoked;
+use pdfs_sync::root::{Doubt, RootInput};
 
 /// Drop `uid` from one mount's tree and tell that mount's kernel session the
 /// entry is gone. Shared by the trash and delete paths, which differ only in
@@ -148,7 +149,12 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
             core.db.sync_remote_changed(&node_uid.to_string(), None)
         }
         // What changed went by unseen: every pass walks Drive whole again.
-        DriveEvent::ContinuityLost { .. } => core.db.sync_walks_clear_all().map(|()| Vec::new()),
+        DriveEvent::ContinuityLost { .. } => {
+            core.sync
+                .roots
+                .input_all(RootInput::Doubted(Doubt::EventGap));
+            core.db.sync_walks_clear_all().map(|()| Vec::new())
+        }
         _ => Ok(Vec::new()),
     };
     match marked {

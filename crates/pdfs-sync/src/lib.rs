@@ -26,6 +26,7 @@ pub mod mirror;
 pub mod model;
 pub mod naming;
 pub mod planner;
+pub mod root;
 pub mod store;
 pub mod trace;
 

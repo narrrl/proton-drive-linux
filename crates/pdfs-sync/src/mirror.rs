@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 use crate::evidence::{Evidence, RemoteEvidence, Side};
 use crate::local_dirty::Claim;
 use crate::planner::HasKind;
+use crate::root::{RootInput, Suspension};
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::syncignore::IgnoreRules;
@@ -101,15 +102,21 @@ impl Syncer {
     pub fn reconcile_folder(&self, folder: &StoredSyncFolder) {
         // A paused folder skips the settle too: a queued switch to on-demand
         // evicts the local tree, which is only safe after a pass uploaded it.
+        self.roots.begin(folder.id, folder.last_sync != 0);
         if self.sync_folder_paused(folder.id) {
             debug!(id = folder.id, "sync: folder paused, skipping reconcile");
+            self.roots
+                .input(folder.id, RootInput::Suspended(Suspension::Paused));
             return;
         }
+        self.roots.input(folder.id, RootInput::Resumed);
         // `ondemand` folders are live FUSE mounts, not mirrored, so there is nothing
         // to reconcile — but one may still carry a queued switch back to `mirror`,
         // so the settle below is not skipped with it.
         if folder.mode == "mirror" {
             self.reconcile_pass(folder);
+        } else {
+            self.roots.input(folder.id, RootInput::HandedOff);
         }
         self.settle_pending_mode(folder.id);
     }
@@ -150,8 +157,18 @@ impl Syncer {
             let _ = self
                 .store
                 .sync_folder_set_state(folder.id, "error", now_secs());
+            self.roots
+                .input(folder.id, RootInput::Suspended(Suspension::RootMissing));
             return;
         }
+        self.roots.input(
+            folder.id,
+            if push_only {
+                RootInput::HandoffQueued
+            } else {
+                RootInput::Mirrored
+            },
+        );
 
         let _ = self
             .store
@@ -212,6 +229,9 @@ impl Syncer {
         let progress = self.progress.lock().get(&folder.id).cloned();
         self.progress_end(folder.id);
         self.log_trace(folder, &result, started.elapsed());
+        if result.is_ok() && !push_only {
+            self.roots.input(folder.id, RootInput::Covered);
+        }
         match result {
             Ok(outcome) => {
                 // A folder only reaches `idle` when every path applied cleanly —

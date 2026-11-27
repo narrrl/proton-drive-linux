@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use super::trace::PassTrace;
 use super::*;
 use crate::local_dirty::LocalDirty;
+use crate::root::{Doubt, RootInput};
 
 /// How long the watcher must go quiet before a burst counts as finished.
 ///
@@ -248,6 +249,7 @@ pub fn run(core: Syncer, rx: Receiver<SyncMsg>) {
     let tx_events = core.tx.clone();
     let watched_events = watched.clone();
     let dirty = core.local_dirty.clone();
+    let roots = core.roots.clone();
     let handler = move |res: notify::Result<notify::Event>| {
         let event = match res {
             Ok(event) => event,
@@ -257,11 +259,13 @@ pub fn run(core: Syncer, rx: Receiver<SyncMsg>) {
             Err(e) => {
                 warn!(error = %e, "sync: filesystem watcher error");
                 dirty.lost();
+                roots.input_all(RootInput::Doubted(Doubt::WatchLost));
                 return;
             }
         };
         if event.need_rescan() {
             dirty.overflowed();
+            roots.input_all(RootInput::Doubted(Doubt::Overflow));
         }
         // Ignore pure metadata/access noise; content changes are what matter.
         if matches!(event.kind, notify::EventKind::Access(_)) {
@@ -575,6 +579,7 @@ fn rewatch(
         let _ = watcher.unwatch(&path);
         if let Some((_, id)) = before.iter().find(|(p, _)| *p == path) {
             core.local_dirty.forget(*id);
+            core.roots.forget(*id);
         }
     }
     // Add newly wanted watches.

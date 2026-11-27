@@ -1920,11 +1920,22 @@ mod tests {
         }));
         let after = quiet_pass(&daemon, folder).expect("a quiet pass is traced");
         assert_eq!(counted(&after, "local dirty untrusted"), 0, "{after}");
-        let missed: Vec<String> = take_logged()
-            .into_iter()
+        let logged = take_logged();
+        let missed: Vec<&String> = logged
+            .iter()
             .filter(|line| line.contains("local dirty set missed"))
             .collect();
         assert!(missed.is_empty(), "{missed:?}");
+        // The first pass took the folder from discovery to following, and
+        // nothing since put it in doubt (`root`).
+        let roots: Vec<&String> = logged
+            .iter()
+            .filter(|line| line.contains("sync: root state"))
+            .collect();
+        assert!(
+            roots.len() == 1 && roots[0].contains("to=following"),
+            "{roots:?}"
+        );
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }

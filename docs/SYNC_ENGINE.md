@@ -203,6 +203,26 @@ that grows into hours: it is network-bound, while the local walk only reads the 
 What a quiet pass still costs: loading the baseline and the picture from the database, and the
 local walk. The local dirty set removes the local walk.
 
+## Root reducer as built
+
+The states above are first built as a check. `pdfs_sync::root` holds one reducer per mirror
+folder. `step(state, input)` is pure: the passes, the watcher, the event stream and pause are
+inputs, so a sequence of inputs replays exactly.
+
+| State | Meaning |
+|---|---|
+| Discovering | No pass over the folder has finished yet. |
+| Following | A pass covered the whole folder, and nothing since says a change went unreported. |
+| Auditing | A doubt arrived: a watcher error, an overflowed queue, a gap in Drive's event stream, a restart or a suspension. Only a pass over the whole folder ends it. |
+| Suspended | The local root is missing, or the folder is paused. |
+| Draining | A switch to on-demand is queued, and passes only push. |
+| HandedOff | The folder is on-demand. Going back to a mirror starts discovery again. |
+
+Nothing acts on the state yet: every pass still covers the whole folder, so a finished pass
+always returns the folder to Following. The engine logs each transition as `sync: root state`,
+so the reducer can be compared with what the engine did. Once a Following folder plans from its
+dirty sets alone, the state decides which passes must walk everything.
+
 ## Plan of work (separate PRs)
 
 1. **Frontier checkpoint.**

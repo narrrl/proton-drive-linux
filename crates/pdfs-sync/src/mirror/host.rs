@@ -89,6 +89,8 @@ pub struct SyncParts {
     /// Where each mirror folder changed on disk since a pass last looked,
     /// as the filesystem watcher reports it.
     pub local_dirty: Arc<crate::local_dirty::LocalDirty>,
+    /// What each mirror folder's sync knows about its coverage (`root`).
+    pub roots: Arc<crate::root::Roots>,
 }
 
 impl SyncParts {
