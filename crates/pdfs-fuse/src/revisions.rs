@@ -16,7 +16,7 @@
 //!   file rather than trying to describe the new one. The next read repopulates
 //!   from whatever is live by then.
 //! - **The active revision cannot be deleted**, and the server — not this code —
-//!   is what enforces that. [`Core::delete_revision_for_uid`] refuses locally
+//!   is what enforces that. [`Revisions::delete`] refuses locally
 //!   too, so the user gets a sentence instead of an API code.
 
 use std::path::Path;
@@ -27,7 +27,12 @@ use proton_drive_rs::Revision;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::info;
 
+use std::sync::Arc;
+
+use proton_drive_rs::ProtonDriveClient;
+
 use super::Core;
+use crate::drive::DriveApi;
 
 /// A [`Revision`] as the control protocol reports it.
 fn revision_info(revision: Revision) -> RevisionInfo {
@@ -45,70 +50,37 @@ fn revision_info(revision: Revision) -> RevisionInfo {
     }
 }
 
-impl Core {
-    /// The version history of the file at mountpoint-relative `rel`.
-    pub(crate) fn list_revisions(&self, rel: &Path) -> CoreResult<Vec<RevisionInfo>> {
-        let (_ino, uid) = self.resolve(rel)?;
-        self.list_revisions_for_uid(&uid)
-    }
+/// A file's revisions on Drive. Every method takes a node already resolved to
+/// its uid, and the name the activity feed shows for it.
+///
+/// It reaches the filesystem through [`RevisionsHost`]. [`Core::revisions`]
+/// builds one on demand with the daemon as its host.
+pub(crate) struct Revisions {
+    client: ProtonDriveClient,
+    drive: Arc<dyn DriveApi>,
+    rt: tokio::runtime::Handle,
+    host: Arc<dyn RevisionsHost>,
+}
 
-    /// [`Core::list_revisions`] for a node addressed through any daemon location.
-    pub(crate) fn list_revisions_by_uid(&self, uid: &str) -> CoreResult<Vec<RevisionInfo>> {
-        let uid = self.resolve_anywhere(uid)?;
-        self.list_revisions_for_uid(&uid)
-    }
+/// What [`Revisions`] needs from the filesystem.
+pub(crate) trait RevisionsHost: Send + Sync {
+    /// Refuse unless this daemon may change the node's content. `what` names
+    /// the operation in the error.
+    fn require_writable(&self, uid: &NodeUid, what: &str) -> CoreResult<()>;
+    /// The node's active revision changed on the server: forget its cached
+    /// content and open readers, and fetch it again if it is kept offline.
+    fn content_replaced(&self, uid: &NodeUid);
+    /// Add an entry to the activity log.
+    fn log_activity(&self, kind: ActivityKind, target: String, detail: String, ok: bool);
+}
 
-    fn list_revisions_for_uid(&self, uid: &NodeUid) -> CoreResult<Vec<RevisionInfo>> {
-        let revisions = self
-            .rt
-            .block_on(self.client.enumerate_revisions(uid))
-            .map_err(|e| CoreError::from_api(&e, "list revisions"))?;
-        Ok(revisions.into_iter().map(revision_info).collect())
-    }
-
-    /// Make `revision_id` the current content of the file at `rel`.
-    pub(crate) fn restore_revision(&self, rel: &Path, revision_id: &str) -> CoreResult<()> {
-        let (_ino, uid) = self.resolve(rel)?;
-        let name = rel
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| uid.to_string());
-        self.restore_revision_for_uid(&uid, revision_id, &name)?;
-        // The size and mtime a listing shows describe the revision that was
-        // active a moment ago.
-        self.invalidate_parent_listing(rel);
-        Ok(())
-    }
-
-    /// [`Core::restore_revision`] for a node addressed through any daemon
-    /// location.
-    pub(crate) fn restore_revision_by_uid(&self, uid: &str, revision_id: &str) -> CoreResult<()> {
-        let uid = self.resolve_anywhere(uid)?;
-        let name = uid.to_string();
-        self.restore_revision_for_uid(&uid, revision_id, &name)
-    }
-
-    fn restore_revision_for_uid(
-        &self,
-        uid: &NodeUid,
-        revision_id: &str,
-        name: &str,
-    ) -> CoreResult<()> {
-        // Restoring rewrites the file's content: the same authority a write
-        // needs, not the one a read needs.
+impl RevisionsHost for Core {
+    fn require_writable(&self, uid: &NodeUid, what: &str) -> CoreResult<()> {
         self.require_uid_writable(uid)
-            .map_err(|error| self.errno_error(error, "restore revision"))?;
-        if let Err(e) = self
-            .rt
-            .block_on(self.client.restore_revision(uid, revision_id))
-        {
-            let error = CoreError::from_api(&e, "restore revision");
-            self.log_activity(ActivityKind::Restore, name, &error, false);
-            return Err(error);
-        }
-        // The active revision is changing behind our back — anything describing
-        // the old one (cached blocks, an open reader, the size in a listing) is
-        // stale from here on, and the server may not have applied the swap yet.
+            .map_err(|error| self.errno_error(error, what))
+    }
+
+    fn content_replaced(&self, uid: &NodeUid) {
         self.cache.evict(uid);
         self.evict_reader(uid);
         // A file kept offline gets the restored content back on disk, and
@@ -116,9 +88,58 @@ impl Core {
         if self.cache.is_pinned(uid) {
             self.recheck_pinned(uid);
         }
-        self.log_activity(
+    }
+
+    fn log_activity(&self, kind: ActivityKind, target: String, detail: String, ok: bool) {
+        Core::log_activity(self, kind, target, detail, ok);
+    }
+}
+
+impl Core {
+    /// The revisions service, with this daemon as its host.
+    pub(crate) fn revisions(&self) -> Revisions {
+        Revisions {
+            client: self.client.clone(),
+            drive: self.drive.clone(),
+            rt: self.rt.clone(),
+            host: Arc::new(self.clone()),
+        }
+    }
+}
+
+impl Revisions {
+    pub(crate) fn list(&self, uid: &NodeUid) -> CoreResult<Vec<RevisionInfo>> {
+        let revisions = self
+            .rt
+            .block_on(self.client.enumerate_revisions(uid))
+            .map_err(|e| CoreError::from_api(&e, "list revisions"))?;
+        Ok(revisions.into_iter().map(revision_info).collect())
+    }
+
+    pub(crate) fn restore(&self, uid: &NodeUid, revision_id: &str, name: &str) -> CoreResult<()> {
+        // Restoring rewrites the file's content: the same authority a write
+        // needs, not the one a read needs.
+        self.host.require_writable(uid, "restore revision")?;
+        if let Err(e) = self
+            .rt
+            .block_on(self.client.restore_revision(uid, revision_id))
+        {
+            let error = CoreError::from_api(&e, "restore revision");
+            self.host.log_activity(
+                ActivityKind::Restore,
+                name.to_string(),
+                error.to_string(),
+                false,
+            );
+            return Err(error);
+        }
+        // The active revision is changing behind our back — anything describing
+        // the old one (cached blocks, an open reader, the size in a listing) is
+        // stale from here on, and the server may not have applied the swap yet.
+        self.host.content_replaced(uid);
+        self.host.log_activity(
             ActivityKind::Restore,
-            name,
+            name.to_string(),
             format!("restored version {revision_id}"),
             true,
         );
@@ -126,32 +147,8 @@ impl Core {
         Ok(())
     }
 
-    /// Permanently delete `revision_id` from the history of the file at `rel`.
-    pub(crate) fn delete_revision(&self, rel: &Path, revision_id: &str) -> CoreResult<()> {
-        let (_ino, uid) = self.resolve(rel)?;
-        let name = rel
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| uid.to_string());
-        self.delete_revision_for_uid(&uid, revision_id, &name)
-    }
-
-    /// [`Core::delete_revision`] for a node addressed through any daemon
-    /// location.
-    pub(crate) fn delete_revision_by_uid(&self, uid: &str, revision_id: &str) -> CoreResult<()> {
-        let uid = self.resolve_anywhere(uid)?;
-        let name = uid.to_string();
-        self.delete_revision_for_uid(&uid, revision_id, &name)
-    }
-
-    fn delete_revision_for_uid(
-        &self,
-        uid: &NodeUid,
-        revision_id: &str,
-        name: &str,
-    ) -> CoreResult<()> {
-        self.require_uid_writable(uid)
-            .map_err(|error| self.errno_error(error, "delete revision"))?;
+    pub(crate) fn delete(&self, uid: &NodeUid, revision_id: &str, name: &str) -> CoreResult<()> {
+        self.host.require_writable(uid, "delete revision")?;
         // The server rejects deleting the active revision; saying so here is a
         // sentence the user can act on instead of an API code, and it costs one
         // listing the front-end already made to show the version list.
@@ -171,9 +168,9 @@ impl Core {
         self.rt
             .block_on(self.client.delete_revision(uid, revision_id))
             .map_err(|e| CoreError::from_api(&e, "delete revision"))?;
-        self.log_activity(
+        self.host.log_activity(
             ActivityKind::DeleteForever,
-            name,
+            name.to_string(),
             format!("deleted version {revision_id}"),
             true,
         );
@@ -181,36 +178,7 @@ impl Core {
         Ok(())
     }
 
-    /// Write `revision_id` of the file at `rel` to the absolute local path
-    /// `dest`, leaving the file itself untouched.
-    pub(crate) fn save_revision_as(
-        &self,
-        rel: &Path,
-        revision_id: &str,
-        dest: &Path,
-    ) -> CoreResult<u64> {
-        let (_ino, uid) = self.resolve(rel)?;
-        let name = rel
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| uid.to_string());
-        self.save_revision_for_uid(&uid, revision_id, &name, dest)
-    }
-
-    /// [`Core::save_revision_as`] for a node addressed through any daemon
-    /// location.
-    pub(crate) fn save_revision_as_by_uid(
-        &self,
-        uid: &str,
-        revision_id: &str,
-        dest: &Path,
-    ) -> CoreResult<u64> {
-        let uid = self.resolve_anywhere(uid)?;
-        let name = uid.to_string();
-        self.save_revision_for_uid(&uid, revision_id, &name, dest)
-    }
-
-    fn save_revision_for_uid(
+    pub(crate) fn save_as(
         &self,
         uid: &NodeUid,
         revision_id: &str,
@@ -253,13 +221,18 @@ impl Core {
                 // A half-written file looks like a successful export to every
                 // tool that opens it afterwards.
                 let _ = std::fs::remove_file(dest);
-                self.log_activity(ActivityKind::Download, name, &error, false);
+                self.host.log_activity(
+                    ActivityKind::Download,
+                    name.to_string(),
+                    error.to_string(),
+                    false,
+                );
                 return Err(error);
             }
         };
-        self.log_activity(
+        self.host.log_activity(
             ActivityKind::Download,
-            name,
+            name.to_string(),
             format!("saved version {revision_id} to {}", dest.display()),
             true,
         );

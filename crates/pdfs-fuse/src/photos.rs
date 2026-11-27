@@ -31,11 +31,20 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{NodeKind, PhotoTag, PhotoTagsUpdate, Thumbnail, ThumbnailType};
 use tracing::{debug, info, warn};
 
-use super::drive::RevisionRead;
+use super::ContentCache;
+use super::drive::{DriveApi, RevisionRead};
+use super::events::EventHub;
+use super::shutdown::Shutdown;
+use super::transfers::{CountingWriter, TransferRegistry};
 use super::{
     Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, ThumbnailMissCaches,
     WriteAuthority, link, node_size, now_ms, parse_uid,
 };
+use pdfs_core::control::TransferDirection;
+use pdfs_core::control::{ActivityKind, DirEntry};
+use pdfs_core::lifecycle::ServiceBoard;
+use proton_drive_rs::proton_sdk::error::ProtonError;
+use proton_drive_rs::{ProtonDriveClient, ProtonPhotosClient};
 
 /// Longest edge, in px, of a thumbnail generated locally for a photo the server
 /// has none for. Matches the server's own thumbnail scale closely enough that a
@@ -129,8 +138,107 @@ const DECODE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// The process-wide [`DecodeBudget`] every thumbnail decode draws from.
 static DECODE_BUDGET: DecodeBudget = DecodeBudget::new(DECODE_BUDGET_BYTES);
 
+mod albums;
+pub(crate) mod redate;
+pub(crate) mod takeout;
+pub(crate) use albums::AlbumOutcome;
+pub(crate) use takeout::sha1_of;
 mod thumbs;
 mod timeline;
+mod trash;
+
+/// The Photos service: the timeline, albums and thumbnails.
+///
+/// It holds only the handles it calls, and reaches the filesystem through
+/// [`PhotosHost`], so it does not depend on [`Core`]. [`Core::photos`] builds
+/// one on demand, the same way [`Core::syncer`] builds the sync engine. A clone
+/// shares everything, which is how a refresh or a thumbnail job moves onto a
+/// background task.
+#[derive(Clone)]
+pub(crate) struct Photos {
+    client: ProtonDriveClient,
+    drive: Arc<dyn DriveApi>,
+    rt: tokio::runtime::Handle,
+    cache: Arc<ContentCache>,
+    db: Arc<pdfs_store::db::Db>,
+    shutdown: Arc<Shutdown>,
+    services: ServiceBoard,
+    events: Arc<EventHub>,
+    transfers: Arc<TransferRegistry>,
+    jobs: PhotoJobs,
+    host: Arc<dyn PhotosHost>,
+}
+
+/// What the Photos service needs from the filesystem.
+pub(crate) trait PhotosHost: Send + Sync {
+    /// List a folder of the mount, for the recursive thumbnail build.
+    fn list_dir(&self, rel: &Path) -> CoreResult<Vec<DirEntry>>;
+    /// Record a change this daemon made, so its echo in the event feed is not
+    /// taken for a remote edit.
+    fn note_self_change(&self, uid: &NodeUid);
+    /// Add an entry to the activity log.
+    fn log_activity(&self, kind: ActivityKind, target: String, detail: String, ok: bool);
+}
+
+impl PhotosHost for Core {
+    fn list_dir(&self, rel: &Path) -> CoreResult<Vec<DirEntry>> {
+        Core::list_dir(self, rel)
+    }
+
+    fn note_self_change(&self, uid: &NodeUid) {
+        Core::note_self_change(self, uid)
+    }
+
+    fn log_activity(&self, kind: ActivityKind, target: String, detail: String, ok: bool) {
+        Core::log_activity(self, kind, target, detail, ok);
+    }
+}
+
+impl Core {
+    /// The Photos service, with this daemon as its host.
+    pub(crate) fn photos(&self) -> Photos {
+        Photos {
+            client: self.client.clone(),
+            drive: self.drive.clone(),
+            rt: self.rt.clone(),
+            cache: self.cache.clone(),
+            db: self.db.clone(),
+            shutdown: self.shutdown.clone(),
+            services: self.services.clone(),
+            events: self.events.clone(),
+            transfers: self.transfers.clone(),
+            jobs: self.photo_jobs.clone(),
+            host: Arc::new(self.clone()),
+        }
+    }
+}
+
+impl Photos {
+    /// The Photos API over the daemon's single authenticated session.
+    fn photos_api(&self) -> ProtonPhotosClient {
+        ProtonPhotosClient::from_drive_client(self.client.clone())
+    }
+
+    /// Like [`download_file_tracked_to`] for a photo, streaming through the
+    /// photos client's [`download_photo_to`].
+    ///
+    /// [`download_file_tracked_to`]: crate::Core::download_file_tracked_to
+    /// [`download_photo_to`]: ProtonPhotosClient::download_photo_to
+    fn download_photo_tracked(
+        &self,
+        photos: &ProtonPhotosClient,
+        uid: &NodeUid,
+        name: &str,
+        total: u64,
+    ) -> std::result::Result<Vec<u8>, ProtonError> {
+        let guard = self
+            .transfers
+            .begin(name, uid.to_string(), TransferDirection::Download, total);
+        let mut out = CountingWriter::new(Vec::with_capacity(total as usize), &guard);
+        self.rt.block_on(photos.download_photo_to(uid, &mut out))?;
+        Ok(out.into_inner())
+    }
+}
 
 /// What the Photos and thumbnail jobs are doing right now: which refreshes
 /// and builds are running, how far they got, and which thumbnails are known
@@ -149,7 +257,7 @@ pub(crate) struct PhotoJobs {
     /// The same, for the album listing.
     pub(crate) albums_refreshing: Arc<AtomicBool>,
     /// True while the similar-photo pass hashes thumbnails (see
-    /// [`Core::photo_similar`]), so asking again doesn't start a second one.
+    /// [`Photos::photo_similar`]), so asking again doesn't start a second one.
     pub(crate) similar_hashing: Arc<AtomicBool>,
     /// Photos whose missing thumbnail is being generated right now. A tile that is
     /// still on screen asks for its thumbnail again every few seconds, and each of

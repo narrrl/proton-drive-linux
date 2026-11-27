@@ -82,7 +82,6 @@ use proton_drive_rs::{
 };
 
 mod activity;
-mod albums;
 mod attach;
 mod background;
 mod conflicts;
@@ -118,9 +117,9 @@ mod photos;
 mod pins;
 mod profile;
 mod queue;
+mod quota;
 mod reads;
 mod recovery;
-mod redate;
 mod relocate;
 mod remote;
 mod requests;
@@ -139,7 +138,6 @@ mod supervisor;
 mod sweep;
 mod sync;
 mod systemd;
-mod takeout;
 use pdfs_core::transfers;
 mod upload;
 mod r#virtual;
@@ -562,10 +560,9 @@ struct Core {
     /// Whether Drive answers, when the link went down and a condvar for its
     /// coming back (see [`link`]).
     link: Arc<link::Link>,
-    /// When the user paused syncing, the Unix second it resumes by itself;
-    /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
-    /// Persisted, so a pause survives a restart (see [`Core::sync_paused`]).
-    sync_paused_until: Arc<AtomicI64>,
+    /// Whether the user paused syncing, and until when. Persisted, so a pause
+    /// survives a restart. See [`pause::SyncPause`].
+    pause: pause::SyncPause,
     /// The write-back's state: writes accepted from the kernel and not yet sent,
     /// nodes removed here that a stale listing may still return, and the changes
     /// this daemon made that Drive's event feed will echo back.
@@ -587,7 +584,7 @@ struct Core {
     services: pdfs_core::lifecycle::ServiceBoard,
     /// Whether a trash refresh is running, and the wake-up for requests waiting
     /// on its progress.
-    trash: trash::TrashState,
+    trash_jobs: trash::TrashState,
     /// What the conflict sweep may do, and the copies it already checked this
     /// run.
     sweep: sweep::SweepState,
@@ -600,7 +597,10 @@ struct Core {
     photo_jobs: photos::PhotoJobs,
     /// The last account quota answer, for `statfs(2)`, and whether a refresh
     /// of it is running.
-    quota_cache: sharing::QuotaCache,
+    quota: quota::QuotaCache,
+    /// Sharing, public links, invitations and bookmarks. See
+    /// [`sharing::Sharing`].
+    sharing: sharing::Sharing,
     /// Database maintenance that has been moved off the request thread.
     ///
     /// `VACUUM` and a deep `integrity_check` both hold the single connection for
@@ -1372,32 +1372,12 @@ impl Core {
         cv.notify_all();
     }
 
-    /// Download a whole file's plaintext, registering the transfer so
+    /// Download a whole file into `out`, registering the transfer so
     /// `GetQueueStatus` can report its progress. `total` is the expected size
     /// (`0` if unknown). Streams through [`download_file_to`] so each block ticks
-    /// the progress counter.
+    /// the progress counter, and nothing is held in memory.
     ///
     /// [`download_file_to`]: ProtonDriveClient::download_file_to
-    fn download_file_tracked(
-        &self,
-        uid: &NodeUid,
-        name: &str,
-        total: u64,
-    ) -> std::result::Result<Vec<u8>, ProtonError> {
-        let guard = self
-            .transfers
-            .begin(name, uid.to_string(), TransferDirection::Download, total);
-        let mut out = CountingWriter::new(Vec::with_capacity(total as usize), &guard);
-        self.rt
-            .block_on(self.drive.download_file_to(uid, &mut out))?;
-        Ok(out.into_inner())
-    }
-
-    /// Download a whole file directly into `out`, without retaining its
-    /// plaintext in memory. This is the disk-backed twin of
-    /// [`Core::download_file_tracked`], and preserves the same transfer
-    /// accounting while allowing callers that only need an on-disk file to
-    /// keep memory use independent of file size.
     fn download_file_tracked_to<W: Write + Send>(
         &self,
         uid: &NodeUid,
@@ -1411,26 +1391,6 @@ impl Core {
         let mut out = CountingWriter::new(out, &guard);
         self.rt
             .block_on(self.drive.download_file_to(uid, &mut out))?;
-        Ok(out.into_inner())
-    }
-
-    /// Like [`download_file_tracked`] for a photo, streaming through the photos
-    /// client's [`download_photo_to`].
-    ///
-    /// [`download_file_tracked`]: Core::download_file_tracked
-    /// [`download_photo_to`]: ProtonPhotosClient::download_photo_to
-    fn download_photo_tracked(
-        &self,
-        photos: &ProtonPhotosClient,
-        uid: &NodeUid,
-        name: &str,
-        total: u64,
-    ) -> std::result::Result<Vec<u8>, ProtonError> {
-        let guard = self
-            .transfers
-            .begin(name, uid.to_string(), TransferDirection::Download, total);
-        let mut out = CountingWriter::new(Vec::with_capacity(total as usize), &guard);
-        self.rt.block_on(photos.download_photo_to(uid, &mut out))?;
         Ok(out.into_inner())
     }
 
@@ -1493,7 +1453,7 @@ impl Core {
     /// reuses the daemon's single authenticated session rather than logging in
     /// again (Proton refresh tokens are single-use). Cheap — the Drive client
     /// is `Clone` over `Arc`-backed state.
-    fn photos(&self) -> ProtonPhotosClient {
+    fn photos_api(&self) -> ProtonPhotosClient {
         ProtonPhotosClient::from_drive_client(self.client.clone())
     }
 

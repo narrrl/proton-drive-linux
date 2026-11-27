@@ -750,7 +750,8 @@ Step 3 so far: the daemon's long-lived threads and async loops start and stop th
 `Services` set (§9).
 `Core`'s fields are grouped by owner, each group a struct in the module that owns it:
 `photos::PhotoJobs`, `drain::DrainState`, `reads::ReadState`, `sizes::SizeState`,
-`trash::TrashState`, `shared::SharedState`, `sharing::QuotaCache` and `sweep::SweepState`.
+`trash::TrashState`, `shared::SharedState`, `quota::QuotaCache`, `pause::SyncPause` and
+`sweep::SweepState`.
 `Core`'s methods are split by area out of `lib.rs` into their own modules. The daemon's run loop
 moved out of `pdfs-cli` into `pdfs-daemon`, which is where the services will be built.
 
@@ -765,6 +766,44 @@ State that several owners share sits behind a narrow interface of its own:
   fresh cells from `SessionCells::fork`, and shares the rest of `Core`.
 - `link::Link` holds whether Drive answers, next to when the link went down. Code reads it through
   `Core::is_online`.
+
+Some areas are services of their own rather than methods on `Core`. `sharing::Sharing` holds
+only the handles it calls (the client, Drive, the content cache, the transfer list and a read of
+the tree), and every one of its methods takes a node already resolved to its uid. Like the sync
+engine's `Syncer`, it can be built and tested without the rest of the daemon.
+
+`photos::Photos` is the timeline, albums, thumbnails, the Google Photos import and the redate
+job. It holds the handles it calls and the `PhotoJobs` state, and reaches the filesystem through a
+`PhotosHost` port with three methods: list a folder, for the recursive thumbnail build; note a
+change made here, so its echo in the event feed is not taken for a remote edit; and add an entry
+to the activity log. `Core::photos` builds one on demand with the daemon as its
+host, as `Core::syncer` does for the sync engine. Trashing photos stays on `Core`, because it
+checks write authority against the tree and drops open readers.
+
+`trash::Trash` lists the Drive trash, refreshes that listing, and restores or deletes from it. Its
+`TrashHost` port has two methods, both of which reach every mount: re-enumerate the folders a
+restored node comes back into, and forget nodes the server no longer has. `Core::trash` builds it
+on demand.
+
+`revisions::Revisions` lists, restores, deletes and saves a file's earlier revisions. Like
+`Sharing`, it only takes a node already resolved to its uid. Its `RevisionsHost` port checks that
+the node may be written, drops what describes the old content (cached blocks and open readers)
+and fetches it again if it is kept offline, and adds an activity entry.
+
+`devices::Devices` holds the account's devices on Drive: listing, renaming, deleting, adopting
+and migrating them, and registering this computer. Its `DevicesHost` port moves a folder, runs a
+sync pass and re-enumerates a folder, which is what migrating a device's folders needs. Synced
+folders and on-demand mounts are still methods on `Core`.
+
+`profile::ProfileBackup` writes this machine's profile to its device and reads the profiles other
+machines wrote, to offer their folders for restore. It needs nothing from the filesystem, so it
+has no host. Turning the offered folders into synced folders stays on `Core`.
+
+The control socket answers each area's requests in a module of its own under `control/`:
+sharing, Photos, synced folders and devices, revisions, and the trash and cache. Each module
+exports a pattern macro naming its requests, and the main match hands them over in one arm, so
+the compiler still checks that every request has an answer. A module turns a path or a uid into a
+node once, then asks the service.
 
 What is left in `Core` is the tree, the database, the cache and the Drive client, which most
 owners use, plus single fields that belong to one module each.

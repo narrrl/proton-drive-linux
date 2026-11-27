@@ -2,7 +2,7 @@
 //!
 //! Both are persisted projections of what the photos volume reports, refreshed
 //! on the same stale-while-serving rule as the timeline
-//! ([`crate::photos`]): a listing already on disk is served immediately and
+//! ([`super`]): a listing already on disk is served immediately and
 //! refreshed behind the caller, and only an empty one waits on the network.
 //!
 //! An album is a folder node carrying album properties, so it has a name like
@@ -23,15 +23,16 @@ use proton_drive_rs::NodeKind;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::warn;
 
-use super::{
-    ALBUM_SYNCED_PREFIX, ALBUMS_SYNCED_MS, Core, PHOTOS_AVAILABLE, TIMELINE_ENRICH_CHUNK,
-    TIMELINE_TTL, link, now_ms, parse_uid,
+use super::Photos;
+use crate::{
+    ALBUM_SYNCED_PREFIX, ALBUMS_SYNCED_MS, PHOTOS_AVAILABLE, TIMELINE_ENRICH_CHUNK, TIMELINE_TTL,
+    link, listing::listing_stale, now_ms, parse_uid,
 };
 
-impl Core {
+impl Photos {
     /// The album listing, served from disk and refreshed behind the caller when
     /// stale. `None` means the account has no photos volume — the same signal
-    /// [`Core::photos_timeline`] gives.
+    /// [`Photos::photos_timeline`] gives.
     pub(crate) fn albums(&self) -> CoreResult<Option<Vec<AlbumInfo>>> {
         let count = self.db.albums_count().map_err(CoreError::from)?;
         if count == 0
@@ -44,13 +45,13 @@ impl Core {
             // Nothing on disk, so this one request waits for the fetch — unless
             // the account is already known to have no photos volume.
             let known_empty = self.db.state_i64(PHOTOS_AVAILABLE).ok().flatten() == Some(0);
-            if known_empty && !self.listing_stale(ALBUMS_SYNCED_MS, TIMELINE_TTL) {
+            if known_empty && !listing_stale(&self.db, ALBUMS_SYNCED_MS, TIMELINE_TTL) {
                 return Ok(None);
             }
             if !self.rt.block_on(self.refresh_albums())? {
                 return Ok(None);
             }
-        } else if self.listing_stale(ALBUMS_SYNCED_MS, TIMELINE_TTL) {
+        } else if listing_stale(&self.db, ALBUMS_SYNCED_MS, TIMELINE_TTL) {
             self.spawn_albums_refresh();
         }
 
@@ -66,7 +67,7 @@ impl Core {
             .db
             .photo_projection_generation()
             .map_err(CoreError::from)?;
-        let photos = self.photos();
+        let photos = self.photos_api();
         if link::bounded(photos.get_photos_root())
             .await
             .map_err(|e| CoreError::from_api(&e, "photos root"))?
@@ -132,22 +133,16 @@ impl Core {
 
     /// Refresh the album listing off the request path. At most one runs at a time.
     pub(crate) fn spawn_albums_refresh(&self) {
-        if self
-            .photo_jobs
-            .albums_refreshing
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.jobs.albums_refreshing.swap(true, Ordering::SeqCst) {
             return;
         }
-        let core = self.clone();
+        let this = self.clone();
         self.services
             .spawn_task_job(&self.rt, "pdfs-albums-refresh", async move {
-                let refreshed = core.refresh_albums().await;
-                core.photo_jobs
-                    .albums_refreshing
-                    .store(false, Ordering::SeqCst);
+                let refreshed = this.refresh_albums().await;
+                this.jobs.albums_refreshing.store(false, Ordering::SeqCst);
                 match refreshed {
-                    Ok(_) => core.events.publish(&[Topic::Photos]),
+                    Ok(_) => this.events.publish(&[Topic::Photos]),
                     Err(e) => warn!(error = %e, "background album refresh failed"),
                 }
             });
@@ -177,12 +172,12 @@ impl Core {
                 .is_none()
         {
             self.rt.block_on(self.refresh_album(album))?;
-        } else if self.listing_stale(&stamp, TIMELINE_TTL) {
-            let core = self.clone();
+        } else if listing_stale(&self.db, &stamp, TIMELINE_TTL) {
+            let this = self.clone();
             let album = album.clone();
             self.services
                 .spawn_task_job(&self.rt, "pdfs-album-refresh", async move {
-                    if let Err(e) = core.refresh_album(&album).await {
+                    if let Err(e) = this.refresh_album(&album).await {
                         warn!(%album, error = %e, "background album refresh failed");
                     }
                 });
@@ -235,7 +230,7 @@ impl Core {
             .db
             .photo_projection_generation()
             .map_err(CoreError::from)?;
-        let photos = self.photos();
+        let photos = self.photos_api();
         let items = link::bounded(photos.enumerate_album(album))
             .await
             .map_err(|e| CoreError::from_api(&e, "album"))?;
@@ -285,11 +280,11 @@ impl Core {
     }
 
     /// Create an album and return its uid. The listing is refreshed before
-    /// answering, so the next [`Core::albums`] already shows it.
+    /// answering, so the next [`Photos::albums`] already shows it.
     pub(crate) fn create_album(&self, name: &str) -> CoreResult<String> {
         let uid = self
             .rt
-            .block_on(self.photos().create_album(name))
+            .block_on(self.photos_api().create_album(name))
             .map_err(|e| CoreError::from_api(&e, "create album"))?;
         self.after_album_change(None);
         Ok(uid.to_string())
@@ -297,7 +292,7 @@ impl Core {
 
     pub(crate) fn rename_album(&self, album: &NodeUid, name: &str) -> CoreResult<()> {
         self.rt
-            .block_on(self.photos().rename_album(album, name))
+            .block_on(self.photos_api().rename_album(album, name))
             .map_err(|e| CoreError::from_api(&e, "rename album"))?;
         self.after_album_change(None);
         Ok(())
@@ -307,7 +302,7 @@ impl Core {
     /// which only matters for photos that exist in the album alone.
     pub(crate) fn delete_album(&self, album: &NodeUid, delete_photos: bool) -> CoreResult<()> {
         self.rt
-            .block_on(self.photos().delete_album(album, delete_photos))
+            .block_on(self.photos_api().delete_album(album, delete_photos))
             .map_err(|e| CoreError::from_api(&e, "delete album"))?;
         let key = album.to_string();
         if let Err(error) = self.db.photos_delete(&[key]) {
@@ -325,7 +320,7 @@ impl Core {
     ) -> CoreResult<AlbumOutcome> {
         let outcomes = self
             .rt
-            .block_on(self.photos().add_photos_to_album(album, photos))
+            .block_on(self.photos_api().add_photos_to_album(album, photos))
             .map_err(|e| CoreError::from_api(&e, "add to album"))?;
         self.after_album_change(Some(album));
         Ok(album_outcome(outcomes))
@@ -340,7 +335,7 @@ impl Core {
     ) -> CoreResult<AlbumOutcome> {
         let outcomes = self
             .rt
-            .block_on(self.photos().remove_photos_from_album(album, photos))
+            .block_on(self.photos_api().remove_photos_from_album(album, photos))
             .map_err(|e| CoreError::from_api(&e, "remove from album"))?;
         self.after_album_change(Some(album));
         Ok(album_outcome(outcomes))
@@ -363,7 +358,7 @@ impl Core {
     }
 
     /// Drop the album listing's and every album's freshness stamp, so the next
-    /// request re-enumerates. Paired with [`Core::invalidate_photos`] — a change
+    /// request re-enumerates. Paired with [`Core::invalidate_photos`](crate::Core::invalidate_photos) — a change
     /// to the timeline can just as easily be a change to an album.
     pub(crate) fn invalidate_albums(&self) {
         let _ = self.db.clear_state(ALBUMS_SYNCED_MS);

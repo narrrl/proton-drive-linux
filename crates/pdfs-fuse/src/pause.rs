@@ -51,41 +51,106 @@ fn store_folder_paused(db: &Db, id: i64, paused: bool) -> pdfs_core::Result<()> 
 /// A pause with no end time: it lasts until the user resumes.
 pub(crate) const PAUSED_INDEFINITELY: i64 = i64::MAX;
 
-/// The persisted pause, or `0` when there is none (or it cannot be read — a
-/// broken state row must not keep sync paused forever).
-pub(crate) fn load_paused_until(db: &Db) -> i64 {
-    match db.state_i64(PAUSED_UNTIL_KEY) {
-        Ok(Some(until)) => until,
-        Ok(None) => 0,
-        Err(error) => {
-            warn!(%error, "reading the sync pause failed; treating sync as running");
-            0
+/// The global pause: when it ends, in memory and in the database.
+///
+/// The value is the Unix second the pause ends, [`PAUSED_INDEFINITELY`] for
+/// "until resumed", or `0` when sync runs. Only this type reads or writes it;
+/// the rest of the daemon asks [`Core::sync_paused`].
+#[derive(Clone)]
+pub(crate) struct SyncPause {
+    until: Arc<AtomicI64>,
+    db: Arc<Db>,
+}
+
+impl SyncPause {
+    /// The persisted pause, or none when there is no row or it cannot be read:
+    /// a broken state row must not keep sync paused forever.
+    pub(crate) fn load(db: Arc<Db>) -> Self {
+        let until = match db.state_i64(PAUSED_UNTIL_KEY) {
+            Ok(Some(until)) => until,
+            Ok(None) => 0,
+            Err(error) => {
+                warn!(%error, "reading the sync pause failed; treating sync as running");
+                0
+            }
+        };
+        Self {
+            until: Arc::new(AtomicI64::new(until)),
+            db,
         }
+    }
+
+    fn is_paused(&self) -> bool {
+        paused_at(self.until.load(Ordering::Relaxed), now_secs())
+    }
+
+    /// `None` when not paused, `Some(None)` when paused until resumed,
+    /// `Some(Some(t))` when it ends at Unix second `t`.
+    fn status(&self) -> Option<Option<i64>> {
+        let until = self.until.load(Ordering::Relaxed);
+        match paused_at(until, now_secs()) {
+            false => None,
+            true if until == PAUSED_INDEFINITELY => Some(None),
+            true => Some(Some(until)),
+        }
+    }
+
+    /// The end of a timed pause still in force, which needs a timer.
+    pub(crate) fn deadline(&self) -> Option<i64> {
+        self.status().flatten()
+    }
+
+    /// Persist `value`, then take it. A pause that cannot be saved is not
+    /// taken, so what the user sees never outlives a restart by surprise.
+    fn store(&self, value: i64) -> Result<(), CoreError> {
+        let persisted = match value {
+            0 => self.db.clear_state(PAUSED_UNTIL_KEY),
+            value => self.db.set_state_i64(PAUSED_UNTIL_KEY, value),
+        };
+        if let Err(error) = persisted {
+            return Err(CoreError::internal(format!(
+                "saving the sync pause: {error}"
+            )));
+        }
+        self.until.store(value, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// End the pause that lasts until `until`, if it is still the one in
+    /// force. Returns whether it was: a later pause or resume replaced it
+    /// otherwise, and the timer that asks has nothing to do.
+    fn expire(&self, until: i64) -> bool {
+        if self
+            .until
+            .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        if let Err(error) = self.db.clear_state(PAUSED_UNTIL_KEY) {
+            warn!(%error, "clearing an expired sync pause failed");
+        }
+        true
     }
 }
 
 /// Whether a pause lasting until `until` is still in force at `now` (both Unix
 /// seconds). `0` is "not paused".
-pub(crate) fn paused_at(until: i64, now: i64) -> bool {
+fn paused_at(until: i64, now: i64) -> bool {
     until != 0 && now < until
 }
 
 impl Core {
     /// True while the user has sync paused.
     pub(crate) fn sync_paused(&self) -> bool {
-        paused_at(self.sync_paused_until.load(Ordering::Relaxed), now_secs())
+        self.pause.is_paused()
     }
 
     /// The pause's end, for status reporting: `None` when not paused,
     /// `Some(None)` when paused until resumed, `Some(Some(t))` when it ends at
     /// Unix second `t`.
     pub(crate) fn sync_pause(&self) -> Option<Option<i64>> {
-        let until = self.sync_paused_until.load(Ordering::Relaxed);
-        match paused_at(until, now_secs()) {
-            false => None,
-            true if until == PAUSED_INDEFINITELY => Some(None),
-            true => Some(Some(until)),
-        }
+        self.pause.status()
     }
 
     /// Pause sync until Unix second `until` (`None`: until resumed), or resume
@@ -103,16 +168,7 @@ impl Core {
             }
             (true, Some(until)) => until,
         };
-        let persisted = match value {
-            0 => self.db.clear_state(PAUSED_UNTIL_KEY),
-            value => self.db.set_state_i64(PAUSED_UNTIL_KEY, value),
-        };
-        if let Err(error) = persisted {
-            return Err(CoreError::internal(format!(
-                "saving the sync pause: {error}"
-            )));
-        }
-        self.sync_paused_until.store(value, Ordering::Relaxed);
+        self.pause.store(value)?;
         match value {
             0 => {
                 info!("sync resumed");
@@ -186,14 +242,7 @@ impl Core {
             if !core.shutdown.sleep(wait) {
                 return;
             }
-            if core
-                .sync_paused_until
-                .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                if let Err(error) = core.db.clear_state(PAUSED_UNTIL_KEY) {
-                    warn!(%error, "clearing an expired sync pause failed");
-                }
+            if core.pause.expire(until) {
                 info!("sync pause ended");
                 core.resume_sync_work();
             }

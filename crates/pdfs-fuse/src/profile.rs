@@ -21,8 +21,13 @@ use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{info, warn};
 
+use super::devices::Devices;
+use super::drive::DriveApi;
 use super::sync;
 use super::{Core, now_secs, parse_uid, this_hostname};
+use pdfs_core::lifecycle::ServiceBoard;
+use pdfs_store::db::Db;
+use std::sync::Arc;
 
 /// Coalescing flags for background profile saves.
 ///
@@ -40,7 +45,146 @@ fn save_state() -> &'static (AtomicBool, AtomicBool) {
     SAVE_STATE.get_or_init(|| (AtomicBool::new(false), AtomicBool::new(false)))
 }
 
+/// The backup of this machine's arrangement on Drive: which folders sync where
+/// and in which mode. It writes the profile and reads the ones other machines
+/// wrote, to offer their folders for restore.
+///
+/// It needs nothing from the filesystem. [`Core::profile`] builds one on
+/// demand. A clone shares everything, which is how a save moves onto a
+/// background job.
+#[derive(Clone)]
+pub(crate) struct ProfileBackup {
+    drive: Arc<dyn DriveApi>,
+    rt: tokio::runtime::Handle,
+    db: Arc<Db>,
+    services: ServiceBoard,
+    devices: Devices,
+}
+
 impl Core {
+    /// The profile backup.
+    pub(crate) fn profile(&self) -> ProfileBackup {
+        ProfileBackup {
+            drive: self.drive.clone(),
+            rt: self.rt.clone(),
+            db: self.db.clone(),
+            services: self.services.clone(),
+            devices: self.devices(),
+        }
+    }
+
+    /// Attach remote device folders to local paths and let the sync engine fill
+    /// them in.
+    ///
+    /// The download is not written here: a new sync-folder row starts with an
+    /// empty baseline, and an empty baseline against an empty local directory
+    /// and a populated remote already classifies as "download everything". The
+    /// restore is therefore just bookkeeping plus a `Reconcile`, and it reuses
+    /// the engine's conflict handling for the case where the local directory
+    /// turns out not to be empty after all.
+    pub(crate) fn restore_sync_folders(
+        &self,
+        items: &[pdfs_core::control::RestoreItem],
+        device: Option<&str>,
+    ) -> CoreResult<RestoreOutcome> {
+        let _registration = super::devices::SYNC_ROOT_REGISTRATION.lock();
+        if items.is_empty() {
+            return Err(CoreError::invalid("nothing to restore"));
+        }
+        let device = self.devices().restore_source(device)?;
+        let existing = self
+            .db
+            .sync_folder_list()
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
+
+        // A caller must not smuggle a My files root into a device mapping,
+        // where destructive device-only operations would otherwise be allowed.
+        let device_root = super::parse_uid(&device.root_uid)
+            .ok_or_else(|| CoreError::internal("invalid device root"))?;
+        let children = self.devices().device_root_nodes(&device_root)?;
+        let reserved = crate::devices::sync_root_reserved();
+        let mut roots: Vec<PathBuf> = existing
+            .iter()
+            .map(|f| PathBuf::from(&f.local_path))
+            .collect();
+        let mut restored = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
+        for item in items {
+            if !children.iter().any(|node| {
+                node.uid.to_string() == item.remote_uid
+                    && node.is_folder()
+                    && !node.trashed
+                    && node.name != PROFILE_DIR_NAME
+            }) {
+                skipped.push(format!(
+                    "{}: not a folder under this device",
+                    item.local_path
+                ));
+                continue;
+            }
+            // The path is proposed from the profile another machine wrote, and
+            // may hold a folder name from Drive: checked like any new root.
+            let local = match pdfs_core::syncroot::resolve(Path::new(&item.local_path)) {
+                Ok(local) => local,
+                Err(e) => {
+                    skipped.push(format!("{}: {e}", item.local_path));
+                    continue;
+                }
+            };
+            if existing.iter().any(|f| f.remote_uid == item.remote_uid) {
+                skipped.push(format!("{}: already synced", item.local_path));
+                continue;
+            }
+            if let Some(problem) = pdfs_core::syncroot::problem(&local, &roots, &reserved) {
+                skipped.push(format!("{}: {problem}", item.local_path));
+                continue;
+            }
+            if let Err(e) = std::fs::create_dir_all(&local) {
+                skipped.push(format!("{}: {e}", item.local_path));
+                continue;
+            }
+            let mode = match restore_mode(&item.mode) {
+                Some(mode) => mode,
+                None => {
+                    skipped.push(format!("{}: unknown mode {}", item.local_path, item.mode));
+                    continue;
+                }
+            };
+            let id = match self.db.sync_folder_add(
+                &local.to_string_lossy(),
+                &item.remote_uid,
+                &device.share_id,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    // The folders restored before this one still need their
+                    // watches.
+                    let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
+                    return Err(CoreError::internal(format!("db: {e:?}")));
+                }
+            };
+            // `ondemand` is applied through the normal request path, which
+            // mounts the FUSE session and handles the folder being busy — the
+            // restore does not get its own copy of that logic.
+            if mode == MountMode::OnDemand {
+                let _ = self.request_sync_folder_mode(id, "ondemand");
+            }
+            let _ = self.sync.tx.send(sync::SyncMsg::Reconcile(id));
+            roots.push(local);
+            restored += 1;
+        }
+        let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
+
+        // The reply is gone once the app has shown it; the log keeps why.
+        for reason in &skipped {
+            info!(reason, "restore skipped a folder");
+        }
+        info!(restored, skipped = skipped.len(), "restore complete");
+        Ok(RestoreOutcome { restored, skipped })
+    }
+}
+
+impl ProfileBackup {
     /// Note that the arrangement this machine's profile describes has changed,
     /// and upload a fresh profile in the background.
     ///
@@ -54,11 +198,11 @@ impl Core {
         if saving.swap(true, Ordering::SeqCst) {
             return;
         }
-        let core = self.clone();
+        let this = self.clone();
         if let Err(error) = self.services.spawn_job("pdfs-profile-backup", move || {
             let (saving, dirty) = save_state();
             while dirty.swap(false, Ordering::SeqCst) {
-                if let Err(e) = core.save_profile() {
+                if let Err(e) = this.save_profile() {
                     warn!(error = %e.message, "profile backup failed");
                     break;
                 }
@@ -142,7 +286,7 @@ impl Core {
     }
 
     /// Snapshot the local arrangement into a [`Profile`].
-    fn build_profile(&self, device_uid: &str, machine_id: &str) -> CoreResult<Profile> {
+    pub(crate) fn build_profile(&self, device_uid: &str, machine_id: &str) -> CoreResult<Profile> {
         let folders = profile_folders(
             self.db
                 .sync_folder_list()
@@ -180,7 +324,7 @@ impl Core {
     ///
     /// The sibling of `find_device_child_folder`; kept separate because a folder
     /// named `profile.json` must not be mistaken for the profile.
-    fn find_device_child_file(
+    pub(crate) fn find_device_child_file(
         &self,
         parent_uid: &NodeUid,
         name: &str,
@@ -204,7 +348,7 @@ impl Core {
 
     /// The untrashed files directly under `parent_uid` whose name passes
     /// `keep`.
-    fn device_child_files(
+    pub(crate) fn device_child_files(
         &self,
         parent_uid: &NodeUid,
         keep: impl Fn(&str) -> bool,
@@ -233,8 +377,11 @@ impl Core {
     /// Reused by stable identity rather than recreated: a second folder of the
     /// same name would split the profile across two documents, and the restore
     /// would have no way to tell which is current.
-    fn ensure_profile_dir(&self, root_uid: &NodeUid) -> CoreResult<NodeUid> {
-        if let Some(uid) = self.find_device_child_folder(root_uid, PROFILE_DIR_NAME)? {
+    pub(crate) fn ensure_profile_dir(&self, root_uid: &NodeUid) -> CoreResult<NodeUid> {
+        if let Some(uid) = self
+            .devices
+            .find_device_child_folder(root_uid, PROFILE_DIR_NAME)?
+        {
             return Ok(uid);
         }
         let uid = self
@@ -258,8 +405,11 @@ impl Core {
     /// is left alone rather than trashed, so an older client on another
     /// machine keeps working. A profile that cannot be read is left out and
     /// logged; the others still count.
-    fn load_profiles(&self, root_uid: &NodeUid) -> CoreResult<Vec<Profile>> {
-        let mut uids = match self.find_device_child_folder(root_uid, PROFILE_DIR_NAME)? {
+    pub(crate) fn load_profiles(&self, root_uid: &NodeUid) -> CoreResult<Vec<Profile>> {
+        let mut uids = match self
+            .devices
+            .find_device_child_folder(root_uid, PROFILE_DIR_NAME)?
+        {
             Some(dir_uid) => self.device_child_files(&dir_uid, is_profile_file_name)?,
             None => Vec::new(),
         };
@@ -301,7 +451,7 @@ impl Core {
         &self,
         device: Option<&str>,
     ) -> CoreResult<Vec<RestorableFolder>> {
-        let device = self.restore_source(device)?;
+        let device = self.devices.restore_source(device)?;
         let root_uid = parse_uid(&device.root_uid).ok_or_else(|| {
             CoreError::internal(format!("bad device root uid: {}", device.root_uid))
         })?;
@@ -367,116 +517,6 @@ impl Core {
                 }
             })
             .collect())
-    }
-
-    /// Attach remote device folders to local paths and let the sync engine fill
-    /// them in.
-    ///
-    /// The download is not written here: a new sync-folder row starts with an
-    /// empty baseline, and an empty baseline against an empty local directory
-    /// and a populated remote already classifies as "download everything". The
-    /// restore is therefore just bookkeeping plus a `Reconcile`, and it reuses
-    /// the engine's conflict handling for the case where the local directory
-    /// turns out not to be empty after all.
-    pub(crate) fn restore_sync_folders(
-        &self,
-        items: &[pdfs_core::control::RestoreItem],
-        device: Option<&str>,
-    ) -> CoreResult<RestoreOutcome> {
-        let _registration = super::devices::SYNC_ROOT_REGISTRATION.lock();
-        if items.is_empty() {
-            return Err(CoreError::invalid("nothing to restore"));
-        }
-        let device = self.restore_source(device)?;
-        let existing = self
-            .db
-            .sync_folder_list()
-            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
-
-        // A caller must not smuggle a My files root into a device mapping,
-        // where destructive device-only operations would otherwise be allowed.
-        let device_root = super::parse_uid(&device.root_uid)
-            .ok_or_else(|| CoreError::internal("invalid device root"))?;
-        let children = self.device_root_nodes(&device_root)?;
-        let reserved = crate::devices::sync_root_reserved();
-        let mut roots: Vec<PathBuf> = existing
-            .iter()
-            .map(|f| PathBuf::from(&f.local_path))
-            .collect();
-        let mut restored = 0usize;
-        let mut skipped: Vec<String> = Vec::new();
-        for item in items {
-            if !children.iter().any(|node| {
-                node.uid.to_string() == item.remote_uid
-                    && node.is_folder()
-                    && !node.trashed
-                    && node.name != PROFILE_DIR_NAME
-            }) {
-                skipped.push(format!(
-                    "{}: not a folder under this device",
-                    item.local_path
-                ));
-                continue;
-            }
-            // The path is proposed from the profile another machine wrote, and
-            // may hold a folder name from Drive: checked like any new root.
-            let local = match pdfs_core::syncroot::resolve(Path::new(&item.local_path)) {
-                Ok(local) => local,
-                Err(e) => {
-                    skipped.push(format!("{}: {e}", item.local_path));
-                    continue;
-                }
-            };
-            if existing.iter().any(|f| f.remote_uid == item.remote_uid) {
-                skipped.push(format!("{}: already synced", item.local_path));
-                continue;
-            }
-            if let Some(problem) = pdfs_core::syncroot::problem(&local, &roots, &reserved) {
-                skipped.push(format!("{}: {problem}", item.local_path));
-                continue;
-            }
-            if let Err(e) = std::fs::create_dir_all(&local) {
-                skipped.push(format!("{}: {e}", item.local_path));
-                continue;
-            }
-            let mode = match restore_mode(&item.mode) {
-                Some(mode) => mode,
-                None => {
-                    skipped.push(format!("{}: unknown mode {}", item.local_path, item.mode));
-                    continue;
-                }
-            };
-            let id = match self.db.sync_folder_add(
-                &local.to_string_lossy(),
-                &item.remote_uid,
-                &device.share_id,
-            ) {
-                Ok(id) => id,
-                Err(e) => {
-                    // The folders restored before this one still need their
-                    // watches.
-                    let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
-                    return Err(CoreError::internal(format!("db: {e:?}")));
-                }
-            };
-            // `ondemand` is applied through the normal request path, which
-            // mounts the FUSE session and handles the folder being busy — the
-            // restore does not get its own copy of that logic.
-            if mode == MountMode::OnDemand {
-                let _ = self.request_sync_folder_mode(id, "ondemand");
-            }
-            let _ = self.sync.tx.send(sync::SyncMsg::Reconcile(id));
-            roots.push(local);
-            restored += 1;
-        }
-        let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
-
-        // The reply is gone once the app has shown it; the log keeps why.
-        for reason in &skipped {
-            info!(reason, "restore skipped a folder");
-        }
-        info!(restored, skipped = skipped.len(), "restore complete");
-        Ok(RestoreOutcome { restored, skipped })
     }
 }
 

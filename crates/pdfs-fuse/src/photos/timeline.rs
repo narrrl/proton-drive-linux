@@ -3,7 +3,7 @@
 
 use super::*;
 
-impl Core {
+impl Photos {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn photos_timeline(
         &self,
@@ -90,7 +90,7 @@ impl Core {
     /// The SDK reports one outcome per photo rather than failing the call, so the
     /// single outcome is unwrapped back into this request's result.
     pub(crate) fn set_photo_favorite(&self, uid: &NodeUid, favorite: bool) -> CoreResult<()> {
-        let photos = self.photos();
+        let photos = self.photos_api();
         let update = PhotoTagsUpdate {
             node_uid: uid.clone(),
             tags_to_add: if favorite {
@@ -114,7 +114,7 @@ impl Core {
         // `NodeUpdated`, which is indistinguishable from the same photo being
         // favorited on a phone. Claim the echo, or the gallery pays for a
         // resolve of a node whose one changed field is already stored below.
-        self.note_self_change(uid);
+        self.host.note_self_change(uid);
         self.db
             .photos_set_favorite(&uid.to_string(), favorite)
             .map_err(CoreError::from)?;
@@ -142,7 +142,7 @@ impl Core {
         let sets = self.db.photo_similar().map_err(CoreError::from)?;
         let (done, total) = self.db.similar_progress().map_err(CoreError::from)?;
         let hashing = self
-            .photo_jobs
+            .jobs
             .similar_hashing
             .load(Ordering::SeqCst)
             .then_some(MappingProgress { done, total });
@@ -155,23 +155,19 @@ impl Core {
     }
 
     pub(crate) fn spawn_similar_hashing(&self) {
-        if self.photo_jobs.similar_hashing.swap(true, Ordering::SeqCst) {
+        if self.jobs.similar_hashing.swap(true, Ordering::SeqCst) {
             return;
         }
-        let core = self.clone();
+        let this = self.clone();
         let spawned = self.services.spawn_job("pdfs-similar", move || {
-            if let Err(e) = core.hash_similar() {
+            if let Err(e) = this.hash_similar() {
                 warn!(error = %e, "similar-photo hashing failed");
             }
-            core.photo_jobs
-                .similar_hashing
-                .store(false, Ordering::SeqCst);
+            this.jobs.similar_hashing.store(false, Ordering::SeqCst);
         });
         if let Err(e) = spawned {
             warn!(error = %e, "could not start similar-photo hashing");
-            self.photo_jobs
-                .similar_hashing
-                .store(false, Ordering::SeqCst);
+            self.jobs.similar_hashing.store(false, Ordering::SeqCst);
         }
     }
 
@@ -320,100 +316,6 @@ impl Core {
         out
     }
 
-    /// Mutation admission for a photo, which [`Core::require_uid_writable`]
-    /// cannot answer on its own.
-    ///
-    /// Photos live on the photo volume, and that volume is not part of the FUSE
-    /// tree: a photo has no `nodes` row, so every authority comes back
-    /// [`WriteAuthority::Unknown`] and the plain check refuses the whole
-    /// library. Membership of our own timeline is the authority that does exist
-    /// here — the timeline is enumerated from our photo share, so a uid in it is
-    /// ours to trash. Anything else (an album photo on someone else's volume)
-    /// still fails closed.
-    pub(crate) fn require_photo_writable(&self, uid: &NodeUid) -> Result<(), fuser::Errno> {
-        match self.uid_write_authority(uid) {
-            WriteAuthority::Writable => Ok(()),
-            WriteAuthority::Denied => Err(fuser::Errno::EACCES),
-            WriteAuthority::Unknown => {
-                let key = uid.to_string();
-                let known = self
-                    .db
-                    .photos_by_uid(std::slice::from_ref(&key))
-                    .map(|rows| !rows.is_empty())
-                    .unwrap_or(false);
-                if known {
-                    Ok(())
-                } else {
-                    Err(fuser::Errno::EACCES)
-                }
-            }
-        }
-    }
-
-    /// Trash photos by uid, and forget them locally.
-    ///
-    /// The gallery is not part of the FUSE mount, so this is the photos-side
-    /// counterpart of [`Core::delete`]: same destination (Proton trash, so the
-    /// Trash page can restore them), addressed by uid because that is all a tile
-    /// has.
-    ///
-    /// The server answers per node, and so does this: a batch where one photo
-    /// fails still removes the ones that went, and the caller is told which is
-    /// which. Only what actually left the server is forgotten locally.
-    ///
-    /// A photo that is one file of a group takes its whole group with it. The
-    /// gallery shows a RAW+JPEG shot as one tile, so deleting that tile has to
-    /// delete the shot — leaving the RAW behind would put the photo back on the
-    /// Raw tab and nowhere else. `files_only` turns that off, for removing
-    /// one copy of a shot that is stored twice.
-    pub(crate) fn trash_photos(
-        &self,
-        uids: &[NodeUid],
-        files_only: bool,
-    ) -> CoreResult<TrashOutcome> {
-        if uids.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let expanded;
-        let uids = if files_only {
-            uids
-        } else {
-            expanded = self.expand_photo_groups(uids);
-            &expanded
-        };
-        for uid in uids {
-            self.require_photo_writable(uid)
-                .map_err(|errno| self.errno_error(errno, "trash access"))?;
-        }
-        let outcomes = self
-            .rt
-            .block_on(self.drive.trash_nodes(uids))
-            .map_err(|e| CoreError::from_api(&e, "trash"))?;
-        let (trashed, failed) = pdfs_core::batch::split(outcomes);
-
-        let trashed: Vec<String> = trashed.iter().map(|uid| uid.to_string()).collect();
-        for uid in &trashed {
-            if let Some(parsed) = parse_uid(uid) {
-                self.cache.evict(&parsed);
-                self.evict_reader(&parsed);
-            }
-        }
-        // The timeline is served from the database, so removing the rows is what
-        // makes the photos disappear now rather than at the next refresh.
-        if let Err(error) = self.db.photos_delete(&trashed) {
-            warn!(%error, "trashed photos could not be removed from the timeline");
-        }
-        self.invalidate_photos();
-        self.invalidate_albums();
-        self.invalidate_trash();
-
-        let failed = failed
-            .into_iter()
-            .map(|(uid, error)| (uid.to_string(), error.to_string()))
-            .collect();
-        Ok((trashed, failed))
-    }
-
     /// Commit the lightweight listing before resolving pending nodes. The
     /// feed generation fences both commits against events received in flight.
     pub(crate) async fn refresh_timeline(&self) -> CoreResult<bool> {
@@ -422,7 +324,7 @@ impl Core {
             .db
             .photo_projection_generation()
             .map_err(CoreError::from)?;
-        let photos = self.photos();
+        let photos = self.photos_api();
         if self
             .db
             .state_i64(PHOTOS_SYNCED_MS)
@@ -468,7 +370,7 @@ impl Core {
         let total = self.db.photos_count().map_err(CoreError::from)?;
         let skipped = total.saturating_sub(pending.len());
         let mut resolved = 0;
-        let progress = ProgressGuard(&self.photo_jobs.timeline_progress);
+        let progress = ProgressGuard(&self.jobs.timeline_progress);
         for (index, chunk) in pending.chunks(TIMELINE_ENRICH_CHUNK).enumerate() {
             if self.shutdown.is_stopping() {
                 break;
@@ -537,12 +439,8 @@ impl Core {
     /// whole library at once, sharing the session's rate limit and taking
     /// minutes. Returns whether the account has a photos library.
     pub(crate) fn refresh_timeline_joined(&self) -> CoreResult<bool> {
-        if self
-            .photo_jobs
-            .timeline_refreshing
-            .swap(true, Ordering::SeqCst)
-        {
-            while self.photo_jobs.timeline_refreshing.load(Ordering::SeqCst)
+        if self.jobs.timeline_refreshing.swap(true, Ordering::SeqCst) {
+            while self.jobs.timeline_refreshing.load(Ordering::SeqCst)
                 && !self.shutdown.is_stopping()
             {
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -555,18 +453,13 @@ impl Core {
                 .state_i64(PHOTOS_SYNCED_MS)
                 .map_err(CoreError::from)?
                 .is_some()
-                || self
-                    .photo_jobs
-                    .timeline_refreshing
-                    .swap(true, Ordering::SeqCst)
+                || self.jobs.timeline_refreshing.swap(true, Ordering::SeqCst)
             {
                 return Ok(self.db.state_i64(PHOTOS_AVAILABLE).ok().flatten() != Some(0));
             }
         }
         let refreshed = self.rt.block_on(self.refresh_timeline());
-        self.photo_jobs
-            .timeline_refreshing
-            .store(false, Ordering::SeqCst);
+        self.jobs.timeline_refreshing.store(false, Ordering::SeqCst);
         if refreshed.is_ok() {
             self.events.publish(&[Topic::Photos]);
         }
@@ -574,24 +467,18 @@ impl Core {
     }
 
     pub(crate) fn spawn_timeline_refresh(&self) {
-        if self
-            .photo_jobs
-            .timeline_refreshing
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.jobs.timeline_refreshing.swap(true, Ordering::SeqCst) {
             return;
         }
-        let core = self.clone();
+        let this = self.clone();
         self.services
             .spawn_task_job(&self.rt, "pdfs-timeline-refresh", async move {
-                let refreshed = core.refresh_timeline().await;
-                core.photo_jobs
-                    .timeline_refreshing
-                    .store(false, Ordering::SeqCst);
+                let refreshed = this.refresh_timeline().await;
+                this.jobs.timeline_refreshing.store(false, Ordering::SeqCst);
                 // Only a refresh that landed: a front-end re-reading after a failed
                 // one would find the timeline still stale and start another.
                 match refreshed {
-                    Ok(_) => core.events.publish(&[Topic::Photos]),
+                    Ok(_) => this.events.publish(&[Topic::Photos]),
                     Err(e) => warn!(error = %e, "background timeline refresh failed"),
                 }
             });
@@ -600,7 +487,7 @@ impl Core {
     /// How far the running timeline refresh has got reading photo metadata, or
     /// `None` when no refresh is reading any.
     pub(crate) fn timeline_progress(&self) -> Option<MappingProgress> {
-        self.photo_jobs
+        self.jobs
             .timeline_progress
             .lock()
             .map(|(done, total)| MappingProgress { done, total })
@@ -609,13 +496,13 @@ impl Core {
     /// Whether a timeline refresh is running. A front-end that asked for one
     /// watches this to know when the new timeline is worth re-reading.
     pub(crate) fn timeline_refreshing(&self) -> bool {
-        self.photo_jobs.timeline_refreshing.load(Ordering::SeqCst)
+        self.jobs.timeline_refreshing.load(Ordering::SeqCst)
     }
 
     /// Download a photo's full content into the content cache, returning its
     /// on-disk path (served from cache when a fresh blob already exists).
     pub(crate) fn open_photo(&self, uid: &NodeUid) -> CoreResult<PathBuf> {
-        let photos = self.photos();
+        let photos = self.photos_api();
         let node = self
             .rt
             .block_on(photos.get_node(uid))

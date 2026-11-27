@@ -20,6 +20,7 @@ use pdfs_core::mounts::MountMode;
 use pdfs_core::profile::PROFILE_DIR_NAME;
 use pdfs_core::{CoreError, CoreResult};
 use pdfs_store::db::{StoredDevice, StoredSyncFolder};
+use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DeviceUid, NodeUid};
 use proton_drive_rs::{DeviceType, Node};
 use tracing::{info, warn};
@@ -146,28 +147,70 @@ fn migrated_name(name: &str, device: &str, taken: &[String]) -> Option<String> {
         .find(|candidate| free(candidate))
 }
 
-impl Core {
-    // ---- devices ----------------------------------------------------------
+/// This account's devices on Drive, and which one is this computer: listing,
+/// renaming, deleting, adopting and migrating them, and registering this one.
+///
+/// It reaches the rest of the daemon through [`DevicesHost`]. [`Core::devices`]
+/// builds one on demand with the daemon as its host.
+#[derive(Clone)]
+pub(crate) struct Devices {
+    client: proton_drive_rs::ProtonDriveClient,
+    drive: std::sync::Arc<dyn crate::drive::DriveApi>,
+    rt: tokio::runtime::Handle,
+    db: std::sync::Arc<pdfs_store::db::Db>,
+    host: std::sync::Arc<dyn DevicesHost>,
+}
 
-    /// Unified local-location listing for the control protocol.
-    pub(crate) fn list_locations(&self) -> CoreResult<Vec<MountSpec>> {
-        let progress = self.sync.progress.lock();
-        let mut locations = self
-            .db
-            .mount_list()
-            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
-        for location in &mut locations {
-            location.mounted = self.states.is_mounted_at(Path::new(&location.local_path));
-            if let MountKind::Device { sync_folder_id } | MountKind::Attached { sync_folder_id } =
-                &location.kind
-            {
-                location.progress = progress.get(sync_folder_id).cloned();
-                location.paused = self.sync_folder_paused(*sync_folder_id);
-            }
-        }
-        Ok(locations)
+/// What [`Devices`] needs from the rest of the daemon, to migrate a device's
+/// folders onto this one.
+pub(crate) trait DevicesHost: Send + Sync {
+    /// Move a node under `parent` on the server, renaming it to `name` if
+    /// given, and update the tree to match.
+    fn move_node(
+        &self,
+        uid: &NodeUid,
+        parent: &NodeUid,
+        name: Option<&str>,
+    ) -> Result<(), ProtonError>;
+    /// Run a sync pass for one synced folder now.
+    fn sync_now(&self, id: Option<i64>);
+    /// Re-enumerate a folder's children on next access.
+    fn invalidate_children_of(&self, parent: &NodeUid);
+}
+
+impl DevicesHost for Core {
+    fn move_node(
+        &self,
+        uid: &NodeUid,
+        parent: &NodeUid,
+        name: Option<&str>,
+    ) -> Result<(), ProtonError> {
+        self.move_rename_remote(uid, parent, name)
     }
 
+    fn sync_now(&self, id: Option<i64>) {
+        Core::sync_now(self, id);
+    }
+
+    fn invalidate_children_of(&self, parent: &NodeUid) {
+        Core::invalidate_children_of(self, parent);
+    }
+}
+
+impl Core {
+    /// The devices service, with this daemon as its host.
+    pub(crate) fn devices(&self) -> Devices {
+        Devices {
+            client: self.client.clone(),
+            drive: self.drive.clone(),
+            rt: self.rt.clone(),
+            db: self.db.clone(),
+            host: std::sync::Arc::new(self.clone()),
+        }
+    }
+}
+
+impl Devices {
     /// List the account's registered devices, flagging the one *this* machine
     /// syncs to so a front-end can treat it as more than another computer in the
     /// list — deleting it takes this machine's synced folders down with it.
@@ -354,7 +397,10 @@ impl Core {
                 continue;
             }
             let new_name = migrated_name(&node.name, &source.name, &taken);
-            if let Err(e) = self.move_rename_remote(&node.uid, &target_root, new_name.as_deref()) {
+            if let Err(e) = self
+                .host
+                .move_node(&node.uid, &target_root, new_name.as_deref())
+            {
                 warn!(name = %node.name, error = %e, "migrate: could not move folder");
                 failed.push(format!("{}: {e}", node.name));
                 continue;
@@ -371,11 +417,11 @@ impl Core {
                 if let Err(e) = self.db.sync_folder_set_share(folder.id, &target.share_id) {
                     warn!(id = folder.id, error = ?e, "migrate: could not re-point sync folder");
                 }
-                self.sync_now(Some(folder.id));
+                self.host.sync_now(Some(folder.id));
             }
         }
-        self.invalidate_children_of(&source_root);
-        self.invalidate_children_of(&target_root);
+        self.host.invalidate_children_of(&source_root);
+        self.host.invalidate_children_of(&target_root);
 
         let mut message = format!("moved {moved} folder(s) from {}", source.name);
         if !renamed.is_empty() {
@@ -394,8 +440,6 @@ impl Core {
         }
         Ok(message)
     }
-
-    // ---- device folder sync -------------------------
 
     /// Auto-register (or recover) this machine as a Proton Drive Device, caching
     /// it so restarts reuse the same device. Recovery matches an existing remote
@@ -503,7 +547,7 @@ impl Core {
     }
 
     /// Everything directly under a device root, trashed nodes included.
-    pub(super) fn device_root_nodes(&self, root_uid: &NodeUid) -> CoreResult<Vec<Node>> {
+    pub(crate) fn device_root_nodes(&self, root_uid: &NodeUid) -> CoreResult<Vec<Node>> {
         let uids = self
             .rt
             .block_on(self.drive.enumerate_folder_children_node_uids(root_uid))
@@ -515,6 +559,31 @@ impl Core {
             .block_on(self.drive.enumerate_nodes(&uids))
             .map_err(|e| CoreError::from_api(&e, "resolve device root children"))
     }
+}
+
+impl Core {
+    // ---- devices ----------------------------------------------------------
+
+    /// Unified local-location listing for the control protocol.
+    pub(crate) fn list_locations(&self) -> CoreResult<Vec<MountSpec>> {
+        let progress = self.sync.progress.lock();
+        let mut locations = self
+            .db
+            .mount_list()
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
+        for location in &mut locations {
+            location.mounted = self.states.is_mounted_at(Path::new(&location.local_path));
+            if let MountKind::Device { sync_folder_id } | MountKind::Attached { sync_folder_id } =
+                &location.kind
+            {
+                location.progress = progress.get(sync_folder_id).cloned();
+                location.paused = self.sync_folder_paused(*sync_folder_id);
+            }
+        }
+        Ok(locations)
+    }
+
+    // ---- device folder sync -------------------------
 
     /// Add a local folder to this device's sync set: register the device if
     /// needed, create a matching folder under the device root, upload the local
@@ -568,7 +637,7 @@ impl Core {
             )));
         }
 
-        let device = self.ensure_device()?;
+        let device = self.devices().ensure_device()?;
         let root_uid = parse_uid(&device.root_uid).ok_or_else(|| {
             CoreError::internal(format!("bad device root uid: {}", device.root_uid))
         })?;
@@ -580,7 +649,7 @@ impl Core {
         // original, not leave the user with two "Downloads" in their Drive. The
         // reconcile treats an existing remote tree correctly: unmatched paths read as
         // a conflict, not as data loss.
-        let remote_root = match self.find_device_child_folder(&root_uid, &name)? {
+        let remote_root = match self.devices().find_device_child_folder(&root_uid, &name)? {
             Some(uid) => {
                 info!(name, "reusing existing device folder");
                 uid

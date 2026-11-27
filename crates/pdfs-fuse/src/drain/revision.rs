@@ -232,7 +232,7 @@ impl Core {
         }
 
         let alt = conflict_name(&name, now_secs());
-        let thumbnails = self.upload_thumbnails(blob, &alt);
+        let thumbnails = self.photos().upload_thumbnails(blob, &alt);
         let guard =
             self.transfers
                 .begin(&alt, meta.uid.clone(), TransferDirection::Upload, meta.len);
@@ -377,7 +377,7 @@ impl Core {
         }
 
         let name = self.node_name(&uid);
-        let thumbnails = self.upload_thumbnails(&blob, &name);
+        let thumbnails = self.photos().upload_thumbnails(&blob, &name);
         let guard =
             self.transfers
                 .begin(&name, meta.uid.clone(), TransferDirection::Upload, meta.len);

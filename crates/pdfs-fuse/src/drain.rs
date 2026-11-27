@@ -41,8 +41,8 @@ use proton_drive_rs::{Node, NodeKind};
 use tracing::{debug, error, info, warn};
 
 use super::link::{self, is_network_error};
+use super::photos::sha1_of;
 use super::state::{Intervals, PendingRevision};
-use super::takeout::sha1_of;
 use super::transfers::CountingReader;
 use super::{
     Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, DRAIN_REVISION_DEBOUNCE,
