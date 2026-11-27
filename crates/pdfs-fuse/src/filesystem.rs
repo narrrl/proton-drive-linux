@@ -647,7 +647,7 @@ impl Filesystem for ProtonFs {
         let ino = self.tree(ino);
         let (handle, unlinked_uid, releasing) = {
             let mut st = self.core.state();
-            let unlinked_uid = release_unlinked_entry(&mut st, ino.0);
+            let unlinked_uid = st.release_unlinked(ino.0);
             let (h, releasing) = match st.open.release(fh.0) {
                 Released::Last(h) => {
                     let ino = h.ino;

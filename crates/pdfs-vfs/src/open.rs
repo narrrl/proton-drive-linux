@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pdfs_drive::{node_revision_id, node_size};
@@ -579,6 +579,83 @@ pub struct PendingRevision {
     pub meta: StagedWrite,
 }
 
+/// Fold the staged blob of an undrained write into the blob at `src` that is
+/// about to supersede it, so the newer write inherits the older one's bytes
+/// instead of losing them.
+///
+/// Only the ranges the older write authored and the newer one did not are
+/// copied, so a small edit over a small edit moves almost nothing. What neither
+/// wrote is untouched remote content, which is why `base_size`, `base_mtime` and
+/// the baseline all come from the write being superseded: that is the revision
+/// those ranges were last observed against, and the one the drain must gap-fill
+/// and conflict-check them against.
+pub fn merge_over_pending(
+    meta: &mut StagedWrite,
+    src: &Path,
+    previous: &PendingRevision,
+) -> std::io::Result<()> {
+    let mut written = Intervals::default();
+    for &(s, e) in &meta.authored {
+        written.add(s, e);
+    }
+    let mut earlier = Intervals::default();
+    for &(s, e) in &previous.meta.authored {
+        earlier.add(s, e);
+    }
+    let blob = File::open(&previous.path)?;
+    let dst = std::fs::OpenOptions::new().write(true).open(src)?;
+    for (s, e, authored) in written.clone().segments(0, meta.len) {
+        if authored {
+            continue;
+        }
+        for (ps, pe, have) in earlier.segments(s, e.min(previous.meta.len)) {
+            if !have {
+                continue;
+            }
+            let mut buf = vec![0u8; (pe - ps) as usize];
+            blob.read_exact_at(&mut buf, ps)?;
+            dst.write_all_at(&buf, ps)?;
+            written.add(ps, pe);
+        }
+    }
+    dst.sync_all()?;
+    meta.base_size = previous.meta.base_size;
+    meta.base_mtime = previous.meta.base_mtime;
+    meta.based_on = previous.meta.based_on.clone();
+    meta.authored = written
+        .segments(0, meta.len)
+        .into_iter()
+        .filter(|&(_, _, authored)| authored)
+        .map(|(s, e, _)| (s, e))
+        .collect();
+    meta.complete = StagedWrite::covers(&meta.authored, meta.len);
+    Ok(())
+}
+
+/// Seed a truncate scratch file from a complete queued revision.
+///
+/// `File` writes use an explicit offset so this is independent of either
+/// descriptor's cursor and remains correct when the destination came from the
+/// cache's scratch allocator.
+pub fn copy_pending_for_truncate(
+    pending: &PendingRevision,
+    destination: &File,
+) -> std::io::Result<()> {
+    let source = File::open(&pending.path)?;
+    destination.set_len(0)?;
+    let mut offset = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = source.read_at(&mut buffer, offset)?;
+        if count == 0 {
+            break;
+        }
+        destination.write_all_at(&buffer[..count], offset)?;
+        offset += count as u64;
+    }
+    destination.set_len(offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,5 +1040,174 @@ mod tests {
         });
         assert_eq!(base.unwrap().as_deref(), Some(&b"CDefgh\0\0"[..]));
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod merge_over_pending_tests {
+    use super::{PendingRevision, merge_over_pending};
+    use pdfs_store::cache::{Baseline, StagedWrite};
+    use std::io::Write as _;
+    use std::path::PathBuf;
+
+    /// A unique temp directory removed on drop; avoids a dev-dependency, as in
+    /// `state.rs`.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "pdfs-merge-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn staged(len: u64, base_size: u64, authored: &[(u64, u64)]) -> StagedWrite {
+        StagedWrite {
+            uid: "vol~link".into(),
+            len,
+            base_size,
+            base_mtime: 100,
+            complete: StagedWrite::covers(authored, len),
+            authored: authored.to_vec(),
+            based_on: Some(Baseline {
+                mtime: 100,
+                size: base_size,
+                hash: None,
+                revision_id: Some("r1".into()),
+            }),
+        }
+    }
+
+    /// Write a file of `len` bytes with `fill` at every offset in `ranges`.
+    fn blob(
+        dir: &std::path::Path,
+        name: &str,
+        len: u64,
+        ranges: &[(u64, u64)],
+        fill: u8,
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut bytes = vec![0u8; len as usize];
+        for &(s, e) in ranges {
+            bytes[s as usize..e as usize].fill(fill);
+        }
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&bytes).unwrap();
+        path
+    }
+
+    /// The case the merge exists for: two small edits to different parts of a
+    /// file, the second closing before the first has drained. The second blob
+    /// must come out holding both, or the first edit is silently lost.
+    #[test]
+    fn the_superseding_write_inherits_the_earlier_ones_bytes() {
+        let dir = TempDir::new();
+        let previous = PendingRevision {
+            path: blob(&dir.0, "old", 64, &[(0, 16)], 0xAA),
+            meta: staged(64, 64, &[(0, 16)]),
+        };
+        let src = blob(&dir.0, "new", 64, &[(32, 48)], 0xBB);
+        let mut meta = staged(64, 64, &[(32, 48)]);
+
+        merge_over_pending(&mut meta, &src, &previous).unwrap();
+
+        assert_eq!(meta.authored, vec![(0, 16), (32, 48)]);
+        assert!(
+            !meta.complete,
+            "the untouched middle still comes from the base"
+        );
+        let merged = std::fs::read(&src).unwrap();
+        assert!(
+            merged[0..16].iter().all(|&b| b == 0xAA),
+            "earlier edit kept"
+        );
+        assert!(merged[32..48].iter().all(|&b| b == 0xBB), "newer edit kept");
+    }
+
+    /// Where they overlap, the newer write wins — it is the later state of the
+    /// file, and the older bytes were never visible to anyone after it landed.
+    #[test]
+    fn the_newer_write_wins_the_ranges_it_authored() {
+        let dir = TempDir::new();
+        let previous = PendingRevision {
+            path: blob(&dir.0, "old", 32, &[(0, 32)], 0xAA),
+            meta: staged(32, 32, &[(0, 32)]),
+        };
+        let src = blob(&dir.0, "new", 32, &[(8, 16)], 0xBB);
+        let mut meta = staged(32, 32, &[(8, 16)]);
+
+        merge_over_pending(&mut meta, &src, &previous).unwrap();
+
+        assert_eq!(meta.authored, vec![(0, 32)]);
+        assert!(meta.complete, "between them they cover the file");
+        let merged = std::fs::read(&src).unwrap();
+        assert!(
+            merged[8..16].iter().all(|&b| b == 0xBB),
+            "newer edit survives"
+        );
+        assert!(merged[16..32].iter().all(|&b| b == 0xAA));
+    }
+
+    /// The baseline has to come from the write being superseded. This one's own
+    /// "base" is the earlier *staged blob*, whose size and mtime are ours, not
+    /// the server's — filling or conflict-checking against that would compare
+    /// the remote to a revision it never had.
+    #[test]
+    fn the_baseline_is_inherited_from_the_write_being_superseded() {
+        let dir = TempDir::new();
+        let mut earlier = staged(64, 64, &[(0, 16)]);
+        earlier.base_mtime = 42;
+        earlier.base_size = 50;
+        earlier.based_on = Some(Baseline {
+            mtime: 42,
+            size: 50,
+            hash: None,
+            revision_id: Some("original".into()),
+        });
+        let previous = PendingRevision {
+            path: blob(&dir.0, "old", 64, &[(0, 16)], 0xAA),
+            meta: earlier,
+        };
+        let src = blob(&dir.0, "new", 64, &[(32, 48)], 0xBB);
+        // Opened over the staged blob, so this write thinks its base is 64/100.
+        let mut meta = staged(64, 64, &[(32, 48)]);
+
+        merge_over_pending(&mut meta, &src, &previous).unwrap();
+
+        assert_eq!(meta.base_mtime, 42);
+        assert_eq!(meta.base_size, 50);
+        assert_eq!(
+            meta.based_on.unwrap().revision_id.as_deref(),
+            Some("original")
+        );
+    }
+
+    /// A shrink must not drag the earlier write's tail back in.
+    #[test]
+    fn a_truncating_write_does_not_inherit_past_its_own_length() {
+        let dir = TempDir::new();
+        let previous = PendingRevision {
+            path: blob(&dir.0, "old", 64, &[(0, 64)], 0xAA),
+            meta: staged(64, 64, &[(0, 64)]),
+        };
+        let src = blob(&dir.0, "new", 16, &[(8, 16)], 0xBB);
+        let mut meta = staged(16, 64, &[(8, 16)]);
+
+        merge_over_pending(&mut meta, &src, &previous).unwrap();
+
+        assert_eq!(meta.authored, vec![(0, 16)]);
+        assert!(meta.complete);
+        assert_eq!(std::fs::metadata(&src).unwrap().len(), 16);
     }
 }

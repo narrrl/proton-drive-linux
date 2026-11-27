@@ -37,7 +37,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
@@ -150,7 +149,9 @@ pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
     SecondaryInsertRejection, SecondaryMount, clear_stale_mount, fuse_connection_id, spawn_session,
 };
-use pdfs_vfs::open::{Intervals, PendingRevision, WriteHandle};
+use pdfs_vfs::open::{
+    Intervals, PendingRevision, WriteHandle, copy_pending_for_truncate, merge_over_pending,
+};
 use reads::STREAM_BYPASS_MIN;
 use state::{Entry, State, StateGuard};
 pub use systemd::{
@@ -346,6 +347,28 @@ const LOCAL_INDEX_TTL: Duration = Duration::from_secs(15 * 60);
 const LOCAL_INDEX_CHECK: Duration = Duration::from_secs(60);
 
 use pdfs_vfs::ids::{ORPHAN_INO, ROOT_INO};
+
+use pdfs_vfs::nodes::{
+    apply_pending_sizes, is_unrevised, local_node, node_visible, overlay_queued,
+};
+
+/// Convert one kernel pathname component into the UTF-8 name accepted by Drive.
+fn fuse_name(name: &OsStr) -> Result<String, Errno> {
+    pdfs_vfs::names::component(name).map_err(|error| match error {
+        pdfs_vfs::names::NameError::TooLong => Errno::ENAMETOOLONG,
+        pdfs_vfs::names::NameError::Reserved => Errno::EINVAL,
+        pdfs_vfs::names::NameError::NotUtf8 => Errno::EILSEQ,
+    })
+}
+
+/// Whether a `rename` may replace an existing destination, as an errno.
+fn check_replaceable(src_dir: bool, dst_dir: bool, dst_empty: bool) -> Result<(), Errno> {
+    pdfs_vfs::names::check_replaceable(src_dir, dst_dir, dst_empty).map_err(|error| match error {
+        pdfs_vfs::names::ReplaceError::IsDirectory => Errno::EISDIR,
+        pdfs_vfs::names::ReplaceError::NotDirectory => Errno::ENOTDIR,
+        pdfs_vfs::names::ReplaceError::NotEmpty => Errno::ENOTEMPTY,
+    })
+}
 
 /// The errno the kernel gets for a node the tree refused.
 fn node_errno(error: pdfs_vfs::tree::NodeError) -> Errno {
@@ -1175,73 +1198,6 @@ fn preserve_on_access_denied(
     Ok(())
 }
 
-/// Fold the staged blob of an undrained write into the blob at `src` that is
-/// about to supersede it, so the newer write inherits the older one's bytes
-/// instead of losing them.
-///
-/// Only the ranges the older write authored and the newer one did not are
-/// copied, so a small edit over a small edit moves almost nothing. What neither
-/// wrote is untouched remote content, which is why `base_size`, `base_mtime` and
-/// the baseline all come from the write being superseded: that is the revision
-/// those ranges were last observed against, and the one the drain must gap-fill
-/// and conflict-check them against.
-fn merge_over_pending(
-    meta: &mut StagedWrite,
-    src: &Path,
-    previous: &PendingRevision,
-) -> std::io::Result<()> {
-    let mut written = Intervals::default();
-    for &(s, e) in &meta.authored {
-        written.add(s, e);
-    }
-    let mut earlier = Intervals::default();
-    for &(s, e) in &previous.meta.authored {
-        earlier.add(s, e);
-    }
-    let blob = File::open(&previous.path)?;
-    let dst = std::fs::OpenOptions::new().write(true).open(src)?;
-    for (s, e, authored) in written.clone().segments(0, meta.len) {
-        if authored {
-            continue;
-        }
-        for (ps, pe, have) in earlier.segments(s, e.min(previous.meta.len)) {
-            if !have {
-                continue;
-            }
-            let mut buf = vec![0u8; (pe - ps) as usize];
-            blob.read_exact_at(&mut buf, ps)?;
-            dst.write_all_at(&buf, ps)?;
-            written.add(ps, pe);
-        }
-    }
-    dst.sync_all()?;
-    meta.base_size = previous.meta.base_size;
-    meta.base_mtime = previous.meta.base_mtime;
-    meta.based_on = previous.meta.based_on.clone();
-    meta.authored = written
-        .segments(0, meta.len)
-        .into_iter()
-        .filter(|&(_, _, authored)| authored)
-        .map(|(s, e, _)| (s, e))
-        .collect();
-    meta.complete = StagedWrite::covers(&meta.authored, meta.len);
-    Ok(())
-}
-
-/// Retire the last resident reference to an unlinked inode without touching its
-/// persisted node row. The namespace path already chose whether that row is
-/// disposable or retained as queued-trash authority.
-fn release_unlinked_entry(state: &mut State, ino: u64) -> Option<NodeUid> {
-    let entry = state.entries.get_mut(&ino)?;
-    entry.open_count = entry.open_count.saturating_sub(1);
-    if entry.open_count != 0 || !entry.unlinked {
-        return None;
-    }
-    let uid = entry.uid.clone();
-    state.forget_mem(&uid);
-    Some(uid)
-}
-
 fn release_must_retain_queued_trash(db: &Db, uid: &NodeUid) -> pdfs_core::Result<bool> {
     db.has_pending_op(&uid.to_string(), OP_TRASH)
 }
@@ -1732,47 +1688,6 @@ fn is_gone(e: &(dyn std::error::Error + 'static)) -> bool {
     api_code(e) == Some(ResponseCode::DoesNotExist)
 }
 
-/// Fabricate the node the server would have returned, for a `create`/`mkdir`
-/// that could not reach it. Everything the kernel asks about a fresh node —
-/// name, kind, size, times — is knowable locally; the uid is the only invention,
-/// and the drain replaces it with the real one.
-fn local_node(uid: NodeUid, parent_uid: NodeUid, name: String, is_dir: bool) -> Node {
-    let now = now_secs();
-    Node {
-        uid,
-        parent_uid: Some(parent_uid),
-        kind: if is_dir {
-            NodeKind::Folder
-        } else {
-            NodeKind::File {
-                media_type: media_type_for(&name).to_string(),
-                total_size_on_storage: 0,
-                // No revision has been sealed: nothing has been uploaded yet.
-                active_revision_state: None,
-                active_revision_id: None,
-                content_sha1: None,
-                claimed_size: Some(0),
-                claimed_modification_time: None,
-            }
-        },
-        name,
-        creation_time: now,
-        modification_time: now,
-        trashed: false,
-        is_shared: false,
-        is_shared_publicly: false,
-        signature_email: None,
-        membership: None,
-        // A locally fabricated node is on the main volume, never a photo/album.
-        photo: None,
-        album: None,
-        // Nothing signed it: it has never been near the crypto layer.
-        verification: Default::default(),
-        direct_role: None,
-        share_id: None,
-    }
-}
-
 /// Whether `dir` has no entries.
 fn dir_is_empty(dir: &Path) -> std::io::Result<bool> {
     Ok(std::fs::read_dir(dir)?.next().is_none())
@@ -1814,53 +1729,6 @@ fn sync_folder_info(
     }
 }
 
-/// The plaintext size, in bytes, that a node reports.
-/// Overwrite each file node's `claimed_size` with the optimistic size of its
-/// queued write, where it has one. Folders and nodes with nothing queued are
-/// left alone. See [`Core::stamp_pending_sizes`] for why this exists.
-fn apply_pending_sizes(nodes: &mut [Node], sizes: &HashMap<NodeUid, u64>) {
-    for node in nodes {
-        if let Some(&len) = sizes.get(&node.uid)
-            && let NodeKind::File { claimed_size, .. } = &mut node.kind
-        {
-            *claimed_size = Some(len as i64);
-        }
-    }
-}
-
-/// Whether a `rename` may replace an existing destination, per POSIX.
-///
-/// Split out from the handler because it is the part that is pure and the part
-/// that is dangerous: every `Err` here is a refusal that happens *before*
-/// anything is trashed, and getting one wrong turns a refusal into the
-/// destruction of the destination (`docs/BUGS.md` B13).
-///
-/// `dst_empty` is only meaningful when `dst_dir`; pass `true` otherwise.
-fn check_replaceable(src_dir: bool, dst_dir: bool, dst_empty: bool) -> Result<(), Errno> {
-    match (src_dir, dst_dir) {
-        // A non-directory may not replace a directory, or vice versa.
-        (false, true) => Err(Errno::EISDIR),
-        (true, false) => Err(Errno::ENOTDIR),
-        // Proton trashes a folder with its whole subtree, so replacing a
-        // non-empty one would silently take its contents with it. POSIX says
-        // ENOTEMPTY, which is also the safe answer.
-        (true, true) if !dst_empty => Err(Errno::ENOTEMPTY),
-        _ => Ok(()),
-    }
-}
-
-/// Whether `node` is a file Drive lists without an active revision, as it does
-/// one whose create has not been committed.
-fn is_unrevised(node: &Node) -> bool {
-    matches!(
-        node.kind,
-        NodeKind::File {
-            active_revision_id: None,
-            ..
-        }
-    )
-}
-
 /// `call`, failed with a remote error once it has run for
 /// [`TRASH_CALL_TIMEOUT`].
 async fn within_trash_call<T>(what: &str, call: impl Future<Output = T>) -> CoreResult<T> {
@@ -1880,27 +1748,6 @@ fn count_noun(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// Seed a truncate scratch file from a complete queued revision.
-///
-/// `File` writes use an explicit offset so this is independent of either
-/// descriptor's cursor and remains correct when the destination came from the
-/// cache's scratch allocator.
-fn copy_pending_for_truncate(pending: &PendingRevision, destination: &File) -> std::io::Result<()> {
-    let source = File::open(&pending.path)?;
-    destination.set_len(0)?;
-    let mut offset = 0u64;
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        let count = source.read_at(&mut buffer, offset)?;
-        if count == 0 {
-            break;
-        }
-        destination.write_all_at(&buffer[..count], offset)?;
-        offset += count as u64;
-    }
-    destination.set_len(offset)
-}
-
 /// Whether a rename must be represented as a durable desired end state.
 /// Local-first, offline, or into a not-yet-uploaded directory, the API is not
 /// called in the syscall. Only remote-to-remote renames sent inline
@@ -1913,69 +1760,6 @@ fn rename_needs_queue(
     _name_changed: bool,
 ) -> bool {
     !inline || destination_is_local
-}
-
-/// Convert one kernel pathname component into the UTF-8 name accepted by Drive.
-/// Linux filesystems conventionally cap a component at `NAME_MAX` (255 bytes),
-/// but the FUSE kernel path can pass a longer component through to userspace.
-fn fuse_name(name: &OsStr) -> Result<String, Errno> {
-    let bytes = name.as_bytes();
-    if bytes.len() > 255 {
-        return Err(Errno::ENAMETOOLONG);
-    }
-    if bytes.is_empty() || bytes == b"." || bytes == b".." {
-        return Err(Errno::EINVAL);
-    }
-    name.to_str().map(str::to_owned).ok_or(Errno::EILSEQ)
-}
-
-fn node_visible(node: &Node, folder_uid: &NodeUid, hidden: &HashSet<NodeUid>) -> bool {
-    if !remote_name_is_safe(&node.name) {
-        warn!(uid = %node.uid, "a remote name cannot be a local file name; leaving it out");
-        return false;
-    }
-    !node.trashed && node.uid != *folder_uid && !hidden.contains(&node.uid)
-}
-
-/// The children `entries` hold for each folder in `listed`, gathered in one
-/// pass over them.
-///
-/// The root is its own parent (that is what `..` resolves to), so it would
-/// count as its own child; a directory listed inside itself makes the kernel
-/// fail the lookup with EIO, taking the whole listing down with it.
-///
-/// A pass per listed folder took 1.7 s on a tree of 37,000 nodes with 4,600 of
-/// them listed, at every start before the mount came up (`docs/BUGS.md` B167).
-fn listed_children(entries: &HashMap<u64, Entry>, listed: Vec<u64>) -> HashMap<u64, Vec<u64>> {
-    let mut children: HashMap<u64, Vec<u64>> =
-        listed.into_iter().map(|ino| (ino, Vec::new())).collect();
-    for (&ino, entry) in entries {
-        if ino != entry.parent
-            && !entry.node.trashed
-            && let Some(kids) = children.get_mut(&entry.parent)
-        {
-            kids.push(ino);
-        }
-    }
-    children
-}
-
-/// Lay what is queued for a folder over Drive's listing of it, from
-/// `Db::queued_children`: a node a queued rename moved away is dropped, and a
-/// node a queued create, mkdir or rename put there is listed as the DB has it.
-///
-/// That node holds its name here: a create Drive already has but whose answer
-/// is still on its way, or which the drain is still reading back, is listed by
-/// Drive under its new uid and by the queue under its stand-in. Both were
-/// listed, and a 128-file folder listed 129 (`docs/BUGS.md` B164).
-fn overlay_queued(nodes: &mut Vec<Node>, queued: Vec<Node>, gone: &HashSet<String>) {
-    let here: HashSet<String> = queued.iter().map(|node| node.uid.to_string()).collect();
-    let names: HashSet<&str> = queued.iter().map(|node| node.name.as_str()).collect();
-    nodes.retain(|node| {
-        let uid = node.uid.to_string();
-        !gone.contains(&uid) && !here.contains(&uid) && !names.contains(node.name.as_str())
-    });
-    nodes.extend(queued);
 }
 
 /// Bytes rendered with a binary unit and one decimal place (e.g. `"1.2 GB"`),
@@ -2024,223 +1808,6 @@ fn unix_secs(secs: i64) -> SystemTime {
     }
 }
 
-#[cfg(test)]
-mod merge_over_pending_tests {
-    use super::{PendingRevision, merge_over_pending};
-    use pdfs_store::cache::{Baseline, StagedWrite};
-    use std::io::Write as _;
-    use std::path::PathBuf;
-
-    /// A unique temp directory removed on drop; avoids a dev-dependency, as in
-    /// `state.rs`.
-    struct TempDir(PathBuf);
-    impl TempDir {
-        fn new() -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static N: AtomicU64 = AtomicU64::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "pdfs-merge-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            TempDir(p)
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn staged(len: u64, base_size: u64, authored: &[(u64, u64)]) -> StagedWrite {
-        StagedWrite {
-            uid: "vol~link".into(),
-            len,
-            base_size,
-            base_mtime: 100,
-            complete: StagedWrite::covers(authored, len),
-            authored: authored.to_vec(),
-            based_on: Some(Baseline {
-                mtime: 100,
-                size: base_size,
-                hash: None,
-                revision_id: Some("r1".into()),
-            }),
-        }
-    }
-
-    /// Write a file of `len` bytes with `fill` at every offset in `ranges`.
-    fn blob(
-        dir: &std::path::Path,
-        name: &str,
-        len: u64,
-        ranges: &[(u64, u64)],
-        fill: u8,
-    ) -> std::path::PathBuf {
-        let path = dir.join(name);
-        let mut bytes = vec![0u8; len as usize];
-        for &(s, e) in ranges {
-            bytes[s as usize..e as usize].fill(fill);
-        }
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&bytes).unwrap();
-        path
-    }
-
-    /// The case the merge exists for: two small edits to different parts of a
-    /// file, the second closing before the first has drained. The second blob
-    /// must come out holding both, or the first edit is silently lost.
-    #[test]
-    fn the_superseding_write_inherits_the_earlier_ones_bytes() {
-        let dir = TempDir::new();
-        let previous = PendingRevision {
-            path: blob(&dir.0, "old", 64, &[(0, 16)], 0xAA),
-            meta: staged(64, 64, &[(0, 16)]),
-        };
-        let src = blob(&dir.0, "new", 64, &[(32, 48)], 0xBB);
-        let mut meta = staged(64, 64, &[(32, 48)]);
-
-        merge_over_pending(&mut meta, &src, &previous).unwrap();
-
-        assert_eq!(meta.authored, vec![(0, 16), (32, 48)]);
-        assert!(
-            !meta.complete,
-            "the untouched middle still comes from the base"
-        );
-        let merged = std::fs::read(&src).unwrap();
-        assert!(
-            merged[0..16].iter().all(|&b| b == 0xAA),
-            "earlier edit kept"
-        );
-        assert!(merged[32..48].iter().all(|&b| b == 0xBB), "newer edit kept");
-    }
-
-    /// Where they overlap, the newer write wins — it is the later state of the
-    /// file, and the older bytes were never visible to anyone after it landed.
-    #[test]
-    fn the_newer_write_wins_the_ranges_it_authored() {
-        let dir = TempDir::new();
-        let previous = PendingRevision {
-            path: blob(&dir.0, "old", 32, &[(0, 32)], 0xAA),
-            meta: staged(32, 32, &[(0, 32)]),
-        };
-        let src = blob(&dir.0, "new", 32, &[(8, 16)], 0xBB);
-        let mut meta = staged(32, 32, &[(8, 16)]);
-
-        merge_over_pending(&mut meta, &src, &previous).unwrap();
-
-        assert_eq!(meta.authored, vec![(0, 32)]);
-        assert!(meta.complete, "between them they cover the file");
-        let merged = std::fs::read(&src).unwrap();
-        assert!(
-            merged[8..16].iter().all(|&b| b == 0xBB),
-            "newer edit survives"
-        );
-        assert!(merged[16..32].iter().all(|&b| b == 0xAA));
-    }
-
-    /// The baseline has to come from the write being superseded. This one's own
-    /// "base" is the earlier *staged blob*, whose size and mtime are ours, not
-    /// the server's — filling or conflict-checking against that would compare
-    /// the remote to a revision it never had.
-    #[test]
-    fn the_baseline_is_inherited_from_the_write_being_superseded() {
-        let dir = TempDir::new();
-        let mut earlier = staged(64, 64, &[(0, 16)]);
-        earlier.base_mtime = 42;
-        earlier.base_size = 50;
-        earlier.based_on = Some(Baseline {
-            mtime: 42,
-            size: 50,
-            hash: None,
-            revision_id: Some("original".into()),
-        });
-        let previous = PendingRevision {
-            path: blob(&dir.0, "old", 64, &[(0, 16)], 0xAA),
-            meta: earlier,
-        };
-        let src = blob(&dir.0, "new", 64, &[(32, 48)], 0xBB);
-        // Opened over the staged blob, so this write thinks its base is 64/100.
-        let mut meta = staged(64, 64, &[(32, 48)]);
-
-        merge_over_pending(&mut meta, &src, &previous).unwrap();
-
-        assert_eq!(meta.base_mtime, 42);
-        assert_eq!(meta.base_size, 50);
-        assert_eq!(
-            meta.based_on.unwrap().revision_id.as_deref(),
-            Some("original")
-        );
-    }
-
-    /// A shrink must not drag the earlier write's tail back in.
-    #[test]
-    fn a_truncating_write_does_not_inherit_past_its_own_length() {
-        let dir = TempDir::new();
-        let previous = PendingRevision {
-            path: blob(&dir.0, "old", 64, &[(0, 64)], 0xAA),
-            meta: staged(64, 64, &[(0, 64)]),
-        };
-        let src = blob(&dir.0, "new", 16, &[(8, 16)], 0xBB);
-        let mut meta = staged(16, 64, &[(8, 16)]);
-
-        merge_over_pending(&mut meta, &src, &previous).unwrap();
-
-        assert_eq!(meta.authored, vec![(0, 16)]);
-        assert!(meta.complete);
-        assert_eq!(std::fs::metadata(&src).unwrap().len(), 16);
-    }
-}
-
-#[cfg(test)]
-mod replace_tests {
-    use super::check_replaceable;
-
-    /// The case that motivated all of this: rsync renaming its temp file over
-    /// the real one. Two plain files, and it has to be allowed — refusing is
-    /// what made every rsync transfer fail at the last step (`docs/BUGS.md` B13).
-    #[test]
-    fn a_file_may_replace_a_file() {
-        assert!(check_replaceable(false, false, true).is_ok());
-    }
-
-    #[test]
-    fn an_empty_directory_may_be_replaced_by_a_directory() {
-        assert!(check_replaceable(true, true, true).is_ok());
-    }
-
-    /// Proton trashes a folder with its whole subtree, so allowing this would
-    /// discard every file under the destination without ever naming them.
-    #[test]
-    fn a_non_empty_directory_is_never_replaced() {
-        let e = check_replaceable(true, true, false).expect_err("must refuse");
-        assert_eq!(e.code(), libc::ENOTEMPTY);
-    }
-
-    #[test]
-    fn the_two_ends_must_agree_on_being_a_directory() {
-        assert_eq!(
-            check_replaceable(false, true, true)
-                .expect_err("a file may not replace a directory")
-                .code(),
-            libc::EISDIR
-        );
-        assert_eq!(
-            check_replaceable(true, false, true)
-                .expect_err("a directory may not replace a file")
-                .code(),
-            libc::ENOTDIR
-        );
-    }
-
-    /// `dst_empty` describes a directory; it must not leak into the file case,
-    /// where callers pass `true` by convention.
-    #[test]
-    fn emptiness_is_ignored_when_the_destination_is_a_file() {
-        assert!(check_replaceable(false, false, false).is_ok());
-    }
-}
 #[cfg(test)]
 mod local_uid_tests {
     use super::*;
@@ -2310,94 +1877,6 @@ mod local_uid_tests {
 }
 
 #[cfg(test)]
-mod pending_size_tests {
-    use super::{Node, NodeKind, NodeUid, apply_pending_sizes, node_size};
-    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
-    use std::collections::HashMap;
-
-    fn uid(link: &str) -> NodeUid {
-        NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
-    }
-
-    fn file(link: &str, claimed: i64) -> Node {
-        Node {
-            uid: uid(link),
-            parent_uid: Some(uid("parent")),
-            kind: NodeKind::File {
-                media_type: "text/plain".into(),
-                total_size_on_storage: 0,
-                active_revision_state: None,
-                active_revision_id: None,
-                content_sha1: None,
-                claimed_size: Some(claimed),
-                claimed_modification_time: None,
-            },
-            name: link.into(),
-            creation_time: 100,
-            modification_time: 100,
-            trashed: false,
-            is_shared: false,
-            is_shared_publicly: false,
-            signature_email: None,
-            membership: None,
-            photo: None,
-            album: None,
-            verification: Default::default(),
-            direct_role: None,
-            share_id: None,
-        }
-    }
-
-    fn folder(link: &str) -> Node {
-        Node {
-            kind: NodeKind::Folder,
-            ..file(link, 0)
-        }
-    }
-
-    /// B11: a re-enumeration mid-write must not revert the size to the
-    /// server's. A file that stats as 0 gets no `read` from the kernel at all,
-    /// so the staged blob is never served and the file reads as empty.
-    #[test]
-    fn a_queued_write_keeps_its_optimistic_size_through_a_re_enumeration() {
-        let mut nodes = vec![file("queued", 0), file("settled", 4096)];
-        let sizes = HashMap::from([(uid("queued"), 3)]);
-
-        apply_pending_sizes(&mut nodes, &sizes);
-
-        assert_eq!(
-            node_size(&nodes[0]),
-            3,
-            "the remote's pre-write size must not win over the queued write's"
-        );
-        assert_eq!(
-            node_size(&nodes[1]),
-            4096,
-            "a file with nothing queued keeps the size the server reported"
-        );
-    }
-
-    /// The map is keyed by uid and says nothing about kind; a folder that
-    /// somehow collides must not grow a `claimed_size`.
-    #[test]
-    fn folders_are_left_alone() {
-        let mut nodes = vec![folder("dir")];
-        apply_pending_sizes(&mut nodes, &HashMap::from([(uid("dir"), 999)]));
-        assert!(matches!(nodes[0].kind, NodeKind::Folder));
-        assert_eq!(node_size(&nodes[0]), 0);
-    }
-
-    /// The common case: nothing queued, nothing touched.
-    #[test]
-    fn an_empty_pending_map_changes_nothing() {
-        let mut nodes = vec![file("a", 10), file("b", 20)];
-        apply_pending_sizes(&mut nodes, &HashMap::new());
-        assert_eq!(node_size(&nodes[0]), 10);
-        assert_eq!(node_size(&nodes[1]), 20);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::trash::{expand_restore, first_seen_in_trash};
     use super::{
@@ -2407,9 +1886,9 @@ mod tests {
         copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, off_the_runtime,
         orphan_past_retention, prepare_shared_roots, preserve_on_access_denied,
         publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
-        release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
-        rename_needs_queue, require_node_parent_access, require_rename_access,
-        resolve_anywhere_with, shared_with_me_uid, uid_write_authority, virtual_node,
+        release_can_discard_unlinked, release_must_retain_queued_trash, rename_needs_queue,
+        require_node_parent_access, require_rename_access, resolve_anywhere_with,
+        shared_with_me_uid, uid_write_authority, virtual_node,
     };
     use super::{Db, WriteAuthority};
     use std::time::Duration;
@@ -4460,7 +3939,7 @@ mod tests {
                 .is_some()
         );
 
-        let released = release_unlinked_entry(&mut state, ino).unwrap();
+        let released = state.release_unlinked(ino).unwrap();
         assert_eq!(released, uid);
         assert!(!state.by_uid.contains_key(&uid));
         assert!(release_must_retain_queued_trash(&state.db, &uid).unwrap());
@@ -4539,7 +4018,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let mut listings = super::listed_children(&entries, vec![1, 2]);
+        let mut listings = pdfs_vfs::tree::listed_children(&entries, vec![1, 2]);
         listings.values_mut().for_each(|kids| kids.sort());
         assert_eq!(listings, HashMap::from([(1, vec![2, 3]), (2, vec![4])]));
     }
