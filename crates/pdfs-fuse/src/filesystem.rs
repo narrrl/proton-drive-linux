@@ -1498,6 +1498,9 @@ impl ProtonFs {
                 return;
             }
         };
+        // Written before the victim is removed and ended when this returns, so
+        // a stop in between is settled on the next start (`docs/BUGS.md` B302).
+        let mut _journal: Option<ReplaceJournal> = None;
         let replacement_authorized = if let Some((victim_ino, victim_uid)) = &victim {
             if flags.contains(RenameFlags::RENAME_NOREPLACE) {
                 reply.error(Errno::EEXIST);
@@ -1550,6 +1553,14 @@ impl ProtonFs {
             ) {
                 reply.error(error);
                 return;
+            }
+            match ReplaceJournal::begin(&self.core.db, &uid, victim_uid, &new_parent_uid, newname) {
+                Ok(journal) => _journal = Some(journal),
+                Err(error) => {
+                    error!(%uid, %error, "recording a replacing rename failed; refusing it");
+                    reply.error(Errno::EIO);
+                    return;
+                }
             }
             if let Err(e) = self.core.remove_replaced(*victim_ino, victim_uid, newname) {
                 reply.error(e);
@@ -1922,6 +1933,45 @@ impl ProtonFs {
             reply.error(Errno::ERANGE);
         } else {
             reply.data(&buf);
+        }
+    }
+}
+
+/// A replacing rename's journal entry, ended when the rename returns, however
+/// it returns. Only a stop leaves it behind, and that is what it is for.
+struct ReplaceJournal {
+    db: Arc<Db>,
+    source: String,
+}
+
+impl ReplaceJournal {
+    fn begin(
+        db: &Arc<Db>,
+        source: &NodeUid,
+        victim: &NodeUid,
+        new_parent: &NodeUid,
+        new_name: &str,
+    ) -> pdfs_core::Result<Self> {
+        let source = source.to_string();
+        db.begin_replace(&pdfs_store::db::ReplaceIntent {
+            source_uid: source.clone(),
+            victim_uid: victim.to_string(),
+            new_parent_uid: new_parent.to_string(),
+            new_name: new_name.to_owned(),
+            started_ms: now_millis(),
+            run: 0,
+        })?;
+        Ok(Self {
+            db: db.clone(),
+            source,
+        })
+    }
+}
+
+impl Drop for ReplaceJournal {
+    fn drop(&mut self) {
+        if let Err(error) = self.db.end_replace(&self.source) {
+            warn!(source = %self.source, %error, "ending a replacing rename's journal entry failed");
         }
     }
 }

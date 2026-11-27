@@ -2,6 +2,7 @@
 //! recovering writes that were fsynced but not queued when the daemon stopped.
 
 use super::*;
+use pdfs_vfs::namespace::{ReplaceOutcome, settle_from_drive, settle_from_queue};
 
 impl Core {
     /// Rehydrate the in-memory `State` maps from the DB on mount, so a cold
@@ -117,11 +118,47 @@ pub(crate) trait RecoveryHost: Send + Sync {
     /// Queue a write recovered from a blob fsynced before a stop, as if its
     /// handle had just been released.
     fn queue_recovered(&self, uid: &NodeUid, blob: &Path, meta: StagedWrite) -> Result<(), Errno>;
+
+    /// Drive's node `uid`: `None` when Drive cannot be asked now, and
+    /// `Some(None)` when it does not have the node.
+    fn remote_node(&self, uid: &NodeUid) -> Option<Option<Node>>;
+
+    /// Drop the queued trash of a replaced node whose rename was never
+    /// queued, so it stays where it is.
+    fn withdraw_victim_trash(&self, uid: &NodeUid) -> Result<(), Errno>;
+
+    /// Bring a replaced node back out of Drive's trash. Best effort; a failure
+    /// is logged and recorded in the activity log.
+    fn restore_victim(&self, uid: &NodeUid, parent: &NodeUid, name: &str);
 }
 
 impl RecoveryHost for Core {
     fn queue_recovered(&self, uid: &NodeUid, blob: &Path, meta: StagedWrite) -> Result<(), Errno> {
         self.enqueue_staged_write(uid, 0, blob, meta)
+    }
+
+    fn remote_node(&self, uid: &NodeUid) -> Option<Option<Node>> {
+        if !self.is_online() {
+            return None;
+        }
+        match self.block_on_bounded(self.drive.enumerate_nodes(std::slice::from_ref(uid))) {
+            Ok(nodes) => Some(nodes.into_iter().find(|node| node.uid == *uid)),
+            Err(error) if is_gone(&error) => Some(None),
+            Err(error) => {
+                self.lost_link(&error, "settle a replacing rename");
+                None
+            }
+        }
+    }
+
+    fn withdraw_victim_trash(&self, uid: &NodeUid) -> Result<(), Errno> {
+        self.discard_queued_ops(uid)?;
+        self.writes.unhide(uid);
+        Ok(())
+    }
+
+    fn restore_victim(&self, uid: &NodeUid, parent: &NodeUid, name: &str) {
+        self.restore_replaced(Some(&(0, uid.clone())), parent, name);
     }
 }
 
@@ -136,6 +173,97 @@ pub(crate) struct Recovery {
 }
 
 impl Recovery {
+    /// Settle the replacing renames an earlier run started and did not end
+    /// (`docs/BUGS.md` B302): forget the ones that reached their end state,
+    /// and put the victim back where the rename did not happen. One that needs
+    /// Drive while Drive cannot be asked stays for a later pass.
+    ///
+    /// Runs at mount, after [`hydrate_pending`](Self::hydrate_pending), and on
+    /// the drain's idle passes. The journal holds only this run's own renames
+    /// apart from cut-off ones, and those are left alone, so the idle pass
+    /// never undoes a rename in progress.
+    pub(crate) fn settle_replaces(&self) {
+        let intents = match self.db.open_replaces() {
+            Ok(intents) if intents.is_empty() => return,
+            Ok(intents) => intents,
+            Err(error) => {
+                warn!(%error, "reading cut-off replacing renames failed");
+                return;
+            }
+        };
+        let ops = match self.db.pending_ops() {
+            Ok(ops) => ops,
+            Err(error) => {
+                warn!(%error, "reading the queue to settle replacing renames failed");
+                return;
+            }
+        };
+        for intent in intents {
+            let (Some(source), Some(victim), Some(parent)) = (
+                parse_node_uid(&intent.source_uid),
+                parse_node_uid(&intent.victim_uid),
+                parse_node_uid(&intent.new_parent_uid),
+            ) else {
+                warn!(source = %intent.source_uid, "dropping a replace intent with an unparseable uid");
+                let _ = self.db.end_replace(&intent.source_uid);
+                continue;
+            };
+            // The source's end state is queued when one of its ops puts it at
+            // the new name: a rename, or the create a queued node's rename
+            // rewrote.
+            let rename_queued = ops.iter().any(|op| {
+                op.uid == intent.source_uid
+                    && [OP_RENAME, OP_CREATE, OP_MKDIR].contains(&op.kind.as_str())
+                    && op.parent_uid.as_deref() == Some(intent.new_parent_uid.as_str())
+                    && op.name.as_deref() == Some(intent.new_name.as_str())
+            });
+            let victim_trash_queued = ops
+                .iter()
+                .any(|op| op.uid == intent.victim_uid && op.kind == OP_TRASH);
+            let outcome = settle_from_queue(rename_queued, victim_trash_queued, is_local_uid(&victim))
+                .unwrap_or_else(|| {
+                    if is_local_uid(&source) {
+                        // A queued node whose create landed under the rename;
+                        // Drive knows it by a uid this entry does not have.
+                        warn!(%source, %victim, name = intent.new_name,
+                            "cannot settle a replacing rename of a node created here; leaving the replaced node in the trash");
+                        return ReplaceOutcome::Done;
+                    }
+                    let source_node = self.host.remote_node(&source);
+                    let victim_node = match source_node {
+                        Some(_) => self.host.remote_node(&victim),
+                        None => None,
+                    };
+                    settle_from_drive(
+                        &parent,
+                        &intent.new_name,
+                        source_node.as_ref().map(Option::as_ref),
+                        victim_node.as_ref().map(Option::as_ref),
+                    )
+                });
+            match outcome {
+                ReplaceOutcome::Wait => continue,
+                ReplaceOutcome::Done => {
+                    info!(%source, name = intent.new_name, "a replacing rename cut off by a stop had finished");
+                }
+                ReplaceOutcome::WithdrawVictimTrash => {
+                    if let Err(error) = self.host.withdraw_victim_trash(&victim) {
+                        warn!(%victim, ?error, "withdrawing a replaced node's queued trash failed; trying again later");
+                        continue;
+                    }
+                    info!(%victim, name = intent.new_name, "kept a node a cut-off rename was replacing");
+                }
+                ReplaceOutcome::RestoreVictim => {
+                    self.host.restore_victim(&victim, &parent, &intent.new_name);
+                    info!(%victim, name = intent.new_name, "restored a node a cut-off rename had replaced");
+                }
+            }
+            if let Err(error) = self.db.end_replace(&intent.source_uid) {
+                warn!(%source, %error, "ending a settled replace intent failed");
+            }
+        }
+    }
+
     /// Rebuild the in-memory pending map from the `pending_op` table on mount.
     ///
     /// A queued write survives a restart — that is the point of persisting it —

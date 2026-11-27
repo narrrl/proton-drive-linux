@@ -421,6 +421,10 @@ impl Core {
                         // Cheap and a no-op when empty.
                         self.cache.flush_touches();
                         self.recovery().recover_fsynced_writes();
+                        // One a stop cut off that waited for Drive.
+                        if online {
+                            self.recovery().settle_replaces();
+                        }
                         // Parked rows are invisible to `claim_next_due_op`, so
                         // an idle queue is exactly when a park that has outlived
                         // its writer has to be noticed.

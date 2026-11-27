@@ -17,6 +17,7 @@
 pub mod files;
 pub mod ids;
 pub mod names;
+pub mod namespace;
 pub mod nodes;
 pub mod open;
 pub mod tree;
