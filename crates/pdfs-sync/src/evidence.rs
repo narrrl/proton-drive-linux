@@ -317,6 +317,80 @@ mod tests {
         );
     }
 
+    /// The paths a pass classifies are the ones the separate filters let
+    /// through before: the ignore rules on the union of the walks, then
+    /// `Unscanned::covers` and `RemoteGaps::hides`.
+    #[test]
+    fn classifiable_paths_are_the_ones_the_old_filters_kept() {
+        let rules =
+            IgnoreRules::with_folder_text(std::path::Path::new("/r"), &[], "*.tmp\ncache/\n");
+        let local = map(&[
+            ("a.txt", false),
+            ("b.tmp", false),
+            ("cache", true),
+            ("locked", true),
+            ("docs", true),
+            ("docs/new.txt", false),
+        ]);
+        let remote = map(&[
+            ("a.txt", false),
+            ("docs", true),
+            ("docs/kept.txt", false),
+            ("pics", true),
+            ("remote-only.txt", false),
+        ]);
+        let baseline: HashMap<String, Item> = map(&[
+            ("a.txt", false),
+            ("gone-here.txt", false),
+            ("docs/lost.txt", false),
+            ("pics/2019/x.jpg", false),
+            ("locked/inner.txt", false),
+            ("old.tmp", false),
+            ("cache", true),
+        ]);
+        let mut unscanned = Unscanned::default();
+        unscanned.unreadable("locked".into(), "permission denied");
+        let remote_dirs = dirs(&["", "docs", "pics"]);
+        let mut gaps = RemoteGaps::default();
+        gaps.short_listing("docs");
+        gaps.unlisted("pics");
+        let evidence = Evidence {
+            rules: &rules,
+            local: &local,
+            unscanned: &unscanned,
+            remote: Some(RemoteEvidence {
+                entries: &remote,
+                dirs: &remote_dirs,
+                gaps: &gaps,
+            }),
+        };
+        let mut old = crate::planner::classification_order(&local, &remote, &baseline, &rules);
+        old.retain(|rel| !unscanned.covers(rel) && !gaps.hides(rel, &remote, &remote_dirs));
+        let mut new = crate::planner::classification_order(
+            &local,
+            &remote,
+            &baseline,
+            &IgnoreRules::load(std::path::Path::new("/nonexistent-sync-root"), &[]),
+        );
+        new.retain(|rel| evidence.classifiable(rel));
+        old.sort();
+        new.sort();
+        assert_eq!(old, new);
+        // Left out: ignored paths, everything under the unreadable folder,
+        // what may hide under the short and the failed listing.
+        assert_eq!(
+            old,
+            [
+                "a.txt",
+                "docs",
+                "docs/kept.txt",
+                "gone-here.txt",
+                "pics",
+                "remote-only.txt"
+            ]
+        );
+    }
+
     #[test]
     fn a_pass_that_does_not_walk_drive_knows_nothing_there() {
         let rules = none();
