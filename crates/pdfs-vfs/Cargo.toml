@@ -19,5 +19,6 @@ pdfs-drive.workspace = true
 pdfs-store.workspace = true
 proton-drive-rs.workspace = true
 libc.workspace = true
+parking_lot.workspace = true
 tracing.workspace = true
 

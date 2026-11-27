@@ -99,6 +99,7 @@ use pdfs_drive::{node_revision_id, node_size};
 use pdfs_sync::naming::{conflict_label, conflict_label_of, conflict_name_as};
 use pdfs_sync::naming::{conflict_name, this_hostname};
 mod echoes;
+pub(crate) use pdfs_vfs::writes;
 mod events;
 mod filesystem;
 mod gallery;
@@ -107,7 +108,6 @@ mod keeper;
 mod link;
 mod listing;
 mod session;
-mod writes;
 pub use filesystem::ProtonFs;
 mod maintenance;
 mod mount;
@@ -2399,14 +2399,13 @@ mod pending_size_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::echoes::{SELF_CHANGE_TTL_MS, note_self_change, take_self_change};
     use super::trash::{expand_restore, first_seen_in_trash};
     use super::{
         Access, AccessFlags, Errno, HashMap, PendingRevision, RootListingSnapshot, ShareId,
         SharedWithMeItem, StateRegistry, VirtualRootPlan, accepted_share_provenance,
         conflict_label, conflict_label_of, conflict_name, conflict_name_as,
         copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, off_the_runtime,
-        orphan_past_retention, parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
+        orphan_past_retention, prepare_shared_roots, preserve_on_access_denied,
         publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
         release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
         rename_needs_queue, require_node_parent_access, require_rename_access,
@@ -3278,67 +3277,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(db_error.kind, pdfs_core::control::ErrorKind::Internal);
         assert!(db_error.message.contains("lookup failed"));
-    }
-
-    /// An event feed carries no revision id, so the only thing that tells a
-    /// remote change apart from the echo of one this daemon just made is this
-    /// bookkeeping. Getting it wrong is expensive in both directions: too eager
-    /// and we evict the bytes we uploaded and re-download them from an API that
-    /// may still be serving the previous revision (a SQLite file on the mount
-    /// read back `malformed`); too generous and a real change from another device
-    /// is ignored.
-    #[test]
-    fn a_self_change_is_claimed_once_and_expires() {
-        let mut changes = HashMap::new();
-        let uid = parse_node_uid("vol~link").unwrap();
-        let other = parse_node_uid("vol~other").unwrap();
-        let t0 = 1_000_000;
-
-        assert!(
-            !take_self_change(&mut changes, &uid, t0),
-            "a node we never touched is never ours"
-        );
-
-        note_self_change(&mut changes, &uid, t0);
-        assert!(
-            take_self_change(&mut changes, &uid, t0 + 5_000),
-            "the echo of our own change is claimed"
-        );
-        assert!(
-            !take_self_change(&mut changes, &uid, t0 + 6_000),
-            "and only once, so a later foreign change still applies"
-        );
-
-        // A create followed by a revision upload is two changes to one node, and
-        // the feed reports both.
-        note_self_change(&mut changes, &uid, t0);
-        note_self_change(&mut changes, &uid, t0);
-        assert!(take_self_change(&mut changes, &uid, t0 + 1));
-        assert!(take_self_change(&mut changes, &uid, t0 + 2));
-        assert!(!take_self_change(&mut changes, &uid, t0 + 3));
-
-        // Past the window the attribution is a guess, and a wrong guess leaves
-        // the user looking at a stale file.
-        note_self_change(&mut changes, &uid, t0);
-        assert!(!take_self_change(
-            &mut changes,
-            &uid,
-            t0 + SELF_CHANGE_TTL_MS
-        ));
-        assert!(
-            !changes.contains_key(&uid),
-            "an expired change is dropped, not left to be re-tested"
-        );
-
-        // An echo that never arrives must not accumulate for the life of the
-        // daemon; the next recorded change prunes it.
-        note_self_change(&mut changes, &uid, t0);
-        note_self_change(&mut changes, &other, t0 + SELF_CHANGE_TTL_MS);
-        assert_eq!(
-            changes.len(),
-            1,
-            "recording a change prunes the ones whose echo never came"
-        );
     }
 
     /// The predicate must answer *only* for a dead FUSE connection. A healthy

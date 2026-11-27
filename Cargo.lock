@@ -3806,6 +3806,7 @@ name = "pdfs-vfs"
 version = "3.10.0"
 dependencies = [
  "libc",
+ "parking_lot 0.13.0",
  "pdfs-core",
  "pdfs-drive",
  "pdfs-store",

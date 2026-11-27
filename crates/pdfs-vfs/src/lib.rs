@@ -10,8 +10,10 @@
 //! stable inode numbers, and the per-mount roots; and the open files
 //! ([`open`]): the scratch file a handle writes into, which bytes of it are
 //! authored, the released write that waits for its upload, and directory
-//! handles.
+//! handles; and what the mount accepted but has not sent to Drive yet
+//! ([`writes`]).
 
 pub mod ids;
 pub mod open;
 pub mod tree;
+pub mod writes;
