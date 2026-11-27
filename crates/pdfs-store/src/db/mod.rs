@@ -438,25 +438,6 @@ fn is_in_memory(path: &Path) -> bool {
     p == ":memory:" || p.is_empty()
 }
 
-/// Take the single-instance write lock for the database at `path`.
-///
-/// The daemon is the only writer by design — the front-ends go through the
-/// control socket — but nothing stopped a hand-run `pdfs mount` from starting
-/// alongside the systemd unit, at which point two processes own the same inode
-/// space, the same content cache, and the same drain queue. SQLite's own
-/// locking makes each *statement* safe and does nothing about that.
-///
-/// `flock` on a sibling `.lock` file rather than on the database itself:
-/// SQLite uses POSIX record locks, so the two never interact, and a lock file
-/// left behind carries no state — the lock lives in the kernel and dies with
-/// the process, however it exits.
-///
-/// A refusal is retried for [`LOCK_RETRY`] before it counts as another
-/// daemon. A child this process spawns holds a copy of every descriptor from
-/// its fork until its exec closes them, and `flock` belongs to the open file,
-/// not the descriptor. So a lock the process has just let go of can stay held
-/// for that moment, and a reopen right after a drop is refused
-/// (`docs/BUGS.md` B290).
 /// A value no other opening of a database has used: the time in nanoseconds,
 /// made unique within this process by a counter.
 fn next_run() -> u64 {
@@ -476,6 +457,25 @@ fn next_run() -> u64 {
     }
 }
 
+/// Take the single-instance write lock for the database at `path`.
+///
+/// The daemon is the only writer by design — the front-ends go through the
+/// control socket — but nothing stopped a hand-run `pdfs mount` from starting
+/// alongside the systemd unit, at which point two processes own the same inode
+/// space, the same content cache, and the same drain queue. SQLite's own
+/// locking makes each *statement* safe and does nothing about that.
+///
+/// `flock` on a sibling `.lock` file rather than on the database itself:
+/// SQLite uses POSIX record locks, so the two never interact, and a lock file
+/// left behind carries no state — the lock lives in the kernel and dies with
+/// the process, however it exits.
+///
+/// A refusal is retried for [`LOCK_RETRY`] before it counts as another
+/// daemon. A child this process spawns holds a copy of every descriptor from
+/// its fork until its exec closes them, and `flock` belongs to the open file,
+/// not the descriptor. So a lock the process has just let go of can stay held
+/// for that moment, and a reopen right after a drop is refused
+/// (`docs/BUGS.md` B290).
 fn acquire_single_writer_lock(path: &Path) -> Result<Option<File>> {
     if is_in_memory(path) {
         return Ok(None);

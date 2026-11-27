@@ -14,7 +14,7 @@
 //! ([`writes`]); the POSIX rules on names and on what a rename may replace
 //! ([`names`]); which nodes a folder lists ([`nodes`]); and two services
 //! behind host ports: the open files from open to close ([`files`]), and
-//! create, mkdir, unlink and rmdir ([`namespace`]).
+//! create, mkdir, unlink, rmdir and rename ([`namespace`]).
 
 pub mod files;
 pub mod ids;

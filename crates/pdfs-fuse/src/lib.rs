@@ -361,15 +361,6 @@ fn fuse_name(name: &OsStr) -> Result<String, Errno> {
     })
 }
 
-/// Whether a `rename` may replace an existing destination, as an errno.
-fn check_replaceable(src_dir: bool, dst_dir: bool, dst_empty: bool) -> Result<(), Errno> {
-    pdfs_vfs::names::check_replaceable(src_dir, dst_dir, dst_empty).map_err(|error| match error {
-        pdfs_vfs::names::ReplaceError::IsDirectory => Errno::EISDIR,
-        pdfs_vfs::names::ReplaceError::NotDirectory => Errno::ENOTDIR,
-        pdfs_vfs::names::ReplaceError::NotEmpty => Errno::ENOTEMPTY,
-    })
-}
-
 /// The errno the kernel gets for an operation the open-file service refused.
 fn file_errno(error: pdfs_vfs::files::FileError<Errno>) -> Errno {
     use pdfs_vfs::files::FileError;
@@ -445,6 +436,9 @@ fn namespace_errno(error: pdfs_vfs::namespace::NamespaceError<Errno>) -> Errno {
         NamespaceError::IsDirectory => Errno::EISDIR,
         NamespaceError::NotDirectory => Errno::ENOTDIR,
         NamespaceError::NotEmpty => Errno::ENOTEMPTY,
+        NamespaceError::InvalidArgument => Errno::EINVAL,
+        NamespaceError::Exists => Errno::EEXIST,
+        NamespaceError::Busy => Errno::EBUSY,
         NamespaceError::Io => Errno::EIO,
         NamespaceError::Host(errno) => errno,
     }
@@ -465,8 +459,12 @@ impl pdfs_vfs::namespace::NamespaceHost for Core {
         Core::ensure_children(self, ino)
     }
 
-    fn lookup_child(&self, parent: u64, name: &str) -> Result<(u64, NodeUid), Errno> {
-        Core::lookup_child(self, parent, name)
+    fn lookup_child(&self, parent: u64, name: &str) -> Result<Option<(u64, NodeUid)>, Errno> {
+        match Core::lookup_child(self, parent, name) {
+            Ok(found) => Ok(Some(found)),
+            Err(e) if e == Errno::ENOENT => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn sends_inline(&self) -> bool {
@@ -548,6 +546,71 @@ impl pdfs_vfs::namespace::NamespaceHost for Core {
                 Err(Errno::EIO)
             }
         }
+    }
+
+    fn remove_replaced(&self, ino: u64, uid: &NodeUid, name: &str) -> Result<(), Errno> {
+        Core::remove_replaced(self, ino, uid, name)
+    }
+
+    fn restore_replaced(&self, victim: Option<&(u64, NodeUid)>, parent: &NodeUid, name: &str) {
+        Core::restore_replaced(self, victim, parent, name);
+    }
+
+    fn queue_rename(
+        &self,
+        ino: u64,
+        uid: &NodeUid,
+        old_parent_uid: &NodeUid,
+        new_parent_ino: u64,
+        new_parent_uid: &NodeUid,
+        new_name: &str,
+        authorized: bool,
+    ) -> Result<(), Errno> {
+        if authorized {
+            self.queue_rename_authorized(
+                ino,
+                uid,
+                old_parent_uid,
+                new_parent_ino,
+                new_parent_uid,
+                new_name,
+            )
+        } else {
+            Core::queue_rename(
+                self,
+                ino,
+                uid,
+                old_parent_uid,
+                new_parent_ino,
+                new_parent_uid,
+                new_name,
+            )
+        }
+    }
+
+    fn rename_remote(
+        &self,
+        uid: &NodeUid,
+        new_parent: Option<&NodeUid>,
+        new_name: Option<&str>,
+    ) -> Result<bool, Errno> {
+        let renamed = match (new_parent, new_name) {
+            (Some(parent), name) => self.move_rename_remote(uid, parent, name),
+            (None, Some(name)) => Core::rename_remote(self, uid, name),
+            (None, None) => Ok(()),
+        };
+        match renamed {
+            Ok(()) => Ok(true),
+            Err(e) if self.lost_link(&e, "rename") => Ok(false),
+            Err(e) => {
+                error!(%uid, error = %e, "rename failed");
+                Err(Errno::EIO)
+            }
+        }
+    }
+
+    fn wake_drain(&self) {
+        Core::wake_drain(self);
     }
 
     fn trashed(&self, uid: &NodeUid, name: &str, open: bool) {
@@ -1960,20 +2023,6 @@ fn count_noun(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// Whether a rename must be represented as a durable desired end state.
-/// Local-first, offline, or into a not-yet-uploaded directory, the API is not
-/// called in the syscall. Only remote-to-remote renames sent inline
-/// ([`Core::sends_inline`]) stay synchronous, so a successful kernel reply means
-/// the remote namespace has already reached the same end state.
-fn rename_needs_queue(
-    inline: bool,
-    destination_is_local: bool,
-    _parent_changed: bool,
-    _name_changed: bool,
-) -> bool {
-    !inline || destination_is_local
-}
-
 /// Bytes rendered with a binary unit and one decimal place (e.g. `"1.2 GB"`),
 /// for the activity log. Uses 1024-based steps but the shorter SI labels.
 fn human_bytes(bytes: u64) -> String {
@@ -2098,9 +2147,9 @@ mod tests {
         copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, off_the_runtime,
         orphan_past_retention, prepare_shared_roots, preserve_on_access_denied,
         publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
-        release_can_discard_unlinked, release_must_retain_queued_trash, rename_needs_queue,
-        require_node_parent_access, require_rename_access, resolve_anywhere_with,
-        shared_with_me_uid, uid_write_authority, virtual_node,
+        release_can_discard_unlinked, release_must_retain_queued_trash, require_node_parent_access,
+        require_rename_access, resolve_anywhere_with, shared_with_me_uid, uid_write_authority,
+        virtual_node,
     };
     use super::{Db, WriteAuthority};
     use std::time::Duration;
@@ -3085,20 +3134,6 @@ mod tests {
     }
 
     #[test]
-    fn online_combined_cross_directory_rename_stays_synchronous() {
-        assert!(!rename_needs_queue(true, false, true, true));
-        assert!(rename_needs_queue(false, false, false, true));
-        assert!(rename_needs_queue(true, true, true, false));
-    }
-
-    #[test]
-    fn one_step_online_namespace_changes_stay_synchronous() {
-        assert!(!rename_needs_queue(true, false, false, true));
-        assert!(!rename_needs_queue(true, false, true, false));
-        assert!(!rename_needs_queue(true, false, false, false));
-    }
-
-    #[test]
     fn fuse_names_enforce_linux_component_limits() {
         use std::ffi::OsStr;
 
@@ -3443,11 +3478,13 @@ mod tests {
             assert_before(function, gate, remote_call);
         }
 
-        let filesystem = include_str!("filesystem.rs");
-        let rename = function_source(filesystem, "fn serve_rename(");
-        assert_before(rename, "require_rename_access", "remove_replaced");
-        assert_before(rename, "remove_replaced", "queue_rename_authorized");
-        assert_before(rename, "require_rename_access", "rename_remote");
+        let rename = function_source(namespace, "pub fn rename(");
+        assert_before(rename, "self.authorize_replace(", "remove_replaced");
+        assert_before(rename, "remove_replaced", "self.host.queue_rename(");
+        assert_before(rename, "self.require_rename_access(", ".rename_remote(");
+        let authorize = function_source(namespace, "fn authorize_replace(");
+        assert_before(authorize, "check_replaceable", "require_rename_access");
+        assert_before(authorize, "require_rename_access", "ReplaceJournal::begin");
         let control_mkdir = function_source(source, "fn create_folder(");
         assert_before(
             control_mkdir,
@@ -3834,10 +3871,13 @@ mod tests {
         // Through the raw lock, the move stayed in the state's outbox, and the
         // next lookup rebuilt the destination from a database without it
         // (B135).
-        let rename: String = function_source(include_str!("filesystem.rs"), "fn serve_rename(")
-            .split_whitespace()
-            .collect();
-        assert!(rename.contains("self.core.state().relocate("));
+        let rename: String = function_source(
+            include_str!("../../pdfs-vfs/src/namespace.rs"),
+            "pub fn rename(",
+        )
+        .split_whitespace()
+        .collect();
+        assert!(rename.contains("self.state().relocate("));
         assert!(!rename.contains(".lock().relocate("));
     }
 
