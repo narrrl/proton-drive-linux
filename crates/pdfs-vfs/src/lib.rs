@@ -15,8 +15,16 @@
 //! ([`names`]); which nodes a folder lists ([`nodes`]); and two services
 //! behind host ports: the open files from open to close ([`files`]), and
 //! create, mkdir, unlink, rmdir and rename ([`namespace`]).
+//!
+//! A second adapter, [`headless`], serves the same services by path with no
+//! kernel and no Drive. The scenarios in `conformance` (with the
+//! `test-support` feature) run through it here and through a FUSE mount in
+//! `pdfs-fuse`, and both have to see the same outcomes.
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
 pub mod files;
+pub mod headless;
 pub mod ids;
 pub mod names;
 pub mod namespace;
