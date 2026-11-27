@@ -38,6 +38,8 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use sha1::{Digest as _, Sha1};
 use tracing::{debug, info, warn};
 
+use crate::evidence::{Evidence, RemoteEvidence, Side};
+use crate::planner::HasKind;
 use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::syncignore::IgnoreRules;
@@ -352,6 +354,27 @@ impl Syncer {
         }
     }
 
+    /// Shadow check of a deletion the pass is about to make: count and log it
+    /// when the evidence does not prove the path gone on the side the
+    /// deletion is based on. Acts on nothing; the filters before the plan are
+    /// what keep such a path out of it, and this says when they did not.
+    fn check_deletion<L: HasKind, R: HasKind>(
+        &self,
+        evidence: &Evidence<'_, L, R>,
+        rel: &str,
+        side: Side,
+    ) {
+        if let Some(basis) = evidence.unproven_deletion(rel, side) {
+            warn!(
+                rel,
+                ?side,
+                ?basis,
+                "sync: a planned deletion is not backed by proof of absence"
+            );
+            self.trace_count(Count::UnprovenDeletions, 1);
+        }
+    }
+
     /// Add `took` to a stage of the running pass's trace.
     fn trace_phase(&self, phase: Phase, took: Duration) {
         self.engine.trace(|t| t.phase(phase, took));
@@ -501,7 +524,10 @@ impl Syncer {
         // ignored one, and a remote path under it has nowhere to be written.
         // The same holds for a path the remote walk could not read: missing
         // from it, it would read as deleted on Drive (B212).
-        order.retain(|rel| !unscanned.covers(rel) && !gaps.hides(rel, &remote, &remote_dirs));
+        // Only a path both walks know about is classified (`evidence`).
+        order.retain(|rel| {
+            pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps).classifiable(rel)
+        });
 
         let mut unscanned_report = unscanned.report();
         unscanned_report.extend(gaps.report());
@@ -587,6 +613,11 @@ impl Syncer {
                     }
                     (true, false) => {
                         // In baseline, gone remotely → the remote side deleted it.
+                        self.check_deletion(
+                            &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
+                            rel,
+                            Side::Local,
+                        );
                         delete_local_dirs.push(rel.clone());
                     }
                     (false, true) if !in_base => {
@@ -601,6 +632,11 @@ impl Syncer {
                     }
                     (false, true) => {
                         // In baseline, gone locally → the local side deleted it.
+                        self.check_deletion(
+                            &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
+                            rel,
+                            Side::Remote,
+                        );
                         delete_remote_dirs.push((rel.clone(), remote[rel].uid.clone()));
                     }
                     (false, false) => {
@@ -691,6 +727,11 @@ impl Syncer {
                     }
                 },
                 FilePlan::DeleteLocal => {
+                    self.check_deletion(
+                        &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
+                        rel,
+                        Side::Local,
+                    );
                     let path = local_root.join(rel_to_path(rel));
                     // The plan comes from a scan taken before the remote walk,
                     // which can take minutes. An edit saved since then is not
@@ -717,6 +758,11 @@ impl Syncer {
                     outcome.deleted += 1;
                 }
                 FilePlan::DeleteRemote => {
+                    self.check_deletion(
+                        &pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps),
+                        rel,
+                        Side::Remote,
+                    );
                     let remote = r.expect("remote deletion requires a remote file");
                     let step = Instant::now();
                     let trashed = self
@@ -859,6 +905,29 @@ impl Syncer {
 
 /// A [`Read`] that hashes what an upload reads through it, so the digest Drive
 /// reports afterwards can be compared with what was sent.
+/// The evidence of a mirror pass, built where it is asked so it borrows the
+/// walks only for the question: `remote_dirs` gains the folders the pass
+/// creates between questions.
+fn pass_evidence<'a>(
+    rules: &'a IgnoreRules,
+    local: &'a HashMap<String, LocalItem>,
+    unscanned: &'a Unscanned,
+    remote: &'a HashMap<String, RemoteItem>,
+    remote_dirs: &'a HashMap<String, NodeUid>,
+    gaps: &'a RemoteGaps,
+) -> Evidence<'a, LocalItem, RemoteItem> {
+    Evidence {
+        rules,
+        local,
+        unscanned,
+        remote: Some(RemoteEvidence {
+            entries: remote,
+            dirs: remote_dirs,
+            gaps,
+        }),
+    }
+}
+
 struct Sha1Tap<R> {
     inner: R,
     hasher: Arc<Mutex<Sha1>>,

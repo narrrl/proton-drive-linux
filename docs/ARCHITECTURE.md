@@ -50,7 +50,7 @@ graph TD
 | [`pdfs-core`](../crates/pdfs-core) | Authentication and keyring (`auth`), configuration and directories (`config`), the control protocol (`control`), search scoring, ignore rules, Google Takeout parsing, the machine profile, the transfer registry (`transfers`) and the shutdown signal (`shutdown`) |
 | [`pdfs-store`](../crates/pdfs-store) | The SQLite schema and queries (`db/`), the content cache (`cache`) |
 | [`pdfs-drive`](../crates/pdfs-drive) | The `DriveApi` seam over the SDK, the call counter (`counted`), and `FakeDrive` for the simulations |
-| [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes (`mirror`), split into the walks (`mirror::walk`), applying a plan (`mirror::apply`) and the push pass (`mirror::push`), its engine thread (`mirror::engine`), its reads and writes of the local disk in one module (`mirror::local`), and the parts with no I/O: planner, pass model and pass trace. It owns its state (`SyncParts`), reads and writes its tables only through `SyncStore`, and reaches the daemon only through `SyncHost` |
+| [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes (`mirror`), split into the walks (`mirror::walk`), applying a plan (`mirror::apply`) and the push pass (`mirror::push`), its engine thread (`mirror::engine`), its reads and writes of the local disk in one module (`mirror::local`), and the parts with no I/O: planner, what each walk proves about a path (`evidence`), pass model and pass trace. It owns its state (`SyncParts`), reads and writes its tables only through `SyncStore`, and reaches the daemon only through `SyncHost` |
 | [`pdfs-vfs`](../crates/pdfs-vfs) | The mounted-files service, with no kernel adapter: the tree (`tree`: nodes, stable inodes, per-mount roots), the reserved inodes (`ids`), the open files (`open`: write handles and their authored ranges, released writes waiting for upload, directory handles, `fallocate` rules), the open-file service (`files`: open, write, resize, fsync and close, behind the `FilesHost` port), the namespace service (`namespace`: create, mkdir, unlink, rmdir and rename behind the `NamespaceHost` port, and the settling of a cut-off replacing rename), a headless adapter that serves both by path (`headless`) and the scenarios every adapter has to pass (`conformance`), and what the mount accepted but has not sent yet (`writes`: queued revisions, nodes removed here, echoes of our own changes). Errors are typed; the FUSE adapter maps them to errno |
 | [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), finding nodes (`resolve`), folder listings and file sizes (`listing`, `sizes`), reads (`reads`), queueing and the drain (`enqueue`, `queue`, `drain`, `upload`), calls sent straight to Drive (`remote`), requests by path (`requests`), startup recovery (`recovery`), pins, search, trash, the shared tree (`shared`), the link state (`link`), remote events (`background`), the daemon's side of the sync engine (`sync`, which implements `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
 | [`pdfs-daemon`](../crates/pdfs-daemon) | The daemon's composition root: waits for a session, opens the database and the content cache, resumes the session and mounts, then remounts or retries with a backoff and records each failure |
@@ -342,6 +342,14 @@ A filesystem watcher (`notify`) and a remote poll every 120 s feed a debounced p
 
 Safety rules:
 
+- **Absence is a typed fact** (`pdfs_sync::evidence`). For each path and side, a pass knows
+  that it is there (`Present`), that the walk read the folder it would be in completely and it
+  was not there (`Absent`), that the ignore rules exclude it (`Excluded`), or that the walk could
+  not tell, and why (`Unknown`: unreadable or vanished here; unread, under a short listing or
+  under a failed listing on Drive). Only a path known on both sides is classified, and only
+  `Absent` backs a deletion. Every deletion a pass plans is checked against the evidence once
+  more. For now that check acts on nothing: it logs the deletion and counts it as `unproven
+  deletions` in the pass trace, which should stay at zero.
 - **Wipe guard.** A pass in which every previously synced file has vanished locally is refused
   instead of trashing the whole folder on Drive. It applies to any non-empty baseline.
 - **Open for writing.** Files that some process holds open for writing (`/proc/*/fd`,

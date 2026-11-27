@@ -102,7 +102,8 @@ pub fn filter_baseline<'a, B>(
 /// stopping every other file in the tree from syncing (B196).
 #[derive(Default)]
 pub struct Unscanned {
-    covered: HashSet<String>,
+    /// Each left-out path, with why it was left out.
+    covered: HashMap<String, crate::evidence::Unknown>,
     /// The subset worth telling the user about, with why: an entry that only
     /// vanished mid-scan is not, since the next pass sees it settled.
     unreadable: Vec<String>,
@@ -111,29 +112,37 @@ pub struct Unscanned {
 impl Unscanned {
     /// Leave out `rel`, which vanished while the scan looked at it.
     pub fn vanished(&mut self, rel: String) {
-        self.covered.insert(rel);
+        // An unreadable path stays unreadable: that is the reason the user
+        // is told about.
+        self.covered
+            .entry(rel)
+            .or_insert(crate::evidence::Unknown::Vanished);
     }
 
     /// Leave out `rel`, which cannot be read for `reason`.
     pub fn unreadable(&mut self, rel: String, reason: &str) {
         self.unreadable.push(format!("{rel} ({reason})"));
-        self.covered.insert(rel);
+        self.covered
+            .insert(rel, crate::evidence::Unknown::Unreadable);
     }
 
     /// Whether `rel` is a left-out path or lies under one.
     pub fn covers(&self, rel: &str) -> bool {
+        self.why(rel).is_some()
+    }
+
+    /// Why `rel` was left out, when it is a left-out path or lies under one.
+    /// The nearest left-out path above it decides.
+    pub fn why(&self, rel: &str) -> Option<crate::evidence::Unknown> {
         if self.covered.is_empty() {
-            return false;
+            return None;
         }
         let mut at = rel;
         loop {
-            if self.covered.contains(at) {
-                return true;
+            if let Some(why) = self.covered.get(at) {
+                return Some(*why);
             }
-            match at.rfind('/') {
-                Some(i) => at = &at[..i],
-                None => return false,
-            }
+            at = &at[..at.rfind('/')?];
         }
     }
 
@@ -305,21 +314,37 @@ impl RemoteGaps {
         remote: &HashMap<String, R>,
         remote_dirs: &HashMap<String, NodeUid>,
     ) -> bool {
+        self.why(rel, remote, remote_dirs).is_some()
+    }
+
+    /// Why `rel` may be missing from `remote` only because the walk could not
+    /// read it, or `None` when its absence is real. A path the walk returned
+    /// is never hidden.
+    pub fn why<R>(
+        &self,
+        rel: &str,
+        remote: &HashMap<String, R>,
+        remote_dirs: &HashMap<String, NodeUid>,
+    ) -> Option<crate::evidence::Unknown> {
+        use crate::evidence::Unknown;
         if self.is_empty() || remote.contains_key(rel) {
-            return false;
+            return None;
         }
         if self.unread.contains(rel) {
-            return true;
+            return Some(Unknown::Unread);
         }
         // The deepest folder the walk did list decides: under a short listing,
         // anything not returned may be one of the nodes it could not read.
         let mut at = parent_rel(rel);
         loop {
             if remote_dirs.contains_key(at) {
-                return self.short.contains(at) || self.unlisted.contains(at);
+                if self.unlisted.contains(at) {
+                    return Some(Unknown::Unlisted);
+                }
+                return self.short.contains(at).then_some(Unknown::ShortListing);
             }
             if at.is_empty() {
-                return false;
+                return None;
             }
             at = parent_rel(at);
         }

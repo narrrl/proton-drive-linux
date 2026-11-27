@@ -304,6 +304,10 @@ What the parts mean:
   happens on the first pass, once a day, and after the daemon lost track of Proton Drive's
   changes. **`resumed`** counts the paths a pass took from a listing that a restart cut short.
 
+- **`unproven deletions`** counts deletions a pass planned for a path it had not proven gone.
+  It should never appear. If it does, the journal has a `sync: a planned deletion is not backed
+  by proof of absence` line for each one; please report it with those lines.
+
 Please include these lines when you report a slow folder.
 
 ### Files named `(sync-conflict …)` appeared

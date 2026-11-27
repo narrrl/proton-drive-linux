@@ -308,6 +308,15 @@ impl Syncer {
             }
             return Ok(outcome);
         }
+        let evidence: Evidence<'_, LocalItem, RemoteItem> = Evidence {
+            rules,
+            local: &local,
+            unscanned: &unscanned,
+            remote: None,
+        };
+        for rel in &deletions {
+            self.check_deletion(&evidence, rel, Side::Remote);
+        }
         let mut trashed: Vec<String> = Vec::new();
         for rel in &deletions {
             if trashed

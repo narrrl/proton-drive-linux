@@ -127,10 +127,14 @@ pub enum Count {
     Reused,
     /// Folders on Drive marked as changed since the last pass listed them.
     Dirty,
+    /// Deletions the pass planned that the evidence does not back: the path
+    /// was not proven gone on the side the deletion is based on. Should stay
+    /// zero; see `evidence`.
+    UnprovenDeletions,
 }
 
 impl Count {
-    const ALL: [Count; 9] = [
+    const ALL: [Count; 10] = [
         Count::LocalEntries,
         Count::RemoteFolders,
         Count::Nodes,
@@ -140,6 +144,7 @@ impl Count {
         Count::Resumed,
         Count::Reused,
         Count::Dirty,
+        Count::UnprovenDeletions,
     ];
 
     fn name(self) -> &'static str {
@@ -153,6 +158,7 @@ impl Count {
             Count::Resumed => "resumed",
             Count::Reused => "reused",
             Count::Dirty => "dirty folders",
+            Count::UnprovenDeletions => "unproven deletions",
         }
     }
 }
