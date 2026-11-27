@@ -1,55 +1,65 @@
-//! Inode bookkeeping: the maps that give a remote node a stable kernel inode,
+//! The tree: inode bookkeeping, the maps that give a remote node a stable kernel inode,
 //! the open write handles, and the interval set that tracks which bytes of a
 //! staged write are authored locally.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::open::OpenFiles;
 use pdfs_core::{Access, access_for};
 use pdfs_store::db::Db;
-use pdfs_vfs::open::OpenFiles;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use proton_drive_rs::MemberRole;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 use tracing::warn;
 
+/// Why the tree refused an operation on a node. The kernel adapter maps it
+/// to an errno.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeError {
+    /// No node has the inode.
+    NotFound,
+    /// The node is there, but the share it is in does not allow writing.
+    NotWritable,
+}
+
 /// A node known to the filesystem, addressed by its kernel inode.
-pub(crate) struct Entry {
-    pub(crate) uid: NodeUid,
-    pub(crate) parent: u64,
-    pub(crate) node: Node,
-    pub(crate) access: Access,
-    pub(crate) lookup_count: u64,
-    pub(crate) open_count: u32,
-    pub(crate) unlinked: bool,
+pub struct Entry {
+    pub uid: NodeUid,
+    pub parent: u64,
+    pub node: Node,
+    pub access: Access,
+    pub lookup_count: u64,
+    pub open_count: u32,
+    pub unlinked: bool,
 }
 
 impl Entry {
-    pub(crate) fn writable(&self) -> bool {
+    pub fn writable(&self) -> bool {
         self.access.writable()
     }
 }
 
 /// Where [`State::next_ino`] starts: far above any local id a database hands
 /// out, so a fallback inode never names a node that has a row.
-pub(crate) const FALLBACK_INO: u64 = 1 << 48;
+pub const FALLBACK_INO: u64 = 1 << 48;
 
 /// The inode of the node with local id `lid` ([`Db::lids_for`]). One above the
-/// lid, so no node takes [`crate::ROOT_INO`], which each session uses for its
+/// lid, so no node takes [`crate::ids::ROOT_INO`], which each session uses for its
 /// own root. The same in every mount and after a restart.
-pub(crate) fn lid_ino(lid: i64) -> u64 {
-    lid.unsigned_abs() + crate::ROOT_INO
+pub fn lid_ino(lid: i64) -> u64 {
+    lid.unsigned_abs() + crate::ids::ROOT_INO
 }
 
 /// The inodes of the stored nodes among `nodes`, from their local ids, for
 /// [`State::intern_batch_with_inos`]. Called before the state lock is taken;
 /// a node that already has a row keeps its id. Empty when the database fails,
 /// which leaves the allocation to the lock holder, as before.
-pub(crate) fn inos_for(db: &Db, nodes: &[Node]) -> HashMap<NodeUid, u64> {
+pub fn inos_for(db: &Db, nodes: &[Node]) -> HashMap<NodeUid, u64> {
     let stored: Vec<&Node> = nodes
         .iter()
-        .filter(|node| !crate::r#virtual::is_virtual_uid(&node.uid))
+        .filter(|node| !crate::ids::is_virtual_uid(&node.uid))
         .collect();
     if stored.is_empty() {
         return HashMap::new();
@@ -69,8 +79,8 @@ pub(crate) fn inos_for(db: &Db, nodes: &[Node]) -> HashMap<NodeUid, u64> {
 
 /// The local id of the node at inode `ino`, the inverse of [`lid_ino`]:
 /// `None` for the root and a fallback inode.
-pub(crate) fn ino_lid(ino: u64) -> Option<i64> {
-    (ino > crate::ROOT_INO && ino < FALLBACK_INO).then(|| (ino - crate::ROOT_INO) as i64)
+pub fn ino_lid(ino: u64) -> Option<i64> {
+    (ino > crate::ids::ROOT_INO && ino < FALLBACK_INO).then(|| (ino - crate::ids::ROOT_INO) as i64)
 }
 
 /// Mutable inode bookkeeping, guarded by a mutex because fuser drives the
@@ -79,35 +89,35 @@ pub(crate) fn ino_lid(ino: u64) -> Option<i64> {
 /// One tree for every mount of the daemon. Each FUSE session sees it from its
 /// own root ([`State::roots`]) and calls that root inode 1; `ProtonFs`
 /// translates at the kernel boundary.
-pub(crate) struct State {
+pub struct State {
     /// inode -> node metadata.
-    pub(crate) entries: HashMap<u64, Entry>,
+    pub entries: HashMap<u64, Entry>,
     /// Dedupe inodes by node uid so a node keeps a stable inode across lookups.
-    pub(crate) by_uid: HashMap<NodeUid, u64>,
+    pub by_uid: HashMap<NodeUid, u64>,
     /// Cached directory listings: parent inode -> child inodes. Presence of a
     /// key means the directory has been enumerated.
-    pub(crate) children: HashMap<u64, Vec<u64>>,
+    pub children: HashMap<u64, Vec<u64>>,
     /// The inodes some session has been rooted at ([`State::install_root`]).
     /// A root is its own parent. Kept after its session unmounts: the node is
     /// still one of ours.
-    pub(crate) roots: HashSet<u64>,
+    pub roots: HashSet<u64>,
     /// The next inode for a node the database could not give a local id, from
     /// a range lids never reach ([`FALLBACK_INO`]).
-    pub(crate) next_ino: u64,
+    pub next_ino: u64,
     /// The files open for writing, their handles and their releases.
-    pub(crate) open: OpenFiles,
+    pub open: OpenFiles,
     /// Resident inode attributes whose effective access changed during an
     /// intern/root refresh. Core drains this set and notifies the matching
     /// kernel only after releasing the State lock.
-    pub(crate) access_changes: HashSet<u64>,
+    pub access_changes: HashSet<u64>,
     /// Persisted shared-root authority, loaded once and updated
     /// on every explicit role/tombstone change. Descendant inheritance reads
     /// this map instead of issuing one SQLite query per interned inode.
-    pub(crate) share_access: HashMap<NodeUid, Access>,
+    pub share_access: HashMap<NodeUid, Access>,
     /// Unified SQLite metadata cache. Read from here (`has_children`) but never
     /// written: mutations go to [`State::outbox`] and are applied after the lock
     /// is released. See [`StateGuard`].
-    pub(crate) db: Arc<Db>,
+    pub db: Arc<Db>,
     /// Write-throughs this mutation owes SQLite, applied by [`StateGuard`] once
     /// the inode lock is released.
     ///
@@ -124,7 +134,7 @@ pub(crate) struct State {
 ///
 /// Deliberately a small closed set rather than a boxed closure: these run
 /// outside the lock, and what they can touch should be readable here.
-pub(crate) enum DbWrite {
+pub enum DbWrite {
     /// One node or a whole listing. Both go through `upsert_nodes`, which is a
     /// single transaction either way, so there is nothing to gain by splitting
     /// them — and a `Node` is large enough that a variant holding one inline
@@ -163,13 +173,13 @@ impl DbWrite {
 /// — several fsyncs' worth — and nothing about that needs the maps frozen. The
 /// write still happens synchronously on this thread before the caller proceeds,
 /// so a read that follows a mutation still sees it.
-pub(crate) struct StateGuard<'a> {
+pub struct StateGuard<'a> {
     guard: Option<pdfs_core::lockrank::RankedGuard<'a, State>>,
     db: &'a Arc<Db>,
 }
 
 impl<'a> StateGuard<'a> {
-    pub(crate) fn new(guard: pdfs_core::lockrank::RankedGuard<'a, State>, db: &'a Arc<Db>) -> Self {
+    pub fn new(guard: pdfs_core::lockrank::RankedGuard<'a, State>, db: &'a Arc<Db>) -> Self {
         Self {
             guard: Some(guard),
             db,
@@ -214,8 +224,8 @@ impl State {
     /// first and then applies them, which is the whole point. A test driving a
     /// bare `State` has no guard, so it calls this where the daemon would have
     /// dropped one.
-    #[cfg(test)]
-    pub(crate) fn flush_outbox(&mut self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn flush_outbox(&mut self) {
         let db = self.db.clone();
         for write in std::mem::take(&mut self.outbox) {
             write.apply(&db);
@@ -228,15 +238,15 @@ impl State {
     /// which in the daemon is the state after the guard dropped. Handing back an
     /// owned `Arc` rather than a borrow keeps it usable inside an `assert_eq!`
     /// that also touches `st`.
-    #[cfg(test)]
-    pub(crate) fn flushed_db(&mut self) -> Arc<Db> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn flushed_db(&mut self) -> Arc<Db> {
         self.flush_outbox();
         self.db.clone()
     }
 
     /// A fresh, empty tree over `db`. A node's inode comes from its local id
     /// ([`lid_ino`]).
-    pub(crate) fn new(db: Arc<Db>, share_access: HashMap<NodeUid, Access>) -> Self {
+    pub fn new(db: Arc<Db>, share_access: HashMap<NodeUid, Access>) -> Self {
         Self {
             entries: HashMap::new(),
             by_uid: HashMap::new(),
@@ -259,7 +269,7 @@ impl State {
     /// may have left for it is dropped. A node already in the tree keeps its
     /// inode and its lookups, and stops naming a parent: a session's `..` at
     /// its root is the root.
-    pub(crate) fn install_root(&mut self, root: Node) -> u64 {
+    pub fn install_root(&mut self, root: Node) -> u64 {
         if let Err(e) = self.db.upsert_node(&root) {
             warn!(uid = %root.uid, error = %e, "db upsert root failed");
         }
@@ -298,7 +308,7 @@ impl State {
     /// can outlive their dentries for open-handle and access-revocation
     /// semantics, so `by_uid` membership alone is not proof that a
     /// control-socket operation may address the node.
-    pub(crate) fn owns_visible_uid(&self, uid: &NodeUid, roots: &[u64]) -> bool {
+    pub fn owns_visible_uid(&self, uid: &NodeUid, roots: &[u64]) -> bool {
         let Some(&target) = self.by_uid.get(uid) else {
             return false;
         };
@@ -344,22 +354,23 @@ impl State {
         }
     }
 
-    pub(crate) fn require_writable(&self, ino: u64) -> Result<(), fuser::Errno> {
+    /// Whether the node at `ino` may be written.
+    pub fn require_writable(&self, ino: u64) -> Result<(), NodeError> {
         match self.entries.get(&ino) {
             Some(entry) if entry.writable() => Ok(()),
-            Some(_) => Err(fuser::Errno::EACCES),
-            None => Err(fuser::Errno::ENOENT),
+            Some(_) => Err(NodeError::NotWritable),
+            None => Err(NodeError::NotFound),
         }
     }
 
-    pub(crate) fn access_by_uid(&self, uid: &NodeUid) -> Option<Access> {
+    pub fn access_by_uid(&self, uid: &NodeUid) -> Option<Access> {
         self.by_uid
             .get(uid)
             .and_then(|ino| self.entries.get(ino))
             .map(|entry| entry.access)
     }
 
-    pub(crate) fn take_access_changes(&mut self) -> Vec<u64> {
+    pub fn take_access_changes(&mut self) -> Vec<u64> {
         self.access_changes.drain().collect()
     }
 
@@ -368,7 +379,7 @@ impl State {
     /// Used to decide how a node with no resolvable parent is classified:
     /// our own volume fails open (it is owned content), a foreign volume
     /// fails closed (it can only be there because of a share).
-    pub(crate) fn is_own_volume(&self, uid: &NodeUid) -> bool {
+    pub fn is_own_volume(&self, uid: &NodeUid) -> bool {
         self.roots.iter().any(|ino| {
             self.entries
                 .get(ino)
@@ -380,7 +391,7 @@ impl State {
         self.share_access.get(uid).copied()
     }
 
-    pub(crate) fn access_for_node(&mut self, parent: u64, node: &Node) -> Access {
+    pub fn access_for_node(&mut self, parent: u64, node: &Node) -> Access {
         let parent_access = self
             .entries
             .get(&parent)
@@ -411,8 +422,8 @@ impl State {
     /// `share_access`. P3 can call this method only when its share-root endpoint
     /// explicitly observed a role; explicit absence or an unknown wire role is
     /// represented by `None` and fails closed to Viewer.
-    #[cfg(test)]
-    pub(crate) fn record_observed_share_root_role(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_observed_share_root_role(
         &mut self,
         uid: &NodeUid,
         role: Option<MemberRole>,
@@ -451,12 +462,7 @@ impl State {
     /// Install access already committed atomically with the root node. Unlike
     /// the observation hook this performs no database write and cannot swallow
     /// a publication failure.
-    pub(crate) fn intern_published_share_root(
-        &mut self,
-        parent: u64,
-        node: Node,
-        access: Access,
-    ) -> u64 {
+    pub fn intern_published_share_root(&mut self, parent: u64, node: Node, access: Access) -> u64 {
         self.share_access.insert(node.uid.clone(), access);
         self.intern_mem_with_access(parent, node, access)
     }
@@ -465,7 +471,7 @@ impl State {
     /// resident inode or persisted authority. Open handles remain usable for
     /// reads, while removing the root's cached listing guarantees a later
     /// reappearance re-enumerates descendants instead of exposing stale rows.
-    pub(crate) fn hide_shared_root(&mut self, uid: &NodeUid) -> Vec<u64> {
+    pub fn hide_shared_root(&mut self, uid: &NodeUid) -> Vec<u64> {
         let changed = self.downgrade_shared_subtree(uid);
         self.hide_subtree_mem(uid);
         changed
@@ -473,7 +479,7 @@ impl State {
 
     /// Withdraw a foreign child removed by its authoritative folder listing.
     /// Authority is retained because this is content deletion, not access loss.
-    pub(crate) fn hide_foreign_subtree(&mut self, uid: &NodeUid) {
+    pub fn hide_foreign_subtree(&mut self, uid: &NodeUid) {
         self.hide_subtree_mem(uid);
     }
 
@@ -539,7 +545,7 @@ impl State {
     ///
     /// This intentionally ignores nested authorities: losing access to an
     /// outer tree must not leave a cached inner entry writable.
-    pub(crate) fn downgrade_shared_subtree(&mut self, uid: &NodeUid) -> Vec<u64> {
+    pub fn downgrade_shared_subtree(&mut self, uid: &NodeUid) -> Vec<u64> {
         self.share_access.insert(uid.clone(), Access::Viewer);
         let Some(&root) = self.by_uid.get(uid) else {
             return Vec::new();
@@ -566,7 +572,7 @@ impl State {
     /// Downgrade resident shared subtrees identified by persisted authority,
     /// live membership, or already-inherited non-owner access. Owned and device
     /// entries remain `Owner`.
-    pub(crate) fn downgrade_known_shared_access(&mut self) -> Vec<u64> {
+    pub fn downgrade_known_shared_access(&mut self) -> Vec<u64> {
         for access in self.share_access.values_mut() {
             *access = Access::Viewer;
         }
@@ -607,7 +613,7 @@ impl State {
 
     /// Rebuild effective access after cold hydration. The memo makes each
     /// parent edge resolve once, then every child is a direct inheritance.
-    pub(crate) fn hydrate_access(&mut self) {
+    pub fn hydrate_access(&mut self) {
         fn resolve(
             state: &State,
             ino: u64,
@@ -723,11 +729,11 @@ impl State {
     }
 
     /// Write `node` through as it is, in order with the tree's other changes.
-    pub(crate) fn write_through(&mut self, node: Node) {
+    pub fn write_through(&mut self, node: Node) {
         self.outbox.push(DbWrite::Upsert(vec![node]));
     }
 
-    pub(crate) fn intern(&mut self, parent: u64, mut node: Node) -> u64 {
+    pub fn intern(&mut self, parent: u64, mut node: Node) -> u64 {
         self.keep_revision_mtime(&mut node);
         self.outbox.push(DbWrite::Upsert(vec![node.clone()]));
         self.intern_mem(parent, node)
@@ -778,7 +784,7 @@ impl State {
     /// Allocate (or reuse) a stable inode for a node, updating the hot-cache maps
     /// only. Every caller owes the DB a write-through — see the callers below;
     /// the split exists so a batch can pay for one transaction instead of `n`.
-    pub(crate) fn intern_mem(&mut self, parent: u64, node: Node) -> u64 {
+    pub fn intern_mem(&mut self, parent: u64, node: Node) -> u64 {
         let access = self.access_for_node(parent, &node);
         self.intern_mem_with_access(parent, node, access)
     }
@@ -845,7 +851,7 @@ impl State {
     fn new_inos(&mut self, nodes: &[&Node]) -> HashMap<NodeUid, u64> {
         let (virtual_nodes, stored): (Vec<&Node>, Vec<&Node>) = nodes
             .iter()
-            .partition(|node| crate::r#virtual::is_virtual_uid(&node.uid));
+            .partition(|node| crate::ids::is_virtual_uid(&node.uid));
         let mut inos = match self.db.lids_for(&stored) {
             Ok(lids) => stored
                 .iter()
@@ -873,7 +879,7 @@ impl State {
     }
 
     /// Decrement lookup count for an inode and prune if lookup_count == 0 && open_count == 0 && unlinked.
-    pub(crate) fn forget_lookup(&mut self, ino: u64, nlookup: u64) -> Option<(u64, String)> {
+    pub fn forget_lookup(&mut self, ino: u64, nlookup: u64) -> Option<(u64, String)> {
         if let Some(entry) = self.entries.get_mut(&ino) {
             entry.lookup_count = entry.lookup_count.saturating_sub(nlookup);
             if entry.lookup_count == 0 && entry.open_count == 0 && entry.unlinked {
@@ -893,7 +899,7 @@ impl State {
     /// queues it. Taking the remote's size shrank a SQLite database to its empty
     /// create while SQLite held it open, and the kernel then capped every read
     /// at that size (docs/BUGS.md B109).
-    pub(crate) fn keep_open_write_size(&self, ino: u64, node: &mut Node) {
+    pub fn keep_open_write_size(&self, ino: u64, node: &mut Node) {
         let (Some(aw), Some(entry)) = (self.open.writer(ino), self.entries.get(&ino)) else {
             return;
         };
@@ -903,7 +909,7 @@ impl State {
         }
     }
 
-    pub(crate) fn intern_from_db(&mut self, parent: u64, node: Node) -> u64 {
+    pub fn intern_from_db(&mut self, parent: u64, node: Node) -> u64 {
         self.intern_mem(parent, node)
     }
 
@@ -912,8 +918,8 @@ impl State {
     ///
     /// This is what keeps `ls` on a large folder quick: one commit for the
     /// listing, rather than one autocommit — and one fsync — per child.
-    #[cfg(test)]
-    pub(crate) fn intern_batch(&mut self, parent: u64, nodes: Vec<Node>) -> Vec<u64> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn intern_batch(&mut self, parent: u64, nodes: Vec<Node>) -> Vec<u64> {
         self.intern_batch_with_inos(parent, nodes, HashMap::new())
     }
 
@@ -922,7 +928,7 @@ impl State {
     /// is a write transaction, and under the lock every inline handler of
     /// every mount waited for it (`docs/BUGS.md` B221). A node missing from
     /// `inos` still gets one here.
-    pub(crate) fn intern_batch_with_inos(
+    pub fn intern_batch_with_inos(
         &mut self,
         parent: u64,
         mut nodes: Vec<Node>,
@@ -953,12 +959,12 @@ impl State {
     /// Record `uid`'s listing as complete once the lock is released, after the
     /// rows of its children: written the other way round, a crash between the
     /// two left a folder marked complete with no children to show.
-    pub(crate) fn record_listed(&mut self, uid: NodeUid) {
+    pub fn record_listed(&mut self, uid: NodeUid) {
         self.outbox.push(DbWrite::SetListed(uid, true));
     }
 
     /// Check if a directory inode has any child nodes in memory or in the database.
-    pub(crate) fn has_children(&self, parent: u64) -> bool {
+    pub fn has_children(&self, parent: u64) -> bool {
         // A resident listing is authoritative even when empty. Falling through
         // from `Some([])` to SQLite lets an obsolete child row contradict the
         // listing `ensure_children` just established, so readdir says empty but
@@ -975,7 +981,7 @@ impl State {
     }
 
     /// Check if `ancestor_ino` is `target_ino` or an ancestor of `target_ino` (for rename cycle prevention).
-    pub(crate) fn is_ancestor_of(&self, ancestor_ino: u64, mut target_ino: u64) -> bool {
+    pub fn is_ancestor_of(&self, ancestor_ino: u64, mut target_ino: u64) -> bool {
         if ancestor_ino == target_ino {
             return true;
         }
@@ -996,7 +1002,7 @@ impl State {
 
     /// Forget a node or, if open handles exist (open_count > 0), mark it unlinked
     /// and remove it from parent children so lookups fail while open reads succeed.
-    pub(crate) fn forget_or_unlink(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
+    pub fn forget_or_unlink(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
         if let Some(&ino) = self.by_uid.get(uid)
             && let Some(entry) = self.entries.get_mut(&ino)
             && entry.open_count > 0
@@ -1013,7 +1019,7 @@ impl State {
     /// Remove a dentry while retaining both open inode state and the persisted
     /// node row. Queued trash needs the row as drain-time authority; if the node
     /// is open, POSIX also requires its inode to survive until the final close.
-    pub(crate) fn unlink_mem(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
+    pub fn unlink_mem(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
         if let Some(&ino) = self.by_uid.get(uid)
             && let Some(entry) = self.entries.get_mut(&ino)
             && entry.open_count > 0
@@ -1031,7 +1037,7 @@ impl State {
     /// listing, its slot in its parent's listing, and its DB row. Returns
     /// `(parent_ino, name)` when the node was known, so the caller can notify
     /// the kernel.
-    pub(crate) fn forget(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
+    pub fn forget(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
         self.outbox.push(DbWrite::Delete(uid.clone()));
         self.forget_mem(uid)
     }
@@ -1040,7 +1046,7 @@ impl State {
     ///
     /// A queued trash uses the row as its drain-time access authority and only
     /// deletes it after the remote mutation lands.
-    pub(crate) fn forget_mem(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
+    pub fn forget_mem(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
         let ino = self.by_uid.remove(uid)?;
         let entry = self.entries.remove(&ino)?;
         self.children.remove(&ino);
@@ -1058,7 +1064,7 @@ impl State {
     /// server did. A queued rename cannot: re-enumerating needs the network, and
     /// the server has not been told yet in any case — so this *is* the tree's
     /// new truth until the op drains.
-    pub(crate) fn rename_in_place(
+    pub fn rename_in_place(
         &mut self,
         ino: u64,
         new_parent: u64,
@@ -1106,7 +1112,7 @@ impl State {
     /// trimmed from the hot cache but still `listed` in the DB is exactly the
     /// case that needs invalidating — returning early there would leave
     /// `ensure_children` free to rebuild the stale listing from disk.
-    pub(crate) fn invalidate_listing(&mut self, ino: u64) {
+    pub fn invalidate_listing(&mut self, ino: u64) {
         self.children.remove(&ino);
         if let Some(e) = self.entries.get(&ino) {
             let uid = e.uid.clone();
@@ -1136,7 +1142,7 @@ impl State {
     /// entry TTL expires. Keeping the inode keeps the kernel's dentry valid.
     ///
     /// A pure rename (`from == to`) invalidates that one directory once.
-    pub(crate) fn relocate(
+    pub fn relocate(
         &mut self,
         ino: u64,
         from_parent: u64,
@@ -1153,7 +1159,7 @@ impl State {
 
     /// Update a file entry's recorded plaintext size so `getattr` reflects an
     /// in-progress write before the new revision is sealed.
-    pub(crate) fn set_size(&mut self, ino: u64, size: u64) {
+    pub fn set_size(&mut self, ino: u64, size: u64) {
         if let Some(e) = self.entries.get_mut(&ino)
             && let NodeKind::File { claimed_size, .. } = &mut e.node.kind
         {
@@ -1162,7 +1168,7 @@ impl State {
     }
 
     /// Update a file entry's modification time (epoch seconds).
-    pub(crate) fn touch_mtime(&mut self, ino: u64, secs: i64) {
+    pub fn touch_mtime(&mut self, ino: u64, secs: i64) {
         if let Some(e) = self.entries.get_mut(&ino) {
             e.node.modification_time = secs;
         }
@@ -1182,7 +1188,7 @@ impl State {
     /// failure has to be reported, not logged. Dropping the row silently means
     /// the daemon acknowledged a write and then serves the old size for it, so
     /// the caller has to be able to turn it into a failed `release`.
-    pub(crate) fn record_pending_write(&mut self, ino: u64, size: u64, mtime: i64) -> Option<Node> {
+    pub fn record_pending_write(&mut self, ino: u64, size: u64, mtime: i64) -> Option<Node> {
         self.set_size(ino, size);
         self.touch_mtime(ino, mtime);
         self.entries.get(&ino).map(|e| e.node.clone())
@@ -1192,7 +1198,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfs_vfs::open::{Intervals, WriteHandle};
+    use crate::open::{Intervals, WriteHandle};
     use proton_drive_rs::ShareMembership;
     use proton_drive_rs::proton_sdk::ids::{LinkId, ShareId, ShareMembershipId, VolumeId};
     use std::fs::File;
@@ -1201,7 +1207,7 @@ mod tests {
     #[test]
     fn an_inode_gives_back_the_lid_it_was_made_from() {
         assert_eq!(ino_lid(lid_ino(7)), Some(7));
-        assert_eq!(ino_lid(crate::ROOT_INO), None);
+        assert_eq!(ino_lid(crate::ids::ROOT_INO), None);
         assert_eq!(ino_lid(FALLBACK_INO + 3), None);
     }
 
@@ -1314,7 +1320,7 @@ mod tests {
         st.flush_outbox();
         let db = st.db.clone();
         assert_ne!(inos[0], inos[1]);
-        assert!(!inos.contains(&crate::ROOT_INO));
+        assert!(!inos.contains(&crate::ids::ROOT_INO));
 
         let mut other = State::new(db.clone(), HashMap::new());
         assert_eq!(other.intern(0, node("b", "root", "b.txt", false)), inos[1]);
@@ -1649,11 +1655,17 @@ mod tests {
         assert_eq!(st.entries[&child].access, Access::Viewer);
         assert_eq!(st.entries[&leaf].access, Access::Viewer);
         assert_eq!(
-            st.require_writable(shared).unwrap_err().code(),
-            libc::EACCES
+            st.require_writable(shared).unwrap_err(),
+            NodeError::NotWritable
         );
-        assert_eq!(st.require_writable(child).unwrap_err().code(), libc::EACCES);
-        assert_eq!(st.require_writable(leaf).unwrap_err().code(), libc::EACCES);
+        assert_eq!(
+            st.require_writable(child).unwrap_err(),
+            NodeError::NotWritable
+        );
+        assert_eq!(
+            st.require_writable(leaf).unwrap_err(),
+            NodeError::NotWritable
+        );
         assert!(st.require_writable(owned_root).is_ok());
     }
 
@@ -1669,24 +1681,24 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, node)| {
-                let ino = crate::ROOT_INO + i as u64;
+                let ino = crate::ids::ROOT_INO + i as u64;
                 st.by_uid.insert(node.uid.clone(), ino);
                 ino
             })
             .collect();
-        st.next_ino = crate::ROOT_INO + nodes.len() as u64;
-        st.roots.insert(crate::ROOT_INO);
+        st.next_ino = crate::ids::ROOT_INO + nodes.len() as u64;
+        st.roots.insert(crate::ids::ROOT_INO);
         // Reverse order so entries are inserted before their parents, matching
         // the hydration path's non-topological materialization.
         for (i, node) in nodes.iter().enumerate().rev() {
             let ino = inos[i];
-            let parent = if ino == crate::ROOT_INO {
-                crate::ROOT_INO
+            let parent = if ino == crate::ids::ROOT_INO {
+                crate::ids::ROOT_INO
             } else {
                 node.parent_uid
                     .as_ref()
                     .and_then(|p| st.by_uid.get(p).copied())
-                    .unwrap_or(crate::ORPHAN_INO)
+                    .unwrap_or(crate::ids::ORPHAN_INO)
             };
             st.entries.insert(
                 ino,
@@ -1753,7 +1765,10 @@ mod tests {
         assert_eq!(st.entries[&inos[0]].access, Access::Owner);
         for ino in &inos[1..] {
             assert_eq!(st.entries[ino].access, Access::Unknown);
-            assert_eq!(st.require_writable(*ino).unwrap_err().code(), libc::EACCES);
+            assert_eq!(
+                st.require_writable(*ino).unwrap_err(),
+                NodeError::NotWritable
+            );
         }
     }
 
@@ -1776,7 +1791,10 @@ mod tests {
         assert_eq!(st.entries[&inos[0]].access, Access::Owner);
         for ino in &inos[1..] {
             assert_eq!(st.entries[ino].access, Access::Viewer);
-            assert_eq!(st.require_writable(*ino).unwrap_err().code(), libc::EACCES);
+            assert_eq!(
+                st.require_writable(*ino).unwrap_err(),
+                NodeError::NotWritable
+            );
         }
     }
 
@@ -1796,7 +1814,10 @@ mod tests {
 
         for ino in [shared, child, leaf] {
             assert_eq!(st.entries[&ino].access, Access::Viewer);
-            assert_eq!(st.require_writable(ino).unwrap_err().code(), libc::EACCES);
+            assert_eq!(
+                st.require_writable(ino).unwrap_err(),
+                NodeError::NotWritable
+            );
         }
         assert_eq!(
             st.flushed_db().share_access(&uid("shared")).unwrap(),
@@ -1943,7 +1964,10 @@ mod tests {
         assert!(!st.entries.contains_key(&shared));
         assert_eq!(st.entries[&child].access, Access::Viewer);
         assert_eq!(st.entries[&leaf].access, Access::Viewer);
-        assert_eq!(st.require_writable(leaf).unwrap_err().code(), libc::EACCES);
+        assert_eq!(
+            st.require_writable(leaf).unwrap_err(),
+            NodeError::NotWritable
+        );
         assert_eq!(
             st.flushed_db().effective_node_access(&uid("leaf")).unwrap(),
             Some(Access::Viewer)
@@ -1988,7 +2012,10 @@ mod tests {
 
         assert_eq!(st.entries[&child].access, Access::Viewer);
         assert_eq!(st.entries[&leaf].access, Access::Viewer);
-        assert_eq!(st.require_writable(leaf).unwrap_err().code(), libc::EACCES);
+        assert_eq!(
+            st.require_writable(leaf).unwrap_err(),
+            NodeError::NotWritable
+        );
     }
 
     #[test]
@@ -2084,13 +2111,13 @@ mod tests {
         assert_eq!(st.entries[&ino].node.name, "b.txt");
         // A listing that leaves the size out still describes revision r1.
         let mut bare = at_revision(file.clone(), "r1", 170);
-        assert_eq!(crate::node_size(&st.entries[&ino].node), 7);
+        assert_eq!(pdfs_drive::node_size(&st.entries[&ino].node), 7);
         if let NodeKind::File { claimed_size, .. } = &mut bare.kind {
             *claimed_size = None;
         }
         st.intern(root, bare);
         assert_eq!(st.entries[&ino].node.modification_time, 100);
-        assert_eq!(crate::node_size(&st.entries[&ino].node), 7);
+        assert_eq!(pdfs_drive::node_size(&st.entries[&ino].node), 7);
         st.intern(root, at_revision(file, "r2", 200));
         assert_eq!(st.entries[&ino].node.modification_time, 200);
     }
@@ -2126,12 +2153,12 @@ mod tests {
 
         // The remote still holds the empty file the create sealed.
         st.intern(0, node("file", "root", "workload.db", false));
-        assert_eq!(crate::node_size(&st.entries[&ino].node), 16384);
+        assert_eq!(pdfs_drive::node_size(&st.entries[&ino].node), 16384);
         assert_eq!(st.entries[&ino].node.modification_time, 500);
 
         // Once the handle is gone the remote is authoritative again.
         st.open.remove_writer(ino);
         st.intern(0, node("file", "root", "workload.db", false));
-        assert_eq!(crate::node_size(&st.entries[&ino].node), 0);
+        assert_eq!(pdfs_drive::node_size(&st.entries[&ino].node), 0);
     }
 }

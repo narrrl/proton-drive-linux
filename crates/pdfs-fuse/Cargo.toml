@@ -42,6 +42,7 @@ notify = "8"
 parking_lot.workspace = true
 
 [dev-dependencies]
+pdfs-vfs = { workspace = true, features = ["test-support"] }
 pdfs-drive = { workspace = true, features = ["sim"] }
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -9,9 +9,15 @@ repository.workspace = true
 homepage.workspace = true
 description = "The mounted-files service of the Proton Drive Linux client, without a kernel adapter"
 
+[features]
+# Helpers that let other crates' tests build and inspect a tree.
+test-support = []
+
 [dependencies]
+pdfs-core.workspace = true
 pdfs-drive.workspace = true
 pdfs-store.workspace = true
 proton-drive-rs.workspace = true
 libc.workspace = true
+tracing.workspace = true
 

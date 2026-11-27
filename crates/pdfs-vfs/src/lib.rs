@@ -6,8 +6,12 @@
 //! kernel. Nothing in this crate knows about `fuser` or errno: the FUSE
 //! adapter in `pdfs-fuse` maps the typed errors at the boundary.
 //!
-//! The first slice is the open file ([`open`]): the scratch file a handle
-//! writes into, which bytes of it are authored, and the released write that
-//! waits for its upload.
+//! So far it holds the tree ([`tree`]): the nodes a mount shows, their
+//! stable inode numbers, and the per-mount roots; and the open files
+//! ([`open`]): the scratch file a handle writes into, which bytes of it are
+//! authored, the released write that waits for its upload, and directory
+//! handles.
 
+pub mod ids;
 pub mod open;
+pub mod tree;

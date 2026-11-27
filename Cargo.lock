@@ -3806,9 +3806,11 @@ name = "pdfs-vfs"
 version = "3.10.0"
 dependencies = [
  "libc",
+ "pdfs-core",
  "pdfs-drive",
  "pdfs-store",
  "proton-drive-rs",
+ "tracing",
 ]
 
 [[package]]

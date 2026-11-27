@@ -133,7 +133,7 @@ mod trash;
 use pdfs_core::shutdown;
 #[cfg(test)]
 mod sim;
-mod state;
+pub(crate) use pdfs_vfs::tree as state;
 mod supervisor;
 mod sweep;
 mod sync;
@@ -345,13 +345,15 @@ const LOCAL_INDEX_TTL: Duration = Duration::from_secs(15 * 60);
 /// How often the scanner thread wakes to check whether the index went stale.
 const LOCAL_INDEX_CHECK: Duration = Duration::from_secs(60);
 
-/// The FUSE root inode is always 1.
-const ROOT_INO: u64 = 1;
+use pdfs_vfs::ids::{ORPHAN_INO, ROOT_INO};
 
-/// Parent inode for a persisted node whose parent row is missing from the DB.
-/// No folder carries this inode, so such a node is listed by nobody and stays
-/// inert until a live enumeration re-parents it.
-const ORPHAN_INO: u64 = 0;
+/// The errno the kernel gets for a node the tree refused.
+fn node_errno(error: pdfs_vfs::tree::NodeError) -> Errno {
+    match error {
+        pdfs_vfs::tree::NodeError::NotFound => Errno::ENOENT,
+        pdfs_vfs::tree::NodeError::NotWritable => Errno::EACCES,
+    }
+}
 
 /// Extended attribute exposing the small server-side thumbnail of a file.
 const XATTR_THUMBNAIL: &str = "user.proton.thumbnail";
@@ -893,7 +895,7 @@ impl Core {
     }
 
     fn require_writable(&self, ino: u64) -> Result<(), Errno> {
-        self.state().require_writable(ino)
+        self.state().require_writable(ino).map_err(node_errno)
     }
 
     /// Mutation admission point. Persisted and every resident authority must
