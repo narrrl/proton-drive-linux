@@ -200,28 +200,59 @@ that grows into hours: it is network-bound, while the local walk only reads the 
   `a_pass_lists_only_the_folders_changed_on_drive` (sim: an edit, a new folder with a folder
   in it, and a deletion arrive, and a folder nothing changed in is never listed).
 
-What a quiet pass still costs: loading the baseline and the picture from the database, and the
-local walk. The local dirty set removes the local walk.
+What a quiet pass still costs: loading the baseline and the picture from the database. The local
+dirty set takes the place of the local walk, as described below.
 
 ## Root reducer as built
 
-The states above are first built as a check. `pdfs_sync::root` holds one reducer per mirror
-folder. `step(state, input)` is pure: the passes, the watcher, the event stream and pause are
-inputs, so a sequence of inputs replays exactly.
+`pdfs_sync::root` holds one reducer per mirror folder. `step(state, input)` is pure: the passes,
+the watcher, the event stream and pause are inputs, so a sequence of inputs replays exactly.
 
-| State | Meaning |
+| Phase | Meaning |
 |---|---|
 | Discovering | No pass over the folder has finished yet. |
-| Following | A pass covered the whole folder, and nothing since says a change went unreported. |
-| Auditing | A doubt arrived: a watcher error, an overflowed queue, a gap in Drive's event stream, a restart or a suspension. Only a pass over the whole folder ends it. |
+| Following | Passes covered the whole folder, and nothing since says a change went unreported. |
+| Auditing | A doubt arrived, and the side it is about has not been walked in full since. |
 | Suspended | The local root is missing, or the folder is paused. |
 | Draining | A switch to on-demand is queued, and passes only push. |
 | HandedOff | The folder is on-demand. Going back to a mirror starts discovery again. |
 
-Nothing acts on the state yet: every pass still covers the whole folder, so a finished pass
-always returns the folder to Following. The engine logs each transition as `sync: root state`,
-so the reducer can be compared with what the engine did. Once a Following folder plans from its
-dirty sets alone, the state decides which passes must walk everything.
+A doubt is about one side, since the disk and Drive are followed by different things that fail
+on their own. The state keeps, for each side, the first doubt not yet answered (`Owed`):
+
+| Doubt | Side | Where it comes from |
+|---|---|---|
+| FirstSync | both | A folder no pass has walked, or one that is a mirror again. |
+| Restart | disk | The daemon started: nothing watched the disk while it was down. Drive's event stream resumes from its cursor. |
+| WatchLost | disk | A watcher error, or a root that went missing and took its watch with it. |
+| Overflow | disk | The watcher's queue overflowed. |
+| EventGap | Drive | The event stream reported `ContinuityLost`. |
+| Pushed | Drive | A switch to on-demand was called off; the push passes dropped the picture of Drive. |
+
+A pause owes nothing by itself: the watcher and the event stream keep running for a paused
+folder. A doubt that arrives while a folder is suspended is kept for when it comes back.
+
+**Acted on:** a pass asks the state what it owes before it walks. A side that is owed is walked
+in full: the disk without the kept walk, and Drive without the saved picture (a walk an earlier
+pass cut short still resumes). The pass reports which sides it walked in full
+(`Outcome::walked_in_full`), and only those answer a doubt. A pass from the dirty sets keeps a
+Following folder Following.
+
+The checks a pass made before (a trusted claim, a fresh event stream, the audit intervals) still
+apply on top: the state can make a pass walk more, never less. Today each doubt also breaks one
+of those checks, so the state adds no full walks except after a missing root. When the state is
+what forces a walk, the journal says `the root state asks for a walk of the whole disk` or `of
+all of Drive`.
+
+A root that goes missing loses its watch, and one made again in its place is a new folder the
+old watch does not see. The engine drops the watch when it finds the root missing, and sets it
+up again on the first pass that finds the root back. Until then the disk is owed a full walk.
+
+**Tests:** the `root::tests` unit tests (a doubt per side, a restart, a suspension, a handoff),
+`a_restart_walks_the_disk_in_full_and_not_drive` (sim: the first pass after a restart walks the
+disk and reuses the picture of Drive), and `a_root_made_again_is_watched_again` (sim: a file
+written in a root moved away and made again reaches Drive within a minute; it fails without the
+new watch).
 
 ## Plan of work (separate PRs)
 
@@ -230,14 +261,31 @@ dirty sets alone, the state decides which passes must walk everything.
    - Left: per-subtree apply, once a round-level guard exists. A resumable local walk matters
      less now that the local walk is the only full walk left, and is cheap next to Drive.
 2. **Remote dirty set.** Done, described above.
-3. **Local dirty set.**
-   - Done, as a check: the watcher marks each path an event names in `LocalDirty` (in memory).
-     A pass claims the marks, and retires them once it applied everything it found. A claim is
-     trusted when the watch was live since the last pass claimed; a watcher error, an overflow or
-     a restart breaks that. Each pass still walks the whole folder, and counts the changes it
-     found that a trusted claim did not cover (`missed local changes` in the trace).
-   - Left: once that count stays at zero, a trusted claim stands in for the local walk, and
-     only the marked folders are read.
+3. **Local dirty set.** Done:
+   - The watcher marks each path an event names in `LocalDirty` (in memory): the path, with
+     what is under it, and the folder it is in. A pass claims the marks before it looks at the
+     disk, so a change made while it looks stays marked for the next pass, and retires them once
+     it applied everything it found. A claim is trusted when the watch was live since the last
+     pass claimed; a watcher error, an overflow or a restart breaks that.
+   - A pass keeps what it found on disk (`LocalWalk`) for the next one, unless it changed the
+     disk itself (a download, a conflict copy, a folder made or removed), failed a step, deferred
+     a file or could not read a path. Its own changes are marked only once the watcher reports
+     them, which may come after the next pass claims, so that pass walks in full instead.
+   - The next pass with a trusted claim, the same ignore rules (`IgnoreRules::source`) and a
+     full walk less than an hour old starts from the kept walk (`local reused` in the trace).
+     It lists each marked folder again, walks each marked path again with what is under it, and
+     reads again each file that was open for writing. Everything else is taken as it was.
+   - A full walk with a trusted claim still counts the changes the claim did not cover
+     (`missed local changes`). It runs at least once an hour, and after anything that breaks
+     the trust.
+   - A mark that was missed delays a change until the next full walk. It cannot lose one: a
+     download and a local deletion check the file on disk against what the pass planned from
+     before they act, and a path missing from the kept walk is one a walk found gone.
+   - **Tests:** the `rewalk` unit tests in `mirror.rs` (each kind of change, ignored folders, a
+     mark that came before its folder's, a file that was open for writing), and
+     `a_trusted_local_dirty_set_stands_in_for_the_walk` (sim: an edit, a new folder, a deletion
+     and a folder moved in reach Drive through reused walks; it fails with the watcher's marks
+     switched off).
 4. **Step scheduler.** Replace `run_burst` and the per-pass lock with steps and priorities.
 5. **Drop the 120 s poll** for the daily audit, once 2 and 3 have run for a release with the
    poll still on, and traces show the dirty sets catch everything the poll finds.

@@ -19,8 +19,9 @@ use tracing::{debug, warn};
 
 use super::model::{LocalItem, LocalSig, system_mtime, system_mtime_ns};
 use super::planner::{
-    Unscanned, conflict_path_with_suffix, filter_baseline, join_rel, rel_to_path,
+    Unscanned, conflict_path_with_suffix, filter_baseline, join_rel, parent_rel, rel_to_path,
 };
+use crate::local_dirty::Claim;
 
 /// A local file's identity and content SHA-1, both read from one descriptor,
 /// or `None` when it is gone. The identity is taken after the hash, so a file
@@ -270,88 +271,269 @@ pub(super) fn walk_local_dir(
     let entries = std::fs::read_dir(dir).map_err(io(format!("read {}", dir.display())))?;
     for entry in entries {
         let entry = entry.map_err(io(format!("read entry in {}", dir.display())))?;
-        let path = entry.path();
-        let stripped = path.strip_prefix(root).map_err(|e| {
-            ScanError::Failed(format!(
-                "local path {} escaped sync root {}: {e}",
-                path.display(),
-                root.display()
-            ))
-        })?;
-        let Some(rel) = stripped.to_str() else {
-            // Nothing can be keyed by this name: not the baseline, which only
-            // ever held paths this scan produced, and not Drive, whose names are
-            // UTF-8. Leaving it out cannot read as a deletion of anything.
-            warn!(path = %path.display(), "sync: name is not valid UTF-8; leaving it out of the pass");
-            unscanned.unreadable(
-                stripped.to_string_lossy().into_owned(),
-                "name is not valid UTF-8",
-            );
-            continue;
-        };
-        // Ignore our own in-flight download temp files.
-        if rel.contains(".pdfs-tmp-") {
+        walk_local_entry(root, &entry.path(), rules, writing, out, unscanned, scanned)?;
+    }
+    Ok(())
+}
+
+/// Collect one entry of the local tree, at `path`, into `out`: a file, or a
+/// folder with everything under it. What cannot be read goes to `unscanned`,
+/// as in [`walk_local_tree`].
+pub(super) fn walk_local_entry(
+    root: &Path,
+    path: &Path,
+    rules: &IgnoreRules,
+    writing: &HashSet<PathBuf>,
+    out: &mut HashMap<String, LocalItem>,
+    unscanned: &mut Unscanned,
+    scanned: &mut dyn FnMut(&str),
+) -> Result<(), ScanError> {
+    let stripped = path.strip_prefix(root).map_err(|e| {
+        ScanError::Failed(format!(
+            "local path {} escaped sync root {}: {e}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    let Some(rel) = stripped.to_str() else {
+        // Nothing can be keyed by this name: not the baseline, which only
+        // ever held paths this scan produced, and not Drive, whose names are
+        // UTF-8. Leaving it out cannot read as a deletion of anything.
+        warn!(path = %path.display(), "sync: name is not valid UTF-8; leaving it out of the pass");
+        unscanned.unreadable(
+            stripped.to_string_lossy().into_owned(),
+            "name is not valid UTF-8",
+        );
+        return Ok(());
+    };
+    // Ignore our own in-flight download temp files.
+    if rel.contains(".pdfs-tmp-") {
+        return Ok(());
+    }
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        // Gone since the listing, or in a folder that lists but does not
+        // allow `stat`. Either way this pass cannot say what it is.
+        Err(error) => {
+            let what = format!("stat {}", path.display());
+            return leave_out(rel, ScanError::Io { what, error }, unscanned);
+        }
+    };
+    // Ignored paths are dropped here as well as from the classification
+    // union — not for correctness (the union filter is what makes this
+    // safe) but so an ignored `node_modules/` is never descended into or
+    // counted against scan progress.
+    if rules.is_ignored(rel, meta.is_dir()) {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        out.insert(
+            rel.to_string(),
+            LocalItem {
+                is_dir: true,
+                mtime: 0,
+                mtime_ns: None,
+                size: 0,
+                open_for_write: false,
+            },
+        );
+        scanned(rel);
+        if let Err(failure) = walk_local_dir(root, path, rules, writing, out, unscanned, scanned) {
+            leave_out(rel, failure, unscanned)?;
+            // What the folder did list before failing goes with it: a
+            // half-read folder is as unknown as an unread one.
+            let prefix = format!("{rel}/");
+            out.retain(|k, _| k != rel && !k.starts_with(&prefix));
+        }
+    } else if meta.is_file() {
+        // Check whether any process holds this file open for writing.
+        // The canonical path is used because /proc/*/fd links resolve
+        // to canonical targets.
+        let ofw = std::fs::canonicalize(path)
+            .map(|canon| writing.contains(&canon))
+            .unwrap_or(false);
+        out.insert(
+            rel.to_string(),
+            LocalItem {
+                is_dir: false,
+                mtime: system_mtime(&meta),
+                mtime_ns: system_mtime_ns(&meta),
+                size: meta.len() as i64,
+                open_for_write: ofw,
+            },
+        );
+        scanned(rel);
+    }
+    Ok(())
+}
+
+/// Bring `items`, a walk of `root` that an earlier pass kept, up to date with
+/// what `claim` reports changed since, instead of walking the whole tree:
+///
+/// - each folder whose direct children changed is listed again: a child gone
+///   from it goes with everything under it, a child that is new or no longer
+///   the same kind is walked, and a subfolder still there keeps what the
+///   earlier walk found under it;
+/// - each path that changed in full is walked again, with what is under it;
+/// - each file that was open for writing is read again, since closing it is
+///   not a change the watcher reports.
+///
+/// Everything else stands as the earlier walk found it. That is only sound
+/// for a claim that is trusted, of a walk taken before it, with the same
+/// ignore rules: see `local_dirty`.
+pub(super) fn rewalk_local_tree(
+    root: &Path,
+    rules: &IgnoreRules,
+    writing: &HashSet<PathBuf>,
+    claim: &Claim,
+    items: &mut HashMap<String, LocalItem>,
+    unscanned: &mut Unscanned,
+    scanned: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let walked = |rel: &str, items: &HashMap<String, LocalItem>| {
+        rel.is_empty() || items.get(rel).is_some_and(|item| item.is_dir)
+    };
+    // A path whose folder the earlier walk did not find (a mark that came
+    // before its folder's, or one in an ignored folder) is walked from the
+    // nearest folder it did find.
+    let anchored = |mut rel: String, items: &HashMap<String, LocalItem>| {
+        while !walked(parent_rel(&rel), items) {
+            rel = parent_rel(&rel).to_string();
+        }
+        rel
+    };
+    // Paths walked again in full.
+    let mut again: Vec<String> = claim
+        .deep()
+        .map(str::to_string)
+        .chain(
+            items
+                .iter()
+                .filter(|(_, item)| item.open_for_write)
+                .map(|(rel, _)| rel.clone()),
+        )
+        .map(|rel| anchored(rel, items))
+        .collect();
+    if again.iter().any(String::is_empty) {
+        items.clear();
+        return walk_local_tree(root, rules, writing, items, unscanned, scanned);
+    }
+    let mut folders: Vec<&str> = claim.shallow().collect();
+    folders.sort_by_key(|dir| (dir.matches('/').count(), *dir));
+    let mut children: HashMap<&str, Vec<String>> =
+        folders.iter().map(|dir| (*dir, Vec::new())).collect();
+    for rel in items.keys() {
+        if let Some(of) = children.get_mut(parent_rel(rel)) {
+            of.push(rel.clone());
+        }
+    }
+    // Subtrees to drop from the earlier walk before walking anything again.
+    let mut dropped: HashSet<String> = again.iter().cloned().collect();
+    for dir in folders {
+        if !walked(dir, items) {
+            // Not a folder the earlier walk found: new, ignored, or no
+            // longer a folder. It is walked in full.
+            let rel = anchored(dir.to_string(), items);
+            dropped.insert(rel.clone());
+            again.push(rel);
             continue;
         }
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            // Gone since the listing, or in a folder that lists but does not
-            // allow `stat`. Either way this pass cannot say what it is.
+        let path = root.join(rel_to_path(dir));
+        let listing = std::fs::read_dir(&path).and_then(|entries| {
+            entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<PathBuf>>>()
+        });
+        let listing = match listing {
+            Ok(listing) => listing,
+            Err(error) if dir.is_empty() => {
+                return Err(format!("read {}: {error}", path.display()));
+            }
             Err(error) => {
-                let what = format!("stat {}", path.display());
-                leave_out(rel, ScanError::Io { what, error }, unscanned)?;
+                dropped.insert(dir.to_string());
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    let what = format!("read {}", path.display());
+                    leave_out(dir, ScanError::Io { what, error }, unscanned)
+                        .map_err(|e| e.to_string())?;
+                }
                 continue;
             }
         };
-        // Ignored paths are dropped here as well as from the classification
-        // union — not for correctness (the union filter is what makes this
-        // safe) but so an ignored `node_modules/` is never descended into or
-        // counted against scan progress.
-        if rules.is_ignored(rel, meta.is_dir()) {
-            continue;
-        }
-        if meta.is_dir() {
-            out.insert(
-                rel.to_string(),
-                LocalItem {
-                    is_dir: true,
-                    mtime: 0,
-                    mtime_ns: None,
-                    size: 0,
-                    open_for_write: false,
-                },
-            );
-            scanned(rel);
-            if let Err(failure) =
-                walk_local_dir(root, &path, rules, writing, out, unscanned, scanned)
-            {
-                leave_out(rel, failure, unscanned)?;
-                // What the folder did list before failing goes with it: a
-                // half-read folder is as unknown as an unread one.
-                let prefix = format!("{rel}/");
-                out.retain(|k, _| k != rel && !k.starts_with(&prefix));
+        let mut present: HashSet<String> = HashSet::with_capacity(listing.len());
+        for child in listing {
+            let Some(rel) = child
+                .strip_prefix(root)
+                .ok()
+                .and_then(|rel| rel.to_str())
+                .map(str::to_string)
+            else {
+                // Walked again, so a name that cannot be keyed is reported
+                // as a full walk reports it.
+                again.push(dir.to_string());
+                dropped.insert(dir.to_string());
+                break;
+            };
+            let still_a_folder = items.get(&rel).is_some_and(|item| item.is_dir)
+                && std::fs::symlink_metadata(&child).is_ok_and(|meta| meta.is_dir());
+            if !still_a_folder {
+                dropped.insert(rel.clone());
+                again.push(rel.clone());
             }
-        } else if meta.is_file() {
-            // Check whether any process holds this file open for writing.
-            // The canonical path is used because /proc/*/fd links resolve
-            // to canonical targets.
-            let ofw = std::fs::canonicalize(&path)
-                .map(|canon| writing.contains(&canon))
-                .unwrap_or(false);
-            out.insert(
-                rel.to_string(),
-                LocalItem {
-                    is_dir: false,
-                    mtime: system_mtime(&meta),
-                    mtime_ns: system_mtime_ns(&meta),
-                    size: meta.len() as i64,
-                    open_for_write: ofw,
-                },
-            );
-            scanned(rel);
+            present.insert(rel);
+        }
+        for rel in &children[dir] {
+            if !present.contains(rel) {
+                dropped.insert(rel.clone());
+            }
         }
     }
+    items.retain(|rel, _| !under_any(rel, &dropped));
+    again.sort_by_key(|rel| (rel.matches('/').count(), rel.clone()));
+    again.dedup();
+    let mut walked_again: HashSet<String> = HashSet::new();
+    for rel in again {
+        if under_any(&rel, &walked_again) {
+            continue;
+        }
+        let path = root.join(rel_to_path(&rel));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                walk_local_entry(root, &path, rules, writing, items, unscanned, scanned)
+                    .map_err(|e| e.to_string())?;
+            }
+            // Gone since it was marked, or its folder is no longer one:
+            // nothing to find.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                let what = format!("stat {}", path.display());
+                leave_out(&rel, ScanError::Io { what, error }, unscanned)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        walked_again.insert(rel);
+    }
     Ok(())
+}
+
+/// Whether `rel` is one of `roots` or lies under one.
+fn under_any(rel: &str, roots: &HashSet<String>) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    let mut at = rel;
+    loop {
+        if roots.contains(at) {
+            return true;
+        }
+        match at.rfind('/') {
+            Some(i) => at = &at[..i],
+            None => return false,
+        }
+    }
 }
 
 /// Why the mirror copy at `rel` holds something Proton Drive does not, or

@@ -146,6 +146,15 @@ pub struct Outcome {
     /// The first step that failed in this pass, so the line that ends a pass
     /// in `error` says why without a search back through the journal.
     pub first_error: Option<String>,
+    /// Changes the pass made on disk itself: files downloaded, conflict
+    /// copies kept, folders made, and files and folders removed. Not part of
+    /// the summary, which counts them by kind; a pass that made any does not
+    /// keep its walk for the next one (`local_dirty`).
+    pub local_changes: usize,
+    /// Which sides the pass walked in full, rather than bringing the last
+    /// walk up to date from the dirty set: the disk, and Drive. The root
+    /// state counts a side covered only after a walk in full (`root`).
+    pub walked_in_full: (bool, bool),
 }
 
 impl Outcome {
@@ -162,8 +171,14 @@ impl Outcome {
         match applied {
             Applied::Dir(..) => self.created += 1,
             Applied::Uploaded => self.uploaded += 1,
-            Applied::Downloaded => self.downloaded += 1,
-            Applied::Conflict => self.conflicts += 1,
+            Applied::Downloaded => {
+                self.downloaded += 1;
+                self.local_changes += 1;
+            }
+            Applied::Conflict => {
+                self.conflicts += 1;
+                self.local_changes += 1;
+            }
             Applied::Vanished | Applied::Adopted => {}
         }
     }
