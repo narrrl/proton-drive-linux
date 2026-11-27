@@ -148,10 +148,18 @@ pub enum Count {
     /// Paths on disk taken from the last pass's walk, which a trusted claim
     /// of the local dirty set keeps up to date, instead of walked again.
     LocalReused,
+    /// Effects sent again that a stopped daemon had sent and not heard back
+    /// from: each may have happened already (`effect`).
+    UnsureResent,
+    /// Effects sent again after they failed.
+    Retried,
+    /// Unsettled effects of earlier passes that this pass looked at and no
+    /// longer sent.
+    Superseded,
 }
 
 impl Count {
-    const ALL: [Count; 14] = [
+    const ALL: [Count; 17] = [
         Count::LocalEntries,
         Count::RemoteFolders,
         Count::Nodes,
@@ -166,6 +174,9 @@ impl Count {
         Count::LocalUntrusted,
         Count::MissedLocal,
         Count::LocalReused,
+        Count::UnsureResent,
+        Count::Retried,
+        Count::Superseded,
     ];
 
     fn name(self) -> &'static str {
@@ -184,6 +195,9 @@ impl Count {
             Count::LocalUntrusted => "local dirty untrusted",
             Count::MissedLocal => "missed local changes",
             Count::LocalReused => "local reused",
+            Count::UnsureResent => "unsure resent",
+            Count::Retried => "retried",
+            Count::Superseded => "superseded",
         }
     }
 }

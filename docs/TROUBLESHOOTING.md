@@ -327,6 +327,11 @@ What the parts mean:
   A `sync: root state` line in the journal says when a folder's state changes, for example
   `from=following to=auditing (local: Overflow)`: the side named is walked in full by the next
   pass, which takes the folder back to `following`.
+  **`unsure resent`** counts effects sent again that a daemon stopped before it heard back
+  from; the apply step checks whether each already landed before it sends it. **`retried`**
+  counts effects sent again after a failure, and **`superseded`** counts unsettled effects of
+  earlier passes that were no longer needed. A `sync: an effect keeps failing` line names an
+  upload, download or folder that failed five times in a row.
 
 Please include these lines when you report a slow folder.
 

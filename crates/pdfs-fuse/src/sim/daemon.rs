@@ -2115,6 +2115,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An effect a daemon sent and never heard back from is `unsure` at the
+    /// next start. One the folder still needs is sent again, and settles; one
+    /// it no longer needs is settled by the first pass that looks (`effect`).
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn an_effect_left_unsure_by_a_stop_is_sent_again_or_settled() {
+        take_logged();
+        let drive = FakeDrive::new();
+        let dir = scratch("unsure-effect");
+        let (daemon, folder, client) = start_mirror(&drive, &dir, &[("a.txt", b"one")]);
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        // What a daemon killed while it sent two uploads leaves: one landed
+        // (a.txt is on Drive), the other never went out.
+        let sent = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 10;
+        let db = reopen(&dir);
+        db.sync_intent_issue(folder, "a.txt", "upload", sent)
+            .unwrap();
+        db.sync_intent_issue(folder, "new.txt", "upload", sent)
+            .unwrap();
+        drop(db);
+        std::fs::write(dir.join("local").join("new.txt"), b"new").unwrap();
+        take_logged();
+        let daemon = Daemon::start(&dir, client).unwrap();
+        assert!(wait_until(Duration::from_secs(60), || drive
+            .lookup("mirrored/new.txt")
+            .is_some()));
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        let logged = take_logged();
+        let has = |text: &str| logged.iter().any(|line| line.contains(text));
+        assert!(
+            has("effects=2") && has("did not hear back from"),
+            "{logged:#?}"
+        );
+        assert!(
+            has("sending again an effect a stopped daemon may have made"),
+            "{logged:#?}"
+        );
+        assert!(
+            has("an effect a stopped daemon may have made is no longer needed"),
+            "{logged:#?}"
+        );
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        assert!(
+            reopen(&dir).sync_intents(Some(folder)).unwrap().is_empty(),
+            "every intent settled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A restart owes the disk a walk in full, since nothing watched it
     /// meanwhile, and owes Drive nothing: its event stream resumes from the
     /// cursor (`root`).

@@ -11,9 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **50**. New tables save a mirror folder's walk of Proton Drive (48). A finished walk is
+Schema: **51**. New tables save a mirror folder's walk of Proton Drive (48). A finished walk is
 kept, with a list of the folders that changed on Proton Drive since (49). Each mirror folder
-counts the deletions it made in the last day (50).
+counts the deletions it made in the last day (50). Each upload, download or folder a mirror pass
+sends is recorded until its result is in (51).
 
 ### Added
 - **`pdfs diagnostics` says which of the daemon's background services are running.** If one

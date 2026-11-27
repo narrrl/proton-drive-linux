@@ -20,6 +20,7 @@ use pdfs_store::db::{DeleteWindow, StoredSyncEntry};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 
+pub mod effect;
 pub mod evidence;
 pub mod local_dirty;
 pub mod mirror;

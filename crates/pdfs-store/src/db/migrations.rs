@@ -11,7 +11,7 @@ use super::Db;
 use pdfs_core::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 50;
+pub(super) const SCHEMA_VERSION: i64 = 51;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -551,6 +551,16 @@ impl Db {
             )?;
             if has_folders {
                 tx.execute_batch(MIGRATION_V50)?;
+            }
+        }
+        if current < 51 {
+            let has_folders: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_folder'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )?;
+            if has_folders {
+                tx.execute_batch(MIGRATION_V51)?;
             }
         }
         tx.execute(
@@ -1582,6 +1592,38 @@ CREATE TRIGGER sync_delete_window_drop_on_folder_delete
 AFTER DELETE ON sync_folder
 BEGIN
   DELETE FROM sync_delete_window WHERE folder_id = OLD.id;
+END;
+";
+
+/// Schema v51: an intent for each effect a mirror pass sends, written before
+/// it is sent and removed once its result is in (`docs/SYNC_ENGINE.md`).
+///
+/// One row a folder, path and kind of effect. A row left `issued` was sent by
+/// a daemon that stopped before it heard back: the effect may or may not have
+/// happened. A change to what the folder is, or its removal, drops its rows.
+const MIGRATION_V51: &str = "
+CREATE TABLE IF NOT EXISTS sync_intent (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  folder_id  INTEGER NOT NULL,
+  rel_path   TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  state      TEXT NOT NULL,
+  attempts   INTEGER NOT NULL,
+  issued_at  INTEGER NOT NULL,
+  last_error TEXT,
+  UNIQUE (folder_id, rel_path, kind)
+);
+DROP TRIGGER IF EXISTS sync_intent_drop_on_folder_update;
+DROP TRIGGER IF EXISTS sync_intent_drop_on_folder_delete;
+CREATE TRIGGER sync_intent_drop_on_folder_update
+AFTER UPDATE OF local_path, remote_uid, mode ON sync_folder
+BEGIN
+  DELETE FROM sync_intent WHERE folder_id = OLD.id;
+END;
+CREATE TRIGGER sync_intent_drop_on_folder_delete
+AFTER DELETE ON sync_folder
+BEGIN
+  DELETE FROM sync_intent WHERE folder_id = OLD.id;
 END;
 ";
 

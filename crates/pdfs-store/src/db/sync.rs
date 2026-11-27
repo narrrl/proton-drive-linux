@@ -19,6 +19,23 @@ pub struct DeleteWindow {
     pub deleted: u64,
 }
 
+/// An effect a mirror pass sent, or is about to send, and has not settled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredIntent {
+    pub id: i64,
+    pub folder_id: i64,
+    pub rel_path: String,
+    /// What the effect does, such as `upload` or `download`.
+    pub kind: String,
+    /// Where it stands, as the effect reducer names it.
+    pub state: String,
+    /// How many times it was sent, this time included.
+    pub attempts: u32,
+    /// When it was last sent, in seconds since the epoch.
+    pub issued_at: i64,
+    pub last_error: Option<String>,
+}
+
 /// What a mirror pass has walked of Drive, saved so a pass cut short
 /// resumes the walk instead of listing every folder again (B294), and so a
 /// finished walk serves as the next pass's picture of Drive.
@@ -828,6 +845,116 @@ impl Db {
         Ok(())
     }
 
+    /// Record that an effect is about to be sent: a new intent in state
+    /// `issued`, or the one already there for the same folder, path and kind,
+    /// sent once more. Returns the intent as it is now, and the state it was
+    /// in before, if there was one.
+    pub fn sync_intent_issue(
+        &self,
+        folder_id: i64,
+        rel_path: &str,
+        kind: &str,
+        now: i64,
+    ) -> Result<(StoredIntent, Option<String>)> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let before: Option<String> = tx
+            .query_row(
+                "SELECT state FROM sync_intent WHERE folder_id = ?1 AND rel_path = ?2 AND kind = ?3",
+                params![folder_id, rel_path, kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute(
+            "INSERT INTO sync_intent (folder_id, rel_path, kind, state, attempts, issued_at)
+             VALUES (?1, ?2, ?3, 'issued', 1, ?4)
+             ON CONFLICT(folder_id, rel_path, kind) DO UPDATE SET state = 'issued',
+               attempts = attempts + 1, issued_at = excluded.issued_at",
+            params![folder_id, rel_path, kind, now],
+        )?;
+        let intent = tx.query_row(
+            &format!(
+                "SELECT {INTENT_COLUMNS} FROM sync_intent
+                 WHERE folder_id = ?1 AND rel_path = ?2 AND kind = ?3"
+            ),
+            params![folder_id, rel_path, kind],
+            intent_row,
+        )?;
+        tx.commit()?;
+        Ok((intent, before))
+    }
+
+    /// Settle an intent whose effect is done: the row goes.
+    pub fn sync_intent_settle(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM sync_intent WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Move an intent to `state`, with the error that put it there.
+    pub fn sync_intent_set(&self, id: i64, state: &str, error: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE sync_intent SET state = ?2, last_error = ?3 WHERE id = ?1",
+            params![id, state, error],
+        )?;
+        Ok(())
+    }
+
+    /// Every intent not settled, oldest first; only `folder_id`'s when given.
+    pub fn sync_intents(&self, folder_id: Option<i64>) -> Result<Vec<StoredIntent>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {INTENT_COLUMNS} FROM sync_intent
+             WHERE ?1 IS NULL OR folder_id = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt
+            .query_map(params![folder_id], intent_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Move every intent in state `from` to `to`, across all folders.
+    /// Returns how many moved.
+    pub fn sync_intents_move(&self, from: &str, to: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "UPDATE sync_intent SET state = ?2 WHERE state = ?1",
+            params![from, to],
+        )?)
+    }
+
+    /// Settle the intents of `folder_id` in one of `states` that were last
+    /// sent before `before`: a pass that started after them looked at their
+    /// paths and did not send them again. Returns the intents settled.
+    pub fn sync_intents_settle_before(
+        &self,
+        folder_id: i64,
+        states: &[&str],
+        before: i64,
+    ) -> Result<Vec<StoredIntent>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut settled = Vec::new();
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {INTENT_COLUMNS} FROM sync_intent
+                 WHERE folder_id = ?1 AND issued_at < ?2 ORDER BY id"
+            ))?;
+            for row in stmt.query_map(params![folder_id, before], intent_row)? {
+                let row = row?;
+                if states.contains(&row.state.as_str()) {
+                    settled.push(row);
+                }
+            }
+        }
+        for intent in &settled {
+            tx.execute("DELETE FROM sync_intent WHERE id = ?1", params![intent.id])?;
+        }
+        tx.commit()?;
+        Ok(settled)
+    }
+
     /// Drop the entire baseline for a folder. Used when flipping ondemand→mirror:
     /// the local tree was evicted, so the old baseline is stale and would make the
     /// next reconcile mistake "locally deleted" for "must re-download". Clearing it
@@ -840,6 +967,22 @@ impl Db {
         )?;
         Ok(())
     }
+}
+
+const INTENT_COLUMNS: &str =
+    "id, folder_id, rel_path, kind, state, attempts, issued_at, last_error";
+
+fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIntent> {
+    Ok(StoredIntent {
+        id: row.get(0)?,
+        folder_id: row.get(1)?,
+        rel_path: row.get(2)?,
+        kind: row.get(3)?,
+        state: row.get(4)?,
+        attempts: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(u32::MAX),
+        issued_at: row.get(6)?,
+        last_error: row.get(7)?,
+    })
 }
 
 fn clear_walk(tx: &rusqlite::Transaction<'_>, folder_id: i64) -> Result<()> {

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use pdfs_core::Result;
 use pdfs_store::db::{
-    Db, DeleteWindow, SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder,
+    Db, DeleteWindow, SavedWalk, SavedWalkItem, StoredIntent, StoredSyncEntry, StoredSyncFolder,
 };
 
 /// The sync tables, as the mirror engine uses them.
@@ -80,6 +80,34 @@ pub trait SyncStore: Send + Sync {
     fn sync_delete_window(&self, folder_id: i64) -> Result<Option<DeleteWindow>>;
     /// Record the folder's deletion window.
     fn sync_delete_window_set(&self, folder_id: i64, window: &DeleteWindow) -> Result<()>;
+
+    // The intent of each effect sent (`effect`).
+
+    /// Record that an effect is about to be sent; returns the intent and the
+    /// state it was in before, if any.
+    fn sync_intent_issue(
+        &self,
+        folder_id: i64,
+        rel_path: &str,
+        kind: &str,
+        now: i64,
+    ) -> Result<(StoredIntent, Option<String>)>;
+    /// Drop a settled intent.
+    fn sync_intent_settle(&self, id: i64) -> Result<()>;
+    /// Move an intent to `state`, with the error that put it there.
+    fn sync_intent_set(&self, id: i64, state: &str, error: Option<&str>) -> Result<()>;
+    /// Every intent not settled; only `folder_id`'s when given.
+    fn sync_intents(&self, folder_id: Option<i64>) -> Result<Vec<StoredIntent>>;
+    /// Move every intent in state `from` to `to`.
+    fn sync_intents_move(&self, from: &str, to: &str) -> Result<usize>;
+    /// Settle the intents of `folder_id` in one of `states` last sent before
+    /// `before`.
+    fn sync_intents_settle_before(
+        &self,
+        folder_id: i64,
+        states: &[&str],
+        before: i64,
+    ) -> Result<Vec<StoredIntent>>;
 }
 
 impl SyncStore for Db {
@@ -154,6 +182,35 @@ impl SyncStore for Db {
     fn sync_delete_window_set(&self, folder_id: i64, window: &DeleteWindow) -> Result<()> {
         Db::sync_delete_window_set(self, folder_id, window)
     }
+    fn sync_intent_issue(
+        &self,
+        folder_id: i64,
+        rel_path: &str,
+        kind: &str,
+        now: i64,
+    ) -> Result<(StoredIntent, Option<String>)> {
+        Db::sync_intent_issue(self, folder_id, rel_path, kind, now)
+    }
+    fn sync_intent_settle(&self, id: i64) -> Result<()> {
+        Db::sync_intent_settle(self, id)
+    }
+    fn sync_intent_set(&self, id: i64, state: &str, error: Option<&str>) -> Result<()> {
+        Db::sync_intent_set(self, id, state, error)
+    }
+    fn sync_intents(&self, folder_id: Option<i64>) -> Result<Vec<StoredIntent>> {
+        Db::sync_intents(self, folder_id)
+    }
+    fn sync_intents_move(&self, from: &str, to: &str) -> Result<usize> {
+        Db::sync_intents_move(self, from, to)
+    }
+    fn sync_intents_settle_before(
+        &self,
+        folder_id: i64,
+        states: &[&str],
+        before: i64,
+    ) -> Result<Vec<StoredIntent>> {
+        Db::sync_intents_settle_before(self, folder_id, states, before)
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +273,20 @@ mod tests {
         );
         store.sync_remote_dirty_consume(id, dirty[0].0).unwrap();
         assert!(store.sync_remote_dirty(id).unwrap().is_empty());
+
+        let (intent, _) = store.sync_intent_issue(id, "a.txt", "upload", 1).unwrap();
+        store.sync_intent_set(intent.id, "retry", None).unwrap();
+        assert_eq!(store.sync_intents(Some(id)).unwrap()[0].state, "retry");
+        assert_eq!(store.sync_intents_move("retry", "blocked").unwrap(), 1);
+        assert_eq!(
+            store
+                .sync_intents_settle_before(id, &["blocked"], 2)
+                .unwrap()
+                .len(),
+            1
+        );
+        let (intent, _) = store.sync_intent_issue(id, "a.txt", "upload", 3).unwrap();
+        store.sync_intent_settle(intent.id).unwrap();
+        assert!(store.sync_intents(None).unwrap().is_empty());
     }
 }

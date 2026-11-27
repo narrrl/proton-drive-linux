@@ -307,6 +307,19 @@ impl Pending {
         }
     }
 
+    /// The kind of effect its intent records (`effect`).
+    pub fn intent(&self) -> &'static str {
+        match self {
+            Pending::CreateDir { .. } => "create-folder",
+            Pending::UploadNew { .. } => "upload",
+            Pending::UploadRevision { .. } => "upload-revision",
+            Pending::Download { .. } => "download",
+            Pending::Adopt { .. } => "adopt",
+            Pending::Conflict { .. } => "conflict",
+            Pending::PushConflict { .. } => "push-conflict",
+        }
+    }
+
     /// The activity line's detail, which distinguishes ops that share a kind.
     pub fn detail(&self) -> &'static str {
         match self {

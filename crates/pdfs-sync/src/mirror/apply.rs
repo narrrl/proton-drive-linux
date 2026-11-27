@@ -134,6 +134,105 @@ impl Syncer {
         Ok(())
     }
 
+    /// Write the intent of `op` before it is sent (`effect`). In shadow: a
+    /// failure to write it is logged, and the op is sent anyway.
+    fn issue_intent(&self, folder_id: i64, op: &Pending) -> Option<StoredIntent> {
+        let (intent, before) = match self.store.sync_intent_issue(
+            folder_id,
+            op.rel(),
+            op.intent(),
+            now_secs(),
+        ) {
+            Ok(issued) => issued,
+            Err(e) => {
+                debug!(id = folder_id, rel = op.rel(), error = ?e, "sync: cannot record an intent");
+                return None;
+            }
+        };
+        match before.as_deref().and_then(EffectState::from_name) {
+            // Sent by a daemon that stopped before it heard back. The apply
+            // step's own checks tell whether it landed (B266, B39).
+            Some(EffectState::Unsure) => {
+                self.trace_count(Count::UnsureResent, 1);
+                info!(
+                    id = folder_id,
+                    rel = op.rel(),
+                    kind = op.intent(),
+                    attempts = intent.attempts,
+                    "sync: sending again an effect a stopped daemon may have made"
+                );
+            }
+            Some(EffectState::Retry | EffectState::Blocked) => {
+                self.trace_count(Count::Retried, 1);
+            }
+            _ => {}
+        }
+        Some(intent)
+    }
+
+    /// Settle or keep `intent` by how its op ended.
+    fn settle_intent(&self, intent: &StoredIntent, op: &Pending, result: &Result<Applied, String>) {
+        let written = match result {
+            Ok(_) => self.store.sync_intent_settle(intent.id),
+            Err(e) => {
+                let state = effect::failed(intent.attempts);
+                if state == EffectState::Blocked && intent.state != EffectState::Blocked.name() {
+                    warn!(
+                        id = intent.folder_id,
+                        rel = op.rel(),
+                        kind = op.intent(),
+                        attempts = intent.attempts,
+                        error = %e,
+                        "sync: an effect keeps failing"
+                    );
+                }
+                self.store.sync_intent_set(intent.id, state.name(), Some(e))
+            }
+        };
+        if let Err(e) = written {
+            debug!(id = intent.folder_id, rel = op.rel(), error = ?e, "sync: cannot settle an intent");
+        }
+    }
+
+    /// Settle the intents of `folder_id` that a pass begun at `began` did
+    /// not send again, though it looked at every path: what they were for has
+    /// changed, or is done.
+    pub(super) fn supersede_intents(&self, folder_id: i64, began: i64) {
+        let states = [
+            EffectState::Unsure.name(),
+            EffectState::Retry.name(),
+            EffectState::Blocked.name(),
+        ];
+        match self
+            .store
+            .sync_intents_settle_before(folder_id, &states, began)
+        {
+            Ok(settled) => {
+                self.trace_count(Count::Superseded, settled.len());
+                for intent in settled {
+                    let level_info = intent.state == EffectState::Unsure.name();
+                    if level_info {
+                        info!(
+                            id = folder_id,
+                            rel = %intent.rel_path,
+                            kind = %intent.kind,
+                            "sync: an effect a stopped daemon may have made is no longer needed"
+                        );
+                    } else {
+                        debug!(
+                            id = folder_id,
+                            rel = %intent.rel_path,
+                            kind = %intent.kind,
+                            state = %intent.state,
+                            "sync: an effect is no longer needed"
+                        );
+                    }
+                }
+            }
+            Err(e) => debug!(id = folder_id, error = ?e, "sync: cannot settle intents"),
+        }
+    }
+
     /// Whether a removal of `folder_id` is waiting for its running pass.
     pub(super) fn pass_abandoned(&self, folder_id: i64) -> bool {
         self.abandon.lock().contains(&folder_id)
@@ -150,9 +249,13 @@ impl Syncer {
         op: Pending,
     ) -> Result<Applied, String> {
         self.progress_started(folder_id, base_name(op.rel()));
+        let intent = self.issue_intent(folder_id, &op);
         let step = Instant::now();
         let result = self.apply_one(folder_id, local_root, &op).await;
         self.trace_call(op.call(), step.elapsed());
+        if let Some(intent) = intent {
+            self.settle_intent(&intent, &op, &result);
+        }
         self.progress_finished(folder_id);
         let name = base_name(op.rel());
         match &result {
