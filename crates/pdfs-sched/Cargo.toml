@@ -1,0 +1,13 @@
+[package]
+name = "pdfs-sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Admission of background work for the Proton Drive Linux client"
+
+[dependencies]
+tokio.workspace = true

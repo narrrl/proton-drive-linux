@@ -520,6 +520,7 @@ pub(crate) fn mount_with(
         unscanned: Arc::default(),
         abandon: Arc::default(),
         events_read_at: Arc::new(AtomicI64::new(0)),
+        admission: Arc::new(pdfs_sched::Bounded::new(sync::SYNC_CONCURRENCY)),
     };
     let state = Arc::new(Ranked::new(
         Rank::State,
