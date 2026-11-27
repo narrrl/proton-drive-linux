@@ -539,6 +539,81 @@ mod tests {
         assert!(uploads.count >= 1);
     }
 
+    /// How often the daemon has asked Drive for the children of a folder.
+    fn children_listed(daemon: &Daemon) -> u64 {
+        let Ok(Response::Diagnostics { diagnostics }) = daemon.request(&Request::Diagnostics)
+        else {
+            panic!("no diagnostics");
+        };
+        diagnostics
+            .drive_calls
+            .iter()
+            .find(|stat| stat.call == "enumerate_folder_children_node_uids")
+            .map_or(0, |stat| stat.count)
+    }
+
+    fn listing_load(daemon: &Daemon) -> control::AdmissionLoad {
+        let Ok(Response::Diagnostics { diagnostics }) = daemon.request(&Request::Diagnostics)
+        else {
+            panic!("no diagnostics");
+        };
+        diagnostics
+            .admission
+            .into_iter()
+            .find(|load| load.class == "listing")
+            .expect("the admission reports cold listings")
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn callers_that_find_a_folder_unlisted_at_once_share_one_listing() {
+        // Each caller used to ask Drive for the folder itself, and all but
+        // the first threw the answer away. Now the first lists it, through
+        // the daemon's admission, and the others wait for that listing.
+        let drive = FakeDrive::new();
+        let cold = drive.device().mkdir("cold");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            drive
+                .device()
+                .write(&format!("cold/{name}"), name.as_bytes());
+        }
+        let dir = scratch("cold-listing-flight");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let listed = |daemon: &Daemon| match daemon.request(&Request::ListDir {
+            path: "cold".into(),
+        }) {
+            Ok(Response::Entries { entries }) => {
+                let mut names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+                names.sort();
+                names
+            }
+            other => panic!("listing cold: {other:?}"),
+        };
+        // The mount root is listed first, so the only listing held is cold's.
+        let _ = std::fs::read_dir(&daemon.mountpoint).unwrap().count();
+
+        let before = children_listed(&daemon);
+        let held = daemon.client.hold_next_children_of(&cold);
+        std::thread::scope(|scope| {
+            let callers: Vec<_> = (0..4).map(|_| scope.spawn(|| listed(&daemon))).collect();
+            assert!(wait_until(Duration::from_secs(10), || held.reached()));
+            // Give the others time to find the folder unlisted too.
+            std::thread::sleep(Duration::from_millis(500));
+            let load = listing_load(&daemon);
+            assert_eq!((load.running, load.waiting), (1, 0), "{load:?}");
+            drop(held);
+            for caller in callers {
+                assert_eq!(caller.join().unwrap(), ["a.txt", "b.txt", "c.txt"]);
+            }
+        });
+        assert_eq!(children_listed(&daemon) - before, 1);
+        let load = listing_load(&daemon);
+        assert_eq!(load.running, 0, "{load:?}");
+        assert!(load.admitted >= 1, "{load:?}");
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_daemon_on_the_fake_drive_syncs_both_ways() {
@@ -1956,6 +2031,9 @@ mod tests {
         let first = traced_pass(&daemon, folder, |t| calls(t, "upload") > 0)
             .expect("the first pass is traced");
         assert_eq!(calls(&first, "upload"), 3);
+        // Each upload waited for the daemon's admission first, and the time
+        // in line is its own entry, apart from the time on the network.
+        assert_eq!(calls(&first, "admission wait"), 3, "{first}");
         assert_eq!(counted(&first, "local entries"), 3);
         assert!(counted(&first, "remote folders") >= 1);
         for phase in ["baseline", "local walk", "remote walk", "apply"] {
@@ -1969,6 +2047,17 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("sync: pass trace"))
         );
+        let Ok(Response::Diagnostics { diagnostics }) = daemon.request(&Request::Diagnostics)
+        else {
+            panic!("no diagnostics");
+        };
+        let mirror = diagnostics
+            .admission
+            .iter()
+            .find(|load| load.class == "mirror")
+            .expect("the admission reports mirror steps");
+        assert!(mirror.admitted >= 3, "{mirror:?}");
+        assert_eq!((mirror.running, mirror.waiting), (0, 0), "{mirror:?}");
 
         // Drive does not list a node it has just made at once, so the read
         // back after an upload has no revision id to record. The next pass

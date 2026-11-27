@@ -91,6 +91,9 @@ pub struct SyncParts {
     pub local_dirty: Arc<crate::local_dirty::LocalDirty>,
     /// What each mirror folder's sync knows about its coverage (`root`).
     pub roots: Arc<crate::root::Roots>,
+    /// When each step of a pass may start: its uploads, downloads and folder
+    /// creations.
+    pub admission: Arc<dyn pdfs_sched::Admission>,
 }
 
 impl SyncParts {
