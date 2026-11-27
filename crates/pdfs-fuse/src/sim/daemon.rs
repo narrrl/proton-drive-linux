@@ -2025,8 +2025,9 @@ mod tests {
 
     /// A sync root moved away and made again in its place is a new folder
     /// on disk, which the old watch does not see. The engine watches it again
-    /// once it is back, so a file written in it later still reaches Drive
-    /// without waiting for the hourly walk (`root`).
+    /// once it is back, and walks it once more after, so a file written in
+    /// it as the watch was set up still reaches Drive without waiting for the
+    /// poll (`root`).
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_root_made_again_is_watched_again() {
@@ -2058,6 +2059,48 @@ mod tests {
                 line.contains("from=suspended (RootMissing)") && line.contains("to=following")
             })
         }));
+        // Written as that pass ends, which may be before the watch is set up
+        // again: the event is then lost, and only the pass the new watch
+        // brings about finds the file. Nothing else asks for one, and the
+        // poll is two minutes off.
+        std::fs::write(local.join("c.txt"), b"three").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(60), || drive
+                .lookup("mirrored/c.txt")
+                .is_some()),
+            "a file written in the root made again reaches Drive"
+        );
+        assert!(drive.lookup("mirrored/a.txt").is_some());
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sync root replaced between two passes is never seen missing, and
+    /// the watch stays on the folder moved away. The pass sees the root is
+    /// another folder, and the engine watches the new one (`root`).
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_root_replaced_between_passes_is_watched_again() {
+        take_logged();
+        let drive = FakeDrive::new();
+        let dir = scratch("root-replaced");
+        let (daemon, folder, _client) =
+            start_mirror(&drive, &dir, &[("a.txt", b"one"), ("b.txt", b"two")]);
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        let local = dir.join("local");
+        let away = dir.join("away");
+        std::fs::rename(&local, &away).unwrap();
+        std::fs::create_dir(&local).unwrap();
+        for name in ["a.txt", "b.txt"] {
+            std::fs::copy(away.join(name), local.join(name)).unwrap();
+        }
+        take_logged();
+        let _ = daemon.request(&Request::SyncNow { id: Some(folder) });
+        assert!(wait_until(Duration::from_secs(30), || {
+            take_logged()
+                .iter()
+                .any(|line| line.contains("the folder's root was replaced"))
+        }));
         quiet_pass(&daemon, folder).expect("a quiet pass is traced");
         std::fs::write(local.join("c.txt"), b"three").unwrap();
         // Only the watch can bring this pass about: the poll is two minutes
@@ -2066,9 +2109,8 @@ mod tests {
             wait_until(Duration::from_secs(60), || drive
                 .lookup("mirrored/c.txt")
                 .is_some()),
-            "a file written in the root made again reaches Drive"
+            "a file written in the root put in place reaches Drive"
         );
-        assert!(drive.lookup("mirrored/a.txt").is_some());
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
