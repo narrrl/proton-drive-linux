@@ -39,7 +39,7 @@ use sha1::{Digest as _, Sha1};
 use tracing::{debug, info, warn};
 
 use crate::evidence::{Evidence, RemoteEvidence, Side};
-use crate::local_dirty::{Claim, LocalWalk};
+use crate::local_dirty::{Claim, LocalWalk, root_id};
 use crate::planner::HasKind;
 use crate::root::{Doubt, Phase as RootPhase, RootInput, Suspension};
 use pdfs_core::batch;
@@ -175,6 +175,21 @@ impl Syncer {
             .state(folder.id)
             .is_some_and(|state| state.phase == RootPhase::Suspended(Suspension::RootMissing))
         {
+            let _ = self.tx.send(SyncMsg::Rewatch);
+        }
+        // Moved away and made again between two passes, or before the engine
+        // got to drop the old watch: the watch is on a folder that is no
+        // longer the root, and reports nothing of this one.
+        if let Some(watched) = self.local_dirty.watched_root(folder.id)
+            && root_id(&local_root).is_some_and(|now| now != watched)
+        {
+            info!(
+                id = folder.id,
+                "sync: the folder's root was replaced; watching it again"
+            );
+            self.local_dirty.unwatched(folder.id);
+            self.roots
+                .input(folder.id, RootInput::Doubted(Doubt::WatchLost));
             let _ = self.tx.send(SyncMsg::Rewatch);
         }
         self.roots.input(

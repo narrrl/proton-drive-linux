@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use super::trace::PassTrace;
 use super::*;
-use crate::local_dirty::LocalDirty;
+use crate::local_dirty::{LocalDirty, root_id};
 use crate::root::{Doubt, RootInput};
 
 /// How long the watcher must go quiet before a burst counts as finished.
@@ -306,7 +306,7 @@ pub fn run(core: Syncer, rx: Receiver<SyncMsg>) {
             .ok();
     }
 
-    let mut unwatched = rewatch(&core, &mut watcher, &watched);
+    let (mut unwatched, _) = rewatch(&core, &mut watcher, &watched);
     let mut last_rewatch = Instant::now();
     run_burst(&core, &HashSet::new(), true);
 
@@ -327,7 +327,14 @@ pub fn run(core: Syncer, rx: Receiver<SyncMsg>) {
             do_rewatch = true;
         }
         if do_rewatch {
-            unwatched = rewatch(&core, &mut watcher, &watched);
+            let newly;
+            (unwatched, newly) = rewatch(&core, &mut watcher, &watched);
+            // A change made before its folder was watched has no event. A
+            // folder whose root came back was watched only after the pass
+            // that found it walked it, so what was written in between waits
+            // for this pass, which walks it in full: its claim is not trusted
+            // yet.
+            ids.extend(newly);
             last_rewatch = Instant::now();
         }
         run_burst(&core, &ids, all);
@@ -553,7 +560,7 @@ pub(super) fn mark_dirty(dirty: &LocalDirty, watched: &[(PathBuf, i64)], paths: 
 
 /// Bring the filesystem watches in line with the current mirror-folder set:
 /// watch newly-added folders, drop removed ones. Returns whether a folder is
-/// left unwatched because its watch failed.
+/// left unwatched because its watch failed, and the folders watched anew.
 ///
 /// The watch calls run on a copy, outside the lock: the watcher's event
 /// callback takes the same lock, and a backend that hands a watch request to
@@ -562,7 +569,7 @@ fn rewatch(
     core: &Syncer,
     watcher: &mut notify::RecommendedWatcher,
     watched: &Mutex<Vec<(PathBuf, i64)>>,
-) -> bool {
+) -> (bool, Vec<i64>) {
     let want: Vec<(PathBuf, i64)> = match core.store.sync_folder_list() {
         Ok(f) => f
             .into_iter()
@@ -571,7 +578,7 @@ fn rewatch(
             .collect(),
         Err(e) => {
             warn!(error = ?e, "sync: cannot list folders to watch");
-            return false;
+            return (false, Vec::new());
         }
     };
     let mut have = watched.lock().clone();
@@ -584,18 +591,23 @@ fn rewatch(
             core.roots.forget(*id);
         }
     }
-    // A root that is gone took its watch with it: drop it, so the root is
-    // watched again once it is back (below).
+    // A root that is gone took its watch with it, and a root made again is
+    // another folder than the one watched: drop the watch, so the root is
+    // watched again below.
     have.retain(|(path, id)| {
-        let here = path.is_dir();
-        if !here {
+        let same = core
+            .local_dirty
+            .watched_root(*id)
+            .is_some_and(|root| root_id(path) == Some(root));
+        if !same {
             let _ = watcher.unwatch(path);
             core.local_dirty.unwatched(*id);
         }
-        here
+        same
     });
     // Add newly wanted watches.
     let mut failed = false;
+    let mut newly = Vec::new();
     for (path, id) in &want {
         if have.iter().any(|(p, _)| p == path) {
             continue;
@@ -603,7 +615,8 @@ fn rewatch(
         match watcher.watch(path, RecursiveMode::Recursive) {
             Ok(()) => {
                 have.push((path.clone(), *id));
-                core.local_dirty.watched(*id);
+                core.local_dirty.watched(*id, root_id(path));
+                newly.push(*id);
             }
             Err(e) => {
                 core.local_dirty.unwatched(*id);
@@ -622,7 +635,7 @@ fn rewatch(
         }
     }
     *watched.lock() = have;
-    failed
+    (failed, newly)
 }
 
 /// Keep the watches in `have` that `want` still asks for, and return the paths

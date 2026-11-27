@@ -64,6 +64,22 @@ struct Marks {
     claimed: Option<u64>,
     /// What the last pass found on disk, when it may stand in for a walk.
     walk: Option<LocalWalk>,
+    /// The folder's root as it was when it was watched, as device and
+    /// inode. A watch follows the folder it was set on, so a root moved away
+    /// and made again is another folder the watch does not see.
+    root: Option<RootId>,
+}
+
+/// A folder on disk, as device and inode.
+pub type RootId = (u64, u64);
+
+/// The identity of the folder at `path`, if there is one.
+pub fn root_id(path: &std::path::Path) -> Option<RootId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .filter(|meta| meta.is_dir())
+        .map(|meta| (meta.dev(), meta.ino()))
 }
 
 /// What a pass found on disk, kept for the next pass to start from.
@@ -129,15 +145,21 @@ impl Claim {
 }
 
 impl LocalDirty {
-    /// The watch on `folder` is in place: every change from now on is
-    /// reported.
-    pub fn watched(&self, folder: i64) {
+    /// The watch on `folder` is in place, set on the root `root`: every
+    /// change from now on is reported.
+    pub fn watched(&self, folder: i64, root: Option<RootId>) {
         let mut d = self.inner.lock();
         let now = d.tick();
         let marks = d.folders.entry(folder).or_default();
         if marks.live_since.is_none() {
             marks.live_since = Some(now);
         }
+        marks.root = root;
+    }
+
+    /// The root `folder`'s watch was last set on.
+    pub fn watched_root(&self, folder: i64) -> Option<RootId> {
+        self.inner.lock().folders.get(&folder)?.root
     }
 
     /// The watch on `folder` is gone, or never came up.
@@ -264,7 +286,7 @@ mod tests {
     #[test]
     fn a_claim_is_trusted_only_with_the_watch_live_since_the_last_one() {
         let dirty = LocalDirty::default();
-        dirty.watched(1);
+        dirty.watched(1, None);
         // The first pass after the watch came up has nothing to measure from.
         let first = dirty.claim(1);
         assert!(!first.trusted);
@@ -277,7 +299,7 @@ mod tests {
         let lost = dirty.claim(1);
         assert!(!lost.trusted);
         dirty.looked(1, &lost, true);
-        dirty.watched(1);
+        dirty.watched(1, None);
         dirty.mark(1, "a.txt");
         let back = dirty.claim(1);
         assert!(!back.trusted, "watched again after the last claim");
@@ -309,7 +331,7 @@ mod tests {
     #[test]
     fn an_overflow_breaks_trust_until_a_pass_claims_again() {
         let dirty = LocalDirty::default();
-        dirty.watched(1);
+        dirty.watched(1, None);
         let first = dirty.claim(1);
         dirty.looked(1, &first, true);
         dirty.mark(1, "a.txt");

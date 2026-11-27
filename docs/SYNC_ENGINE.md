@@ -244,15 +244,19 @@ of those checks, so the state adds no full walks except after a missing root. Wh
 what forces a walk, the journal says `the root state asks for a walk of the whole disk` or `of
 all of Drive`.
 
-A root that goes missing loses its watch, and one made again in its place is a new folder the
-old watch does not see. The engine drops the watch when it finds the root missing, and sets it
-up again on the first pass that finds the root back. Until then the disk is owed a full walk.
+A watch follows the folder it was set on, so a root moved away and made again is another folder
+that the old watch does not see. The engine keeps the root's device and inode with each watch.
+A pass that finds the root missing, or finds a root with another inode, drops the folder's trust
+in its claims and asks for the watches to be set up again. Setting them up drops any watch whose
+root is gone or replaced and watches the new one. Then it runs a pass over each folder it watched
+anew, since a file written before the watch was in place has no event. Until a watch is back,
+the disk is walked in full.
 
 **Tests:** the `root::tests` unit tests (a doubt per side, a restart, a suspension, a handoff),
 `a_restart_walks_the_disk_in_full_and_not_drive` (sim: the first pass after a restart walks the
-disk and reuses the picture of Drive), and `a_root_made_again_is_watched_again` (sim: a file
-written in a root moved away and made again reaches Drive within a minute; it fails without the
-new watch).
+disk and reuses the picture of Drive), and `a_root_made_again_is_watched_again` and
+`a_root_replaced_between_passes_is_watched_again` (sims: a file written in a root moved away and
+made again reaches Drive within a minute; the second fails without the inode check).
 
 ## Plan of work (separate PRs)
 
