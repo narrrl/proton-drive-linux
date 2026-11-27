@@ -17,6 +17,9 @@ counts the deletions it made in the last day (50). Each upload, download or fold
 sends is recorded until its result is in (51).
 
 ### Added
+- **`small_uploads` in `config.json` turns off the one-request upload for small files.** It is
+  on by default. Set it to `false` to send every file as a draft, its blocks and a commit, as
+  before. The service reads it at start. See [Configuration](CONFIGURATION.md#small_uploads).
 - **`pdfs diagnostics` says which of the daemon's background services are running.** If one
   ends while the drive is mounted, for example the sync engine after a crash, the journal says
   so once, by name, instead of saying nothing until a restart. It also lists the jobs running
