@@ -370,6 +370,60 @@ fn check_replaceable(src_dir: bool, dst_dir: bool, dst_empty: bool) -> Result<()
     })
 }
 
+/// The errno the kernel gets for an operation the open-file service refused.
+fn file_errno(error: pdfs_vfs::files::FileError<Errno>) -> Errno {
+    use pdfs_vfs::files::FileError;
+    match error {
+        FileError::NotFound => Errno::ENOENT,
+        FileError::IsDirectory => Errno::EISDIR,
+        FileError::Denied => Errno::EACCES,
+        FileError::BadHandle => Errno::EBADF,
+        FileError::NoSpace => Errno::ENOSPC,
+        FileError::QuotaExceeded => Errno::EDQUOT,
+        FileError::Io => Errno::EIO,
+        FileError::Storage(error) => Errno::from(error),
+        FileError::Unsupported => Errno::EOPNOTSUPP,
+        FileError::Base(errno) => errno,
+    }
+}
+
+impl pdfs_vfs::files::FilesHost for Core {
+    type Error = Errno;
+
+    fn settle_size(&self, ino: u64, uid: &NodeUid) -> Option<u64> {
+        self.resolve_provisional_size(ino, uid)
+    }
+
+    fn fill_gaps(
+        &self,
+        uid: &NodeUid,
+        file: &File,
+        len: u64,
+        base_mtime: i64,
+        base_size: u64,
+        written: &Intervals,
+    ) -> Result<(), Errno> {
+        Core::fill_gaps(self, uid, file, len, base_mtime, base_size, written)
+    }
+
+    fn landed(&self, uid: &NodeUid) -> Option<Node> {
+        self.drain.landed.lock().get(uid).cloned()
+    }
+}
+
+impl Core {
+    /// The open-file service over this daemon's tree, cache and write-back.
+    fn files(&self) -> Arc<pdfs_vfs::files::Files<Core>> {
+        Arc::new(pdfs_vfs::files::Files::new(
+            self.state.clone(),
+            self.db.clone(),
+            self.cache.clone(),
+            self.writes.clone(),
+            self.clone(),
+        ))
+    }
+}
+
 /// The errno the kernel gets for a node the tree refused.
 fn node_errno(error: pdfs_vfs::tree::NodeError) -> Errno {
     match error {
@@ -1603,11 +1657,7 @@ fn local_node_uid(lid: i64) -> NodeUid {
     NodeUid::new(VolumeId::from(LOCAL_VOLUME), LinkId::from(lid.to_string()))
 }
 
-/// Whether this node exists only on this machine, so far. Such a uid is
-/// meaningless to the API and must never be sent to it.
-fn is_local_uid(uid: &NodeUid) -> bool {
-    uid.volume_id.as_str() == LOCAL_VOLUME
-}
+use pdfs_vfs::ids::is_local_uid;
 
 /// [`is_local_uid`] for a uid in its persisted `Display` form.
 fn is_local_uid_str(s: &str) -> bool {

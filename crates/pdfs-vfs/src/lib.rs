@@ -14,6 +14,7 @@
 //! ([`writes`]); the POSIX rules on names and on what a rename may replace
 //! ([`names`]); and which nodes a folder lists ([`nodes`]).
 
+pub mod files;
 pub mod ids;
 pub mod names;
 pub mod nodes;

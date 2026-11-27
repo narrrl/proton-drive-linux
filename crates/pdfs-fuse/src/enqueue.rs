@@ -201,18 +201,8 @@ impl Core {
         base_size: u64,
         base_revision_id: Option<String>,
     ) -> Option<Baseline> {
-        if is_local_uid(uid) {
-            return None;
-        }
-        match self.writes.pending.lock().get(uid) {
-            Some(p) => p.meta.based_on.clone(),
-            None => Some(Baseline {
-                mtime: base_mtime,
-                size: base_size,
-                hash: None,
-                revision_id: base_revision_id,
-            }),
-        }
+        self.writes
+            .baseline(uid, base_mtime, base_size, base_revision_id)
     }
 
     /// Move a file holding a node's intended new content into staging and queue

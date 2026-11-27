@@ -6,6 +6,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 
+use pdfs_store::cache::Baseline;
+
+use crate::ids::is_local_uid;
 use crate::open::PendingRevision;
 
 /// The write-back's state: writes accepted from the kernel and not yet sent,
@@ -63,6 +66,32 @@ impl WriteState {
     /// content until the drain sends it.
     pub fn queued(&self, uid: &NodeUid) -> Option<PendingRevision> {
         self.pending.lock().get(uid).cloned()
+    }
+
+    /// The remote revision a write to `uid` was made against, for the
+    /// conflict check: the queued write's own base while one is queued, and
+    /// otherwise the base the handle started from. `None` for a node that has
+    /// never existed remotely: there is no revision to conflict with until its
+    /// create drains.
+    pub fn baseline(
+        &self,
+        uid: &NodeUid,
+        base_mtime: i64,
+        base_size: u64,
+        base_revision_id: Option<String>,
+    ) -> Option<Baseline> {
+        if is_local_uid(uid) {
+            return None;
+        }
+        match self.pending.lock().get(uid) {
+            Some(p) => p.meta.based_on.clone(),
+            None => Some(Baseline {
+                mtime: base_mtime,
+                size: base_size,
+                hash: None,
+                revision_id: base_revision_id,
+            }),
+        }
     }
 
     /// Whether a write for `uid` is queued and not yet sent. A remote change
