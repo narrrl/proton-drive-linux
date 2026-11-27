@@ -278,6 +278,12 @@ pub struct AppConfig {
     /// the field.
     #[serde(default)]
     pub local_first: Option<bool>,
+    /// Send a file small enough, with its thumbnails, to fit 128 KiB in one
+    /// request instead of three or more. `None` means on. `false` uploads
+    /// every file in blocks, the way all files went before. Defaulted for
+    /// configs predating the field.
+    #[serde(default)]
+    pub small_uploads: Option<bool>,
     /// Ask GitHub once a day whether a newer release is out, and say so in the
     /// desktop app. Off by default: GitHub then sees the address and version
     /// asking. Never used where a package manager installs updates (see
@@ -1077,6 +1083,7 @@ mod tests {
             language: Some("de".to_string()),
             online_map: true,
             local_first: Some(false),
+            small_uploads: Some(false),
             update_check: true,
             update_last_checked: Some(1_760_000_000),
             update_latest: Some("3.6.0".to_string()),
@@ -1096,6 +1103,7 @@ mod tests {
         assert_eq!(decoded.update_latest.as_deref(), Some("3.6.0"));
         assert_eq!(decoded.language.as_deref(), Some("de"));
         assert_eq!(decoded.upload_limit, Some(500_000));
+        assert_eq!(decoded.small_uploads, Some(false));
         assert_eq!(decoded.download_limit, None);
         assert_eq!(decoded.files_view, config.files_view);
         assert_eq!(decoded.photos_view, config.photos_view);

@@ -88,6 +88,7 @@ fix it.
 | `device_uid` | string | none | Computers → Continue This Backup Here… or Sync With This Computer… | The computer this machine syncs into. Unset means "match by hostname" |
 | `conflict_sweep` | `off` / `report` / `enforce` | `report` | Sync → Conflict Copies | See [`conflict_sweep`](#conflict_sweep) |
 | `local_first` | bool | `true` | — | See [`local_first`](#local_first) |
+| `small_uploads` | bool | `true` | — | See [`small_uploads`](#small_uploads) |
 | `language` | gettext code | system | General → Appearance | Language of the app, tray and prompt, such as `de` or `pt_BR` |
 | `proton_theme` | bool | follow system | General → Appearance | Proton's colours instead of the system theme |
 | `online_map` | bool | `false` | General → Appearance | Street map for Places from OpenFreeMap |
@@ -144,6 +145,16 @@ call returns at once. The change goes to Drive from the queue, the same way it d
 
 Set it to `false` to have these calls wait for Drive again, as before 3.0.0. The switch is there
 for one release, in case the queued path misbehaves for you; please report it if it does.
+
+### `small_uploads`
+
+A file that fits in 128 KiB with its thumbnails goes to Proton Drive in one request. A larger one
+goes as a draft, its blocks, and a commit, which takes three requests or more. Most synced files
+are small, so this is what decides how fast a folder of many small files syncs.
+
+Set it to `false` to upload every file in blocks again. The setting is read when the service
+starts. The journal says `small files are uploaded in blocks` while it is off. Please report it if
+you need to turn it off.
 
 ### `open_with`
 

@@ -241,6 +241,13 @@ pub fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome
     let (client, session) = rt
         .block_on(auth::resume_client())
         .context("resume session (run `pdfs login` first)")?;
+    // On unless the config turns it off: the one-request upload for small
+    // files is new, and this lets it be switched off without a new build.
+    let small_uploads = config.small_uploads.unwrap_or(true);
+    if !small_uploads {
+        tracing::info!("small files are uploaded in blocks: small_uploads is off in the config");
+    }
+    let client = client.with_small_file_upload(small_uploads);
 
     // Token updates are persisted automatically in real-time. The SDK session has
     // a token refresh callback registered during `resume_client` that writes updated
