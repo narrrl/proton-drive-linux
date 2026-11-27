@@ -254,6 +254,39 @@ disk and reuses the picture of Drive), and `a_root_made_again_is_watched_again` 
 written in a root moved away and made again reaches Drive within a minute; it fails without the
 new watch).
 
+## Effect intents as built
+
+The second reducer, `pdfs_sync::effect`, follows one effect a mirror pass sends: a folder made on
+Drive, an upload, a new revision, a download, an adopted file or a conflict copy (the `Pending`
+ops). Before an op is sent, its intent is written to `sync_intent` (schema 51): one row per
+folder, path and kind, with the number of attempts and the time it was last sent. Its result
+decides what happens next:
+
+| State | Meaning |
+|---|---|
+| issued | Sent, or about to be; no result yet. |
+| unsure | Found `issued` at a start: the daemon stopped before the result came, so the effect may or may not have happened. |
+| retry | It failed, and a later pass may send it again. |
+| blocked | It failed five times in a row. The journal says `sync: an effect keeps failing` once. |
+| settled | Its result is in. The row goes. |
+
+- A start moves every `issued` row to `unsure`, and says how many in the journal.
+- An op sent again keeps its row and counts the attempt. When the row was `unsure`, the journal
+  says `sync: sending again an effect a stopped daemon may have made`.
+- A pass that looked at every path (none unscanned or deferred) settles the rows from before it
+  began that it did not send again: what they were for has changed, or is done. An `unsure` one
+  is logged at info.
+- A change to what the folder is, or its removal, drops its rows.
+
+The intents are kept in shadow for now: nothing reads them to decide what to send. The apply
+step's own checks still decide whether an effect that may have landed is sent again (B266 for a
+create, B39 for a download). Deletions on either side are not recorded yet. Trace counts:
+`unsure resent`, `retried`, `superseded`.
+
+**Tests:** the `effect::tests` unit tests, `an_effect_intent_is_kept_until_it_is_settled_or_its_folder_changes`
+(DB), and `an_effect_left_unsure_by_a_stop_is_sent_again_or_settled` (sim: of two uploads a
+stopped daemon left unsure, the one still needed is sent again and the other is settled).
+
 ## Plan of work (separate PRs)
 
 1. **Frontier checkpoint.**

@@ -66,7 +66,8 @@ pub use photos::{StoredPhoto, StoredPlace, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN
 pub use pins::PinRow;
 pub use replace::ReplaceIntent;
 pub use sync::{
-    DeleteWindow, SavedWalk, SavedWalkDir, SavedWalkItem, StoredSyncEntry, StoredSyncFolder,
+    DeleteWindow, SavedWalk, SavedWalkDir, SavedWalkItem, StoredIntent, StoredSyncEntry,
+    StoredSyncFolder,
 };
 pub use trash::StoredTrash;
 

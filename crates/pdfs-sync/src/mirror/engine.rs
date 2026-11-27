@@ -242,6 +242,19 @@ pub fn run(core: Syncer, rx: Receiver<SyncMsg>) {
         ),
         Err(e) => warn!(error = ?e, "sync: cannot reset folders left syncing"),
     }
+    // An effect still `issued` was sent by a daemon that stopped before it
+    // heard back: it may or may not have happened (`effect`).
+    match core.store.sync_intents_move(
+        effect::EffectState::Issued.name(),
+        effect::EffectState::Unsure.name(),
+    ) {
+        Ok(0) => {}
+        Ok(n) => info!(
+            effects = n,
+            "sync: effects the last run sent and did not hear back from"
+        ),
+        Err(e) => warn!(error = ?e, "sync: cannot read the effects the last run sent"),
+    }
     // Paths the watcher currently covers, mapped to their folder id, so an event
     // path can be resolved back to the folder it belongs to.
     let watched: Arc<Mutex<Vec<(PathBuf, i64)>>> = Arc::new(Mutex::new(Vec::new()));

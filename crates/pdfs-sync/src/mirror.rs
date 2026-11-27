@@ -38,6 +38,7 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use sha1::{Digest as _, Sha1};
 use tracing::{debug, info, warn};
 
+use crate::effect::{self, EffectState};
 use crate::evidence::{Evidence, RemoteEvidence, Side};
 use crate::local_dirty::{Claim, LocalWalk};
 use crate::planner::HasKind;
@@ -48,7 +49,9 @@ use pdfs_core::syncignore::IgnoreRules;
 use pdfs_core::timestamp::now_secs;
 use pdfs_core::transfers::{CountingWriter, OwnedCountingReader};
 use pdfs_drive::parse_uid;
-use pdfs_store::db::{DeleteWindow, SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
+use pdfs_store::db::{
+    DeleteWindow, SavedWalk, SavedWalkItem, StoredIntent, StoredSyncEntry, StoredSyncFolder,
+};
 
 mod apply;
 mod engine;
@@ -517,6 +520,9 @@ impl Syncer {
         remote_root: &NodeUid,
         rules: &IgnoreRules,
     ) -> Result<Outcome, PassAbort> {
+        // Intents sent before this moment that the pass does not send again
+        // are settled at its end (`effect`).
+        let pass_began = now_secs();
         // Loaded before the walks: the remote one uses it to tell which files are
         // unchanged and so can skip decrypting their claimed size, and its size is
         // the only estimate available of how much this pass has to check — the walks
@@ -1028,6 +1034,11 @@ impl Syncer {
         }
         self.trace_phase(Phase::Cleanup, cleanup.elapsed());
         self.settle_deletions(folder_id, window, outcome.deleted);
+        // Every path was looked at and planned: what an earlier pass left
+        // unsettled and this one did not send again is no longer owed.
+        if outcome.unscanned.is_empty() && outcome.deferred == 0 {
+            self.supersede_intents(folder_id, pass_began);
+        }
         // A change the pass could not apply stays dirty for the next one.
         self.local_dirty.looked(
             folder_id,

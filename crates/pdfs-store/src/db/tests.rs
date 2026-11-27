@@ -8452,3 +8452,51 @@ fn a_deletion_window_is_kept_per_folder_until_the_folder_changes() {
     db.sync_folder_remove(other).unwrap();
     assert_eq!(db.sync_delete_window(other).unwrap(), None);
 }
+
+/// An intent is one row per folder, path and kind: sent again, it counts the
+/// attempt and says what state it was left in. It goes once settled, and with
+/// the folder.
+#[test]
+fn an_effect_intent_is_kept_until_it_is_settled_or_its_folder_changes() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.sync_folder_add("/home/me/Docs", "v~root", "s").unwrap();
+    let other = db
+        .sync_folder_add("/home/me/Other", "v~other", "s")
+        .unwrap();
+    let (first, before) = db.sync_intent_issue(id, "a.txt", "upload", 10).unwrap();
+    assert_eq!(before, None);
+    assert_eq!((first.state.as_str(), first.attempts), ("issued", 1));
+    db.sync_intent_set(first.id, "retry", Some("timed out"))
+        .unwrap();
+    let (again, before) = db.sync_intent_issue(id, "a.txt", "upload", 20).unwrap();
+    assert_eq!(before.as_deref(), Some("retry"));
+    assert_eq!(again.id, first.id, "the same intent");
+    assert_eq!((again.attempts, again.issued_at), (2, 20));
+    assert_eq!(again.last_error.as_deref(), Some("timed out"));
+    let (download, _) = db.sync_intent_issue(id, "a.txt", "download", 21).unwrap();
+    db.sync_intent_issue(other, "b.txt", "upload", 5).unwrap();
+    assert_eq!(db.sync_intents(Some(id)).unwrap().len(), 2);
+    assert_eq!(db.sync_intents(None).unwrap().len(), 3);
+
+    db.sync_intent_settle(download.id).unwrap();
+    assert_eq!(db.sync_intents(Some(id)).unwrap().len(), 1);
+
+    // A start finds what a stopped daemon left sent.
+    assert_eq!(db.sync_intents_move("issued", "unsure").unwrap(), 2);
+    assert_eq!(db.sync_intents_move("issued", "unsure").unwrap(), 0);
+    // A pass that began after an intent was sent settles it.
+    let settled = db
+        .sync_intents_settle_before(other, &["unsure"], 6)
+        .unwrap();
+    assert_eq!(settled.len(), 1);
+    assert!(db.sync_intents(Some(other)).unwrap().is_empty());
+    assert!(
+        db.sync_intents_settle_before(id, &["unsure"], 20)
+            .unwrap()
+            .is_empty(),
+        "sent at 20, not before"
+    );
+
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    assert!(db.sync_intents(Some(id)).unwrap().is_empty());
+}
