@@ -383,7 +383,7 @@ fn file_errno(error: pdfs_vfs::files::FileError<Errno>) -> Errno {
         FileError::Io => Errno::EIO,
         FileError::Storage(error) => Errno::from(error),
         FileError::Unsupported => Errno::EOPNOTSUPP,
-        FileError::Base(errno) => errno,
+        FileError::Host(errno) => errno,
     }
 }
 
@@ -408,6 +408,32 @@ impl pdfs_vfs::files::FilesHost for Core {
 
     fn landed(&self, uid: &NodeUid) -> Option<Node> {
         self.drain.landed.lock().get(uid).cloned()
+    }
+
+    fn commit(&self, handle: &mut WriteHandle) -> Result<(), Errno> {
+        self.follow_landed_create(handle);
+        self.queue_revision(handle)
+    }
+
+    fn discard_unlinked(&self, uid: &NodeUid) {
+        if !release_can_discard_unlinked(&self.db, uid) {
+            return;
+        }
+        // Ops withdrawn at unlink left the bytes this handle read behind,
+        // owned by no op any more; they go with the last handle.
+        let withdrawn = self.pending_blob(uid);
+        if let Err(error) = self.discard_queued_ops(uid) {
+            warn!(%uid, ?error, "queued-op cleanup failed; retaining unlinked state");
+            return;
+        }
+        if let Err(error) = self.db.delete_node(uid) {
+            warn!(%uid, %error, "deleting released unlinked node state failed");
+        }
+        if let Some(blob) = withdrawn {
+            self.cache.discard_staged(&blob);
+        }
+        self.cache.evict(uid);
+        self.evict_reader(uid);
     }
 }
 
@@ -3644,10 +3670,10 @@ mod tests {
             trash.matches("self.core.withdraw_queued_ops(&uid)").count(),
             2
         );
-        let release = function_source(filesystem, "fn finish_release(");
+        let release = function_source(CORE_SOURCE, "fn discard_unlinked(");
         assert_before(
             release,
-            "let withdrawn = self.core.pending_blob(&uid)",
+            "let withdrawn = self.pending_blob(uid)",
             "discard_queued_ops",
         );
         assert_before(release, "discard_queued_ops", "discard_staged(&blob)");

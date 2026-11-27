@@ -17,7 +17,7 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 use tracing::{debug, error, warn};
 
-use crate::open::{Fallocate, Intervals, WriteError, WriteHandle};
+use crate::open::{Fallocate, Intervals, Released, WriteError, WriteHandle};
 use crate::tree::{State, StateGuard};
 use crate::writes::WriteState;
 
@@ -32,8 +32,8 @@ pub const OPEN_BASE_ATTEMPTS: usize = 3;
 
 /// Why the open-file service refused or failed an operation.
 ///
-/// `E` is the host's own error for a failure to read the remote base
-/// ([`FilesHost::fill_gaps`]), passed through unchanged.
+/// `E` is the host's own error ([`FilesHost::Error`]), passed through
+/// unchanged.
 #[derive(Debug)]
 pub enum FileError<E> {
     /// No such node.
@@ -56,8 +56,9 @@ pub enum FileError<E> {
     Storage(std::io::Error),
     /// The operation is not one this handle can record.
     Unsupported,
-    /// The remote base could not be read.
-    Base(E),
+    /// The host failed, with its own error: a read of the remote base, or
+    /// queueing a closed file's revision.
+    Host(E),
 }
 
 /// What the open-file service needs from the rest of the daemon.
@@ -84,6 +85,16 @@ pub trait FilesHost {
     /// The node an upload of `uid` just landed, while the tree does not have it
     /// yet.
     fn landed(&self, uid: &NodeUid) -> Option<Node>;
+
+    /// Queue what the closed `handle` wrote as the file's next revision. The
+    /// scratch file is the only copy of those bytes, and the host takes it
+    /// over.
+    fn commit(&self, handle: &mut WriteHandle) -> Result<(), Self::Error>;
+
+    /// Drop what the unlinked `uid` left behind now that its last handle is
+    /// closed: its row, its queued changes and its cached bytes. A queued
+    /// trash of it still needs the row, and then nothing is dropped.
+    fn discard_unlinked(&self, uid: &NodeUid);
 }
 
 /// The open-file service of one daemon, shared by every mount.
@@ -257,7 +268,7 @@ impl<H: FilesHost> Files<H> {
                     ) {
                         let _ = std::fs::remove_file(&path);
                         error!(%uid, "cannot complete the queued revision a write open is based on");
-                        return Err(FileError::Base(error));
+                        return Err(FileError::Host(error));
                     }
                     debug!(%uid, "write open completed an incomplete queued revision");
                 }
@@ -441,6 +452,62 @@ impl<H: FilesHost> Files<H> {
             st.set_size(ino, end);
         }
         Ok(())
+    }
+
+    /// Close the handle `fh` on `ino`, and hand what it wrote to the upload
+    /// queue when it was the last one writing the file.
+    ///
+    /// Until the revision is queued, a read of `ino` is served from the
+    /// writer's view, which `OpenFiles::release` keeps (`docs/BUGS.md` B300).
+    pub fn release(&self, ino: u64, fh: u64) -> Result<(), FileError<H::Error>> {
+        let (handle, unlinked_uid, releasing) = {
+            let mut st = self.state();
+            let unlinked_uid = st.release_unlinked(ino);
+            let (handle, releasing) = match st.open.release(fh) {
+                Released::Last(h) => {
+                    let ino = h.ino;
+                    (Some(h), Some(ino))
+                }
+                Released::StillOpen { .. } | Released::NotWriting => (None, None),
+            };
+            (handle, unlinked_uid, releasing)
+        };
+        let outcome = self.retire(handle, unlinked_uid);
+        if let Some(ino) = releasing {
+            self.state().open.finish_release(ino);
+        }
+        outcome
+    }
+
+    /// Retire what a closed handle leaves behind.
+    fn retire(
+        &self,
+        handle: Option<WriteHandle>,
+        unlinked_uid: Option<NodeUid>,
+    ) -> Result<(), FileError<H::Error>> {
+        let was_unlinked = unlinked_uid.is_some();
+        if let Some(uid) = unlinked_uid {
+            self.host.discard_unlinked(&uid);
+        }
+        // Hand the bytes to the queue rather than uploading them here: the
+        // scratch file is the only copy of what was just written, and blocking
+        // the caller on the network is what made a copy into the mount run at
+        // upload speed (and fail outright offline).
+        match (handle, was_unlinked) {
+            (Some(h), true) => {
+                // POSIX keeps an unlinked file usable until the last close, but
+                // closing it must not resurrect those bytes as a new revision.
+                if let Err(e) = std::fs::remove_file(&h.path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(path = %h.path.display(), error = %e, "discarding unlinked scratch file failed");
+                }
+                self.cache.clear_scratch_durable(&h.path);
+                Ok(())
+            }
+            (Some(mut h), false) => self.host.commit(&mut h).map_err(FileError::Host),
+            (None, _) => Ok(()),
+        }
     }
 
     /// The scratch file of `fh` when it has writes on it, for a flush to sync.
@@ -638,8 +705,13 @@ mod tests {
         }
     }
 
-    /// A host with no network: no size settles and no gap can be filled.
-    struct Offline;
+    /// A host with no network: no size settles and no gap can be filled. It
+    /// records the revisions committed to it and the unlinked files dropped.
+    #[derive(Default)]
+    struct Offline {
+        committed: parking_lot::Mutex<Vec<u64>>,
+        discarded: parking_lot::Mutex<Vec<NodeUid>>,
+    }
 
     impl FilesHost for Offline {
         type Error = &'static str;
@@ -662,6 +734,15 @@ mod tests {
 
         fn landed(&self, _uid: &NodeUid) -> Option<Node> {
             None
+        }
+
+        fn commit(&self, handle: &mut WriteHandle) -> Result<(), &'static str> {
+            self.committed.lock().push(handle.len);
+            Ok(())
+        }
+
+        fn discard_unlinked(&self, uid: &NodeUid) {
+            self.discarded.lock().push(uid.clone());
         }
     }
 
@@ -690,7 +771,13 @@ mod tests {
                 State::new(db.clone(), HashMap::new()),
             ));
             let writes = WriteState::default();
-            let files = Files::new(state.clone(), db.clone(), cache, writes.clone(), Offline);
+            let files = Files::new(
+                state.clone(),
+                db.clone(),
+                cache,
+                writes.clone(),
+                Offline::default(),
+            );
             Fixture {
                 files,
                 state,
@@ -783,6 +870,43 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].1.len, 7);
         assert_eq!(std::fs::read(&recovered[0].0).unwrap(), b"one two");
+    }
+
+    /// The last close of a written file commits its revision; a close while
+    /// another handle still writes it does not, and a read finds the write
+    /// throughout.
+    #[test]
+    fn the_last_close_commits_what_the_handles_wrote() {
+        let fx = Fixture::new();
+        let ino = fx.add("f", false);
+        let first = fx.files.open(ino, true).unwrap();
+        let second = fx.files.open(ino, true).unwrap();
+        fx.files.write(ino, first, 0, b"abc").unwrap();
+        fx.files.release(ino, first).unwrap();
+        assert!(fx.files.host.committed.lock().is_empty());
+        assert_eq!(fx.state().open.reader(ino).unwrap().len, 3);
+        fx.files.release(ino, second).unwrap();
+        assert_eq!(*fx.files.host.committed.lock(), [3]);
+        assert!(!fx.state().open.is_busy(ino));
+        assert_eq!(fx.open_count(ino), 0);
+    }
+
+    /// Closing a file unlinked while open drops its bytes instead of
+    /// committing them.
+    #[test]
+    fn the_last_close_of_an_unlinked_file_discards_it() {
+        let fx = Fixture::new();
+        let ino = fx.add("f", false);
+        let fh = fx.files.open(ino, true).unwrap();
+        fx.files.write(ino, fh, 0, b"gone").unwrap();
+        fx.files.fsync(fh).unwrap();
+        let scratch = fx.state().open.by_fh(fh).unwrap().path.clone();
+        fx.state().unlink_mem(&uid("f"));
+        fx.files.release(ino, fh).unwrap();
+        assert!(fx.files.host.committed.lock().is_empty());
+        assert_eq!(*fx.files.host.discarded.lock(), [uid("f")]);
+        assert!(!scratch.exists());
+        assert!(!ContentCache::scratch_sidecar(&scratch).exists());
     }
 
     #[test]
@@ -883,7 +1007,7 @@ mod tests {
         );
         assert!(matches!(
             fx.files.open(ino, true),
-            Err(FileError::Base("offline"))
+            Err(FileError::Host("offline"))
         ));
         assert_eq!(fx.open_count(ino), 0);
     }

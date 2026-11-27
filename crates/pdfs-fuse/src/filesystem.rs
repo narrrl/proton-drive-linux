@@ -2,7 +2,7 @@
 
 use super::*;
 use pdfs_vfs::files::Files;
-use pdfs_vfs::open::{DirListing, Released, dir_page};
+use pdfs_vfs::open::{DirListing, dir_page};
 
 impl Filesystem for ProtonFs {
     /// Negotiate kernel-side behaviour once, before any other callback.
@@ -587,18 +587,6 @@ impl Filesystem for ProtonFs {
         reply: ReplyEmpty,
     ) {
         let ino = self.tree(ino);
-        let (handle, unlinked_uid, releasing) = {
-            let mut st = self.core.state();
-            let unlinked_uid = st.release_unlinked(ino.0);
-            let (h, releasing) = match st.open.release(fh.0) {
-                Released::Last(h) => {
-                    let ino = h.ino;
-                    (Some(h), Some(ino))
-                }
-                Released::StillOpen { .. } | Released::NotWriting => (None, None),
-            };
-            (h, unlinked_uid, releasing)
-        };
         // Deliberately **not** handed to a worker, unlike the other slow
         // handlers here. The kernel does not wait for a `release` reply before
         // letting `close(2)` return, so the only thing sequencing this against
@@ -613,9 +601,9 @@ impl Filesystem for ProtonFs {
         // did not touch, it stages an incomplete blob and lets the drain thread
         // finish it (audit F1). What is left is a rename, two fsyncs, a database
         // insert, and at most a bounded copy out of the local cache.
-        self.finish_release(handle, unlinked_uid, reply);
-        if let Some(ino) = releasing {
-            self.core.state().open.finish_release(ino);
+        match self.files.release(ino.0, fh.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(file_errno(error)),
         }
     }
 
@@ -1430,61 +1418,6 @@ impl ProtonFs {
             }
         }
         self.trash_child(parent, name_str, reply);
-    }
-
-    /// The tail of [`Filesystem::release`], run off the dispatch loop: retire
-    /// what the closed handle leaves behind.
-    fn finish_release(
-        &self,
-        handle: Option<WriteHandle>,
-        unlinked_uid: Option<NodeUid>,
-        reply: ReplyEmpty,
-    ) {
-        let was_unlinked = unlinked_uid.is_some();
-        if let Some(uid) = unlinked_uid
-            && release_can_discard_unlinked(&self.core.db, &uid)
-        {
-            // Ops withdrawn at unlink left the bytes this handle read behind,
-            // owned by no op any more; they go with the last handle.
-            let withdrawn = self.core.pending_blob(&uid);
-            if let Err(error) = self.core.discard_queued_ops(&uid) {
-                warn!(%uid, ?error, "queued-op cleanup failed; retaining unlinked state");
-            } else {
-                if let Err(error) = self.core.db.delete_node(&uid) {
-                    warn!(%uid, %error, "deleting released unlinked node state failed");
-                }
-                if let Some(blob) = withdrawn {
-                    self.core.cache.discard_staged(&blob);
-                }
-                self.core.cache.evict(&uid);
-                self.core.evict_reader(&uid);
-            }
-        }
-        // Hand the bytes to the queue rather than uploading them here: the
-        // scratch file is the only copy of what was just written, and blocking
-        // the caller on the network is what made a copy into the mount run at
-        // upload speed (and fail outright offline).
-        match (handle, was_unlinked) {
-            (Some(h), true) => {
-                // POSIX keeps an unlinked file usable until the last close, but
-                // closing it must not resurrect those bytes as a new revision.
-                if let Err(e) = std::fs::remove_file(&h.path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!(path = %h.path.display(), error = %e, "discarding unlinked scratch file failed");
-                }
-                self.core.cache.clear_scratch_durable(&h.path);
-                reply.ok();
-            }
-            (Some(mut h), false) => {
-                self.core.follow_landed_create(&mut h);
-                match self.core.queue_revision(&mut h) {
-                    Ok(()) => reply.ok(),
-                    Err(e) => reply.error(e),
-                }
-            }
-            (None, _) => reply.ok(),
-        }
     }
 
     /// The body of [`Filesystem::rename`], run off the dispatch loop.
