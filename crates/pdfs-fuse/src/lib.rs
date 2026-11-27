@@ -437,10 +437,146 @@ impl pdfs_vfs::files::FilesHost for Core {
     }
 }
 
+/// The errno the kernel gets for a namespace change the service refused.
+fn namespace_errno(error: pdfs_vfs::namespace::NamespaceError<Errno>) -> Errno {
+    use pdfs_vfs::namespace::NamespaceError;
+    match error {
+        NamespaceError::NotFound => Errno::ENOENT,
+        NamespaceError::IsDirectory => Errno::EISDIR,
+        NamespaceError::NotDirectory => Errno::ENOTDIR,
+        NamespaceError::NotEmpty => Errno::ENOTEMPTY,
+        NamespaceError::Io => Errno::EIO,
+        NamespaceError::Host(errno) => errno,
+    }
+}
+
+impl pdfs_vfs::namespace::NamespaceHost for Core {
+    type Error = Errno;
+
+    fn require_writable(&self, ino: u64) -> Result<(), Errno> {
+        Core::require_writable(self, ino)
+    }
+
+    fn require_uid_writable(&self, uid: &NodeUid) -> Result<(), Errno> {
+        Core::require_uid_writable(self, uid)
+    }
+
+    fn ensure_children(&self, ino: u64) -> Result<(), Errno> {
+        Core::ensure_children(self, ino)
+    }
+
+    fn lookup_child(&self, parent: u64, name: &str) -> Result<(u64, NodeUid), Errno> {
+        Core::lookup_child(self, parent, name)
+    }
+
+    fn sends_inline(&self) -> bool {
+        Core::sends_inline(self)
+    }
+
+    fn mint(&self, parent_uid: &NodeUid, name: &str, folder: bool) -> Result<Option<Node>, Errno> {
+        // A file starts empty on Drive so it has a real uid at once; what is
+        // written into it is sealed as a new revision on close.
+        let minted = if folder {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .ok();
+            self.block_on_bounded(self.drive.create_folder(parent_uid, name, now))
+        } else {
+            self.block_on_bounded(self.drive.upload_file(
+                parent_uid,
+                name,
+                media_type_for(name),
+                b"",
+            ))
+        };
+        let what = if folder { "mkdir" } else { "create" };
+        match minted {
+            Ok(new_uid) => Ok(self.fetch_minted_node(&new_uid, name)),
+            Err(e) if self.lost_link(&e, what) => Ok(None),
+            Err(e) => {
+                error!(%parent_uid, name, error = %e, "{what} failed on Drive");
+                Err(Errno::EIO)
+            }
+        }
+    }
+
+    fn queue_create(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        folder: bool,
+        parked: bool,
+    ) -> Result<Node, Errno> {
+        self.queue_local_node(parent_uid, name, folder, parked)
+    }
+
+    fn access_changed(&self) {
+        self.flush_access_changes();
+    }
+
+    fn drop_queued(&self, uid: &NodeUid, keep_staged: bool) -> Result<(), Errno> {
+        if keep_staged {
+            self.withdraw_queued_ops(uid)
+        } else {
+            self.discard_queued_ops(uid)
+        }
+    }
+
+    fn landed_uid(&self, ino: u64) -> Option<NodeUid> {
+        self.landed_row_uid(ino)
+    }
+
+    fn has_pending_moves_out_of(&self, uid: &NodeUid) -> Result<bool, Errno> {
+        Core::has_pending_moves_out_of(self, uid)
+    }
+
+    fn queue_trash(&self, uid: &NodeUid, name: &str, open: bool) -> Result<(), Errno> {
+        Core::queue_trash(self, uid, name, open)
+    }
+
+    fn trash_remote(&self, uid: &NodeUid, name: &str) -> Result<bool, Errno> {
+        match self
+            .block_on_bounded(self.drive.trash_nodes(std::slice::from_ref(uid)))
+            .and_then(batch::into_unit)
+        {
+            Ok(()) => Ok(true),
+            Err(e) if self.lost_link(&e, "trash") => Ok(false),
+            Err(e) => {
+                error!(%uid, error = %e, "trash failed");
+                self.log_activity(ActivityKind::Trash, name, e.to_string(), false);
+                Err(Errno::EIO)
+            }
+        }
+    }
+
+    fn trashed(&self, uid: &NodeUid, name: &str, open: bool) {
+        if !open {
+            self.evict_reader(uid);
+        }
+        self.invalidate_trash();
+        // Every other trash site records itself; this one did not, which made a
+        // file found in the trash impossible to attribute after the fact — the
+        // activity log was the only record and it showed nothing (`docs/BUGS.md` B2).
+        self.log_activity(ActivityKind::Trash, name, "trashed from the mount", true);
+    }
+}
+
 impl Core {
     /// The open-file service over this daemon's tree, cache and write-back.
     fn files(&self) -> Arc<pdfs_vfs::files::Files<Core>> {
         Arc::new(pdfs_vfs::files::Files::new(
+            self.state.clone(),
+            self.db.clone(),
+            self.cache.clone(),
+            self.writes.clone(),
+            self.clone(),
+        ))
+    }
+
+    /// The namespace service over this daemon's tree, cache and write-back.
+    fn namespace(&self) -> Arc<pdfs_vfs::namespace::Namespace<Core>> {
+        Arc::new(pdfs_vfs::namespace::Namespace::new(
             self.state.clone(),
             self.db.clone(),
             self.cache.clone(),
@@ -3294,24 +3430,24 @@ mod tests {
             assert_before(function, "cancel_upload", mutation);
         }
 
-        let filesystem = include_str!("filesystem.rs");
-        for signature in ["fn serve_unlink(", "fn serve_rmdir("] {
-            let function = function_source(filesystem, signature);
+        let namespace = include_str!("../../pdfs-vfs/src/namespace.rs");
+        for signature in ["pub fn unlink(", "pub fn rmdir("] {
+            let function = function_source(namespace, signature);
             assert_before(function, "require_writable", "lookup_child");
         }
+        for (signature, gate, remote_call) in [
+            ("fn make(", "require_uid_writable", ".mint("),
+            ("fn trash_child(", "require_uid_writable", ".trash_remote("),
+        ] {
+            let function = function_source(namespace, signature);
+            assert_before(function, gate, remote_call);
+        }
 
+        let filesystem = include_str!("filesystem.rs");
         let rename = function_source(filesystem, "fn serve_rename(");
         assert_before(rename, "require_rename_access", "remove_replaced");
         assert_before(rename, "remove_replaced", "queue_rename_authorized");
-        for (signature, gate, remote_call) in [
-            ("fn serve_create(", "require_uid_writable", "upload_file"),
-            ("fn serve_mkdir(", "require_uid_writable", "create_folder"),
-            ("fn trash_child(", "require_uid_writable", "trash_nodes"),
-            ("fn serve_rename(", "require_rename_access", "rename_remote"),
-        ] {
-            let function = function_source(filesystem, signature);
-            assert_before(function, gate, remote_call);
-        }
+        assert_before(rename, "require_rename_access", "rename_remote");
         let control_mkdir = function_source(source, "fn create_folder(");
         assert_before(
             control_mkdir,
@@ -3664,11 +3800,19 @@ mod tests {
         assert_before(withdraw, "self.pending_blob(uid)", "release_dropped_below");
         assert!(!withdraw.contains("self.writes.pending.lock().remove(uid)"));
 
-        let filesystem = include_str!("filesystem.rs");
-        let trash = function_source(filesystem, "fn trash_child(");
+        let namespace = include_str!("../../pdfs-vfs/src/namespace.rs");
+        let trash = function_source(namespace, "fn trash_child(");
         assert_eq!(
-            trash.matches("self.core.withdraw_queued_ops(&uid)").count(),
+            trash
+                .matches("self.host.drop_queued(&uid, open_now)")
+                .count(),
             2
+        );
+        let drop_queued = function_source(CORE_SOURCE, "fn drop_queued(");
+        assert_before(
+            drop_queued,
+            "if keep_staged",
+            "self.withdraw_queued_ops(uid)",
         );
         let release = function_source(CORE_SOURCE, "fn discard_unlinked(");
         assert_before(

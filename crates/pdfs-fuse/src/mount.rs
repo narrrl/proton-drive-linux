@@ -582,6 +582,9 @@ pub(crate) fn mount_with(
     // Writes queued by a previous run (or left behind by a crash) are still owed
     // an upload, and reads must be served from their staged blobs until they land.
     core.recovery().hydrate_pending();
+    // A replacing rename a stop cut off: its victim comes back, or its end
+    // state stands. After `hydrate_pending`, which hides queued trashes.
+    core.recovery().settle_replaces();
     // Then the writes that were fsynced but never closed, which the cache moved
     // aside at open. After `hydrate_pending`, so a recovered partial write can
     // see an already-queued write to the same node.
