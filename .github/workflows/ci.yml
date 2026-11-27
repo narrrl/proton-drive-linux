@@ -17,6 +17,9 @@ jobs:
 
       - name: Install native dependencies
         run: |
+          # The runner image lists Microsoft's apt repository, which nothing here
+          # needs and which at times answers 403 and fails the update.
+          grep -rl packages.microsoft.com /etc/apt/sources.list.d/ | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install -y \
             pkg-config \
@@ -80,6 +83,9 @@ jobs:
 
       - name: Install native dependencies
         run: |
+          # The runner image lists Microsoft's apt repository, which nothing here
+          # needs and which at times answers 403 and fails the update.
+          grep -rl packages.microsoft.com /etc/apt/sources.list.d/ | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install -y \
             pkg-config \
@@ -129,6 +135,9 @@ jobs:
 
       - name: Install native dependencies
         run: |
+          # The runner image lists Microsoft's apt repository, which nothing here
+          # needs and which at times answers 403 and fails the update.
+          grep -rl packages.microsoft.com /etc/apt/sources.list.d/ | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install -y \
             pkg-config \
