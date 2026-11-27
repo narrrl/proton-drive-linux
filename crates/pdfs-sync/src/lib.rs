@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use pdfs_core::control::ActivityKind;
 use pdfs_core::syncignore::IgnoreRules;
-use pdfs_store::db::StoredSyncEntry;
+use pdfs_store::db::{DeleteWindow, StoredSyncEntry};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 

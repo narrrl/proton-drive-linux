@@ -46,7 +46,7 @@ use pdfs_core::syncignore::IgnoreRules;
 use pdfs_core::timestamp::now_secs;
 use pdfs_core::transfers::{CountingWriter, OwnedCountingReader};
 use pdfs_drive::parse_uid;
-use pdfs_store::db::{SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
+use pdfs_store::db::{DeleteWindow, SavedWalk, SavedWalkItem, StoredSyncEntry, StoredSyncFolder};
 
 mod apply;
 mod engine;
@@ -80,10 +80,10 @@ use planner::conflict_path_as;
 #[cfg(test)]
 use planner::filter_baseline;
 use planner::{
-    FilePlan, RemoteGaps, Unscanned, classification_order, guard_local_wipe, guard_remote_wipe,
-    join_rel, local_deletions, parent_rel, plan_file, rel_to_path, remote_sig,
-    remote_subtree_changed, revision_confirms_baseline, revision_moved, tracked_baseline,
-    unchanged_remote_size,
+    FilePlan, RemoteGaps, Unscanned, classification_order, delete_window, guard_delete_window,
+    guard_local_wipe, guard_remote_wipe, join_rel, local_deletions, parent_rel, plan_file,
+    planned_deletions, rel_to_path, remote_sig, remote_subtree_changed, revision_confirms_baseline,
+    revision_moved, tracked_baseline, unchanged_remote_size,
 };
 use trace::{Call, Count, Phase};
 
@@ -529,6 +529,15 @@ impl Syncer {
             pass_evidence(rules, &local, &unscanned, &remote, &remote_dirs, &gaps).classifiable(rel)
         });
 
+        // The deletions this pass plans, added to those the folder made
+        // lately: a tree lost a little at a time passes the guards above one
+        // pass at a time.
+        let window = self.claim_deletions(
+            folder_id,
+            tracked_baseline(&baseline, rules, &unscanned).len(),
+            planned_deletions(&order, &local, &remote, &baseline),
+        )?;
+
         let mut unscanned_report = unscanned.report();
         unscanned_report.extend(gaps.report());
         let mut outcome = Outcome {
@@ -898,8 +907,60 @@ impl Syncer {
             outcome.deleted += 1;
         }
         self.trace_phase(Phase::Cleanup, cleanup.elapsed());
+        self.settle_deletions(folder_id, window, outcome.deleted);
 
         Ok(outcome)
+    }
+
+    /// Open or continue the folder's deletion window for a pass that plans
+    /// `planned` deletions, and refuse the pass when they would make the
+    /// window a wipe ([`guard_delete_window`]). `tracked` is how many paths
+    /// the folder tracks now.
+    ///
+    /// The window is recorded before anything is deleted, as if every planned
+    /// deletion will succeed: a pass cut short then leaves the window counting
+    /// at least what it deleted. Returns the window as it was before this
+    /// pass, for [`settle_deletions`](Self::settle_deletions).
+    fn claim_deletions(
+        &self,
+        folder_id: i64,
+        tracked: usize,
+        planned: usize,
+    ) -> Result<Option<DeleteWindow>, String> {
+        let open = self
+            .store
+            .sync_delete_window(folder_id)
+            .map_err(|e| format!("load the deletion window: {e:?}"))?;
+        let window = delete_window(open, tracked, now_secs());
+        guard_delete_window(&window, planned)?;
+        if planned == 0 {
+            return Ok(None);
+        }
+        let claimed = DeleteWindow {
+            deleted: window.deleted + planned as u64,
+            ..window
+        };
+        self.store
+            .sync_delete_window_set(folder_id, &claimed)
+            .map_err(|e| format!("record the deletion window: {e:?}"))?;
+        Ok(Some(window))
+    }
+
+    /// Count what a finished pass actually deleted in the window
+    /// [`claim_deletions`](Self::claim_deletions) opened, in place of what it
+    /// planned to: a deletion that failed is tried again by the next pass and
+    /// would otherwise count twice.
+    fn settle_deletions(&self, folder_id: i64, window: Option<DeleteWindow>, deleted: usize) {
+        let Some(window) = window else {
+            return;
+        };
+        let settled = DeleteWindow {
+            deleted: window.deleted + deleted as u64,
+            ..window
+        };
+        if let Err(e) = self.store.sync_delete_window_set(folder_id, &settled) {
+            debug!(id = folder_id, error = ?e, "sync: cannot settle the deletion window");
+        }
     }
 }
 

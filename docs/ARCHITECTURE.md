@@ -352,6 +352,12 @@ Safety rules:
   deletions` in the pass trace, which should stay at zero.
 - **Wipe guard.** A pass in which every previously synced file has vanished locally is refused
   instead of trashing the whole folder on Drive. It applies to any non-empty baseline.
+- **Deletion window.** The wipe guard sees one pass. A tree lost a little at a time passes it once
+  per pass, so each folder also counts the deletions it made in the last day, on either side, in
+  `sync_delete_window` (schema 50). A mirror pass whose deletions would bring that count to nine
+  tenths of what the folder tracked is refused (`guard_delete_window`). A user emptying one large
+  subfolder of a healthy tree stays under it. A pass records its plan before it deletes and what
+  it actually deleted once it ends. Changing or removing the folder drops the window.
 - **Open for writing.** Files that some process holds open for writing (`/proc/*/fd`,
   `open_for_write_set`) are left out of the pass and picked up after they are closed.
 - **Ignore rules.** `.pdfsignore` (or `.protonignore`) at the folder root plus `ignore_patterns`

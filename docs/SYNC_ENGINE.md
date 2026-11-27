@@ -131,6 +131,11 @@ would refuse a user who empties one large folder on purpose. Left out, they woul
 listing or an unmounted disk delete one subtree at a time. Both need a round-level guard
 before planning can be split up.
 
+That guard is the deletion window (`guard_delete_window`): a folder counts the deletions it made
+in the last day against the most paths it tracked in that time, and refuses a pass that would
+bring the count to nine tenths. It already covers a tree lost over several whole passes. Split
+planning would add each step's deletions to the same count.
+
 What is built:
 
 - **Schema 48:** `sync_walk` (root, start time), `sync_walk_dir` (each folder found:

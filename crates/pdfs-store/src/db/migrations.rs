@@ -11,7 +11,7 @@ use super::Db;
 use pdfs_core::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 49;
+pub(super) const SCHEMA_VERSION: i64 = 50;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -541,6 +541,16 @@ impl Db {
                     tx.execute_batch(MIGRATION_V49_COLUMNS)?;
                 }
                 tx.execute_batch(MIGRATION_V49)?;
+            }
+        }
+        if current < 50 {
+            let has_folders: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_folder'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )?;
+            if has_folders {
+                tx.execute_batch(MIGRATION_V50)?;
             }
         }
         tx.execute(
@@ -1545,6 +1555,34 @@ UPDATE album_photos SET resolved=1 WHERE name IS NOT NULL;
 const MIGRATION_V49_COLUMNS: &str = "
 ALTER TABLE sync_walk ADD COLUMN complete INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sync_walk ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Schema v50: the deletions a mirror folder made lately, so the wipe guard
+/// sees a tree lost a little at a time, and not only one lost in a single pass
+/// (`docs/SYNC_ENGINE.md`).
+///
+/// One row a folder: when the window began, how many paths the folder
+/// tracked then, and how many deletions it has made since. A change to what
+/// the folder is, or its removal, drops the row, as it drops the saved walk.
+const MIGRATION_V50: &str = "
+CREATE TABLE IF NOT EXISTS sync_delete_window (
+  folder_id  INTEGER PRIMARY KEY,
+  started_at INTEGER NOT NULL,
+  reference  INTEGER NOT NULL,
+  deleted    INTEGER NOT NULL
+);
+DROP TRIGGER IF EXISTS sync_delete_window_drop_on_folder_update;
+DROP TRIGGER IF EXISTS sync_delete_window_drop_on_folder_delete;
+CREATE TRIGGER sync_delete_window_drop_on_folder_update
+AFTER UPDATE OF local_path, remote_uid, mode ON sync_folder
+BEGIN
+  DELETE FROM sync_delete_window WHERE folder_id = OLD.id;
+END;
+CREATE TRIGGER sync_delete_window_drop_on_folder_delete
+AFTER DELETE ON sync_folder
+BEGIN
+  DELETE FROM sync_delete_window WHERE folder_id = OLD.id;
+END;
 ";
 
 /// See [`MIGRATION_V49_COLUMNS`].
