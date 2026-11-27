@@ -307,9 +307,32 @@ instance's keyring entry so the next run does not sign in again; `--logout` forg
 Proton asks for a CAPTCHA, sign in once by hand with `PDFS_INSTANCE=bench pdfs login`.
 
 The script refuses a `pdfs` built without `PDFS_INSTANCE`, which would act on your own account.
-A new folder's first sync uploads about one small file every four seconds, so with a 500-file
-tree the edit is timed about 35 minutes in. A run that is cut short leaves its folder behind; the
-next run removes it.
+A new folder's first sync uploads about two small files a second (eight at a time), so with a
+500-file tree the edit is timed a few minutes in. A run that is cut short leaves its folder behind;
+the next run removes it.
+
+### The small-file benchmark
+
+`--scenario small` times many small files instead, the case that the API's one-request small
+upload is for. For each tree size (200 by default) it makes files of `--small-size` random bytes
+(4096 by default), plus `--images` noise PNGs that get thumbnails (10 by default). It then:
+
+- times the first sync, until every file is uploaded and the folder is quiet
+- rewrites `--edits` of the files at once (50 by default) and times until all are uploaded again
+
+For each phase it reports wall time, files per second, the daemon's CPU time, and the requests
+the daemon sent. The requests are API calls by method, plus storage uploads. It counts them from
+the SDK's telemetry: the daemon runs with `RUST_LOG=info,pgp=error,proton_sdk::telemetry=debug`,
+and its log goes to the work directory. If the SDK tags each request with its endpoint, the JSON
+output also counts requests per endpoint.
+
+```bash
+scripts/live-bench.py --account-env path/to/.env --pdfs target/release/pdfs --scenario small \
+  --json small.json
+```
+
+Wall time varies by 2x between runs against the live service. Compare medians of three runs,
+and treat the request counts as the stable measure.
 
 ## Before a release
 

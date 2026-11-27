@@ -2,7 +2,10 @@
 """Time one edit in a synced folder, from the write to the new revision on Drive.
 
 Runs against a real account on a separate instance (`PDFS_INSTANCE`), so the
-user's own daemon and session are never touched. For each tree size it:
+user's own daemon and session are never touched. There are two scenarios,
+picked with `--scenario`.
+
+`edit` (the default) times one edit. For each tree size it:
 
 1. makes a disposable folder in My files and a local tree of that many files,
 2. attaches the local tree to it and waits for the first sync to finish,
@@ -11,6 +14,19 @@ user's own daemon and session are never touched. For each tree size it:
    - the pass, split into its stages and calls to Drive (`pdfs diagnostics`),
    - verify: the pass end until `pdfs versions list` shows the new revision,
 4. detaches the folder and trashes the remote copy.
+
+`small` times many small files, the case Proton's one-request small upload is
+for. For each tree size it:
+
+1. makes a tree of files of `--small-size` random bytes, plus `--images` noise
+   PNGs that get thumbnails, and attaches it,
+2. times the first sync until every file is uploaded and the folder is quiet,
+3. rewrites `--edits` of the files at once and times until all of them are
+   uploaded again,
+4. reports, for each phase, the wall time, files per second, the daemon's CPU
+   time and the requests it sent: API calls by method, and storage uploads.
+   The requests come from the SDK's telemetry, so the daemon runs with
+   `proton_sdk::telemetry=debug`.
 
 The account comes from an env file with `username=`, `password=` and, for an
 account with two-factor sign-in, `PROTON_TOTP_SECRET=`. It is read here and
@@ -33,6 +49,8 @@ import hashlib
 import hmac
 import json
 import os
+import random
+import re
 import pty
 import select
 import shutil
@@ -43,6 +61,7 @@ import sys
 import tempfile
 import time
 import uuid
+import zlib
 from pathlib import Path
 
 POLL = 0.1
@@ -300,6 +319,259 @@ def bench_one(
         shutil.rmtree(local, ignore_errors=True)
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+OPERATION = re.compile(r"operation=\W*(\w+)")
+METHOD = re.compile(r"method=(\w+)")
+ENDPOINT = re.compile(r"endpoint=(\S+)")
+SDK_LOG = "info,pgp=error,proton_sdk::telemetry=debug"
+# Slower than `POLL`: each poll is a diagnostics request to the daemon, and the
+# small-file scenario measures the daemon's CPU time.
+SMALL_POLL = 0.5
+
+
+class Requests:
+    """Counts the requests the daemon logs through the SDK's telemetry, from a
+    byte offset of its log on."""
+
+    def __init__(self, log: Path) -> None:
+        self.log = log
+        self.offset = log.stat().st_size
+
+    def take(self) -> dict[str, int]:
+        with self.log.open("rb") as file:
+            file.seek(self.offset)
+            chunk = file.read()
+            self.offset = file.tell()
+        counts: dict[str, int] = {}
+        for line in ANSI.sub("", chunk.decode(errors="replace")).splitlines():
+            if "proton_sdk::telemetry" not in line:
+                continue
+            found = OPERATION.search(line)
+            if not found:
+                continue
+            operation = found.group(1)
+            if operation == "http_request":
+                method = METHOD.search(line)
+                key = f"api {method.group(1) if method else '?'}"
+                # SDKs that tag the endpoint also get a count per endpoint.
+                route = ENDPOINT.search(line)
+                if route:
+                    detail = f"endpoint {method.group(1) if method else '?'} {route.group(1)}"
+                    counts[detail] = counts.get(detail, 0) + 1
+            elif operation.startswith("storage_"):
+                key = operation.replace("_", " ")
+            else:
+                key = f"op {operation}"
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+
+def cpu_seconds(pid: int) -> float:
+    """User and system CPU time of `pid` so far."""
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def noise_png(path: Path, side: int, rng: random.Random) -> None:
+    """A PNG of random pixels: it does not compress, so its size is known, and
+    the daemon makes thumbnails for it."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    rows = b"".join(b"\x00" + rng.randbytes(side * 3) for _ in range(side))
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(rows, 1))
+        + chunk(b"IEND", b"")
+    )
+
+
+def make_small_tree(
+    root: Path, files: int, size: int, images: int, rng: random.Random, per_dir: int = 50
+) -> list[Path]:
+    paths = []
+    for index in range(files):
+        directory = root / f"d{index // per_dir:04d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"f{index:06d}.bin"
+        path.write_bytes(rng.randbytes(size))
+        paths.append(path)
+    if images:
+        (root / "pictures").mkdir()
+    for index in range(images):
+        noise_png(root / "pictures" / f"p{index:04d}.png", 120, rng)
+    return paths
+
+
+class Passes:
+    """The passes over one folder that ended, as the diagnostics show them.
+    They keep only the last one, so poll often enough to see each."""
+
+    def __init__(self, pdfs: Pdfs, folder_id: int, stale: set[str]) -> None:
+        self.pdfs = pdfs
+        self.folder_id = folder_id
+        self.stale = stale
+        self.last: str | None = None
+        self.ended: list[dict] = []
+
+    def poll(self) -> dict:
+        state = sync_state(self.pdfs)
+        trace = trace_for(state, self.folder_id)
+        if trace and trace.get("ended") and state.get("pass_folder") != self.folder_id:
+            key = json.dumps(trace, sort_keys=True)
+            if key != self.last and key not in self.stale:
+                self.last = key
+                self.ended.append(trace)
+        return state
+
+    def calls(self, name: str, since: int = 0) -> int:
+        return sum(
+            call["count"]
+            for trace in self.ended[since:]
+            for call in trace.get("calls", [])
+            if call["name"] == name
+        )
+
+    def totals(self, since: int = 0) -> dict[str, dict[str, int]]:
+        totals: dict[str, dict[str, int]] = {}
+        for trace in self.ended[since:]:
+            for kind in ("phases", "calls"):
+                for stat in trace.get(kind, []):
+                    entry = totals.setdefault(f"{kind[:-1]} {stat['name']}", {"count": 0, "ms": 0})
+                    entry["count"] += stat["count"]
+                    entry["ms"] += stat["total_ms"]
+        return totals
+
+    def wait_for(
+        self, what: str, name: str, at_least: int, since: int, quiet: float, timeout: float
+    ) -> float:
+        """Wait until the passes since `since` made `at_least` calls of `name`,
+        then until no pass ran for `quiet` seconds. Returns when the last pass
+        that did work was seen to end."""
+        deadline = time.monotonic() + timeout
+        while self.calls(name, since) < at_least:
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"timed out waiting for {what}: {self.calls(name, since)} of {at_least}"
+                )
+            self.poll()
+            time.sleep(SMALL_POLL)
+        done = time.monotonic()
+        seen = len(self.ended)
+        while time.monotonic() - done < quiet:
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"the folder did not go quiet after {what}")
+            state = self.poll()
+            if state.get("pass_folder") == self.folder_id or len(self.ended) != seen:
+                seen = len(self.ended)
+                done = time.monotonic()
+            time.sleep(SMALL_POLL)
+        return done
+
+
+def phase_result(
+    files: int, wall: float, cpu: float, requests: dict[str, int], passes: Passes, since: int
+) -> dict:
+    sent = sum(n for key, n in requests.items() if key.startswith(("api ", "storage upload")))
+    return {
+        "files": files,
+        "wall_s": round(wall, 2),
+        "files_per_s": round(files / wall, 3) if wall else None,
+        "cpu_s": round(cpu, 2),
+        "cpu_ms_per_file": round(cpu * 1000 / files) if files else None,
+        "requests": requests,
+        "requests_per_file": round(sent / files, 2) if files else None,
+        "passes": len(passes.ended) - since,
+        "totals": passes.totals(since),
+    }
+
+
+def bench_small(
+    pdfs: Pdfs, daemon_pid: int, mount: Path, work: Path, files: int, args: argparse.Namespace
+) -> dict:
+    rng = random.Random(files)
+    name = f"pdfs-bench-small-{files}-{uuid.uuid4().hex[:8]}"
+    local = work / name
+    local.mkdir()
+    paths = make_small_tree(local, files, args.small_size, args.images, rng)
+    uploads = files + args.images
+    pdfs.run("mkdir", str(mount), name)
+    folder_id = None
+    try:
+        stale = {json.dumps(t, sort_keys=True) for t in sync_state(pdfs).get("traces", [])}
+        requests = Requests(work / "daemon.log")
+        cpu = cpu_seconds(daemon_pid)
+        started = time.monotonic()
+        pdfs.run("sync", "attach", "--to", name, str(local))
+        folder = next(
+            item
+            for item in pdfs.json("sync", "list")["items"]
+            if Path(item["local_path"]).resolve() == local.resolve()
+        )
+        folder_id = folder["id"]
+        passes = Passes(pdfs, folder_id, stale)
+        done = passes.wait_for("the first sync", "upload", uploads, 0, args.quiet, args.timeout)
+        first = phase_result(
+            uploads, done - started, cpu_seconds(daemon_pid) - cpu, requests.take(), passes, 0
+        )
+
+        edits = min(args.edits, files)
+        edited = rng.sample(paths, edits)
+        since = len(passes.ended)
+        cpu = cpu_seconds(daemon_pid)
+        started = time.monotonic()
+        for path in edited:
+            path.write_bytes(rng.randbytes(args.small_size))
+        done = passes.wait_for(
+            "the edits", "upload revision", edits, since, args.quiet, args.timeout
+        )
+        edit = phase_result(
+            edits, done - started, cpu_seconds(daemon_pid) - cpu, requests.take(), passes, since
+        )
+        # The counts say the edits were sent; a few read back say they landed.
+        for path in edited[:3]:
+            remote_path = f"{name}/{path.relative_to(local)}"
+            wait("the edit on Drive", lambda p=remote_path: revisions(pdfs, p) >= 2, args.timeout)
+        return {
+            "scenario": "small",
+            "files": files,
+            "images": args.images,
+            "size": args.small_size,
+            "first_sync": first,
+            "edits": edit,
+        }
+    finally:
+        if folder_id is not None:
+            for _ in range(20):
+                try:
+                    pdfs.run("sync", "rm", str(folder_id))
+                    break
+                except Exception as error:  # noqa: BLE001
+                    print(f"  sync rm: {error}; retrying", file=sys.stderr)
+                    time.sleep(6)
+        with contextlib.suppress(Exception):
+            pdfs.run("rm", f"{mount}/{name}")
+        shutil.rmtree(local, ignore_errors=True)
+
+
+def print_small(result: dict) -> None:
+    print(f"{result['files']:>6} files of {result['size']} B and {result['images']} images:")
+    for phase in ("first_sync", "edits"):
+        r = result[phase]
+        sent = ", ".join(
+            f"{k} {v}" for k, v in sorted(r["requests"].items()) if not k.startswith(("op ", "endpoint "))
+        )
+        print(
+            f"         {phase}: {r['files']} files in {r['wall_s']} s ({r['files_per_s']}/s), "
+            f"CPU {r['cpu_s']} s ({r['cpu_ms_per_file']} ms/file), "
+            f"{r['requests_per_file']} requests/file over {r['passes']} passes"
+        )
+        print(f"           requests: {sent}")
+
+
 def refuse_without_instances(binary: str) -> None:
     """Stop unless `binary` honours PDFS_INSTANCE. One built before it existed
     ignores the variable and would sign in, attach and delete on the default
@@ -348,7 +620,11 @@ def main() -> int:
     parser.add_argument("--account-env", type=Path, required=True, help="env file with the test account")
     parser.add_argument("--pdfs", default="pdfs", help="the pdfs CLI to run")
     parser.add_argument("--instance", default="bench", help="PDFS_INSTANCE to run under")
-    parser.add_argument("--sizes", default="20,500", help="tree sizes, comma-separated")
+    parser.add_argument("--scenario", choices=("edit", "small"), default="edit", help="what to time")
+    parser.add_argument("--sizes", help="tree sizes, comma-separated (default 20,500; 200 for small)")
+    parser.add_argument("--small-size", type=int, default=4096, help="bytes per file (small)")
+    parser.add_argument("--images", type=int, default=10, help="noise PNGs with thumbnails (small)")
+    parser.add_argument("--edits", type=int, default=50, help="files rewritten at once (small)")
     parser.add_argument("--timeout", type=float, default=3600, help="seconds per wait")
     parser.add_argument(
         "--quiet", type=float, default=15, help="seconds without a pass before the edit"
@@ -368,8 +644,11 @@ def main() -> int:
     work = args.work or Path(tempfile.mkdtemp(prefix="pdfs-bench-"))
     work.mkdir(parents=True, exist_ok=True)
     log = (work / "daemon.log").open("w")
+    daemon_env = dict(pdfs.env)
+    if args.scenario == "small":
+        daemon_env["RUST_LOG"] = SDK_LOG
     daemon = subprocess.Popen(
-        [args.pdfs, "daemon"], env=pdfs.env, stdin=subprocess.DEVNULL, stdout=log, stderr=log
+        [args.pdfs, "daemon"], env=daemon_env, stdin=subprocess.DEVNULL, stdout=log, stderr=log
     )
     results = []
     try:
@@ -380,9 +659,14 @@ def main() -> int:
         )
         mount = Path(status["mount"].get("mountpoint") or Path.home() / f"ProtonDrive-{args.instance}")
         remove_leftovers(pdfs, mount)
-        for size in (int(s) for s in args.sizes.split(",")):
-            result = bench_one(pdfs, mount, work, size, args.timeout, args.quiet)
-            print_result(result)
+        sizes = args.sizes or ("200" if args.scenario == "small" else "20,500")
+        for size in (int(s) for s in sizes.split(",")):
+            if args.scenario == "small":
+                result = bench_small(pdfs, daemon.pid, mount, work, size, args)
+                print_small(result)
+            else:
+                result = bench_one(pdfs, mount, work, size, args.timeout, args.quiet)
+                print_result(result)
             results.append(result)
             if args.json:
                 args.json.write_text(json.dumps(results, indent=2))
