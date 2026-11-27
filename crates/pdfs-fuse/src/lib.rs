@@ -932,6 +932,9 @@ struct Core {
     /// Set while a diagnostics report's database probe is still out, so a
     /// database that does not answer costs one stuck thread, not one per report.
     pending_probe: Arc<AtomicBool>,
+    /// Cold listings in flight, by folder, so callers that find the same
+    /// folder unlisted at once share one listing ([`Core::list_children`]).
+    listing_flights: Arc<pdfs_sched::flights::Flights<NodeUid>>,
     /// Secondary FUSE sessions for `ondemand` sync folders, keyed by sync-folder
     /// id. Each is a `ProtonFs` rooted at the folder's remote
     /// node, mounted over its local path, sharing this Core's client/cache/db and
@@ -1197,7 +1200,21 @@ impl Core {
     }
 
     fn require_writable(&self, ino: u64) -> Result<(), Errno> {
-        self.state().require_writable(ino).map_err(node_errno)
+        let st = self.state();
+        st.require_writable(ino).map_err(|error| {
+            // A refusal of a node the mount owns has no cause the user can
+            // see, so it says which node and what access the tree holds.
+            if matches!(error, pdfs_vfs::tree::NodeError::NotWritable) {
+                let entry = st.entries.get(&ino);
+                warn!(
+                    ino,
+                    uid = ?entry.map(|e| &e.uid),
+                    access = ?entry.map(|e| e.access),
+                    "refused a change: the tree holds the node read-only"
+                );
+            }
+            node_errno(error)
+        })
     }
 
     /// Mutation admission point. Persisted and every resident authority must
@@ -1217,7 +1234,14 @@ impl Core {
             // The drain, which replays intent recorded long ago, is the one
             // caller that has to tell the two apart — see
             // [`Core::uid_write_authority`].
-            WriteAuthority::Denied | WriteAuthority::Unknown => Err(Errno::EACCES),
+            refused @ (WriteAuthority::Denied | WriteAuthority::Unknown) => {
+                // Which authority refused, so a refusal nobody expected
+                // leaves evidence: the persisted row, or a resident mount.
+                let persisted = self.db.effective_node_access(uid);
+                let live: Vec<Access> = self.state().access_by_uid(uid).into_iter().collect();
+                warn!(%uid, ?refused, ?persisted, ?live, "refused a change: the node is not writable");
+                Err(Errno::EACCES)
+            }
         }
     }
 

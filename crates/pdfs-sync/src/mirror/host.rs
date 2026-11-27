@@ -86,6 +86,9 @@ pub struct SyncParts {
     /// first read. A pass trusts the feed's dirty folders only while it is
     /// being read.
     pub events_read_at: Arc<AtomicI64>,
+    /// When each step of a pass may start: its uploads, downloads and folder
+    /// creations.
+    pub admission: Arc<dyn pdfs_sched::Admission>,
 }
 
 impl SyncParts {
