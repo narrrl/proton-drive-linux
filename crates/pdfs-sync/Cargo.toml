@@ -10,6 +10,7 @@ homepage.workspace = true
 description = "The mirror engine's planner and pass model for the Proton Drive Linux client"
 
 [dependencies]
+pdfs-sched.workspace = true
 pdfs-core.workspace = true
 pdfs-drive.workspace = true
 pdfs-store.workspace = true

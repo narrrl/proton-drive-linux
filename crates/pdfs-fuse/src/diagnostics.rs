@@ -18,7 +18,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use pdfs_core::control::{Diagnostics, DriveCallStat, InflightRequest, ServiceState, WorkerState};
+use pdfs_core::control::{
+    AdmissionLoad, Diagnostics, DriveCallStat, InflightRequest, ServiceState, WorkerState,
+};
 
 use pdfs_core::lifecycle::ServiceBoard;
 
@@ -198,6 +200,21 @@ impl Core {
                     longest_ms: u64::try_from(stat.longest.as_millis()).unwrap_or(u64::MAX),
                 })
                 .collect(),
+            admission: self
+                .sync
+                .admission
+                .load()
+                .into_iter()
+                .map(|load| AdmissionLoad {
+                    class: load.class.name().to_owned(),
+                    running: load.running,
+                    waiting: load.waiting,
+                    oldest_wait_ms: load.oldest_wait.map(millis),
+                    admitted: load.admitted,
+                    waited_ms: millis(load.waited),
+                    longest_wait_ms: millis(load.longest_wait),
+                })
+                .collect(),
         }
     }
 
@@ -219,6 +236,10 @@ impl Core {
             },
         )
     }
+}
+
+fn millis(took: Duration) -> u64 {
+    u64::try_from(took.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Run `probe` on a thread of its own and wait up to `deadline` for it.
