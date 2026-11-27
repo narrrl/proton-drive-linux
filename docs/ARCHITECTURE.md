@@ -919,6 +919,31 @@ follower whose leader failed lists the folder itself, so each caller still gets 
 A shared folder's refresh stays out of the flight, since its generation check settles races of
 its own.
 
+Step 4 has started, inside `pdfs-sync`:
+
+- **Typed absence.** `evidence` says, for each path a walk touched, what the walk proved about it:
+  present, absent, excluded by the ignore rules, or unknown, with the reason: a folder that could
+  not be read, a path that vanished during the scan, or a Drive listing that failed or came back
+  short. The mirror pass and the push pass both ask it, and a deletion without
+  proof that the path is gone is not made: it is logged and counted, and the next pass plans it
+  again.
+- **A delete guard over time.** Each mirror folder counts its deletions over the last day
+  (`sync_delete_window`), on either side. A pass that would bring the count to nine in ten of
+  what the folder held is refused, so a wipe spread over several passes is caught as one.
+- **The local dirty set.** `local_dirty::LocalDirty` holds where each folder changed on disk since
+  a pass last looked, as the watcher reports it, and whether the watch was live throughout. A pass
+  still walks the whole folder and counts the changes the set did not cover.
+- **The root reducer.** `root::Roots` holds one state machine per folder (discovering, following,
+  auditing, suspended, draining, handed off) that says how far the engine can trust what it has
+  seen. Its transitions are logged; nothing acts on them yet.
+
+Where step 3 stopped: `Core` no longer holds raw state, only the handles of the parts that own it,
+and the areas that are services of their own build from those handles. Taking `Core` apart
+further would change how hundreds of call sites reach the tree without changing who owns what, so
+the mounted-files side stays in `Core` until step 5 moves it out. The inner crates still see the
+SDK's id and node types (`NodeUid`, `Node`), which come with the whole `proton-sdk` crate; a
+crate in the SDK with only those types is the way out, and comes with an SDK release.
+
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and
 macOS adapters, and a separate repository for the sync engine.
