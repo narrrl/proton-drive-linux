@@ -4567,6 +4567,8 @@ mod tests {
     fn a_replace_cut_off_after_its_trash_brings_the_replaced_file_back() {
         let drive = FakeDrive::new();
         let dir = scratch("replace-cut-trash");
+        // Only this test's daemons in the log a failure prints.
+        take_logged();
         let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
         std::fs::write(daemon.mountpoint.join("report.odt"), b"old").unwrap();
         std::fs::write(daemon.mountpoint.join("report.odt.tmp"), b"new").unwrap();
@@ -4586,8 +4588,9 @@ mod tests {
             wait_until(Duration::from_secs(30), || {
                 drive.tree().get("report.odt") == Some(&Entry::File(Arc::new(b"old".to_vec())))
             }),
-            "the replaced file came back: {:?}",
-            drive.tree()
+            "the replaced file came back: {:?}\n{}",
+            drive.tree(),
+            take_logged().join("\n")
         );
         assert!(drive.tree().contains_key("report.odt.tmp"));
         assert!(wait_until(Duration::from_secs(30), || {
