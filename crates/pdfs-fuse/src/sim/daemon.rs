@@ -2492,6 +2492,70 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_mirror_create_whose_reply_was_lost_is_adopted_after_a_restart_and_its_edit_lands() {
+        // Drive made the file, but the answer never came back, and the daemon
+        // stopped before it tried again. While it was stopped the file was
+        // written again. A one-request small upload makes this the common way
+        // a create goes unanswered: it leaves a whole file, never a draft. The
+        // start must find that file, take it as this one, and put the newer
+        // bytes on it: one file, no conflict copy.
+        take_logged();
+        let drive = FakeDrive::new();
+        let dir = scratch("mirror-lost-create-restart");
+        let (daemon, folder, client) = start_mirror(&drive, &dir, &[("a.txt", b"one")]);
+        let local = dir.join("local");
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+
+        client.lose_reply_to_next_create();
+        std::fs::write(local.join("new.txt"), b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            on_drive(&drive, "mirrored/new.txt").is_some_and(|bytes| bytes == b"first")
+        }));
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+
+        std::fs::write(local.join("new.txt"), b"second, written while stopped").unwrap();
+        let daemon = Daemon::start(&dir, client).unwrap();
+        let landed = wait_until(Duration::from_secs(60), || {
+            on_drive(&drive, "mirrored/new.txt")
+                .is_some_and(|bytes| bytes == b"second, written while stopped")
+        });
+        let logged = take_logged();
+        assert!(
+            landed,
+            "{:#?}\n{:#?}",
+            drive.tree(),
+            logged
+                .iter()
+                .filter(|l| l.contains("sync") || l.contains("new"))
+                .collect::<Vec<_>>()
+        );
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+
+        assert!(conflict_copies(&local, "new").is_empty());
+        let tree = drive.tree();
+        assert!(
+            !tree.keys().any(|k| k.contains("sync-conflict")),
+            "{tree:?}"
+        );
+        assert_eq!(
+            tree.keys().filter(|k| k.contains("new")).count(),
+            1,
+            "{tree:?}"
+        );
+        assert_eq!(
+            std::fs::read(local.join("new.txt")).unwrap(),
+            b"second, written while stopped"
+        );
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        assert!(
+            reopen(&dir).sync_intents(Some(folder)).unwrap().is_empty(),
+            "every intent settled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_revision_made_during_a_mirror_download_still_arrives() {
         // The baseline after a download read the node again, and recorded a
         // revision another computer made while the download ran as synced.

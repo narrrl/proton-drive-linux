@@ -96,6 +96,15 @@ pub trait SyncStore: Send + Sync {
     fn sync_intent_settle(&self, id: i64) -> Result<()>;
     /// Move an intent to `state`, with the error that put it there.
     fn sync_intent_set(&self, id: i64, state: &str, error: Option<&str>) -> Result<()>;
+    /// Note that upload `kind` of `rel_path` streamed bytes with SHA-1 `sha1`
+    /// and heard no success back.
+    fn sync_intent_sent(
+        &self,
+        folder_id: i64,
+        rel_path: &str,
+        kind: &str,
+        sha1: &str,
+    ) -> Result<()>;
     /// Every intent not settled; only `folder_id`'s when given.
     fn sync_intents(&self, folder_id: Option<i64>) -> Result<Vec<StoredIntent>>;
     /// Move every intent in state `from` to `to`.
@@ -196,6 +205,15 @@ impl SyncStore for Db {
     }
     fn sync_intent_set(&self, id: i64, state: &str, error: Option<&str>) -> Result<()> {
         Db::sync_intent_set(self, id, state, error)
+    }
+    fn sync_intent_sent(
+        &self,
+        folder_id: i64,
+        rel_path: &str,
+        kind: &str,
+        sha1: &str,
+    ) -> Result<()> {
+        Db::sync_intent_sent(self, folder_id, rel_path, kind, sha1)
     }
     fn sync_intents(&self, folder_id: Option<i64>) -> Result<Vec<StoredIntent>> {
         Db::sync_intents(self, folder_id)

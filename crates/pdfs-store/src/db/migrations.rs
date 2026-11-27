@@ -11,7 +11,7 @@ use super::Db;
 use pdfs_core::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 51;
+pub(super) const SCHEMA_VERSION: i64 = 52;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -561,6 +561,21 @@ impl Db {
             )?;
             if has_folders {
                 tx.execute_batch(MIGRATION_V51)?;
+            }
+        }
+        if current < 52 {
+            let has_intents: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_intent'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )?;
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sync_intent') WHERE name = 'sent_sha1s'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )?;
+            if has_intents && !has_column {
+                tx.execute_batch(MIGRATION_V52)?;
             }
         }
         tx.execute(
@@ -1625,6 +1640,13 @@ AFTER DELETE ON sync_folder
 BEGIN
   DELETE FROM sync_intent WHERE folder_id = OLD.id;
 END;
+";
+
+/// v52: the SHA-1s of the bytes each unsettled mirror upload sent, space
+/// separated. A reply that never came may hide an upload that landed, and its
+/// digest is how a later pass knows the file on Drive for its own.
+const MIGRATION_V52: &str = "
+ALTER TABLE sync_intent ADD COLUMN sent_sha1s TEXT;
 ";
 
 /// See [`MIGRATION_V49_COLUMNS`].

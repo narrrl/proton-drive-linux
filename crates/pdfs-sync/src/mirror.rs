@@ -852,6 +852,18 @@ impl Syncer {
                 }
                 FilePlan::Conflict => {
                     let remote = r.expect("conflict requires a remote file");
+                    if self.landed_unanswered(folder_id, rel, remote.sha1.as_deref()) {
+                        info!(
+                            rel,
+                            "sync: the file on Drive is an upload of ours that went unanswered; sending the newer local bytes as a revision of it"
+                        );
+                        batch.push(Pending::UploadRevision {
+                            rel: rel.clone(),
+                            uid: remote.uid.clone(),
+                            seen: RemoteSeen::from(remote),
+                        });
+                        continue;
+                    }
                     batch.push(Pending::Conflict {
                         rel: rel.clone(),
                         uid: remote.uid.clone(),
