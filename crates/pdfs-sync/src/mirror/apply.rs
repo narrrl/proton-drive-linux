@@ -41,8 +41,8 @@ impl Syncer {
             .map_err(|e| format!("baseline dir {rel}: {e:?}"))
     }
 
-    /// Run a batch of queued [`Pending`] ops concurrently (bounded by
-    /// [`SYNC_CONCURRENCY`]) and fold their results back into the reconcile's
+    /// Run a batch of queued [`Pending`] ops concurrently, each once the
+    /// engine's admission lets it start, and fold their results back into the reconcile's
     /// shared state on the engine thread: created folders are registered in
     /// `remote_dirs` (so deeper paths resolve their parent), and what each op did
     /// is tallied into `outcome`. Driven by `block_on` from the (non-runtime) sync
@@ -67,14 +67,20 @@ impl Syncer {
         let core = self.clone();
         let root = local_root.to_path_buf();
         let results = self.rt.block_on(async move {
-            let sem = Arc::new(tokio::sync::Semaphore::new(SYNC_CONCURRENCY));
             let mut set = tokio::task::JoinSet::new();
             for op in batch {
                 let core = core.clone();
-                let sem = sem.clone();
                 let root = root.clone();
                 set.spawn(async move {
-                    let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+                    let asked = Instant::now();
+                    let _permit = core
+                        .admission
+                        .admit(pdfs_sched::Step {
+                            class: pdfs_sched::Class::Mirror,
+                            root: folder_id,
+                        })
+                        .await;
+                    core.trace_call(Call::Admission, asked.elapsed());
                     // An op still waiting for its turn when the stop comes is
                     // not started; the ones already sending finish.
                     if core.shutdown.is_stopping() {

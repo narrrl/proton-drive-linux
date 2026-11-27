@@ -13,6 +13,7 @@ description = "FUSE on-demand filesystem for Proton Drive"
 pdfs-core.workspace = true
 pdfs-drive.workspace = true
 pdfs-sync.workspace = true
+pdfs-sched.workspace = true
 pdfs-vfs.workspace = true
 pdfs-store.workspace = true
 zip.workspace = true

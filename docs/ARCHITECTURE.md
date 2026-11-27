@@ -51,6 +51,7 @@ graph TD
 | [`pdfs-store`](../crates/pdfs-store) | The SQLite schema and queries (`db/`), the content cache (`cache`) |
 | [`pdfs-drive`](../crates/pdfs-drive) | The `DriveApi` seam over the SDK, the call counter (`counted`), and `FakeDrive` for the simulations |
 | [`pdfs-sync`](../crates/pdfs-sync) | The mirror engine: its passes (`mirror`), split into the walks (`mirror::walk`), applying a plan (`mirror::apply`) and the push pass (`mirror::push`), its engine thread (`mirror::engine`), its reads and writes of the local disk in one module (`mirror::local`), and the parts with no I/O: planner, pass model and pass trace. It owns its state (`SyncParts`), reads and writes its tables only through `SyncStore`, and reaches the daemon only through `SyncHost` |
+| [`pdfs-sched`](../crates/pdfs-sched) | The admission port: a service describes each step of background work it is about to run (`Step`: its class and its root) and waits for a `Permit` from an `Admission`. `Bounded` admits a fixed number at once. The mirror engine admits every upload, download and folder creation of a pass through it |
 | [`pdfs-vfs`](../crates/pdfs-vfs) | The mounted-files service, with no kernel adapter: the tree (`tree`: nodes, stable inodes, per-mount roots), the reserved inodes (`ids`), the open files (`open`: write handles and their authored ranges, released writes waiting for upload, directory handles, `fallocate` rules), the open-file service (`files`: open, write, resize, fsync and close, behind the `FilesHost` port), the namespace service (`namespace`: create, mkdir, unlink, rmdir and rename behind the `NamespaceHost` port, and the settling of a cut-off replacing rename), a headless adapter that serves both by path (`headless`) and the scenarios every adapter has to pass (`conformance`), and what the mount accepted but has not sent yet (`writes`: queued revisions, nodes removed here, echoes of our own changes). Errors are typed; the FUSE adapter maps them to errno |
 | [`pdfs-fuse`](../crates/pdfs-fuse) | The daemon: FUSE handlers (`filesystem`), finding nodes (`resolve`), folder listings and file sizes (`listing`, `sizes`), reads (`reads`), queueing and the drain (`enqueue`, `queue`, `drain`, `upload`), calls sent straight to Drive (`remote`), requests by path (`requests`), startup recovery (`recovery`), pins, search, trash, the shared tree (`shared`), the link state (`link`), remote events (`background`), the daemon's side of the sync engine (`sync`, which implements `SyncHost`), moves between locations (`relocate`), control handlers (`control`), push events (`events`), photos, sharing, devices, the supervisor, and the simulation tests (`sim/`) |
 | [`pdfs-daemon`](../crates/pdfs-daemon) | The daemon's composition root: waits for a session, opens the database and the content cache, resumes the session and mounts, then remounts or retries with a backoff and records each failure |
@@ -721,6 +722,7 @@ apps       pdfs-cli, pdfs-gui                     talk to the daemon over the co
 daemon     pdfs-daemon                            builds the services, supervisor, diagnostics, control server
 adapters   pdfs-fuse (Linux FUSE), pdfs-local (watch, scan, place), pdfs-drive (SDK adapter, fake Drive)
 services   pdfs-sync (mirrors), pdfs-vfs (mounted files: objects, handles, generations), photos, ...
+           pdfs-sched (admission: which step of background work may start)
 base       pdfs-store (SQLite, migrations), pdfs-core (config, protocol, ids, errors)
 ```
 
@@ -878,6 +880,29 @@ a name that is taken, and opens a file it is asked to create when one exists. Th
 and removals with their POSIX refusals; an unlinked open file) run through it in `pdfs-vfs` and
 through a FUSE mount, online and offline, in `pdfs-fuse`'s simulations, and both see the same
 outcomes. `cargo tree -p pdfs-vfs` still shows no kernel or GUI crate.
+
+Step 6 has started. `pdfs-sched` holds the admission port: an `Admission` decides when a `Step`
+may start, and its `Permit` gives the capacity back when dropped. The mirror engine asks it
+before every upload, download and folder creation of a pass, through `SyncParts::admission`,
+instead of a semaphore of its own. The daemon supplies `Bounded` with the engine's old limit of
+8 (`SYNC_CONCURRENCY`); passes run one at a time, so the behaviour is the one from before. An
+account-wide controller that weighs mirror steps against mounted reads and the drain plugs in
+behind the same trait.
+
+An admission also reports its load (`Admission::load`): per class of step, how many run, how
+many wait, how long the oldest has waited, and the total and longest wait so far. `pdfs
+diagnostics` prints it, and each pass trace counts the time its steps spent in line
+(`admission wait`) apart from the time they spent on the network. This is the first item of the
+scheduler's delivery order: measure before any policy changes.
+
+The second item moves one cold path behind admission: a folder the mount has not listed yet. The
+daemon's admission is now `Classes`, a limit of its own per class of step, so mirror steps (8) and
+cold listings (32, above what the mount lists at once today) never wait for each other. Callers
+that find the same folder unlisted at once share one listing through a single flight
+(`pdfs_sched::flights`): the first lists it, the others wait and take what it published, and a
+follower whose leader failed lists the folder itself, so each caller still gets its own answer.
+A shared folder's refresh stays out of the flight, since its generation check settles races of
+its own.
 
 Steps 0 to 3 are 4.0.0. Steps 4 to 6 follow in 4.x, one service at a time. Out of scope for
 now: an encrypted local vault (full-disk encryption covers a copied disk today), Windows and
