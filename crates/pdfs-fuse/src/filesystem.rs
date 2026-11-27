@@ -2,7 +2,7 @@
 
 use super::*;
 use pdfs_vfs::files::Files;
-use pdfs_vfs::namespace::Namespace;
+use pdfs_vfs::namespace::{Namespace, Renamed};
 use pdfs_vfs::open::{DirListing, dir_page};
 
 impl Filesystem for ProtonFs {
@@ -1225,308 +1225,31 @@ impl ProtonFs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        if let Err(error) = self
-            .core
-            .require_writable(parent)
-            .and_then(|()| self.core.require_writable(newparent))
+        let flags = pdfs_vfs::namespace::RenameFlags {
+            no_replace: flags.contains(RenameFlags::RENAME_NOREPLACE),
+            exchange: flags.contains(RenameFlags::RENAME_EXCHANGE),
+        };
+        match self
+            .namespace
+            .rename(parent, name, newparent, newname, flags)
         {
-            reply.error(error);
-            return;
-        }
-        let (ino, mut uid) = match self.core.lookup_child(parent, name) {
-            Ok(x) => x,
-            Err(e) => {
-                reply.error(e);
-                return;
-            }
-        };
-        // Ancestor cycle check: moving a directory into itself or one of its descendants is forbidden by POSIX (EINVAL).
-        {
-            let st = self.core.state();
-            if let Some(entry) = st.entries.get(&ino)
-                && entry.node.is_folder()
-                && st.is_ancestor_of(ino, newparent)
-            {
-                reply.error(Errno::EINVAL);
-                return;
-            }
-        }
-        // The destination has to be listed either way: the queued path pushes
-        // the node into that listing, and the online one drops it to force a
-        // re-enumeration.
-        if newparent != parent
-            && let Err(e) = self.core.ensure_children(newparent)
-        {
-            reply.error(e);
-            return;
-        }
-        let (old_parent_uid, new_parent_uid) = {
-            let st = self.core.state();
-            match (st.entries.get(&parent), st.entries.get(&newparent)) {
-                (Some(old), Some(new)) => (old.uid.clone(), new.uid.clone()),
-                _ => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
-        };
-        // `rename(2)` replaces an existing destination; Proton has no replacing
-        // rename, so the victim has to be removed first and the operation stops
-        // being atomic. Without this the 422 surfaced as a blanket EIO and every
-        // write-to-temp-then-rename tool — rsync, atomic editor saves — failed
-        // at the very end of its transfer (`docs/BUGS.md` B13).
-        //
-        // `RENAME_EXCHANGE` has no Proton primitive and cannot be emulated
-        // without a window in which one of the two names does not exist.
-        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
-            reply.error(Errno::EINVAL);
-            return;
-        }
-        let victim = match self.core.lookup_child(newparent, newname) {
-            // Renaming a node onto its own name is a no-op, never a self-replace.
-            Ok((_, vuid)) if vuid == uid => None,
-            Ok(x) => Some(x),
-            // Nothing to replace: the overwhelmingly common case.
-            Err(e) if e.code() == libc::ENOENT => None,
-            Err(e) => {
-                reply.error(e);
-                return;
-            }
-        };
-        // Written before the victim is removed and ended when this returns, so
-        // a stop in between is settled on the next start (`docs/BUGS.md` B302).
-        let mut _journal: Option<ReplaceJournal> = None;
-        let replacement_authorized = if let Some((victim_ino, victim_uid)) = &victim {
-            if flags.contains(RenameFlags::RENAME_NOREPLACE) {
-                reply.error(Errno::EEXIST);
-                return;
-            }
-            // POSIX requires both ends to agree on being a directory, and the
-            // check has to happen before anything is trashed: getting it wrong
-            // turns a refusal into the destruction of the destination.
-            let (src_dir, dst_dir) = {
-                let st = self.core.state();
-                let is_dir = |i: &u64| {
-                    st.entries
-                        .get(i)
-                        .map(|e| matches!(e.node.kind, NodeKind::Folder))
-                };
-                match (is_dir(&ino), is_dir(victim_ino)) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => {
-                        reply.error(Errno::ENOENT);
-                        return;
+            Ok(Renamed::Done) => reply.ok(),
+            Ok(Renamed::Queued) => {
+                // Answer first: the kernel updates its cache while it
+                // processes the answer, and an invalidation sent before it
+                // would be overwritten, leaving an empty destination listing.
+                reply.ok();
+                if let Some(notifier) = self.core.session.notifier.get() {
+                    let _ = notifier.inval_entry(parent, OsStr::new(name));
+                    let _ = notifier.inval_entry(newparent, OsStr::new(newname));
+                    let _ = notifier.inval_inode(parent);
+                    if newparent != parent {
+                        let _ = notifier.inval_inode(newparent);
                     }
                 }
-            };
-            // Replacing a directory means trashing it, and Proton trashes a
-            // folder with its whole subtree — so the destination's emptiness has
-            // to be known before the decision is made.
-            let dst_empty = if dst_dir {
-                if let Err(e) = self.core.ensure_children(*victim_ino) {
-                    reply.error(e);
-                    return;
-                }
-                self.core
-                    .state
-                    .lock()
-                    .children
-                    .get(victim_ino)
-                    .is_none_or(|kids| kids.is_empty())
-            } else {
-                true
-            };
-            if let Err(e) = check_replaceable(src_dir, dst_dir, dst_empty) {
-                reply.error(e);
-                return;
             }
-            if let Err(error) = require_rename_access(
-                |authority| self.core.require_uid_writable(authority),
-                &uid,
-                &old_parent_uid,
-                &new_parent_uid,
-            ) {
-                reply.error(error);
-                return;
-            }
-            match ReplaceJournal::begin(&self.core.db, &uid, victim_uid, &new_parent_uid, newname) {
-                Ok(journal) => _journal = Some(journal),
-                Err(error) => {
-                    error!(%uid, %error, "recording a replacing rename failed; refusing it");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            }
-            if let Err(e) = self.core.remove_replaced(*victim_ino, victim_uid, newname) {
-                reply.error(e);
-                return;
-            }
-            true
-        } else {
-            false
-        };
-        // A node whose own creation is still queued has no server-side identity
-        // to rename: the queued op *is* the node, so rewriting its target is the
-        // whole rename. Nothing reaches the API, which is why this works offline.
-        // A create that lands meanwhile leaves no op to rewrite; the node is
-        // then renamed by the uid Drive gave it (docs/BUGS.md B142).
-        if is_local_uid(&uid) {
-            match self.core.db.rewrite_op_target(
-                &uid.to_string(),
-                &new_parent_uid.to_string(),
-                newname,
-            ) {
-                Ok(true) => {
-                    self.core
-                        .state()
-                        .rename_in_place(ino, newparent, &new_parent_uid, newname);
-                    // A create that failed on its old name is due again.
-                    self.core.wake_drain();
-                    // Finalize: a transient scratch file (its create parked, bytes
-                    // held back) renamed to a finished name is the moment the
-                    // completed file is meant to reach Drive. Un-park the create so
-                    // the drain uploads it once (docs/BUGS.md B70). Renaming to
-                    // another transient name leaves it parked.
-                    if is_transient_name(name) && !is_transient_name(newname) {
-                        match self.core.db.set_create_hold(&uid.to_string(), false) {
-                            Ok(_) => {
-                                self.core.wake_drain();
-                                debug!(%uid, newname, "un-parked a finalized transient create");
-                            }
-                            Err(e) => {
-                                warn!(%uid, error = %e, "un-parking a finalized transient create failed")
-                            }
-                        }
-                    }
-                    debug!(%uid, newname, "renamed a node whose create is still queued");
-                    reply.ok();
-                    return;
-                }
-                Ok(false) => match self.core.landed_row_uid(ino) {
-                    Some(real) => {
-                        debug!(local = %uid, %real, newname, "create landed under a rename");
-                        uid = real;
-                    }
-                    None => {
-                        warn!(%uid, name, newname, "queued create vanished under a rename");
-                        self.core
-                            .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
-                        reply.error(Errno::EBUSY);
-                        return;
-                    }
-                },
-                Err(e) => {
-                    error!(%uid, error = %e, "rewriting a queued create's target failed");
-                    self.core
-                        .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            }
+            Err(error) => reply.error(namespace_errno(error)),
         }
-        // Offline, or into a folder that does not exist remotely yet: queue the
-        // rename rather than 404 or fail. Online moves into a real parent still
-        // take the synchronous path, so a genuine API refusal (permissions, a
-        // name clash) surfaces to the caller instead of becoming a queued op
-        // that can only ever conflict.
-        // The queued rename, as a closure: the network going away under the
-        // synchronous path below lands here too, with whatever half already
-        // reached Drive. The op records the end state, so the drain finishes
-        // the rest.
-        let queue_it = |reply: ReplyEmpty| {
-            let queued = if replacement_authorized {
-                self.core.queue_rename_authorized(
-                    ino,
-                    &uid,
-                    &old_parent_uid,
-                    newparent,
-                    &new_parent_uid,
-                    newname,
-                )
-            } else {
-                self.core.queue_rename(
-                    ino,
-                    &uid,
-                    &old_parent_uid,
-                    newparent,
-                    &new_parent_uid,
-                    newname,
-                )
-            };
-            match queued {
-                Ok(()) => {
-                    // Send the rename response first. Kernel-side rename cache
-                    // updates happen while processing that response; notifying
-                    // before it lets those updates overwrite our invalidation
-                    // and retain an empty destination readdir page.
-                    reply.ok();
-                    if let Some(notifier) = self.core.session.notifier.get() {
-                        let _ = notifier.inval_entry(parent, OsStr::new(&name));
-                        let _ = notifier.inval_entry(newparent, OsStr::new(&newname));
-                        let _ = notifier.inval_inode(parent);
-                        if newparent != parent {
-                            let _ = notifier.inval_inode(newparent);
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.core
-                        .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
-                    reply.error(e);
-                }
-            }
-        };
-        if rename_needs_queue(
-            self.core.sends_inline(),
-            is_local_uid(&new_parent_uid),
-            newparent != parent,
-            newname != name,
-        ) {
-            queue_it(reply);
-            return;
-        }
-        // A failure past this point has already trashed any node the rename was
-        // replacing, so put it back rather than leaving the caller with neither
-        // the source moved nor the destination intact.
-        if let Err(error) = require_rename_access(
-            |authority| self.core.require_uid_writable(authority),
-            &uid,
-            &old_parent_uid,
-            &new_parent_uid,
-        ) {
-            self.core
-                .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
-            reply.error(error);
-            return;
-        }
-        // A move that also renames is one request, so the name only has to be
-        // free in the destination, and the reply never stands for half of it.
-        let renamed = if newparent != parent {
-            let target = (newname != name).then_some(newname);
-            self.core.move_rename_remote(&uid, &new_parent_uid, target)
-        } else if newname != name {
-            self.core.rename_remote(&uid, newname)
-        } else {
-            Ok(())
-        };
-        if let Err(e) = renamed {
-            if self.core.lost_link(&e, "rename") {
-                queue_it(reply);
-                return;
-            }
-            error!(%uid, error = %e, "rename failed");
-            self.core
-                .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
-            reply.error(Errno::EIO);
-            return;
-        }
-        // Through the guard, so the database has both folders unlisted before
-        // the reply. The next lookup rebuilds a folder still marked listed from
-        // the database, which did not have the move yet (docs/BUGS.md B135).
-        self.core
-            .state()
-            .relocate(ino, parent, newparent, &new_parent_uid, newname);
-        reply.ok();
     }
 
     /// Answer with an inode's current attributes, or `ENOENT` if it went away
@@ -1618,45 +1341,6 @@ impl ProtonFs {
             reply.error(Errno::ERANGE);
         } else {
             reply.data(&buf);
-        }
-    }
-}
-
-/// A replacing rename's journal entry, ended when the rename returns, however
-/// it returns. Only a stop leaves it behind, and that is what it is for.
-struct ReplaceJournal {
-    db: Arc<Db>,
-    source: String,
-}
-
-impl ReplaceJournal {
-    fn begin(
-        db: &Arc<Db>,
-        source: &NodeUid,
-        victim: &NodeUid,
-        new_parent: &NodeUid,
-        new_name: &str,
-    ) -> pdfs_core::Result<Self> {
-        let source = source.to_string();
-        db.begin_replace(&pdfs_store::db::ReplaceIntent {
-            source_uid: source.clone(),
-            victim_uid: victim.to_string(),
-            new_parent_uid: new_parent.to_string(),
-            new_name: new_name.to_owned(),
-            started_ms: now_millis(),
-            run: 0,
-        })?;
-        Ok(Self {
-            db: db.clone(),
-            source,
-        })
-    }
-}
-
-impl Drop for ReplaceJournal {
-    fn drop(&mut self) {
-        if let Err(error) = self.db.end_replace(&self.source) {
-            warn!(source = %self.source, %error, "ending a replacing rename's journal entry failed");
         }
     }
 }
