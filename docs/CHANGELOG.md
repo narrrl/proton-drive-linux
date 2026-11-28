@@ -11,6 +11,21 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [4.0.0] — 2026-11-28
+
+4.0.0 splits the daemon into services that each own their state. The sync engine, the mounted
+files, Drive access, the database and the admission of background work each have a crate of
+their own (`pdfs-sync`, `pdfs-vfs`, `pdfs-drive`, `pdfs-store`, `pdfs-sched`), and the daemon
+builds them in `pdfs-daemon` (see [Architecture](ARCHITECTURE.md#40-from-one-daemon-to-composed-services)).
+A sync pass now keeps track of what each side owes: it lists only what changed on Proton Drive,
+trusts the watcher for the folder on disk, resumes a walk a restart cut short, and records every
+effect it sends until the result is in. Small files go up in one request.
+
+**Upgrading:** the database moves from schema 47 to 52 on first start. 3.10 and older refuse to
+open it, so going back to 3.10 means removing the cache and letting it build again. Files in
+`staging/` and `recovery/`, and synced folders on disk, are not touched by this. Nothing else
+needs doing: configuration, sign-in and synced folders carry over.
+
 Schema: **52**. New tables save a mirror folder's walk of Proton Drive (48). A finished walk is
 kept, with a list of the folders that changed on Proton Drive since (49). Each mirror folder
 counts the deletions it made in the last day (50). Each upload, download or folder a mirror pass
@@ -2639,6 +2654,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[4.0.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v4.0.0
 [3.10.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.10.0
 [3.9.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.9.0
 [3.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.8.1
