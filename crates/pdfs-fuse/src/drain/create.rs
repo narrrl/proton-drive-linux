@@ -637,6 +637,16 @@ impl Core {
         // answer may still have the old name (`docs/BUGS.md` B161).
         let real_key = real.to_string();
         let renaming = self.db.has_pending_op(&real_key, OP_RENAME)?;
+        // Where the tree has the node before the read-back. A rename queued
+        // after the check above and landed before the one under the lock
+        // below leaves no op for either to see, while the read-back can still
+        // have the old name. The tree moved the entry when the rename was
+        // queued, so a placement that changed meanwhile is the user's
+        // (docs/BUGS.md B309).
+        let before = {
+            let st = self.state();
+            placed_in(&st, real).or_else(|| placed_in(&st, local))
+        };
         // Drive answers a create before it lists the new node.
         let mut node = self
             .read_back(real)
@@ -669,8 +679,9 @@ impl Core {
             // before it renames the entry under this lock. Asked only before,
             // a rename made since was overwritten with the name the create was
             // sent with, here and in the node row (`docs/BUGS.md` B152).
-            let renaming =
-                renaming || matches!(self.db.has_pending_op(&real_key, OP_RENAME), Ok(true));
+            let renaming = renaming
+                || placed_in(st, real) != before
+                || matches!(self.db.has_pending_op(&real_key, OP_RENAME), Ok(true));
             if renaming && let Some(e) = st.entries.get(&ino) {
                 node.name = e.node.name.clone();
                 node.parent_uid = e.node.parent_uid.clone();
