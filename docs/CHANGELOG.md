@@ -147,6 +147,11 @@ digest of what it sent (52).
   no longer shown, because nobody can say whose they are. Preferences → Apps adds "Remember
   recent files" and "Clear recent files", and a clear takes effect the next time the window
   opens. See [Configuration](CONFIGURATION.md#prompt) for `remember_recent`.
+- **Dragging onto a folder in Files says what the drop will do.** A label over the view reads, for
+  example, "Move 3 items to “Receipts”" for rows dragged within the app, and "Copy 3 items to
+  “Receipts”" for files dragged from a file manager browsing the drive. Files from elsewhere read
+  "Upload…". It also says how many items can't go there, such as the folder itself in a
+  selection.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different

@@ -59,6 +59,7 @@ scale.browser-status-meter trough { min-width: 140px; min-height: 6px; }
 .dropzone-active { border-color: var(--accent-bg-color); background: color-mix(in srgb, var(--accent-bg-color) 10%, transparent); }
 .files-drop-active { outline: 2px dashed var(--accent-bg-color); outline-offset: -4px; border-radius: 12px; background: color-mix(in srgb, var(--accent-bg-color) 6%, transparent); }
 .files-drop-folder { border-radius: 8px; background: color-mix(in srgb, var(--accent-bg-color) 22%, transparent); box-shadow: inset 0 0 0 2px var(--accent-bg-color); }
+.files-drop-hint { padding: 8px 16px; border-radius: 9999px; background: var(--accent-bg-color); color: var(--accent-fg-color); font-weight: bold; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2); }
 .file-pending { opacity: 0.45; }
 
 /* Photo viewer: always light-on-dark, whatever the system style */

@@ -31,6 +31,9 @@ pub(crate) struct BrowserState {
     /// Swaps the Files content area between the grid/list views and the status
     /// page below; see [`browser_status`].
     pub(crate) content: gtk4::Stack,
+    /// Floats over the views while something is dragged over them, saying
+    /// what a drop there does; see [`show_drop_preview`].
+    pub(crate) drop_hint: gtk4::Label,
     /// The Files empty/loading/error surface, shown in place of the views.
     pub(crate) status: adw::StatusPage,
     /// Sits in [`Self::status`]; shown when a load failed because the mount
@@ -135,6 +138,7 @@ pub(crate) struct BrowserWidgets {
     pub(crate) crumb: gtk4::Box,
     /// Swaps the content area between the grid/list views and the status page.
     pub(crate) content: gtk4::Stack,
+    pub(crate) drop_hint: gtk4::Label,
     /// The empty/loading/error surface shown in place of the views.
     pub(crate) status: adw::StatusPage,
     /// Sits in the status page; shown only when the mount service is down.
@@ -344,6 +348,19 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     content.set_transition_type(gtk4::StackTransitionType::Crossfade);
     content.add_named(&view_stack, Some("views"));
     content.add_named(&status, Some("status"));
+    // What a drop does, over the views while a drag is over them.
+    let drop_hint = gtk4::Label::builder()
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::End)
+        .margin_bottom(18)
+        .justify(gtk4::Justification::Center)
+        .wrap(true)
+        .visible(false)
+        .can_target(false)
+        .build();
+    drop_hint.add_css_class("files-drop-hint");
+    let content_overlay = gtk4::Overlay::builder().child(&content).build();
+    content_overlay.add_overlay(&drop_hint);
 
     // The details pane slides in from the right while its header toggle is on.
     let (details_pane, details) = build_details_pane();
@@ -356,7 +373,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         // itself; the header toggle alone decides.
         .pin_sidebar(true)
         .max_sidebar_width(300.0)
-        .content(&content)
+        .content(&content_overlay)
         .sidebar(&details_pane)
         .build();
 
@@ -492,6 +509,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             files,
             crumb,
             content,
+            drop_hint,
             status,
             retry,
             search,
@@ -1401,11 +1419,16 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
         gtk4::gdk::FileList::static_type(),
         gtk4::gdk::DragAction::COPY | gtk4::gdk::DragAction::MOVE,
     );
+    // Loaded on enter, so the hint can say what the drop does before it lands.
+    drop.set_preload(true);
     let ui_enter = ui.clone();
-    drop.connect_enter(move |_, _, _| {
+    drop.connect_enter(move |target, _, _| {
         ui_enter.browser.content.add_css_class("files-drop-active");
+        page_drop_preview(&ui_enter, target);
         browser_drop_action()
     });
+    let ui_value = ui.clone();
+    drop.connect_value_notify(move |target| page_drop_preview(&ui_value, target));
     drop.connect_motion(|_, _, _| browser_drop_action());
     let ui_leave = ui.clone();
     drop.connect_leave(move |_| {
@@ -1413,6 +1436,7 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
             .browser
             .content
             .remove_css_class("files-drop-active");
+        ui_leave.browser.drop_hint.set_visible(false);
     });
     let ui_drop = ui.clone();
     drop.connect_drop(move |target, value, _, _| {
@@ -1420,6 +1444,7 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
             .browser
             .content
             .remove_css_class("files-drop-active");
+        ui_drop.browser.drop_hint.set_visible(false);
         let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
             return false;
         };
@@ -3024,19 +3049,29 @@ pub(crate) fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box
                 .formats()
                 .contains_type(gtk4::gdk::FileList::static_type())
     });
-    let anchor_enter = anchor.clone();
-    target.connect_enter(move |_, _, _| {
+    target.set_preload(true);
+    let (anchor_enter, ui_enter, item_enter) = (anchor.clone(), ui.clone(), item.clone());
+    target.connect_enter(move |target, _, _| {
         anchor_enter.add_css_class("files-drop-folder");
+        folder_drop_preview(&ui_enter, target, &item_enter);
         browser_drop_action()
     });
+    let (ui_value, item_value) = (ui.clone(), item.clone());
+    target.connect_value_notify(move |target| folder_drop_preview(&ui_value, target, &item_value));
     target.connect_motion(|_, _, _| browser_drop_action());
-    let anchor_leave = anchor.clone();
-    target.connect_leave(move |_| anchor_leave.remove_css_class("files-drop-folder"));
+    let (anchor_leave, ui_leave) = (anchor.clone(), ui.clone());
+    target.connect_leave(move |_| {
+        anchor_leave.remove_css_class("files-drop-folder");
+        // The page's own target takes over under the pointer; it repaints the
+        // hint for the folder on screen as it is entered.
+        ui_leave.browser.drop_hint.set_visible(false);
+    });
     let ui = ui.clone();
     let item = item.clone();
     let anchor_drop = anchor.clone();
     target.connect_drop(move |target, value, _, _| {
         anchor_drop.remove_css_class("files-drop-folder");
+        ui.browser.drop_hint.set_visible(false);
         let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() else {
             return false;
         };
@@ -3053,6 +3088,123 @@ pub(crate) fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box
         drop_files(&ui, &dest, &files, from_this_app(target))
     });
     anchor.add_controller(target);
+}
+
+/// The page's drop hint, for the folder on screen.
+fn page_drop_preview(ui: &Rc<Ui>, target: &gtk4::DropTarget) {
+    if !ui.browser.search.text().trim().is_empty() {
+        // Search results have no one folder to drop into.
+        ui.browser.drop_hint.set_visible(false);
+        return;
+    }
+    let dest = ui.browser.path.borrow().clone();
+    let name = match dest.rsplit('/').next().filter(|name| !name.is_empty()) {
+        Some(name) => name.to_string(),
+        None => gettext("My files"),
+    };
+    show_drop_preview(ui, target, &dest, &name);
+}
+
+/// A folder cell's drop hint, for that folder.
+fn folder_drop_preview(ui: &Rc<Ui>, target: &gtk4::DropTarget, item: &gtk4::ListItem) {
+    let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() else {
+        return;
+    };
+    let (dest, name) = {
+        let entry = obj.borrow::<DirEntry>();
+        (entry_rel(ui, &entry), entry.name.clone())
+    };
+    show_drop_preview(ui, target, &dest, &name);
+}
+
+/// Say what dropping what `target` holds into `dest` would do, the way
+/// [`drop_files`] will do it. Nothing is shown until the files have loaded.
+fn show_drop_preview(ui: &Rc<Ui>, target: &gtk4::DropTarget, dest: &str, name: &str) {
+    let hint = &ui.browser.drop_hint;
+    let Some(files) = target
+        .value()
+        .and_then(|value| value.get::<gtk4::gdk::FileList>().ok())
+    else {
+        hint.set_visible(false);
+        return;
+    };
+    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
+    let (in_drive, uploads) =
+        split_dropped(&mountpoint, files.files().iter().filter_map(|f| f.path()));
+    let moving = from_this_app(target);
+    let dropped = in_drive.len();
+    let going = drop_targets(in_drive, dest, moving).len();
+    hint.set_label(&drop_preview(
+        DropPlan {
+            going,
+            skipped: dropped - going,
+            uploads: uploads.len(),
+            moving,
+        },
+        name,
+    ));
+    hint.set_visible(true);
+}
+
+/// What a drop would do, counted: see [`drop_files`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DropPlan {
+    /// Items already in Proton Drive that go to the folder.
+    pub(crate) going: usize,
+    /// Items already in Proton Drive that cannot go there: the folder itself,
+    /// one of its parents, or, for a move, what is in it already.
+    pub(crate) skipped: usize,
+    /// Files from outside Proton Drive, uploaded into the folder.
+    pub(crate) uploads: usize,
+    /// The items in Proton Drive move rather than copy.
+    pub(crate) moving: bool,
+}
+
+/// The drop hint for `plan` into the folder called `folder`. Each line is one
+/// sentence, so no translation is put together from pieces.
+pub(crate) fn drop_preview(plan: DropPlan, folder: &str) -> String {
+    if plan.going == 0 && plan.uploads == 0 {
+        return gettext("Nothing here can go into this folder");
+    }
+    let mut lines = Vec::new();
+    if plan.going > 0 {
+        let n = plan.going as u64;
+        lines.push(if plan.moving {
+            // Translators: shown while dragging; {folder} is the folder the items would go to.
+            ngettext_f(
+                "Move {n} item to “{folder}”",
+                "Move {n} items to “{folder}”",
+                n,
+                &[("folder", folder)],
+            )
+        } else {
+            // Translators: shown while dragging; {folder} is the folder the items would go to.
+            ngettext_f(
+                "Copy {n} item to “{folder}”",
+                "Copy {n} items to “{folder}”",
+                n,
+                &[("folder", folder)],
+            )
+        });
+    }
+    if plan.uploads > 0 {
+        // Translators: shown while dragging; {folder} is the folder the files would go to.
+        lines.push(ngettext_f(
+            "Upload {n} item to “{folder}”",
+            "Upload {n} items to “{folder}”",
+            plan.uploads as u64,
+            &[("folder", folder)],
+        ));
+    }
+    if plan.skipped > 0 {
+        lines.push(ngettext_f(
+            "{n} item can't go there and is left out",
+            "{n} items can't go there and are left out",
+            plan.skipped as u64,
+            &[],
+        ));
+    }
+    lines.join("\n")
 }
 
 /// The action to answer a drag over the browser with: always a copy. Rows
@@ -3564,9 +3716,9 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MoveTarget, badge_for, copy_target_allowed, drop_targets, hit_location, icon_base_for,
-        listing_summary, move_target_allowed, show_thumbnail_build_progress, sort_entries,
-        split_dropped,
+        DropPlan, MoveTarget, badge_for, copy_target_allowed, drop_preview, drop_targets,
+        hit_location, icon_base_for, listing_summary, move_target_allowed,
+        show_thumbnail_build_progress, sort_entries, split_dropped,
     };
     use std::path::{Path, PathBuf};
 
@@ -3643,6 +3795,40 @@ mod tests {
         assert_eq!(
             drop_targets(sources(), "Docs", false),
             ["Docs/a.pdf", "Photos/b.jpg"]
+        );
+    }
+
+    /// The hint says the same thing the drop will do: a move for rows from
+    /// this app, a copy for files from a file manager browsing the mount, and
+    /// how many are left out.
+    #[test]
+    fn the_drop_hint_names_the_action_and_what_is_left_out() {
+        let plan = |going, skipped, uploads, moving| DropPlan {
+            going,
+            skipped,
+            uploads,
+            moving,
+        };
+        assert_eq!(
+            drop_preview(plan(3, 0, 0, true), "Receipts"),
+            "Move 3 items to “Receipts”"
+        );
+        assert_eq!(
+            drop_preview(plan(1, 0, 0, false), "Receipts"),
+            "Copy 1 item to “Receipts”"
+        );
+        assert_eq!(
+            drop_preview(plan(0, 0, 2, false), "Receipts"),
+            "Upload 2 items to “Receipts”"
+        );
+        // A selection that holds the folder itself: the rest still moves.
+        assert_eq!(
+            drop_preview(plan(2, 1, 0, true), "Receipts"),
+            "Move 2 items to “Receipts”\n1 item can't go there and is left out"
+        );
+        assert_eq!(
+            drop_preview(plan(0, 2, 0, true), "Receipts"),
+            "Nothing here can go into this folder"
         );
     }
     use pdfs_core::config::{FileSort, FilesView};
