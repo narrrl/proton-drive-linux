@@ -5,6 +5,13 @@
 //! searching a file opened often and lately gets a bonus on top of its match
 //! score (see [`frecency_bonus`]).
 //!
+//! A Drive file is remembered with the account it was opened from, and only
+//! that account's files are shown: after a switch to another account, the
+//! first one's names and paths stay out of the window. Local files are shown
+//! whoever is signed in. Preferences can turn the history off or clear it; the
+//! window loads the file again each time it opens, so a clear made in the app
+//! takes effect at once.
+//!
 //! One writer thread owns the file: it loads it, applies every recorded visit
 //! in order and writes the result back atomically. A visit recorded before the
 //! first load finished simply waits in the channel, so it is merged into the
@@ -42,6 +49,19 @@ pub(crate) struct Visit {
     /// When the file was last opened, in epoch seconds.
     pub(crate) last: i64,
     pub(crate) count: u32,
+    /// The account a Drive file was opened from. `None` for a local file, and
+    /// for a Drive file remembered before accounts were recorded, which is
+    /// never shown since nobody can say whose it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) account: Option<String>,
+}
+
+/// Whether `visit` may be shown while `account` is signed in.
+fn visible(visit: &Visit, account: Option<&str>) -> bool {
+    match visit.hit {
+        Hit::Local(_) => true,
+        Hit::Drive(_) => account.is_some() && visit.account.as_deref() == account,
+    }
 }
 
 /// The history bonus for a file opened `count` times, the last time
@@ -55,9 +75,16 @@ pub(crate) fn frecency_bonus(count: u32, age_secs: i64) -> i64 {
 /// Count one more visit of `hit` at `now`, newest first, and keep at most
 /// [`MAX_VISITS`]. The stored hit is replaced, so its size, date and sync
 /// state are the ones from the latest search.
-fn record(visits: &mut Vec<Visit>, hit: Hit, now: i64) {
+fn record(visits: &mut Vec<Visit>, hit: Hit, now: i64, account: Option<String>) {
     let key = hit.key();
-    let count = match visits.iter().position(|visit| visit.hit.key() == key) {
+    let account = match hit {
+        Hit::Local(_) => None,
+        Hit::Drive(_) => account,
+    };
+    let count = match visits
+        .iter()
+        .position(|visit| visit.hit.key() == key && visit.account == account)
+    {
         Some(at) => visits.remove(at).count.saturating_add(1),
         None => 1,
     };
@@ -67,6 +94,7 @@ fn record(visits: &mut Vec<Visit>, hit: Hit, now: i64) {
             hit,
             last: now,
             count,
+            account,
         },
     );
     visits.truncate(MAX_VISITS);
@@ -107,9 +135,19 @@ fn save(path: &Path, visits: &[Visit]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Delete the history file. Used by the window when the history is turned off,
+/// and by the app's Clear Recent Files.
+pub(crate) fn clear(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
 enum Command {
-    Record(Hit, i64),
+    Record(Hit, i64, Option<String>),
     Prune,
+    /// Read the file again: the app may have cleared it.
+    Reload,
+    /// Forget everything, on disk too.
+    Clear,
 }
 
 /// The writer thread's loop: load, then apply commands until the launcher
@@ -123,11 +161,29 @@ fn serve(path: &Path, commands: &async_channel::Receiver<Command>, publish: impl
     }
     while let Ok(command) = commands.recv_blocking() {
         let changed = match command {
-            Command::Record(hit, now) => {
-                record(&mut visits, hit, now);
+            Command::Record(hit, now, account) => {
+                record(&mut visits, hit, now, account);
                 true
             }
             Command::Prune => prune(&mut visits),
+            Command::Reload => {
+                visits = load(path);
+                publish(visits.clone());
+                false
+            }
+            Command::Clear => {
+                if let Err(e) = clear(path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!("cannot remove {}: {e}", path.display());
+                }
+                let had = !visits.is_empty();
+                visits.clear();
+                if had {
+                    publish(Vec::new());
+                }
+                false
+            }
         };
         if changed {
             if let Err(e) = save(path, &visits) {
@@ -142,6 +198,10 @@ fn serve(path: &Path, commands: &async_channel::Receiver<Command>, publish: impl
 pub(crate) struct History {
     visits: Rc<RefCell<Vec<Visit>>>,
     commands: async_channel::Sender<Command>,
+    /// Who is signed in, as the service last said; `None` until it has.
+    account: RefCell<Option<String>>,
+    /// Whether to remember anything, as Preferences last said.
+    remember: std::cell::Cell<bool>,
 }
 
 impl History {
@@ -169,12 +229,38 @@ impl History {
                 changed();
             }
         });
-        Self { visits, commands }
+        Self {
+            visits,
+            commands,
+            account: RefCell::new(None),
+            remember: std::cell::Cell::new(true),
+        }
+    }
+
+    /// Who is signed in now. Drive files opened by anyone else stay hidden.
+    pub(crate) fn set_account(&self, account: Option<String>) {
+        *self.account.borrow_mut() = account;
+    }
+
+    /// Apply Preferences as the window opens: read the file again, since the
+    /// app may have cleared it, or clear it when the history is turned off.
+    pub(crate) fn refresh(&self, remember: bool) {
+        self.remember.set(remember);
+        let command = if remember {
+            Command::Reload
+        } else {
+            Command::Clear
+        };
+        let _ = self.commands.try_send(command);
     }
 
     /// Remember that `hit` was opened just now.
     pub(crate) fn record(&self, hit: Hit) {
-        let _ = self.commands.try_send(Command::Record(hit, now()));
+        if !self.remember.get() {
+            return;
+        }
+        let account = self.account.borrow().clone();
+        let _ = self.commands.try_send(Command::Record(hit, now(), account));
     }
 
     /// Forget local files that were deleted since they were opened.
@@ -184,9 +270,11 @@ impl History {
 
     /// The most recently opened files, newest first.
     pub(crate) fn recent(&self, limit: usize) -> Vec<Hit> {
+        let account = self.account.borrow();
         self.visits
             .borrow()
             .iter()
+            .filter(|visit| visible(visit, account.as_deref()))
             .take(limit)
             .map(|visit| visit.hit.clone())
             .collect()
@@ -195,9 +283,11 @@ impl History {
     /// The frecency bonus of every remembered file, by [`Hit::key`].
     pub(crate) fn bonuses(&self) -> HashMap<(bool, String), i64> {
         let now = now();
+        let account = self.account.borrow();
         self.visits
             .borrow()
             .iter()
+            .filter(|visit| visible(visit, account.as_deref()))
             .map(|visit| {
                 (
                     visit.hit.key(),
@@ -220,6 +310,8 @@ mod tests {
     use pdfs_core::control::{LocalHit, SearchHit};
 
     const DAY: i64 = 86_400;
+    /// The account the tests open Drive files from.
+    const A: &str = "a@proton.me";
 
     fn drive(name: &str) -> Hit {
         Hit::Drive(SearchHit {
@@ -266,9 +358,9 @@ mod tests {
     #[test]
     fn a_repeat_visit_moves_the_file_to_the_top_and_counts_it() {
         let mut visits = Vec::new();
-        record(&mut visits, drive("a.pdf"), 10);
-        record(&mut visits, drive("b.pdf"), 20);
-        record(&mut visits, drive("a.pdf"), 30);
+        record(&mut visits, drive("a.pdf"), 10, Some(A.into()));
+        record(&mut visits, drive("b.pdf"), 20, Some(A.into()));
+        record(&mut visits, drive("a.pdf"), 30, Some(A.into()));
         assert_eq!(visits.len(), 2);
         assert_eq!(visits[0].hit.name(), "a.pdf");
         assert_eq!((visits[0].count, visits[0].last), (2, 30));
@@ -279,7 +371,7 @@ mod tests {
     fn the_history_keeps_the_newest_fifty_files() {
         let mut visits = Vec::new();
         for n in 0..60 {
-            record(&mut visits, drive(&format!("{n}.pdf")), n);
+            record(&mut visits, drive(&format!("{n}.pdf")), n, Some(A.into()));
         }
         assert_eq!(visits.len(), MAX_VISITS);
         assert_eq!(visits[0].hit.name(), "59.pdf");
@@ -291,8 +383,8 @@ mod tests {
         let dir = scratch_dir("round-trip");
         let path = dir.join("prompt-history.json");
         let mut visits = Vec::new();
-        record(&mut visits, drive("a.pdf"), 10);
-        record(&mut visits, drive("a.pdf"), 20);
+        record(&mut visits, drive("a.pdf"), 10, Some(A.into()));
+        record(&mut visits, drive("a.pdf"), 20, Some(A.into()));
         save(&path, &visits).unwrap();
 
         let loaded = load(&path);
@@ -308,17 +400,17 @@ mod tests {
         let dir = scratch_dir("merge");
         let path = dir.join("prompt-history.json");
         let mut stored = Vec::new();
-        record(&mut stored, drive("old.pdf"), 10);
-        record(&mut stored, drive("old.pdf"), 20);
+        record(&mut stored, drive("old.pdf"), 10, Some(A.into()));
+        record(&mut stored, drive("old.pdf"), 20, Some(A.into()));
         save(&path, &stored).unwrap();
 
         // Both visits are queued before the writer has read the file.
         let (commands, inbox) = async_channel::unbounded();
         commands
-            .send_blocking(Command::Record(drive("old.pdf"), 30))
+            .send_blocking(Command::Record(drive("old.pdf"), 30, Some(A.into())))
             .unwrap();
         commands
-            .send_blocking(Command::Record(drive("new.pdf"), 40))
+            .send_blocking(Command::Record(drive("new.pdf"), 40, Some(A.into())))
             .unwrap();
         drop(commands);
 
@@ -351,13 +443,114 @@ mod tests {
             })
         };
         let mut visits = Vec::new();
-        record(&mut visits, local(&kept), 1);
-        record(&mut visits, local(&dir.join("gone.txt")), 2);
-        record(&mut visits, drive("remote.pdf"), 3);
+        record(&mut visits, local(&kept), 1, Some(A.into()));
+        record(&mut visits, local(&dir.join("gone.txt")), 2, Some(A.into()));
+        record(&mut visits, drive("remote.pdf"), 3, Some(A.into()));
 
         assert!(prune(&mut visits));
         let names: Vec<&str> = visits.iter().map(|visit| visit.hit.name()).collect();
         assert_eq!(names, ["remote.pdf", "kept.txt"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// After a switch to account B, account A's Drive files are not shown and
+    /// give no ranking bonus. Local files stay.
+    #[test]
+    fn only_the_signed_in_accounts_drive_files_are_shown() {
+        let mut visits = Vec::new();
+        record(&mut visits, drive("a-secret.pdf"), 1, Some(A.into()));
+        record(
+            &mut visits,
+            drive("b-notes.pdf"),
+            2,
+            Some("b@proton.me".into()),
+        );
+        let local = Hit::Local(LocalHit {
+            name: "here.txt".into(),
+            path: "/home/me/here.txt".into(),
+            is_dir: false,
+            size: 1,
+            modified: 1,
+            score: 0,
+        });
+        record(&mut visits, local, 3, Some(A.into()));
+        assert_eq!(
+            visits[0].account, None,
+            "a local file belongs to no account"
+        );
+
+        let shown = |account: Option<&str>| -> Vec<&str> {
+            visits
+                .iter()
+                .filter(|visit| visible(visit, account))
+                .map(|visit| visit.hit.name())
+                .collect()
+        };
+        assert_eq!(shown(Some("b@proton.me")), ["here.txt", "b-notes.pdf"]);
+        assert_eq!(shown(Some(A)), ["here.txt", "a-secret.pdf"]);
+        // Before the service has said who is signed in, no Drive file shows.
+        assert_eq!(shown(None), ["here.txt"]);
+    }
+
+    /// A Drive file remembered before accounts were recorded has no owner, so
+    /// it is never shown.
+    #[test]
+    fn a_drive_file_from_before_accounts_were_recorded_stays_hidden() {
+        let old: Vec<Visit> = serde_json::from_value(
+            serde_json::json!([{"hit": drive("old.pdf"), "last": 1, "count": 1}]),
+        )
+        .unwrap();
+        assert!(!visible(&old[0], Some(A)));
+    }
+
+    #[test]
+    fn clearing_forgets_everything_on_disk_too() {
+        let dir = scratch_dir("clear");
+        let path = dir.join("prompt-history.json");
+        let mut stored = Vec::new();
+        record(&mut stored, drive("old.pdf"), 10, Some(A.into()));
+        save(&path, &stored).unwrap();
+
+        let (commands, inbox) = async_channel::unbounded();
+        commands.send_blocking(Command::Clear).unwrap();
+        drop(commands);
+        let published = RefCell::new(Vec::new());
+        serve(&path, &inbox, |visits| published.borrow_mut().push(visits));
+
+        assert!(published.borrow().last().unwrap().is_empty());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The app clears the file while the window is hidden; the window reads
+    /// it again when it opens and shows nothing.
+    #[test]
+    fn a_reload_picks_up_a_clear_made_elsewhere() {
+        let dir = scratch_dir("reload");
+        let path = dir.join("prompt-history.json");
+        let mut stored = Vec::new();
+        record(&mut stored, drive("old.pdf"), 10, Some(A.into()));
+        save(&path, &stored).unwrap();
+
+        let (commands, inbox) = async_channel::unbounded();
+        let published = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                serve(&path, &inbox, |visits| {
+                    published.lock().unwrap().push(visits)
+                })
+            });
+            // Let the first load happen, then clear behind the writer's back.
+            while published.lock().unwrap().is_empty() {
+                std::thread::yield_now();
+            }
+            clear(&path).unwrap();
+            commands.send_blocking(Command::Reload).unwrap();
+            drop(commands);
+        });
+        let published = published.into_inner().unwrap();
+        assert_eq!(published.first().unwrap().len(), 1);
+        assert!(published.last().unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

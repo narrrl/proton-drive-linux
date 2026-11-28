@@ -669,30 +669,70 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
 
     match link {
         Some(link) => {
+            let now = glib::real_time() / 1_000_000;
             let url = link.url.clone().unwrap_or_default();
-            let role = role_label(&link.role).unwrap_or_else(|| capitalize(&link.role));
-            // Translators: {role} is the link's role, such as "Viewer".
-            let mut subtitle = gettext_f("Anyone with the link ({role})", &[("role", &role)]);
-            if link.has_password {
-                subtitle.push_str(" · ");
-                subtitle.push_str(&gettext("password-protected"));
-            }
-            if let Some(expires) = link.expires {
-                subtitle.push_str(" · ");
-                subtitle.push_str(&link_expiry_label(expires, glib::real_time() / 1_000_000));
-            }
+            let expired = link.expires.is_some_and(|at| at <= now);
+            // The row says how the link works, not where it is: the address
+            // is a key, and someone showing their screen should not hand it
+            // out by opening the dialog.
             let row = adw::ActionRow::builder()
-                .title(if url.is_empty() {
-                    gettext("Public link")
-                } else {
-                    url.clone()
-                })
-                .subtitle(&subtitle)
+                .title(link_row_title(link.role == "editor", expired))
+                .subtitle(link_policy(
+                    link.role == "editor",
+                    link.has_password,
+                    link.expires,
+                    now,
+                ))
                 .use_markup(false)
                 .build();
             row.add_css_class("property");
+            let (settings, expiry_drop) = link_settings_row(state, link);
 
-            if !url.is_empty() {
+            // The address, hidden until asked for. Every repaint hides it again.
+            let address = adw::ActionRow::builder()
+                .title(&url)
+                .title_selectable(true)
+                .use_markup(false)
+                .visible(false)
+                .build();
+            address.add_css_class("monospace");
+
+            if expired {
+                // An expired link gives nothing to copy: whoever gets it sees an
+                // error. What the owner can do is give it a new expiry.
+                let edit = gtk4::Button::builder()
+                    .label(gettext("Edit Expiry"))
+                    .valign(gtk4::Align::Center)
+                    .build();
+                let (settings, expiry_drop) = (settings.clone(), expiry_drop.clone());
+                edit.connect_clicked(move |_| {
+                    settings.set_expanded(true);
+                    expiry_drop.grab_focus();
+                });
+                row.add_suffix(&edit);
+            } else if !url.is_empty() {
+                let reveal = gtk4::ToggleButton::builder()
+                    .icon_name("view-reveal-symbolic")
+                    .tooltip_text(gettext("Show link address"))
+                    .valign(gtk4::Align::Center)
+                    .build();
+                reveal.add_css_class("flat");
+                let address_t = address.clone();
+                reveal.connect_toggled(move |btn| {
+                    address_t.set_visible(btn.is_active());
+                    btn.set_icon_name(if btn.is_active() {
+                        "view-conceal-symbolic"
+                    } else {
+                        "view-reveal-symbolic"
+                    });
+                    btn.set_tooltip_text(Some(&if btn.is_active() {
+                        gettext("Hide link address")
+                    } else {
+                        gettext("Show link address")
+                    }));
+                });
+                row.add_suffix(&reveal);
+
                 let copy = gtk4::Button::builder()
                     .icon_name("edit-copy-symbolic")
                     .tooltip_text(gettext("Copy link"))
@@ -744,8 +784,8 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
 
             state.link_group.add(&row);
             rows.push(row.upcast());
-
-            let settings = link_settings_row(state, link);
+            state.link_group.add(&address);
+            rows.push(address.upcast());
             state.link_group.add(&settings);
             rows.push(settings.upcast());
         }
@@ -894,6 +934,16 @@ pub(crate) fn link_edit(
     Ok((!unchanged).then_some(edit))
 }
 
+/// The title of an existing link's row: what kind of link it is, never its
+/// address.
+pub(crate) fn link_row_title(editor: bool, expired: bool) -> String {
+    match (expired, editor) {
+        (true, _) => gettext("Expired public link"),
+        (false, true) => gettext("Public editor link"),
+        (false, false) => gettext("Public viewer link"),
+    }
+}
+
 /// How a link works, in one line: who can do what, the password, the expiry.
 pub(crate) fn link_policy(editor: bool, password: bool, expires: Option<i64>, now: i64) -> String {
     let mut parts = vec![if editor {
@@ -932,7 +982,12 @@ fn link_policy_after(
 /// Drive until Save: an owner turning a viewer link into an editor link with a
 /// password must not hand out editing before the password is set, so every
 /// change goes in one update. Closing the dialog drops what was not saved.
-fn link_settings_row(state: &Rc<ShareDialog>, link: &PublicLinkInfo) -> adw::ExpanderRow {
+/// Returns the row and its Expires dropdown, which an expired link's Edit
+/// Expiry button opens the row on.
+fn link_settings_row(
+    state: &Rc<ShareDialog>,
+    link: &PublicLinkInfo,
+) -> (adw::ExpanderRow, gtk4::DropDown) {
     let now = glib::real_time() / 1_000_000;
     let expander = adw::ExpanderRow::builder()
         .title(gettext("Link settings"))
@@ -1064,7 +1119,7 @@ fn link_settings_row(state: &Rc<ShareDialog>, link: &PublicLinkInfo) -> adw::Exp
                 .update_link(link.id.clone(), edit.role, edit.password, edit.expires);
         share_dialog_update_link(&state, request, &expander_w);
     });
-    expander
+    (expander, expiry_drop)
 }
 
 /// Send a link change, then reload the dialog: on success to show the link as
@@ -1332,6 +1387,20 @@ mod tests {
         assert_eq!(
             link_policy_after(&link, &draft, &edit, 1_000),
             "Anyone with the link can edit · no password · never expires"
+        );
+    }
+
+    /// The row names the kind of link and never its address.
+    #[test]
+    fn a_link_row_is_titled_by_what_the_link_does() {
+        assert_eq!(link_row_title(false, false), "Public viewer link");
+        assert_eq!(link_row_title(true, false), "Public editor link");
+        assert_eq!(link_row_title(true, true), "Expired public link");
+        let link = viewer_link(false, Some(10));
+        assert!(!link_row_title(false, false).contains(link.url.as_deref().unwrap()));
+        assert_eq!(
+            link_policy(false, false, link.expires, 20),
+            "Anyone with the link can view · no password · expired"
         );
     }
 

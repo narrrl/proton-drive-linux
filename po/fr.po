@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-28 12:01+0100\n"
+"POT-Creation-Date: 2026-11-28 12:27+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: French\n"
@@ -57,13 +57,14 @@ msgstr "%-d %b %Y"
 msgid "%A, %B %-d, %Y, %H:%M"
 msgstr "%A %-d %B %Y à %H:%M"
 
-#: crates/pdfs-gui/src/app/main.rs:965
+#: crates/pdfs-gui/src/app/main.rs:966
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:543
-#: crates/pdfs-gui/src/app/pages/browser.rs:479
-#: crates/pdfs-gui/src/app/pages/browser.rs:892
-#: crates/pdfs-gui/src/app/pages/browser.rs:1273
-#: crates/pdfs-gui/src/app/pages/browser.rs:2255
-#: crates/pdfs-gui/src/app/pages/browser.rs:2334
+#: crates/pdfs-gui/src/app/pages/browser.rs:496
+#: crates/pdfs-gui/src/app/pages/browser.rs:910
+#: crates/pdfs-gui/src/app/pages/browser.rs:1291
+#: crates/pdfs-gui/src/app/pages/browser.rs:2280
+#: crates/pdfs-gui/src/app/pages/browser.rs:2359
+#: crates/pdfs-gui/src/app/pages/browser.rs:3103
 #: crates/pdfs-gui/src/app/pages/locations.rs:1833
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:252
 #: crates/pdfs-gui/src/app/pages/trash.rs:280
@@ -71,38 +72,38 @@ msgstr "%A %-d %B %Y à %H:%M"
 msgid "My files"
 msgstr "Mes fichiers"
 
-#: crates/pdfs-gui/src/app/main.rs:966 crates/pdfs-gui/src/app/main.rs:1647
+#: crates/pdfs-gui/src/app/main.rs:967 crates/pdfs-gui/src/app/main.rs:1648
 #: crates/pdfs-gui/src/app/pages/albums.rs:657
 #: crates/pdfs-gui/src/app/pages/photos.rs:1016
 #: crates/pdfs-gui/src/app/pages/places.rs:473
 msgid "Photos"
 msgstr "Photos"
 
-#: crates/pdfs-gui/src/app/main.rs:969
+#: crates/pdfs-gui/src/app/main.rs:970
 #: crates/pdfs-gui/src/app/pages/shared.rs:168
 #: crates/pdfs-gui/src/app/pages/shared.rs:493
 msgid "Shared with me"
 msgstr "Partagés avec moi"
 
-#: crates/pdfs-gui/src/app/main.rs:974
+#: crates/pdfs-gui/src/app/main.rs:975
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:120
 msgid "Shared by me"
 msgstr "Partagés par moi"
 
-#: crates/pdfs-gui/src/app/main.rs:977
+#: crates/pdfs-gui/src/app/main.rs:978
 #: crates/pdfs-gui/src/app/pages/devices.rs:140
 #: crates/pdfs-gui/src/app/pages/devices.rs:505
 msgid "Computers"
 msgstr "Ordinateurs"
 
-#: crates/pdfs-gui/src/app/main.rs:978
+#: crates/pdfs-gui/src/app/main.rs:979
 #: crates/pdfs-gui/src/app/pages/trash.rs:167
 #: crates/pdfs-gui/src/app/pages/trash.rs:846
 msgid "Trash"
 msgstr "Corbeille"
 
 #. Translators: sidebar entry for the page listing this computer's synced folders.
-#: crates/pdfs-gui/src/app/main.rs:980
+#: crates/pdfs-gui/src/app/main.rs:981
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:66
 msgid "Sync"
 msgstr "Synchronisation"
@@ -110,9 +111,10 @@ msgstr "Synchronisation"
 #. Translators: a failed action's toast. {what} says what failed, such as
 #. "Couldn't rename"; {detail} is the reason, usually untranslated text
 #. from the mount service.
-#: crates/pdfs-gui/src/app/main.rs:1330
+#: crates/pdfs-gui/src/app/main.rs:1331
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:948
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:284
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:301
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:363
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:175
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:212
 #: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:401
@@ -123,31 +125,31 @@ msgstr "Synchronisation"
 msgid "{what}: {detail}"
 msgstr "{what} : {detail}"
 
-#: crates/pdfs-gui/src/app/main.rs:1353
+#: crates/pdfs-gui/src/app/main.rs:1354
 msgid "You're offline"
 msgstr "Vous êtes hors ligne"
 
-#: crates/pdfs-gui/src/app/main.rs:1354
+#: crates/pdfs-gui/src/app/main.rs:1355
 msgid "That's not there any more"
 msgstr "Cet élément n’existe plus"
 
-#: crates/pdfs-gui/src/app/main.rs:1355
+#: crates/pdfs-gui/src/app/main.rs:1356
 msgid "You don't have access to that"
 msgstr "Vous n’avez pas accès à cet élément"
 
-#: crates/pdfs-gui/src/app/main.rs:1356
+#: crates/pdfs-gui/src/app/main.rs:1357
 msgid "Something changed this first"
 msgstr "Quelque chose l’a modifié entre-temps"
 
-#: crates/pdfs-gui/src/app/main.rs:1357
+#: crates/pdfs-gui/src/app/main.rs:1358
 msgid "Your Proton Drive is full"
 msgstr "Votre Proton Drive est plein"
 
-#: crates/pdfs-gui/src/app/main.rs:1444
+#: crates/pdfs-gui/src/app/main.rs:1445
 msgid "Proton Drive for Linux"
 msgstr "Proton Drive for Linux"
 
-#: crates/pdfs-gui/src/app/main.rs:1452
+#: crates/pdfs-gui/src/app/main.rs:1453
 msgid ""
 "Files-on-demand Proton Drive for the Linux desktop.\n"
 "\n"
@@ -159,23 +161,23 @@ msgstr ""
 "Client non officiel — non affilié à Proton AG, ni approuvé ni pris en charge "
 "par Proton AG."
 
-#: crates/pdfs-gui/src/app/main.rs:1457
+#: crates/pdfs-gui/src/app/main.rs:1458
 msgid "Source Code"
 msgstr "Code source"
 
-#: crates/pdfs-gui/src/app/main.rs:1461
+#: crates/pdfs-gui/src/app/main.rs:1462
 msgid "Proton Terms of Service"
 msgstr "Conditions d’utilisation de Proton"
 
-#: crates/pdfs-gui/src/app/main.rs:1465
+#: crates/pdfs-gui/src/app/main.rs:1466
 msgid "Proton Privacy Policy"
 msgstr "Politique de confidentialité de Proton"
 
-#: crates/pdfs-gui/src/app/main.rs:1470
+#: crates/pdfs-gui/src/app/main.rs:1471
 msgid "Disclaimer"
 msgstr "Avertissement"
 
-#: crates/pdfs-gui/src/app/main.rs:1474
+#: crates/pdfs-gui/src/app/main.rs:1475
 msgid ""
 "This is an unofficial, community-built client. It is not affiliated with, "
 "endorsed by, or supported by Proton AG.\n"
@@ -199,7 +201,7 @@ msgstr ""
 "une copie de toutes les données que vous ne pouvez pas vous permettre de "
 "perdre."
 
-#: crates/pdfs-gui/src/app/main.rs:1482
+#: crates/pdfs-gui/src/app/main.rs:1483
 msgid ""
 "Places are named with data from <a href=\"https://www.geonames.org/"
 "\">GeoNames</a>, licensed under <a href=\"https://creativecommons.org/"
@@ -209,7 +211,7 @@ msgstr ""
 "www.geonames.org/\">GeoNames</a>, sous licence <a href=\"https://"
 "creativecommons.org/licenses/by/4.0/\">CC BY 4.0</a>."
 
-#: crates/pdfs-gui/src/app/main.rs:1490
+#: crates/pdfs-gui/src/app/main.rs:1491
 msgid ""
 "The places map is drawn from <a href=\"https://www.naturalearthdata.com/"
 "\">Natural Earth</a> land, water and borders, which are in the public domain."
@@ -218,7 +220,7 @@ msgstr ""
 "frontières de <a href=\"https://www.naturalearthdata.com/\">Natural Earth</"
 "a>, qui sont dans le domaine public."
 
-#: crates/pdfs-gui/src/app/main.rs:1498
+#: crates/pdfs-gui/src/app/main.rs:1499
 msgid ""
 "The street map, when turned on, comes from <a href=\"https://openfreemap.org/"
 "\">OpenFreeMap</a> in the <a href=\"https://www.openmaptiles.org/"
@@ -235,15 +237,15 @@ msgstr ""
 
 #. Translators: replace with your name(s) and email address(es), one
 #. per line, to be credited in the About dialog.
-#: crates/pdfs-gui/src/app/main.rs:1509
+#: crates/pdfs-gui/src/app/main.rs:1510
 msgid "translator-credits"
 msgstr "Les contributeurs de Proton Drive for Linux"
 
-#: crates/pdfs-gui/src/app/main.rs:1564
+#: crates/pdfs-gui/src/app/main.rs:1565
 msgid "Stop Proton Drive?"
 msgstr "Arrêter Proton Drive ?"
 
-#: crates/pdfs-gui/src/app/main.rs:1565
+#: crates/pdfs-gui/src/app/main.rs:1566
 msgid ""
 "My files goes offline and nothing syncs until you connect again. Proton "
 "Drive starts again at your next login."
@@ -252,12 +254,12 @@ msgstr ""
 "vous reconnectez pas. Proton Drive redémarrera à votre prochaine ouverture "
 "de session."
 
-#: crates/pdfs-gui/src/app/main.rs:1567 crates/pdfs-gui/src/app/main.rs:1899
+#: crates/pdfs-gui/src/app/main.rs:1568 crates/pdfs-gui/src/app/main.rs:1900
 #: crates/pdfs-gui/src/app/pages/albums.rs:265
 #: crates/pdfs-gui/src/app/pages/albums.rs:452
-#: crates/pdfs-gui/src/app/pages/browser.rs:2005
-#: crates/pdfs-gui/src/app/pages/browser.rs:2127
-#: crates/pdfs-gui/src/app/pages/browser.rs:2628
+#: crates/pdfs-gui/src/app/pages/browser.rs:2030
+#: crates/pdfs-gui/src/app/pages/browser.rs:2152
+#: crates/pdfs-gui/src/app/pages/browser.rs:2653
 #: crates/pdfs-gui/src/app/pages/devices.rs:839
 #: crates/pdfs-gui/src/app/pages/devices.rs:1005
 #: crates/pdfs-gui/src/app/pages/devices.rs:1077
@@ -275,11 +277,11 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/login.rs:643
 #: crates/pdfs-gui/src/app/pages/photos.rs:1109
 #: crates/pdfs-gui/src/app/pages/photos.rs:3117
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:509
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:588
 #: crates/pdfs-gui/src/app/pages/shared.rs:952
 #: crates/pdfs-gui/src/app/pages/shared.rs:1161
 #: crates/pdfs-gui/src/app/pages/shared.rs:1202
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:551
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:559
 #: crates/pdfs-gui/src/app/pages/status.rs:641
 #: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:249
 #: crates/pdfs-gui/src/app/pages/takeout.rs:484
@@ -292,148 +294,148 @@ msgstr ""
 msgid "Cancel"
 msgstr "Annuler"
 
-#: crates/pdfs-gui/src/app/main.rs:1568
+#: crates/pdfs-gui/src/app/main.rs:1569
 msgctxt "verb"
 msgid "Stop"
 msgstr "Arrêter"
 
-#: crates/pdfs-gui/src/app/main.rs:1585
+#: crates/pdfs-gui/src/app/main.rs:1586
 msgid "Couldn't stop Proton Drive"
 msgstr "Impossible d’arrêter Proton Drive"
 
-#: crates/pdfs-gui/src/app/main.rs:1586
+#: crates/pdfs-gui/src/app/main.rs:1587
 msgid "The Proton Drive service did not stop."
 msgstr "Le service Proton Drive ne s’est pas arrêté."
 
-#: crates/pdfs-gui/src/app/main.rs:1622
+#: crates/pdfs-gui/src/app/main.rs:1623
 #: crates/pdfs-gui/src/app/pages/status.rs:272
 msgid "General"
 msgstr "Général"
 
-#: crates/pdfs-gui/src/app/main.rs:1624
-#: crates/pdfs-gui/src/app/pages/browser.rs:272
+#: crates/pdfs-gui/src/app/main.rs:1625
+#: crates/pdfs-gui/src/app/pages/browser.rs:276
 msgid "Search Drive"
 msgstr "Rechercher dans Drive"
 
-#: crates/pdfs-gui/src/app/main.rs:1625
-#: crates/pdfs-gui/src/app/pages/browser.rs:1031
+#: crates/pdfs-gui/src/app/main.rs:1626
+#: crates/pdfs-gui/src/app/pages/browser.rs:1049
 #: crates/pdfs-gui/src/app/pages/devices.rs:571
 #: crates/pdfs-gui/src/app/pages/drive_galleries.rs:949
 #: crates/pdfs-gui/src/app/pages/shared.rs:590
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:528
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:536
 #: crates/pdfs-gui/src/app/pages/trash.rs:380
 msgid "Refresh"
 msgstr "Actualiser"
 
-#: crates/pdfs-gui/src/app/main.rs:1626
+#: crates/pdfs-gui/src/app/main.rs:1627
 #: crates/pdfs-gui/src/app/pages/status.rs:416
 msgid "Preferences"
 msgstr "Préférences"
 
-#: crates/pdfs-gui/src/app/main.rs:1627
+#: crates/pdfs-gui/src/app/main.rs:1628
 msgid "Keyboard shortcuts"
 msgstr "Raccourcis clavier"
 
-#: crates/pdfs-gui/src/app/main.rs:1631
+#: crates/pdfs-gui/src/app/main.rs:1632
 msgid "Files"
 msgstr "Fichiers"
 
-#: crates/pdfs-gui/src/app/main.rs:1633
-#: crates/pdfs-gui/src/app/pages/browser.rs:319
+#: crates/pdfs-gui/src/app/main.rs:1634
+#: crates/pdfs-gui/src/app/pages/browser.rs:323
 msgid "New folder"
 msgstr "Nouveau dossier"
 
-#: crates/pdfs-gui/src/app/main.rs:1634
-#: crates/pdfs-gui/src/app/pages/browser.rs:315
+#: crates/pdfs-gui/src/app/main.rs:1635
+#: crates/pdfs-gui/src/app/pages/browser.rs:319
 msgid "Upload files"
 msgstr "Téléverser des fichiers"
 
-#: crates/pdfs-gui/src/app/main.rs:1635
+#: crates/pdfs-gui/src/app/main.rs:1636
 msgid "Back / forward"
 msgstr "Précédent / suivant"
 
-#: crates/pdfs-gui/src/app/main.rs:1636
-#: crates/pdfs-gui/src/app/pages/browser.rs:2102
+#: crates/pdfs-gui/src/app/main.rs:1637
+#: crates/pdfs-gui/src/app/pages/browser.rs:2127
 msgid "Parent folder"
 msgstr "Dossier parent"
 
-#: crates/pdfs-gui/src/app/main.rs:1637
+#: crates/pdfs-gui/src/app/main.rs:1638
 msgid "Grid / list"
 msgstr "Grille / liste"
 
-#: crates/pdfs-gui/src/app/main.rs:1638 crates/pdfs-gui/src/app/main.rs:1649
+#: crates/pdfs-gui/src/app/main.rs:1639 crates/pdfs-gui/src/app/main.rs:1650
 msgid "Larger thumbnails"
 msgstr "Miniatures plus grandes"
 
-#: crates/pdfs-gui/src/app/main.rs:1639 crates/pdfs-gui/src/app/main.rs:1650
+#: crates/pdfs-gui/src/app/main.rs:1640 crates/pdfs-gui/src/app/main.rs:1651
 msgid "Smaller thumbnails"
 msgstr "Miniatures plus petites"
 
-#: crates/pdfs-gui/src/app/main.rs:1640 crates/pdfs-gui/src/app/main.rs:1651
+#: crates/pdfs-gui/src/app/main.rs:1641 crates/pdfs-gui/src/app/main.rs:1652
 msgid "Reset thumbnail size"
 msgstr "Réinitialiser la taille des miniatures"
 
-#: crates/pdfs-gui/src/app/main.rs:1641
+#: crates/pdfs-gui/src/app/main.rs:1642
 #: crates/pdfs-gui/src/app/pages/albums.rs:322
-#: crates/pdfs-gui/src/app/pages/browser.rs:1984
-#: crates/pdfs-gui/src/app/pages/browser.rs:2006
+#: crates/pdfs-gui/src/app/pages/browser.rs:2009
+#: crates/pdfs-gui/src/app/pages/browser.rs:2031
 #: crates/pdfs-gui/src/app/pages/devices.rs:1078
 #: crates/pdfs-gui/src/app/widgets/details.rs:161
 msgid "Rename"
 msgstr "Renommer"
 
-#: crates/pdfs-gui/src/app/main.rs:1642 crates/pdfs-gui/src/app/main.rs:1666
-#: crates/pdfs-gui/src/app/pages/browser.rs:382
-#: crates/pdfs-gui/src/app/pages/browser.rs:971
-#: crates/pdfs-gui/src/app/pages/browser.rs:1006
+#: crates/pdfs-gui/src/app/main.rs:1643 crates/pdfs-gui/src/app/main.rs:1667
+#: crates/pdfs-gui/src/app/pages/browser.rs:399
+#: crates/pdfs-gui/src/app/pages/browser.rs:989
+#: crates/pdfs-gui/src/app/pages/browser.rs:1024
 #: crates/pdfs-gui/src/app/pages/photos.rs:3118
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:56
 #: crates/pdfs-gui/src/app/widgets/details.rs:164
 msgid "Move to Trash"
 msgstr "Mettre à la corbeille"
 
-#: crates/pdfs-gui/src/app/main.rs:1643
+#: crates/pdfs-gui/src/app/main.rs:1644
 msgid "Clear the selection"
 msgstr "Effacer la sélection"
 
-#: crates/pdfs-gui/src/app/main.rs:1652
+#: crates/pdfs-gui/src/app/main.rs:1653
 msgid "Select all"
 msgstr "Tout sélectionner"
 
-#: crates/pdfs-gui/src/app/main.rs:1653
+#: crates/pdfs-gui/src/app/main.rs:1654
 #: crates/pdfs-gui/src/app/pages/devices.rs:85
 #: crates/pdfs-gui/src/app/pages/shared.rs:109
 #: crates/pdfs-gui/src/app/pages/trash.rs:116
 msgid "Back"
 msgstr "Retour"
 
-#: crates/pdfs-gui/src/app/main.rs:1657
+#: crates/pdfs-gui/src/app/main.rs:1658
 msgid "Photo Viewer"
 msgstr "Visionneuse de photos"
 
-#: crates/pdfs-gui/src/app/main.rs:1659
+#: crates/pdfs-gui/src/app/main.rs:1660
 msgid "Previous / next photo"
 msgstr "Photo précédente / suivante"
 
-#: crates/pdfs-gui/src/app/main.rs:1660
+#: crates/pdfs-gui/src/app/main.rs:1661
 msgid "First / last photo"
 msgstr "Première / dernière photo"
 
-#: crates/pdfs-gui/src/app/main.rs:1661
+#: crates/pdfs-gui/src/app/main.rs:1662
 msgid "Show details"
 msgstr "Afficher les détails"
 
-#: crates/pdfs-gui/src/app/main.rs:1662 crates/pdfs-gui/src/app/main.rs:1676
+#: crates/pdfs-gui/src/app/main.rs:1663 crates/pdfs-gui/src/app/main.rs:1677
 msgid "Fullscreen"
 msgstr "Plein écran"
 
-#: crates/pdfs-gui/src/app/main.rs:1663
+#: crates/pdfs-gui/src/app/main.rs:1664
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:2030
 msgid "Slideshow"
 msgstr "Diaporama"
 
 #. Translators: tooltip of a button that opens a menu of further actions.
-#: crates/pdfs-gui/src/app/main.rs:1664
+#: crates/pdfs-gui/src/app/main.rs:1665
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1416
 #: crates/pdfs-gui/src/app/pages/photos.rs:708
 #: crates/pdfs-gui/src/app/widgets/menu.rs:140
@@ -441,56 +443,56 @@ msgid "More"
 msgstr "Plus"
 
 #. Translators: menu item that puts the photo on the clipboard as an image.
-#: crates/pdfs-gui/src/app/main.rs:1665
+#: crates/pdfs-gui/src/app/main.rs:1666
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:2043
 msgid "Copy Image"
 msgstr "Copier l’image"
 
-#: crates/pdfs-gui/src/app/main.rs:1667
+#: crates/pdfs-gui/src/app/main.rs:1668
 #: crates/pdfs-gui/src/app/pages/login.rs:780
 #: crates/pdfs-gui/src/app/pages/shared.rs:1135
 #: crates/pdfs-gui/src/app/pages/status.rs:867
 msgid "Close"
 msgstr "Fermer"
 
-#: crates/pdfs-gui/src/app/main.rs:1671
+#: crates/pdfs-gui/src/app/main.rs:1672
 msgid "Video Player"
 msgstr "Lecteur vidéo"
 
-#: crates/pdfs-gui/src/app/main.rs:1673
+#: crates/pdfs-gui/src/app/main.rs:1674
 msgid "Play / pause"
 msgstr "Lecture / pause"
 
-#: crates/pdfs-gui/src/app/main.rs:1674
+#: crates/pdfs-gui/src/app/main.rs:1675
 msgid "Back / forward 10 seconds"
 msgstr "Reculer / avancer de 10 secondes"
 
-#: crates/pdfs-gui/src/app/main.rs:1675
+#: crates/pdfs-gui/src/app/main.rs:1676
 msgid "Mute"
 msgstr "Couper le son"
 
-#: crates/pdfs-gui/src/app/main.rs:1807
+#: crates/pdfs-gui/src/app/main.rs:1808
 msgid "Select a single item to rename it"
 msgstr "Sélectionnez un seul élément pour le renommer"
 
-#: crates/pdfs-gui/src/app/main.rs:1967
+#: crates/pdfs-gui/src/app/main.rs:1968
 #: crates/pdfs-gui/src/app/pages/albums.rs:88
 #: crates/pdfs-gui/src/app/pages/places.rs:104
 #: crates/pdfs-gui/src/app/pages/status.rs:1588
 msgid "Not connected"
 msgstr "Non connecté"
 
-#: crates/pdfs-gui/src/app/main.rs:1968
+#: crates/pdfs-gui/src/app/main.rs:1969
 msgid "The Proton Drive service isn't running."
 msgstr "Le service Proton Drive n’est pas en cours d’exécution."
 
-#: crates/pdfs-gui/src/app/main.rs:1988 crates/pdfs-gui/src/app/main.rs:2003
-#: crates/pdfs-gui/src/app/main.rs:2012
+#: crates/pdfs-gui/src/app/main.rs:1989 crates/pdfs-gui/src/app/main.rs:2004
+#: crates/pdfs-gui/src/app/main.rs:2013
 #: crates/pdfs-gui/src/app/pages/status.rs:1597
 msgid "Can't open your Drive"
 msgstr "Impossible d’ouvrir Proton Drive"
 
-#: crates/pdfs-gui/src/app/main.rs:1991
+#: crates/pdfs-gui/src/app/main.rs:1992
 #, rust-format
 msgid ""
 "“{path}” already has files in it, and My files would hide them. Proton Drive "
@@ -501,7 +503,7 @@ msgstr ""
 "Proton Drive réessaie de lui-même dès que le dossier est vide. Vous pouvez "
 "aussi choisir un autre dossier pour « Mes fichiers » dans les Préférences."
 
-#: crates/pdfs-gui/src/app/main.rs:2005
+#: crates/pdfs-gui/src/app/main.rs:2006
 #: crates/pdfs-gui/src/app/pages/status.rs:1600 crates/pdfs-gui/src/main.rs:205
 msgid ""
 "Your account keys could not open My Files. After recovering your keys, "
@@ -510,7 +512,7 @@ msgstr ""
 "Les clés de votre compte n’ont pas pu ouvrir Mes fichiers. Après les avoir "
 "récupérées, choisissez Réessayer."
 
-#: crates/pdfs-gui/src/app/main.rs:2015
+#: crates/pdfs-gui/src/app/main.rs:2016
 #, rust-format
 msgid ""
 "The Proton Drive service keeps failing to start and tries again on its own. "
@@ -519,22 +521,22 @@ msgstr ""
 "Le service Proton Drive n’arrive pas à démarrer et réessaie de lui-même. "
 "Dernière erreur : {error}"
 
-#: crates/pdfs-gui/src/app/main.rs:2023
+#: crates/pdfs-gui/src/app/main.rs:2024
 #: crates/pdfs-gui/src/app/pages/status.rs:364
-#: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:579
+#: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:584
 #: crates/pdfs-gui/src/main.rs:498 crates/pdfs-gui/src/main.rs:540
 msgid "Connecting…"
 msgstr "Connexion…"
 
-#: crates/pdfs-gui/src/app/main.rs:2024
+#: crates/pdfs-gui/src/app/main.rs:2025
 msgid "Waiting for the Proton Drive service to start."
 msgstr "En attente du démarrage du service Proton Drive."
 
-#: crates/pdfs-gui/src/app/main.rs:2042
+#: crates/pdfs-gui/src/app/main.rs:2043
 msgid "Your Proton Drive Folder Isn't Empty"
 msgstr "Votre dossier Proton Drive n’est pas vide"
 
-#: crates/pdfs-gui/src/app/main.rs:2046
+#: crates/pdfs-gui/src/app/main.rs:2047
 #, rust-format
 msgid ""
 "“{path}” already has {n} item in it. My files would hide it, so Proton Drive "
@@ -553,15 +555,15 @@ msgstr[1] ""
 "c’est pourquoi Proton Drive ne s’y ouvre pas. Déplacez les éléments dans un "
 "autre dossier, ou choisissez un autre dossier pour « Mes fichiers »."
 
-#: crates/pdfs-gui/src/app/main.rs:2052
+#: crates/pdfs-gui/src/app/main.rs:2053
 msgid "Not Now"
 msgstr "Pas maintenant"
 
-#: crates/pdfs-gui/src/app/main.rs:2053 crates/pdfs-gui/src/main.rs:505
+#: crates/pdfs-gui/src/app/main.rs:2054 crates/pdfs-gui/src/main.rs:505
 msgid "Open Folder"
 msgstr "Ouvrir le dossier"
 
-#: crates/pdfs-gui/src/app/main.rs:2054
+#: crates/pdfs-gui/src/app/main.rs:2055
 msgid "Choose Another Folder…"
 msgstr "Choisir un autre dossier…"
 
@@ -599,7 +601,7 @@ msgid "Nothing in the recent log fits this filter."
 msgstr "Rien dans le journal récent ne correspond à ce filtre."
 
 #: crates/pdfs-gui/src/app/pages/activity.rs:186
-#: crates/pdfs-gui/src/app/pages/browser.rs:306
+#: crates/pdfs-gui/src/app/pages/browser.rs:310
 #: crates/pdfs-gui/src/app/pages/devices.rs:114
 #: crates/pdfs-gui/src/app/pages/locations.rs:194
 #: crates/pdfs-gui/src/app/pages/locations.rs:778
@@ -636,10 +638,10 @@ msgid "View Options"
 msgstr "Options d’affichage"
 
 #: crates/pdfs-gui/src/app/pages/activity.rs:441
-#: crates/pdfs-gui/src/app/pages/browser.rs:410
-#: crates/pdfs-gui/src/app/pages/browser.rs:2276
-#: crates/pdfs-gui/src/app/pages/browser.rs:3214
-#: crates/pdfs-gui/src/app/pages/browser.rs:3218
+#: crates/pdfs-gui/src/app/pages/browser.rs:427
+#: crates/pdfs-gui/src/app/pages/browser.rs:2301
+#: crates/pdfs-gui/src/app/pages/browser.rs:3366
+#: crates/pdfs-gui/src/app/pages/browser.rs:3370
 #: crates/pdfs-gui/src/app/pages/devices.rs:339
 #: crates/pdfs-gui/src/app/pages/drive_galleries.rs:310
 #: crates/pdfs-gui/src/app/pages/locations.rs:202
@@ -662,8 +664,8 @@ msgid "Couldn't read activity"
 msgstr "Impossible de lire l’activité"
 
 #: crates/pdfs-gui/src/app/pages/activity.rs:472
-#: crates/pdfs-gui/src/app/pages/browser.rs:3250
-#: crates/pdfs-gui/src/app/pages/browser.rs:3459
+#: crates/pdfs-gui/src/app/pages/browser.rs:3402
+#: crates/pdfs-gui/src/app/pages/browser.rs:3611
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:354
 #: crates/pdfs-gui/src/app/pages/photos.rs:4805
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:384
@@ -1054,7 +1056,7 @@ msgstr "Impossible de créer un lien vers {name}"
 #. Translators: {name} is a file or folder name.
 #. Translators: {name} is the item's name.
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:213
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:559
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:567
 #, rust-format
 msgid "Stopped sharing {name}"
 msgstr "Partage de {name} arrêté"
@@ -1403,16 +1405,16 @@ msgstr "Impossible de charger les albums"
 #: crates/pdfs-gui/src/app/pages/albums.rs:411
 #: crates/pdfs-gui/src/app/pages/albums.rs:518
 #: crates/pdfs-gui/src/app/pages/albums.rs:590
-#: crates/pdfs-gui/src/app/pages/browser.rs:631
-#: crates/pdfs-gui/src/app/pages/browser.rs:719
-#: crates/pdfs-gui/src/app/pages/browser.rs:1100
-#: crates/pdfs-gui/src/app/pages/browser.rs:1184
-#: crates/pdfs-gui/src/app/pages/browser.rs:1234
-#: crates/pdfs-gui/src/app/pages/browser.rs:1722
-#: crates/pdfs-gui/src/app/pages/browser.rs:1760
-#: crates/pdfs-gui/src/app/pages/browser.rs:1961
-#: crates/pdfs-gui/src/app/pages/browser.rs:2588
-#: crates/pdfs-gui/src/app/pages/browser.rs:2908
+#: crates/pdfs-gui/src/app/pages/browser.rs:649
+#: crates/pdfs-gui/src/app/pages/browser.rs:737
+#: crates/pdfs-gui/src/app/pages/browser.rs:1118
+#: crates/pdfs-gui/src/app/pages/browser.rs:1202
+#: crates/pdfs-gui/src/app/pages/browser.rs:1252
+#: crates/pdfs-gui/src/app/pages/browser.rs:1747
+#: crates/pdfs-gui/src/app/pages/browser.rs:1785
+#: crates/pdfs-gui/src/app/pages/browser.rs:1986
+#: crates/pdfs-gui/src/app/pages/browser.rs:2613
+#: crates/pdfs-gui/src/app/pages/browser.rs:2933
 #: crates/pdfs-gui/src/app/pages/devices.rs:742
 #: crates/pdfs-gui/src/app/pages/devices.rs:782
 #: crates/pdfs-gui/src/app/pages/devices.rs:935
@@ -1445,20 +1447,20 @@ msgstr "Impossible de charger les albums"
 #: crates/pdfs-gui/src/app/pages/takeout.rs:535
 #: crates/pdfs-gui/src/app/pages/takeout.rs:759
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:523
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1089
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1124
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1162
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1144
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1179
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1217
 #: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:170
 #: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:381
 msgid "The Proton Drive service didn't respond."
 msgstr "Le service Proton Drive n’a pas répondu."
 
 #: crates/pdfs-gui/src/app/pages/albums.rs:227
-#: crates/pdfs-gui/src/app/pages/browser.rs:915
+#: crates/pdfs-gui/src/app/pages/browser.rs:933
 #: crates/pdfs-gui/src/app/pages/devices.rs:547
 #: crates/pdfs-gui/src/app/pages/photos.rs:4438
 #: crates/pdfs-gui/src/app/pages/shared.rs:545
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:476
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:486
 #: crates/pdfs-gui/src/app/widgets/details.rs:157
 #: crates/pdfs-gui/src/app/widgets/details.rs:413
 #: crates/pdfs-gui/src/hud/preview.rs:277
@@ -1467,7 +1469,7 @@ msgid "Open"
 msgstr "Ouvrir"
 
 #: crates/pdfs-gui/src/app/pages/albums.rs:233
-#: crates/pdfs-gui/src/app/pages/browser.rs:947
+#: crates/pdfs-gui/src/app/pages/browser.rs:965
 #: crates/pdfs-gui/src/app/pages/devices.rs:421
 #: crates/pdfs-gui/src/app/pages/devices.rs:468
 msgid "Rename…"
@@ -1482,7 +1484,7 @@ msgid "Album name"
 msgstr "Nom de l’album"
 
 #: crates/pdfs-gui/src/app/pages/albums.rs:289
-#: crates/pdfs-gui/src/app/pages/browser.rs:2629
+#: crates/pdfs-gui/src/app/pages/browser.rs:2654
 msgid "Create"
 msgstr "Créer"
 
@@ -1600,54 +1602,54 @@ msgid_plural "{n} photos"
 msgstr[0] "{n} photo"
 msgstr[1] "{n} photos"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:170
+#: crates/pdfs-gui/src/app/pages/browser.rs:174
 msgid "Back (Alt+Left)"
 msgstr "Précédent (Alt+Gauche)"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:177
+#: crates/pdfs-gui/src/app/pages/browser.rs:181
 msgid "Forward (Alt+Right)"
 msgstr "Suivant (Alt+Droite)"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:201
-#: crates/pdfs-gui/src/app/pages/browser.rs:2618
+#: crates/pdfs-gui/src/app/pages/browser.rs:205
+#: crates/pdfs-gui/src/app/pages/browser.rs:2643
 msgid "New Folder"
 msgstr "Nouveau dossier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:203
-#: crates/pdfs-gui/src/app/pages/browser.rs:1022
+#: crates/pdfs-gui/src/app/pages/browser.rs:207
+#: crates/pdfs-gui/src/app/pages/browser.rs:1040
 msgid "Upload Files…"
 msgstr "Téléverser des fichiers…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:205
-#: crates/pdfs-gui/src/app/pages/browser.rs:1023
+#: crates/pdfs-gui/src/app/pages/browser.rs:209
+#: crates/pdfs-gui/src/app/pages/browser.rs:1041
 msgid "Upload Folder…"
 msgstr "Téléverser un dossier…"
 
 #. Translators: tooltip of the menu button that creates a folder or uploads files.
-#: crates/pdfs-gui/src/app/pages/browser.rs:212
+#: crates/pdfs-gui/src/app/pages/browser.rs:216
 msgctxt "create"
 msgid "New"
 msgstr "Nouveau"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:221
+#: crates/pdfs-gui/src/app/pages/browser.rs:225
 #: crates/pdfs-gui/src/app/pages/photos.rs:962
 msgctxt "layout"
 msgid "Grid"
 msgstr "Grille"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:222
+#: crates/pdfs-gui/src/app/pages/browser.rs:226
 msgctxt "layout"
 msgid "List"
 msgstr "Liste"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:225
+#: crates/pdfs-gui/src/app/pages/browser.rs:229
 #: crates/pdfs-gui/src/app/widgets/file_list.rs:392
 msgctxt "column"
 msgid "Name"
 msgstr "Nom"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:226
-#: crates/pdfs-gui/src/app/pages/browser.rs:867
+#: crates/pdfs-gui/src/app/pages/browser.rs:230
+#: crates/pdfs-gui/src/app/pages/browser.rs:885
 #: crates/pdfs-gui/src/app/pages/devices.rs:184
 #: crates/pdfs-gui/src/app/pages/shared.rs:273
 #: crates/pdfs-gui/src/app/pages/trash.rs:224
@@ -1658,90 +1660,90 @@ msgctxt "column"
 msgid "Size"
 msgstr "Taille"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:228
+#: crates/pdfs-gui/src/app/pages/browser.rs:232
 msgid "Last Modified"
 msgstr "Dernière modification"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:231
+#: crates/pdfs-gui/src/app/pages/browser.rs:235
 msgid "Sort By"
 msgstr "Trier par"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:233
+#: crates/pdfs-gui/src/app/pages/browser.rs:237
 msgid "Reversed Order"
 msgstr "Ordre inversé"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:234
+#: crates/pdfs-gui/src/app/pages/browser.rs:238
 msgid "Folders First"
 msgstr "Dossiers en premier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:238
-#: crates/pdfs-gui/src/app/pages/browser.rs:1511
+#: crates/pdfs-gui/src/app/pages/browser.rs:242
+#: crates/pdfs-gui/src/app/pages/browser.rs:1536
 #: crates/pdfs-gui/src/app/widgets/file_list.rs:482
 msgid "Show as list (Ctrl+2)"
 msgstr "Afficher en liste (Ctrl+2)"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:239
+#: crates/pdfs-gui/src/app/pages/browser.rs:243
 msgid "Sort and view options"
 msgstr "Options de tri et d’affichage"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:248
-#: crates/pdfs-gui/src/app/pages/browser.rs:1033
+#: crates/pdfs-gui/src/app/pages/browser.rs:252
+#: crates/pdfs-gui/src/app/pages/browser.rs:1051
 msgid "Open in File Manager"
 msgstr "Ouvrir dans le gestionnaire de fichiers"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:252
+#: crates/pdfs-gui/src/app/pages/browser.rs:256
 msgid "Build Thumbnails"
 msgstr "Générer les miniatures"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:257
+#: crates/pdfs-gui/src/app/pages/browser.rs:261
 msgid "Folder actions"
 msgstr "Actions du dossier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:266
+#: crates/pdfs-gui/src/app/pages/browser.rs:270
 msgid "Cancel thumbnail build"
 msgstr "Annuler la génération des miniatures"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:280
-#: crates/pdfs-gui/src/app/pages/browser.rs:3390
+#: crates/pdfs-gui/src/app/pages/browser.rs:284
+#: crates/pdfs-gui/src/app/pages/browser.rs:3542
 msgid "Search this folder only"
 msgstr "Rechercher uniquement dans ce dossier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:367
+#: crates/pdfs-gui/src/app/pages/browser.rs:384
 msgid "Make available offline"
 msgstr "Rendre disponible hors ligne"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:372
+#: crates/pdfs-gui/src/app/pages/browser.rs:389
 #: crates/pdfs-gui/src/app/pages/status.rs:1731
 msgid "Make online only"
 msgstr "Garder en ligne uniquement"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:377
+#: crates/pdfs-gui/src/app/pages/browser.rs:394
 msgid "Move to…"
 msgstr "Déplacer vers…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:388
+#: crates/pdfs-gui/src/app/pages/browser.rs:405
 msgid "Clear selection (Esc)"
 msgstr "Effacer la sélection (Échap)"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:426
-#: crates/pdfs-gui/src/app/pages/browser.rs:829
+#: crates/pdfs-gui/src/app/pages/browser.rs:443
+#: crates/pdfs-gui/src/app/pages/browser.rs:847
 #, rust-format
 msgid "Size: {n} pixel"
 msgid_plural "Size: {n} pixels"
 msgstr[0] "Taille : {n} pixel"
 msgstr[1] "Taille : {n} pixels"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:432
+#: crates/pdfs-gui/src/app/pages/browser.rs:449
 msgid "Icon size"
 msgstr "Taille des icônes"
 
 #. Translators: {n} is how many items are selected: files and folders in My Files, photos here.
-#: crates/pdfs-gui/src/app/pages/browser.rs:570
-#: crates/pdfs-gui/src/app/pages/browser.rs:999
+#: crates/pdfs-gui/src/app/pages/browser.rs:588
+#: crates/pdfs-gui/src/app/pages/browser.rs:1017
 #: crates/pdfs-gui/src/app/pages/devices.rs:556
 #: crates/pdfs-gui/src/app/pages/photos.rs:3019
 #: crates/pdfs-gui/src/app/pages/shared.rs:569
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:509
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:517
 #: crates/pdfs-gui/src/app/pages/trash.rs:356
 #, rust-format
 msgid "{n} selected"
@@ -1749,25 +1751,25 @@ msgid_plural "{n} selected"
 msgstr[0] "{n} sélectionné"
 msgstr[1] "{n} sélectionnés"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:602
-#: crates/pdfs-gui/src/app/pages/browser.rs:638
+#: crates/pdfs-gui/src/app/pages/browser.rs:620
+#: crates/pdfs-gui/src/app/pages/browser.rs:656
 #: crates/pdfs-gui/src/app/pages/photos.rs:3196
 #: crates/pdfs-gui/src/app/pages/photos.rs:3202
 msgid "Couldn't move to Trash"
 msgstr "Impossible de mettre à la corbeille"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:603
-#: crates/pdfs-gui/src/app/pages/browser.rs:1689
-#: crates/pdfs-gui/src/app/pages/browser.rs:1939
-#: crates/pdfs-gui/src/app/pages/browser.rs:2464
-#: crates/pdfs-gui/src/app/pages/browser.rs:2520
-#: crates/pdfs-gui/src/app/pages/browser.rs:2878
+#: crates/pdfs-gui/src/app/pages/browser.rs:621
+#: crates/pdfs-gui/src/app/pages/browser.rs:1714
+#: crates/pdfs-gui/src/app/pages/browser.rs:1964
+#: crates/pdfs-gui/src/app/pages/browser.rs:2489
+#: crates/pdfs-gui/src/app/pages/browser.rs:2545
+#: crates/pdfs-gui/src/app/pages/browser.rs:2903
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:348
 #: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:91
 msgid "Proton Drive isn't connected."
 msgstr "Proton Drive n’est pas connecté."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:643
+#: crates/pdfs-gui/src/app/pages/browser.rs:661
 #, rust-format
 msgid "Moved {n} item to Trash — some couldn't be moved"
 msgid_plural "Moved {n} items to Trash — some couldn't be moved"
@@ -1776,73 +1778,73 @@ msgstr[0] ""
 msgstr[1] ""
 "{n} éléments mis à la corbeille — certains n’ont pas pu être déplacés"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:648
+#: crates/pdfs-gui/src/app/pages/browser.rs:666
 #, rust-format
 msgid "Moved “{name}” to Trash"
 msgstr "« {name} » mis à la corbeille"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:650
+#: crates/pdfs-gui/src/app/pages/browser.rs:668
 #, rust-format
 msgid "Moved {n} item to Trash"
 msgid_plural "Moved {n} items to Trash"
 msgstr[0] "{n} élément mis à la corbeille"
 msgstr[1] "{n} éléments mis à la corbeille"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:656
+#: crates/pdfs-gui/src/app/pages/browser.rs:674
 #: crates/pdfs-gui/src/app/pages/photos.rs:3189
 msgid "Undo"
 msgstr "Annuler"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:670
+#: crates/pdfs-gui/src/app/pages/browser.rs:688
 msgid "Restored from Trash"
 msgstr "Restauré depuis la corbeille"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:673
+#: crates/pdfs-gui/src/app/pages/browser.rs:691
 #, rust-format
 msgid "Restored {n} item from Trash"
 msgid_plural "Restored {n} items from Trash"
 msgstr[0] "{n} élément restauré depuis la corbeille"
 msgstr[1] "{n} éléments restaurés depuis la corbeille"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:679
+#: crates/pdfs-gui/src/app/pages/browser.rs:697
 msgid "Couldn't restore from Trash"
 msgstr "Impossible de restaurer depuis la corbeille"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:727
-#: crates/pdfs-gui/src/app/pages/browser.rs:1209
-#: crates/pdfs-gui/src/app/pages/browser.rs:1233
+#: crates/pdfs-gui/src/app/pages/browser.rs:745
+#: crates/pdfs-gui/src/app/pages/browser.rs:1227
+#: crates/pdfs-gui/src/app/pages/browser.rs:1251
 msgid "Couldn't change offline state"
 msgstr "Impossible de modifier la disponibilité hors ligne"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:734
+#: crates/pdfs-gui/src/app/pages/browser.rs:752
 #, rust-format
 msgid "Making {n} item available offline…"
 msgid_plural "Making {n} items available offline…"
 msgstr[0] "Mise à disposition hors ligne de {n} élément…"
 msgstr[1] "Mise à disposition hors ligne de {n} éléments…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:741
+#: crates/pdfs-gui/src/app/pages/browser.rs:759
 #, rust-format
 msgid "{n} file is now available offline"
 msgid_plural "{n} files are now available offline"
 msgstr[0] "{n} fichier est désormais disponible hors ligne"
 msgstr[1] "{n} fichiers sont désormais disponibles hors ligne"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:748
+#: crates/pdfs-gui/src/app/pages/browser.rs:766
 #, rust-format
 msgid "{n} item is now online only"
 msgid_plural "{n} items are now online only"
 msgstr[0] "{n} élément est désormais en ligne uniquement"
 msgstr[1] "{n} éléments sont désormais en ligne uniquement"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:755
+#: crates/pdfs-gui/src/app/pages/browser.rs:773
 #, rust-format
 msgid "{n} file is now online only"
 msgid_plural "{n} files are now online only"
 msgstr[0] "{n} fichier est désormais en ligne uniquement"
 msgstr[1] "{n} fichiers sont désormais en ligne uniquement"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:876
+#: crates/pdfs-gui/src/app/pages/browser.rs:894
 #: crates/pdfs-gui/src/app/pages/devices.rs:175
 #: crates/pdfs-gui/src/app/widgets/details.rs:93
 #: crates/pdfs-gui/src/hud/preview.rs:144
@@ -1850,7 +1852,7 @@ msgctxt "column"
 msgid "Modified"
 msgstr "Modifié"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:886
+#: crates/pdfs-gui/src/app/pages/browser.rs:904
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:154
 #: crates/pdfs-gui/src/app/pages/status.rs:199
 #: crates/pdfs-gui/src/app/widgets/details.rs:98
@@ -1858,160 +1860,160 @@ msgstr "Modifié"
 msgid "Location"
 msgstr "Emplacement"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:919
+#: crates/pdfs-gui/src/app/pages/browser.rs:937
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:2046
 #: crates/pdfs-gui/src/app/widgets/player.rs:232
 #: crates/pdfs-gui/src/app/widgets/player.rs:247
 msgid "Open With…"
 msgstr "Ouvrir avec…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:927
-#: crates/pdfs-gui/src/app/pages/browser.rs:930
-#: crates/pdfs-gui/src/app/pages/browser.rs:986
+#: crates/pdfs-gui/src/app/pages/browser.rs:945
+#: crates/pdfs-gui/src/app/pages/browser.rs:948
+#: crates/pdfs-gui/src/app/pages/browser.rs:1004
 #: crates/pdfs-gui/src/app/pages/status.rs:334
 #: crates/pdfs-gui/src/app/widgets/details.rs:113
 #: crates/pdfs-gui/src/hud/preview.rs:308
 msgid "Available offline"
 msgstr "Disponible hors ligne"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:937
+#: crates/pdfs-gui/src/app/pages/browser.rs:955
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:2049
 #: crates/pdfs-gui/src/app/pages/photos.rs:4465
 #: crates/pdfs-gui/src/app/widgets/details.rs:129
 msgid "Share…"
 msgstr "Partager…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:941
+#: crates/pdfs-gui/src/app/pages/browser.rs:959
 #: crates/pdfs-gui/src/app/pages/shared.rs:895
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:492
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:500
 #: crates/pdfs-gui/src/app/widgets/details.rs:130
 msgid "Copy Link"
 msgstr "Copier le lien"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:951
-#: crates/pdfs-gui/src/app/pages/browser.rs:991
+#: crates/pdfs-gui/src/app/pages/browser.rs:969
+#: crates/pdfs-gui/src/app/pages/browser.rs:1009
 msgid "Move To…"
 msgstr "Déplacer vers…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:955
+#: crates/pdfs-gui/src/app/pages/browser.rs:973
 msgid "Make a Copy"
 msgstr "Faire une copie"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:957
-#: crates/pdfs-gui/src/app/pages/browser.rs:995
+#: crates/pdfs-gui/src/app/pages/browser.rs:975
+#: crates/pdfs-gui/src/app/pages/browser.rs:1013
 msgid "Copy To…"
 msgstr "Copier vers…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:962
+#: crates/pdfs-gui/src/app/pages/browser.rs:980
 #: crates/pdfs-gui/src/app/widgets/details.rs:151
 msgid "Versions…"
 msgstr "Versions…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:967
+#: crates/pdfs-gui/src/app/pages/browser.rs:985
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1466
 msgid "Details"
 msgstr "Détails"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1021
+#: crates/pdfs-gui/src/app/pages/browser.rs:1039
 msgid "New Folder…"
 msgstr "Nouveau dossier…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1027
+#: crates/pdfs-gui/src/app/pages/browser.rs:1045
 #: crates/pdfs-gui/src/app/pages/devices.rs:567
 #: crates/pdfs-gui/src/app/pages/shared.rs:586
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:524
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:532
 #: crates/pdfs-gui/src/app/pages/trash.rs:376
 msgid "Select All"
 msgstr "Tout sélectionner"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1048
-#: crates/pdfs-gui/src/app/pages/browser.rs:1060
-#: crates/pdfs-gui/src/app/pages/browser.rs:1179
-#: crates/pdfs-gui/src/app/pages/browser.rs:1183
+#: crates/pdfs-gui/src/app/pages/browser.rs:1066
+#: crates/pdfs-gui/src/app/pages/browser.rs:1078
+#: crates/pdfs-gui/src/app/pages/browser.rs:1197
+#: crates/pdfs-gui/src/app/pages/browser.rs:1201
 #: crates/pdfs-gui/src/app/pages/shared.rs:705
 #: crates/pdfs-gui/src/app/pages/shared.rs:709
 msgid "Couldn't open file"
 msgstr "Impossible d’ouvrir le fichier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1049
+#: crates/pdfs-gui/src/app/pages/browser.rs:1067
 msgid "Open With needs the Proton Drive service to be running."
 msgstr ""
 "« Ouvrir avec » nécessite que le service Proton Drive soit en cours "
 "d’exécution."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1091
+#: crates/pdfs-gui/src/app/pages/browser.rs:1109
 #: crates/pdfs-gui/src/app/pages/shared.rs:897
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:215
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:494
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:707
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:502
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:747
 msgid "Link copied"
 msgstr "Lien copié"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1095
-#: crates/pdfs-gui/src/app/pages/browser.rs:1099
+#: crates/pdfs-gui/src/app/pages/browser.rs:1113
+#: crates/pdfs-gui/src/app/pages/browser.rs:1117
 msgid "Couldn't copy link"
 msgstr "Impossible de copier le lien"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1221
+#: crates/pdfs-gui/src/app/pages/browser.rs:1239
 #, rust-format
 msgid "“{name}” is now online only"
 msgstr "« {name} » est désormais en ligne uniquement"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1224
+#: crates/pdfs-gui/src/app/pages/browser.rs:1242
 #, rust-format
 msgid "Making “{name}” available offline…"
 msgstr "Mise à disposition hors ligne de « {name} »…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1226
+#: crates/pdfs-gui/src/app/pages/browser.rs:1244
 #, rust-format
 msgid "“{name}” is now available offline"
 msgstr "« {name} » est désormais disponible hors ligne"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1486
+#: crates/pdfs-gui/src/app/pages/browser.rs:1511
 msgid "Couldn't save the view"
 msgstr "Impossible d’enregistrer l’affichage"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1509
+#: crates/pdfs-gui/src/app/pages/browser.rs:1534
 #: crates/pdfs-gui/src/app/widgets/file_list.rs:480
 msgid "Show as grid (Ctrl+1)"
 msgstr "Afficher en grille (Ctrl+1)"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1675
+#: crates/pdfs-gui/src/app/pages/browser.rs:1700
 #: crates/pdfs-gui/src/app/pages/trash.rs:580
 #: crates/pdfs-gui/src/app/pages/trash.rs:590
 msgid "Couldn't open the folder"
 msgstr "Impossible d’ouvrir le dossier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1688
-#: crates/pdfs-gui/src/app/pages/browser.rs:1719
-#: crates/pdfs-gui/src/app/pages/browser.rs:1724
+#: crates/pdfs-gui/src/app/pages/browser.rs:1713
+#: crates/pdfs-gui/src/app/pages/browser.rs:1744
+#: crates/pdfs-gui/src/app/pages/browser.rs:1749
 msgid "Couldn't build thumbnails"
 msgstr "Impossible de générer les miniatures"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1703
+#: crates/pdfs-gui/src/app/pages/browser.rs:1728
 msgid "Starting thumbnail build…"
 msgstr "Démarrage de la génération des miniatures…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1737
+#: crates/pdfs-gui/src/app/pages/browser.rs:1762
 msgid "Stopping thumbnail build…"
 msgstr "Arrêt de la génération des miniatures…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1750
-#: crates/pdfs-gui/src/app/pages/browser.rs:1759
+#: crates/pdfs-gui/src/app/pages/browser.rs:1775
+#: crates/pdfs-gui/src/app/pages/browser.rs:1784
 msgid "Couldn't cancel thumbnail build"
 msgstr "Impossible d’annuler la génération des miniatures"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1790
-#: crates/pdfs-gui/src/app/pages/browser.rs:1796
+#: crates/pdfs-gui/src/app/pages/browser.rs:1815
+#: crates/pdfs-gui/src/app/pages/browser.rs:1821
 msgid "Thumbnail build stopped"
 msgstr "Génération des miniatures arrêtée"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1797
+#: crates/pdfs-gui/src/app/pages/browser.rs:1822
 msgid "The Proton Drive service stopped reporting thumbnail progress."
 msgstr "Le service Proton Drive ne signale plus la progression des miniatures."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1817
-#: crates/pdfs-gui/src/app/pages/browser.rs:3537
+#: crates/pdfs-gui/src/app/pages/browser.rs:1842
+#: crates/pdfs-gui/src/app/pages/browser.rs:3689
 #: crates/pdfs-gui/src/app/pages/drive_galleries.rs:249
 #, rust-format
 msgid "{n} folder"
@@ -2020,8 +2022,9 @@ msgstr[0] "{n} dossier"
 msgstr[1] "{n} dossiers"
 
 #. Translators: a count of images and videos that can have a thumbnail.
-#: crates/pdfs-gui/src/app/pages/browser.rs:1819
-#: crates/pdfs-gui/src/app/pages/browser.rs:3538
+#: crates/pdfs-gui/src/app/pages/browser.rs:1844
+#: crates/pdfs-gui/src/app/pages/browser.rs:3690
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:498
 #: crates/pdfs-gui/src/i18n.rs:303
 #, rust-format
 msgid "{n} file"
@@ -2029,24 +2032,24 @@ msgid_plural "{n} files"
 msgstr[0] "{n} fichier"
 msgstr[1] "{n} fichiers"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1822
+#: crates/pdfs-gui/src/app/pages/browser.rs:1847
 #, rust-format
 msgid "Scanning {root}… {folders}, {images}"
 msgstr "Analyse de {root}… {folders}, {images}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1836
+#: crates/pdfs-gui/src/app/pages/browser.rs:1861
 #, rust-format
 msgid "Building thumbnails in {root}… {done} of {total}"
 msgstr "Génération des miniatures dans {root}… {done} sur {total}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1849
+#: crates/pdfs-gui/src/app/pages/browser.rs:1874
 #, rust-format
 msgid "Thumbnails ready for {n} file in {root}"
 msgid_plural "Thumbnails ready for {n} files in {root}"
 msgstr[0] "Miniatures prêtes pour {n} fichier dans {root}"
 msgstr[1] "Miniatures prêtes pour {n} fichiers dans {root}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1856
+#: crates/pdfs-gui/src/app/pages/browser.rs:1881
 #, rust-format
 msgid "Thumbnails ready for {n} file in {root}; {failed} unavailable"
 msgid_plural "Thumbnails ready for {n} files in {root}; {failed} unavailable"
@@ -2055,88 +2058,88 @@ msgstr[0] ""
 msgstr[1] ""
 "Miniatures prêtes pour {n} fichiers dans {root} ; indisponibles : {failed}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1866
+#: crates/pdfs-gui/src/app/pages/browser.rs:1891
 #, rust-format
 msgid "{status}. {message}"
 msgstr "{status}. {message}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:1988
+#: crates/pdfs-gui/src/app/pages/browser.rs:2013
 #: crates/pdfs-gui/src/app/pages/devices.rs:1071
 msgid "New name"
 msgstr "Nouveau nom"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2020
+#: crates/pdfs-gui/src/app/pages/browser.rs:2045
 #, rust-format
 msgid "Renamed to “{name}”"
 msgstr "Renommé en « {name} »"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2028
+#: crates/pdfs-gui/src/app/pages/browser.rs:2053
 msgid "Couldn't rename"
 msgstr "Impossible de renommer"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2075
+#: crates/pdfs-gui/src/app/pages/browser.rs:2100
 #, rust-format
 msgid "Move “{name}”"
 msgstr "Déplacer « {name} »"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2076
-#: crates/pdfs-gui/src/app/pages/browser.rs:2081
+#: crates/pdfs-gui/src/app/pages/browser.rs:2101
+#: crates/pdfs-gui/src/app/pages/browser.rs:2106
 msgid "Choose the folder to move into."
 msgstr "Choisissez le dossier de destination."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2077
-#: crates/pdfs-gui/src/app/pages/browser.rs:2082
+#: crates/pdfs-gui/src/app/pages/browser.rs:2102
+#: crates/pdfs-gui/src/app/pages/browser.rs:2107
 #: crates/pdfs-gui/src/app/pages/devices.rs:1277
 msgid "Move Here"
 msgstr "Déplacer ici"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2080
+#: crates/pdfs-gui/src/app/pages/browser.rs:2105
 #, rust-format
 msgid "Move {n} item"
 msgid_plural "Move {n} items"
 msgstr[0] "Déplacer {n} élément"
 msgstr[1] "Déplacer {n} éléments"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2085
+#: crates/pdfs-gui/src/app/pages/browser.rs:2110
 #, rust-format
 msgid "Copy “{name}”"
 msgstr "Copier « {name} »"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2086
-#: crates/pdfs-gui/src/app/pages/browser.rs:2091
+#: crates/pdfs-gui/src/app/pages/browser.rs:2111
+#: crates/pdfs-gui/src/app/pages/browser.rs:2116
 msgid "Choose the folder to copy into."
 msgstr "Choisissez le dossier où copier."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2087
-#: crates/pdfs-gui/src/app/pages/browser.rs:2092
+#: crates/pdfs-gui/src/app/pages/browser.rs:2112
+#: crates/pdfs-gui/src/app/pages/browser.rs:2117
 msgid "Copy Here"
 msgstr "Copier ici"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2090
+#: crates/pdfs-gui/src/app/pages/browser.rs:2115
 #, rust-format
 msgid "Copy {n} item"
 msgid_plural "Copy {n} items"
 msgstr[0] "Copier {n} élément"
 msgstr[1] "Copier {n} éléments"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2254
+#: crates/pdfs-gui/src/app/pages/browser.rs:2279
 msgid "Locations"
 msgstr "Emplacements"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2299
+#: crates/pdfs-gui/src/app/pages/browser.rs:2324
 msgid "Couldn't read this folder."
 msgstr "Impossible de lire ce dossier."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2327
+#: crates/pdfs-gui/src/app/pages/browser.rs:2352
 msgid "No folders here."
 msgstr "Aucun dossier ici."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2463
-#: crates/pdfs-gui/src/app/pages/browser.rs:2483
+#: crates/pdfs-gui/src/app/pages/browser.rs:2488
+#: crates/pdfs-gui/src/app/pages/browser.rs:2508
 msgid "Couldn't move"
 msgstr "Impossible de déplacer"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2490
+#: crates/pdfs-gui/src/app/pages/browser.rs:2515
 #, rust-format
 msgid "Moved {n} item to {place}, but not all"
 msgid_plural "Moved {n} items to {place}, but not all"
@@ -2144,24 +2147,24 @@ msgstr[0] "{n} élément déplacé vers {place}, mais pas tous"
 msgstr[1] "{n} éléments déplacés vers {place}, mais pas tous"
 
 #. Translators: {place} is a quoted folder name or "Proton Drive".
-#: crates/pdfs-gui/src/app/pages/browser.rs:2498
+#: crates/pdfs-gui/src/app/pages/browser.rs:2523
 #, rust-format
 msgid "Moved to {place}"
 msgstr "Déplacé vers {place}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2503
+#: crates/pdfs-gui/src/app/pages/browser.rs:2528
 #, rust-format
 msgid "Moved {n} item to {place}"
 msgid_plural "Moved {n} items to {place}"
 msgstr[0] "{n} élément déplacé vers {place}"
 msgstr[1] "{n} éléments déplacés vers {place}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2519
-#: crates/pdfs-gui/src/app/pages/browser.rs:2539
+#: crates/pdfs-gui/src/app/pages/browser.rs:2544
+#: crates/pdfs-gui/src/app/pages/browser.rs:2564
 msgid "Couldn't copy"
 msgstr "Impossible de copier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2546
+#: crates/pdfs-gui/src/app/pages/browser.rs:2571
 #, rust-format
 msgid "Copied {n} item to {place}, but not all"
 msgid_plural "Copied {n} items to {place}, but not all"
@@ -2169,12 +2172,12 @@ msgstr[0] "{n} élément copié vers {place}, mais pas tous"
 msgstr[1] "{n} éléments copiés vers {place}, mais pas tous"
 
 #. Translators: {place} is a quoted folder name or "Proton Drive".
-#: crates/pdfs-gui/src/app/pages/browser.rs:2554
+#: crates/pdfs-gui/src/app/pages/browser.rs:2579
 #, rust-format
 msgid "Copied to {place}"
 msgstr "Copié vers {place}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2559
+#: crates/pdfs-gui/src/app/pages/browser.rs:2584
 #, rust-format
 msgid "Copied {n} item to {place}"
 msgid_plural "Copied {n} items to {place}"
@@ -2182,103 +2185,135 @@ msgstr[0] "{n} élément copié vers {place}"
 msgstr[1] "{n} éléments copiés vers {place}"
 
 #. Translators: a folder name in quotes, filled in as {place} in "Moved to {place}".
-#: crates/pdfs-gui/src/app/pages/browser.rs:2603
+#: crates/pdfs-gui/src/app/pages/browser.rs:2628
 #, rust-format
 msgid "“{name}”"
 msgstr "« {name} »"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2619
+#: crates/pdfs-gui/src/app/pages/browser.rs:2644
 msgid "Create a folder in the current directory."
 msgstr "Créer un dossier dans le répertoire actuel."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2623
+#: crates/pdfs-gui/src/app/pages/browser.rs:2648
 msgid "Folder name"
 msgstr "Nom du dossier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2643
+#: crates/pdfs-gui/src/app/pages/browser.rs:2668
 #, rust-format
 msgid "Created “{name}”"
 msgstr "« {name} » créé"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2651
+#: crates/pdfs-gui/src/app/pages/browser.rs:2676
 msgid "Couldn't create folder"
 msgstr "Impossible de créer le dossier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2663
+#: crates/pdfs-gui/src/app/pages/browser.rs:2688
 msgid "Upload Files"
 msgstr "Téléverser des fichiers"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2684
+#: crates/pdfs-gui/src/app/pages/browser.rs:2709
 msgid "Upload Folder"
 msgstr "Téléverser un dossier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2877
-#: crates/pdfs-gui/src/app/pages/browser.rs:2903
-#: crates/pdfs-gui/src/app/pages/browser.rs:2907
+#: crates/pdfs-gui/src/app/pages/browser.rs:2902
+#: crates/pdfs-gui/src/app/pages/browser.rs:2928
+#: crates/pdfs-gui/src/app/pages/browser.rs:2932
 msgid "Couldn't upload"
 msgstr "Impossible de téléverser"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2892
+#: crates/pdfs-gui/src/app/pages/browser.rs:2917
 #: crates/pdfs-gui/src/app/pages/takeout.rs:932
 #: crates/pdfs-gui/src/app/widgets/file_list.rs:537
 msgid "Uploading…"
 msgstr "Téléversement…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2894
+#: crates/pdfs-gui/src/app/pages/browser.rs:2919
 #, rust-format
 msgid "Uploading {n} item…"
 msgid_plural "Uploading {n} items…"
 msgstr[0] "Téléversement de {n} élément…"
 msgstr[1] "Téléversement de {n} éléments…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2897
+#: crates/pdfs-gui/src/app/pages/browser.rs:2922
 #: crates/pdfs-gui/src/app/pages/photos.rs:995
 msgctxt "verb"
 msgid "View"
 msgstr "Afficher"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3219
+#: crates/pdfs-gui/src/app/pages/browser.rs:3167
+msgid "Nothing here can go into this folder"
+msgstr "Rien de tout cela ne peut aller dans ce dossier"
+
+#: crates/pdfs-gui/src/app/pages/browser.rs:3175
+#, rust-format
+msgid "Move {n} item to “{folder}”"
+msgid_plural "Move {n} items to “{folder}”"
+msgstr[0] "Déplacer {n} élément vers « {folder} »"
+msgstr[1] "Déplacer {n} éléments vers « {folder} »"
+
+#: crates/pdfs-gui/src/app/pages/browser.rs:3183
+#, rust-format
+msgid "Copy {n} item to “{folder}”"
+msgid_plural "Copy {n} items to “{folder}”"
+msgstr[0] "Copier {n} élément vers « {folder} »"
+msgstr[1] "Copier {n} éléments vers « {folder} »"
+
+#: crates/pdfs-gui/src/app/pages/browser.rs:3193
+#, rust-format
+msgid "Upload {n} item to “{folder}”"
+msgid_plural "Upload {n} items to “{folder}”"
+msgstr[0] "Téléverser {n} élément vers « {folder} »"
+msgstr[1] "Téléverser {n} éléments vers « {folder} »"
+
+#: crates/pdfs-gui/src/app/pages/browser.rs:3201
+#, rust-format
+msgid "{n} item can't go there and is left out"
+msgid_plural "{n} items can't go there and are left out"
+msgstr[0] "{n} élément ne peut pas aller là et est laissé de côté"
+msgstr[1] "{n} éléments ne peuvent pas aller là et sont laissés de côté"
+
+#: crates/pdfs-gui/src/app/pages/browser.rs:3371
 #: crates/pdfs-gui/src/app/pages/devices.rs:270
 #: crates/pdfs-gui/src/app/pages/trash.rs:547
 msgid "Reading this folder."
 msgstr "Lecture de ce dossier."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3276
+#: crates/pdfs-gui/src/app/pages/browser.rs:3428
 msgid "Folder unavailable"
 msgstr "Dossier indisponible"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3280
+#: crates/pdfs-gui/src/app/pages/browser.rs:3432
 msgid "Couldn't open this folder"
 msgstr "Impossible d’ouvrir ce dossier"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3327
+#: crates/pdfs-gui/src/app/pages/browser.rs:3479
 #: crates/pdfs-gui/src/app/pages/devices.rs:101
 #: crates/pdfs-gui/src/app/pages/shared.rs:464
 #: crates/pdfs-gui/src/app/pages/trash.rs:679
 msgid "This folder is empty"
 msgstr "Ce dossier est vide"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3328
+#: crates/pdfs-gui/src/app/pages/browser.rs:3480
 msgid "Drop files here, or upload a file or create a folder to get started."
 msgstr ""
 "Déposez des fichiers ici, ou téléversez un fichier ou créez un dossier pour "
 "commencer."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3388
+#: crates/pdfs-gui/src/app/pages/browser.rs:3540
 msgid "Search everywhere"
 msgstr "Rechercher partout"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3424
-#: crates/pdfs-gui/src/app/pages/browser.rs:3428
+#: crates/pdfs-gui/src/app/pages/browser.rs:3576
+#: crates/pdfs-gui/src/app/pages/browser.rs:3580
 msgid "Searching…"
 msgstr "Recherche…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3429
+#: crates/pdfs-gui/src/app/pages/browser.rs:3581
 #, rust-format
 msgid "Looking for “{query}”."
 msgstr "Recherche de « {query} »."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3485
+#: crates/pdfs-gui/src/app/pages/browser.rs:3637
 #, rust-format
 msgid "{summary} — showing the first {n} search result"
 msgid_plural "{summary} — showing the first {n} search results"
@@ -2286,30 +2321,30 @@ msgstr[0] "{summary} — affichage de {n} premier résultat de recherche"
 msgstr[1] "{summary} — affichage des {n} premiers résultats de recherche"
 
 #. Translators: {summary} counts the hits, such as "2 folders, 5 files (3.0 MB)".
-#: crates/pdfs-gui/src/app/pages/browser.rs:3492
+#: crates/pdfs-gui/src/app/pages/browser.rs:3644
 #, rust-format
 msgid "{summary} — search results"
 msgstr "{summary} — résultats de recherche"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3498
+#: crates/pdfs-gui/src/app/pages/browser.rs:3650
 msgid "No matches"
 msgstr "Aucun résultat"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3499
+#: crates/pdfs-gui/src/app/pages/browser.rs:3651
 msgid "No files or folders match that search."
 msgstr "Aucun fichier ni dossier ne correspond à cette recherche."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3544
+#: crates/pdfs-gui/src/app/pages/browser.rs:3696
 #, rust-format
 msgid "{files} ({size})"
 msgstr "{files} ({size})"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3549
+#: crates/pdfs-gui/src/app/pages/browser.rs:3701
 #, rust-format
 msgid "{folders}, {files}"
 msgstr "{folders}, {files}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:3554
+#: crates/pdfs-gui/src/app/pages/browser.rs:3706
 #, rust-format
 msgid "{folders}, {files} ({size})"
 msgstr "{folders}, {files} ({size})"
@@ -2666,7 +2701,7 @@ msgstr ""
 "ne peut pas être annulée d’ici."
 
 #: crates/pdfs-gui/src/app/pages/devices.rs:1130
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:394
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:473
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:302
 #: crates/pdfs-gui/src/app/pages/shared.rs:1162
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:641
@@ -3013,14 +3048,14 @@ msgstr ""
 "que vous ne les décochez pas. Les photos que vous ne gardez pas sont mises à "
 "la corbeille, d’où vous pouvez les restaurer."
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:321
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:322
 #, rust-format
 msgid "{date}, {n} copy"
 msgid_plural "{date}, {n} copies"
 msgstr[0] "{date}, {n} copie"
 msgstr[1] "{date}, {n} copies"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:328
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:329
 #: crates/pdfs-gui/src/app/pages/photos.rs:4217
 #, rust-format
 msgid "{date}, {n} photo"
@@ -3028,21 +3063,57 @@ msgid_plural "{date}, {n} photos"
 msgstr[0] "{date}, {n} photo"
 msgstr[1] "{date}, {n} photos"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:362
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:453
 #, rust-format
 msgid "Move {n} copy to Trash"
 msgid_plural "Move {n} copies to Trash"
 msgstr[0] "Mettre {n} copie à la corbeille"
 msgstr[1] "Mettre {n} copies à la corbeille"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:368
+#. Translators: {n} is a number of photos, {files} how many files they are stored as (always more than {n}).
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:460
+#, rust-format
+msgid "Move {n} photo ({files} files) to Trash"
+msgid_plural "Move {n} photos ({files} files) to Trash"
+msgstr[0] "Mettre {n} photo ({files} fichiers) à la corbeille"
+msgstr[1] "Mettre {n} photos ({files} fichiers) à la corbeille"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:466
 #, rust-format
 msgid "Move {n} photo to Trash"
 msgid_plural "Move {n} photos to Trash"
 msgstr[0] "Mettre {n} photo à la corbeille"
 msgstr[1] "Mettre {n} photos à la corbeille"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:463
+#. Translators: {n} photos of a set of {total} stay; the rest go to Trash.
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:478
+#, rust-format
+msgid "Keeping {n} of {total}"
+msgid_plural "Keeping {n} of {total}"
+msgstr[0] "{n} sur {total} gardée"
+msgstr[1] "{n} sur {total} gardées"
+
+#. Translators: a shot stored as a camera RAW file and others, such as its JPEG.
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:492
+#, rust-format
+msgid "RAW + {n} more file"
+msgid_plural "RAW + {n} more files"
+msgstr[0] "RAW + {n} autre fichier"
+msgstr[1] "RAW + {n} autres fichiers"
+
+#. Translators: a photo in the duplicates review that stays.
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:507
+msgctxt "duplicates"
+msgid "Kept"
+msgstr "Gardée"
+
+#. Translators: a photo in the duplicates review that goes to Trash.
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:510
+msgctxt "duplicates"
+msgid "Moves to Trash"
+msgstr "Va à la corbeille"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:559
 msgid "Keep"
 msgstr "Garder"
 
@@ -3080,7 +3151,7 @@ msgid "About Sync Modes"
 msgstr "À propos des modes de synchronisation"
 
 #: crates/pdfs-gui/src/app/pages/locations.rs:189
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:39
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:42
 #: crates/pdfs-gui/src/prompt.rs:65
 msgid "Folders"
 msgstr "Dossiers"
@@ -3709,7 +3780,7 @@ msgid "Email or username"
 msgstr "Adresse électronique ou nom d’utilisateur"
 
 #: crates/pdfs-gui/src/app/pages/login.rs:35
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:966
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1021
 msgid "Password"
 msgstr "Mot de passe"
 
@@ -4763,37 +4834,37 @@ msgstr ""
 "Données cartographiques © {naturalearth} (domaine public) et {geonames} (CC "
 "BY 4.0)"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:35
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:38
 msgid "Text"
 msgstr "Texte"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:36
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:39
 #: crates/pdfs-gui/src/prompt.rs:66
 msgid "Documents"
 msgstr "Documents"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:37
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:40
 #: crates/pdfs-gui/src/prompt.rs:67
 msgid "Images"
 msgstr "Images"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:38
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:41
 msgid "Audio and Video"
 msgstr "Audio et vidéo"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:40
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:43
 msgid "Everything"
 msgstr "Tout"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:46
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:49
 msgid "Add Rule…"
 msgstr "Ajouter une règle…"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:51
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:54
 msgid "Open Files With"
 msgstr "Ouvrir les fichiers avec"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:53
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:56
 msgid ""
 "For files opened from Proton Drive and the search launcher. The first rule "
 "that matches a file decides; other files open in their default app."
@@ -4802,47 +4873,74 @@ msgstr ""
 "première règle qui correspond à un fichier décide ; les autres fichiers "
 "s’ouvrent dans leur application par défaut."
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:59
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:62
 msgid "Other files (empty: default app)"
 msgstr "Autres fichiers (vide : application par défaut)"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:73
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:76
 msgid "Opens as"
 msgstr "S’ouvre comme"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:75
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:78
 msgid "Window"
 msgstr "Fenêtre"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:76
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:79
 msgid "Your Launcher"
 msgstr "Votre lanceur"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:77
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:80
 msgid "fzf in a Terminal"
 msgstr "fzf dans un terminal"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:81
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:84
 msgid "Launcher command (empty: find one)"
 msgstr "Commande du lanceur (vide : en trouver un)"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:91
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:94
 msgid "Results shown"
 msgstr "Résultats affichés"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:102
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:105
 msgid "Show icons"
 msgstr "Afficher les icônes"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:103
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:106
 msgid "When the launcher can show them"
 msgstr "Quand le lanceur peut les afficher"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:106
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:109
+msgid "Remember recent files"
+msgstr "Mémoriser les fichiers récents"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:111
+msgid ""
+"List what you opened before you type, and rank it higher in results. Off, "
+"the list is cleared."
+msgstr ""
+"Affiche ce que vous avez ouvert avant la saisie et le classe plus haut dans "
+"les résultats. Désactivé, la liste est effacée."
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:115
+#: crates/pdfs-gui/src/app/pages/takeout.rs:264
+msgid "Clear"
+msgstr "Effacer"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:119
+msgid "Clear recent files"
+msgstr "Effacer les fichiers récents"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:121
+msgid "The search window forgets what it opened. Your files are not touched."
+msgstr ""
+"La fenêtre de recherche oublie ce qu’elle a ouvert. Vos fichiers ne sont pas "
+"touchés."
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:126
 msgid "Search Launcher"
 msgstr "Lanceur de recherche"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:108
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:128
 msgid ""
 "How “pdfs-prompt” shows search results, for example from a keyboard "
 "shortcut. Your launcher can be any program that reads choices like dmenu, "
@@ -4852,95 +4950,103 @@ msgstr ""
 "depuis un raccourci clavier. Votre lanceur peut être tout programme qui lit "
 "des choix comme dmenu, par exemple rofi, wofi, fuzzel ou bemenu."
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:118
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:140
 msgid "Apps"
 msgstr "Applications"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:144
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:169
 #, rust-format
 msgid "Terminal (empty: {terminal})"
 msgstr "Terminal (vide : {terminal})"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:147
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:172
 msgid "Terminal"
 msgstr "Terminal"
 
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:286
+msgid "Recent files cleared"
+msgstr "Fichiers récents effacés"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:303
+msgid "Couldn't clear recent files"
+msgstr "Impossible d’effacer les fichiers récents"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:365
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:177
 msgid "Couldn't save the setting"
 msgstr "Impossible d’enregistrer le réglage"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:306
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:385
 msgid "A quote is not closed in the command"
 msgstr "Un guillemet n’est pas fermé dans la commande"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:314
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:393
 #, rust-format
 msgid "“{program}” isn't installed; saved anyway"
 msgstr "« {program} » n’est pas installé ; enregistré quand même"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:348
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:427
 msgid "No rules: every file opens in its default app"
 msgstr "Aucune règle : chaque fichier s’ouvre dans son application par défaut"
 
 #. Translators: {command} is a command line such as "nvim".
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:370
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:449
 #, rust-format
 msgid "{command}, in a terminal"
 msgstr "{command}, dans un terminal"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:385
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:464
 #, rust-format
 msgid "“{program}” isn't installed"
 msgstr "« {program} » n’est pas installé"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:392
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:471
 msgid "Move Up"
 msgstr "Monter"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:393
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:472
 msgid "Move Down"
 msgstr "Descendre"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:451
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:530
 msgid "Files, such as *.md, *.txt"
 msgstr "Fichiers, par exemple *.md, *.txt"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:477
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:556
 msgid "Command, such as nvim or code --wait"
 msgstr "Commande, par exemple nvim ou code --wait"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:482
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:561
 msgid "Run in a terminal"
 msgstr "Exécuter dans un terminal"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:483
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:562
 msgid "For programs that run in a terminal, such as vim"
 msgstr "Pour les programmes qui s’exécutent dans un terminal, comme vim"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:497
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:576
 msgid "Or pick kinds of files:"
 msgstr "Ou choisissez des types de fichiers :"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:510
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:589
 #: crates/pdfs-gui/src/app/pages/shared.rs:1203
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:76
 msgid "Save"
 msgstr "Enregistrer"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:523
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:602
 msgid "Edit Rule"
 msgstr "Modifier la règle"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:525
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:604
 msgid "New Rule"
 msgstr "Nouvelle règle"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:547
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:626
 msgid "A quote is not closed in the command."
 msgstr "Un guillemet n’est pas fermé dans la commande."
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:551
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:630
 #, rust-format
 msgid "“{program}” isn't installed."
 msgstr "« {program} » n’est pas installé."
@@ -5118,7 +5224,7 @@ msgid "Nothing has been added to this shared folder yet."
 msgstr "Rien n’a encore été ajouté à ce dossier partagé."
 
 #: crates/pdfs-gui/src/app/pages/shared.rs:551
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:480
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:490
 msgid "Show in My Files"
 msgstr "Afficher dans Mes fichiers"
 
@@ -5339,7 +5445,7 @@ msgid "Link removed"
 msgstr "Lien retiré"
 
 #: crates/pdfs-gui/src/app/pages/shared.rs:1176
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:736
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:776
 msgid "Couldn't remove the link"
 msgstr "Impossible de supprimer le lien"
 
@@ -5398,7 +5504,7 @@ msgid "People"
 msgstr "Personnes"
 
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:198
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:698
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:738
 msgid "Copy link"
 msgstr "Copier le lien"
 
@@ -5474,20 +5580,24 @@ msgstr "Aucun élément correspondant"
 msgid "None of your shared items match this filter."
 msgstr "Aucun de vos éléments partagés ne correspond à ce filtre."
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:470
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:475
+msgid "Edit Link Expiry…"
+msgstr "Modifier l’expiration du lien…"
+
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:480
 msgid "Manage Access…"
 msgstr "Gérer l’accès…"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:496
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:504
 msgid "Open Link"
 msgstr "Ouvrir le lien"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:500
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:515
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:508
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:523
 msgid "Stop Sharing…"
 msgstr "Arrêter le partage…"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:537
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:545
 #, rust-format
 msgid ""
 "Everyone you invited loses access to “{name}”, pending invitations are "
@@ -5496,7 +5606,7 @@ msgstr ""
 "Toutes les personnes invitées perdent l’accès à « {name} », les invitations "
 "en attente sont retirées et son lien public cesse de fonctionner."
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:541
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:549
 #, rust-format
 msgid ""
 "Everyone you invited loses access to {n} item, pending invitations are "
@@ -5512,26 +5622,26 @@ msgstr[1] ""
 "invitations en attente sont retirées et leurs liens publics cessent de "
 "fonctionner."
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:548
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:556
 msgid "Stop Sharing?"
 msgstr "Arrêter le partage ?"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:552
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:560
 msgid "Stop Sharing"
 msgstr "Arrêter le partage"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:561
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:569
 #, rust-format
 msgid "Stopped sharing {n} item"
 msgid_plural "Stopped sharing {n} items"
 msgstr[0] "Partage de {n} élément arrêté"
 msgstr[1] "Partage de {n} éléments arrêté"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:583
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:591
 msgid "Couldn't stop sharing"
 msgstr "Impossible d’arrêter le partage"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:586
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:594
 #, rust-format
 msgid "Stopped Sharing {went} of {n} Item"
 msgid_plural "Stopped Sharing {went} of {n} Items"
@@ -5989,7 +6099,7 @@ msgid "Up to date"
 msgstr "À jour"
 
 #: crates/pdfs-gui/src/app/pages/status.rs:1589
-#: crates/pdfs-gui/src/hud/mod.rs:592 crates/pdfs-gui/src/hud/mod.rs:606
+#: crates/pdfs-gui/src/hud/mod.rs:606 crates/pdfs-gui/src/hud/mod.rs:620
 msgid "Proton Drive isn't running"
 msgstr "Proton Drive n’est pas en cours d’exécution"
 
@@ -6222,10 +6332,6 @@ msgstr "Choisir des fichiers…"
 #: crates/pdfs-gui/src/app/pages/takeout.rs:259
 msgid "Archives to import"
 msgstr "Archives à importer"
-
-#: crates/pdfs-gui/src/app/pages/takeout.rs:264
-msgid "Clear"
-msgstr "Effacer"
 
 #: crates/pdfs-gui/src/app/pages/takeout.rs:265
 msgid "Remove every staged archive"
@@ -6648,7 +6754,7 @@ msgid "Nothing else was in this folder when it was deleted."
 msgstr "Ce dossier ne contenait rien d’autre lors de sa suppression."
 
 #: crates/pdfs-gui/src/app/pages/trash.rs:687
-#: crates/pdfs-gui/src/hud/mod.rs:227 crates/pdfs-gui/src/hud/mod.rs:852
+#: crates/pdfs-gui/src/hud/mod.rs:227 crates/pdfs-gui/src/hud/mod.rs:866
 msgid "No results"
 msgstr "Aucun résultat"
 
@@ -7050,7 +7156,6 @@ msgid "People with access"
 msgstr "Personnes ayant accès"
 
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:400
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:686
 msgid "Public link"
 msgstr "Lien public"
 
@@ -7108,26 +7213,28 @@ msgstr "Accès retiré"
 msgid "Couldn't remove access"
 msgstr "Impossible de retirer l’accès"
 
-#. Translators: {role} is the link's role, such as "Viewer".
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:675
-#, rust-format
-msgid "Anyone with the link ({role})"
-msgstr "Toute personne disposant du lien ({role})"
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:704
+msgid "Edit Expiry"
+msgstr "Modifier l’expiration"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:678
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:905
-msgid "password-protected"
-msgstr "protégé par mot de passe"
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:716
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:731
+msgid "Show link address"
+msgstr "Afficher l’adresse du lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:714
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:729
+msgid "Hide link address"
+msgstr "Masquer l’adresse du lien"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:754
 msgid "Remove link"
 msgstr "Supprimer le lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:728
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:768
 msgid "Remove Public Link?"
 msgstr "Supprimer le lien public ?"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:729
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:769
 msgid ""
 "The link stops working for everyone who has it. A new link will have a "
 "different address."
@@ -7135,57 +7242,73 @@ msgstr ""
 "Le lien cesse de fonctionner pour toutes les personnes qui l’ont. Un nouveau "
 "lien aura une adresse différente."
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:730
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:770
 msgid "Remove Link"
 msgstr "Supprimer le lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:735
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:775
 msgid "Public link removed"
 msgstr "Lien public supprimé"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:753
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:946
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:793
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1001
 msgid "Link role"
 msgstr "Rôle du lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:755
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:795
 msgid "Password (optional)"
 msgstr "Mot de passe (facultatif)"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:759
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:952
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:799
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1007
 msgid "Expires"
 msgstr "Expiration"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:763
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:803
 msgid "The new link"
 msgstr "Le nouveau lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:768
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:808
 msgid "Create Public Link"
 msgstr "Créer un lien public"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:900
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:941
+msgid "Expired public link"
+msgstr "Lien public expiré"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:942
+msgid "Public editor link"
+msgstr "Lien public en modification"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:943
+msgid "Public viewer link"
+msgstr "Lien public en lecture"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:950
 msgid "Anyone with the link can edit"
 msgstr "Toute personne disposant du lien peut modifier"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:902
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:952
 msgid "Anyone with the link can view"
 msgstr "Toute personne disposant du lien peut consulter"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:907
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:955
+msgid "password-protected"
+msgstr "protégé par mot de passe"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:957
 msgid "no password"
 msgstr "sans mot de passe"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:911
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:961
 msgid "never expires"
 msgstr "n’expire jamais"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:938
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:993
 msgid "Link settings"
 msgstr "Paramètres du lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:940
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:995
 msgid ""
 "Change who can edit, the password or the expiry, then save. The link stays "
 "the same."
@@ -7193,61 +7316,61 @@ msgstr ""
 "Modifiez qui peut modifier, le mot de passe ou l’expiration, puis "
 "enregistrez. Le lien reste le même."
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:958
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1013
 msgid "Require a password"
 msgstr "Exiger un mot de passe"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:964
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1019
 msgid "New password (optional)"
 msgstr "Nouveau mot de passe (facultatif)"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:974
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:995
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1029
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1050
 msgid "No changes"
 msgstr "Aucune modification"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:979
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1034
 msgid "Save Link Settings"
 msgstr "Enregistrer les paramètres du lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1000
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1055
 msgid "After saving"
 msgstr "Après l’enregistrement"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1005
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1060
 msgid "Enter a password to save"
 msgstr "Saisissez un mot de passe pour enregistrer"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1082
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1137
 msgid "Link updated"
 msgstr "Lien mis à jour"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1084
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1088
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1139
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1143
 msgid "Couldn't change the link"
 msgstr "Impossible de modifier le lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1115
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1170
 msgid "Public link created"
 msgstr "Lien public créé"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1119
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1123
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1174
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1178
 msgid "Couldn't create the link"
 msgstr "Impossible de créer le lien"
 
 #. Translators: a public link past its expiry date.
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1175
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1230
 msgid "expired"
 msgstr "expiré"
 
 #. Translators: strftime format for a link's expiry date; "%x" is the locale's date, such as "09/23/26".
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1178
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1233
 msgid "%x"
 msgstr "%x"
 
 #. Translators: {date} is the date a public link stops working.
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1185
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1240
 #, rust-format
 msgid "expires {date}"
 msgstr "expire le {date}"
@@ -7422,60 +7545,60 @@ msgstr "Démarrez Proton Drive pour rechercher dans vos fichiers."
 msgid "↑↓ navigate · ↵ open · Tab filter"
 msgstr "↑↓ naviguer · ↵ ouvrir · Tab filtrer"
 
-#: crates/pdfs-gui/src/hud/mod.rs:854
+#: crates/pdfs-gui/src/hud/mod.rs:868
 msgid "Search your Drive"
 msgstr "Rechercher dans votre Drive"
 
-#: crates/pdfs-gui/src/hud/mod.rs:859
+#: crates/pdfs-gui/src/hud/mod.rs:873
 msgid "Still indexing this computer — local results will fill in shortly."
 msgstr ""
 "Indexation de cet ordinateur en cours — les résultats locaux vont bientôt "
 "apparaître."
 
-#: crates/pdfs-gui/src/hud/mod.rs:861
+#: crates/pdfs-gui/src/hud/mod.rs:875
 msgid "Try a different search, or another filter."
 msgstr "Essayez une autre recherche ou un autre filtre."
 
-#: crates/pdfs-gui/src/hud/mod.rs:863
+#: crates/pdfs-gui/src/hud/mod.rs:877
 msgid "Start typing to search Proton Drive and the files on this computer."
 msgstr ""
 "Commencez à taper pour rechercher dans Proton Drive et dans les fichiers de "
 "cet ordinateur."
 
-#: crates/pdfs-gui/src/hud/mod.rs:890
+#: crates/pdfs-gui/src/hud/mod.rs:904
 msgid "No pinned files"
 msgstr "Aucun fichier épinglé"
 
-#: crates/pdfs-gui/src/hud/mod.rs:891
+#: crates/pdfs-gui/src/hud/mod.rs:905
 #, rust-format
 msgid "{n} pinned file"
 msgid_plural "{n} pinned files"
 msgstr[0] "{n} fichier épinglé"
 msgstr[1] "{n} fichiers épinglés"
 
-#: crates/pdfs-gui/src/hud/mod.rs:904
+#: crates/pdfs-gui/src/hud/mod.rs:918
 #, rust-format
 msgid "{drive} in Drive · {local} on this computer · indexing…"
 msgstr "{drive} dans Drive · {local} sur cet ordinateur · indexation…"
 
 #. Translators: result counts in the footer; {drive} and {local} are numbers.
-#: crates/pdfs-gui/src/hud/mod.rs:909
+#: crates/pdfs-gui/src/hud/mod.rs:923
 #, rust-format
 msgid "{drive} in Drive · {local} on this computer"
 msgstr "{drive} dans Drive · {local} sur cet ordinateur"
 
 #. Translators: {name} is a file name.
-#: crates/pdfs-gui/src/hud/mod.rs:1040
+#: crates/pdfs-gui/src/hud/mod.rs:1054
 #, rust-format
 msgid "Opening {name}…"
 msgstr "Ouverture de {name}…"
 
-#: crates/pdfs-gui/src/hud/mod.rs:1080
+#: crates/pdfs-gui/src/hud/mod.rs:1094
 #, rust-format
 msgid "Could not open: {message}"
 msgstr "Impossible d’ouvrir : {message}"
 
-#: crates/pdfs-gui/src/hud/mod.rs:1084
+#: crates/pdfs-gui/src/hud/mod.rs:1098
 msgid "Couldn't reach Proton Drive"
 msgstr "Impossible de joindre Proton Drive"
 
@@ -7766,6 +7889,10 @@ msgstr "{count} a"
 #, rust-format
 msgid "cannot reach the Proton Drive daemon: {error}"
 msgstr "impossible de joindre le démon Proton Drive : {error}"
+
+#, rust-format
+#~ msgid "Anyone with the link ({role})"
+#~ msgstr "Toute personne disposant du lien ({role})"
 
 #~ msgid "Add a password"
 #~ msgstr "Ajouter un mot de passe"

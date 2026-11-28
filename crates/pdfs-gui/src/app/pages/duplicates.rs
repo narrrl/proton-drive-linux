@@ -310,6 +310,7 @@ fn duplicate_review(
 
     // Every copy's toggle, by set, so the button can count what goes.
     let toggles: Rc<RefCell<SetToggles>> = Rc::new(RefCell::new(Vec::new()));
+    let mut kept_labels: Vec<gtk4::Label> = Vec::new();
     for set in sets {
         let Some(first) = set.first() else {
             continue;
@@ -333,20 +334,29 @@ fn duplicate_review(
         };
         let heading = gtk4::Label::builder().label(title).xalign(0.0).build();
         heading.add_css_class("heading");
+        // How many of the set stay, in the heading's line: a set wider than
+        // the window hides some of its cards, and this still says what goes.
+        let kept = gtk4::Label::builder().xalign(1.0).hexpand(true).build();
+        kept.add_css_class("dim-label");
+        let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        header.append(&heading);
+        header.append(&kept);
         let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
         let mut set_toggles = Vec::new();
         for (index, photo) in set.into_iter().enumerate() {
-            let (card, keep) = copy_card(ui, &photo, index == 0 || finder == Finder::Similar);
+            let (card, keep) =
+                copy_card(ui, &photo, index == 0 || finder == Finder::Similar, finder);
             row.append(&card);
             set_toggles.push((photo, keep));
         }
+        kept_labels.push(kept);
         let row_scroll = gtk4::ScrolledWindow::builder()
             .vscrollbar_policy(gtk4::PolicyType::Never)
             .propagate_natural_height(true)
             .child(&row)
             .build();
         let section = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-        section.append(&heading);
+        section.append(&header);
         section.append(&row_scroll);
         content.append(&section);
         toggles.borrow_mut().push(set_toggles);
@@ -356,22 +366,14 @@ fn duplicate_review(
         let toggles = toggles.clone();
         let trash = trash.clone();
         move || {
-            let n = doomed(&toggles.borrow()).len();
-            trash.set_label(&match finder {
-                Finder::Exact => ngettext_f(
-                    "Move {n} copy to Trash",
-                    "Move {n} copies to Trash",
-                    n as u64,
-                    &[],
-                ),
-                Finder::Similar => ngettext_f(
-                    "Move {n} photo to Trash",
-                    "Move {n} photos to Trash",
-                    n as u64,
-                    &[],
-                ),
-            });
+            let toggles = toggles.borrow();
+            let (n, files) = doomed_counts(&toggles, finder);
+            trash.set_label(&trash_label(finder, n, files));
             trash.set_sensitive(n > 0);
+            for (set, label) in toggles.iter().zip(&kept_labels) {
+                let keep = set.iter().filter(|(_, t)| t.is_active()).count();
+                label.set_label(&kept_label(keep, set.len()));
+            }
         }
     };
     sync();
@@ -421,6 +423,94 @@ fn duplicate_review(
     (scroll.upcast(), handler)
 }
 
+/// How many photos go to Trash, and how many files that is. An exact copy is
+/// one file. A similar photo takes its whole shot, a RAW and its JPEG
+/// together.
+fn doomed_counts(toggles: &SetToggles, finder: Finder) -> (usize, usize) {
+    let doomed: Vec<&PhotoItem> = toggles
+        .iter()
+        .flatten()
+        .filter(|(_, keep)| !keep.is_active())
+        .map(|(photo, _)| photo)
+        .collect();
+    (doomed.len(), files_of(doomed.into_iter(), finder))
+}
+
+/// How many files trashing `photos` moves.
+fn files_of<'a>(photos: impl Iterator<Item = &'a PhotoItem>, finder: Finder) -> usize {
+    photos
+        .map(|photo| match finder {
+            Finder::Exact => 1,
+            Finder::Similar => photo.group_size.max(1) as usize,
+        })
+        .sum()
+}
+
+/// The footer button: what it moves, in photos and, when that differs, files.
+fn trash_label(finder: Finder, photos: usize, files: usize) -> String {
+    match finder {
+        Finder::Exact => ngettext_f(
+            "Move {n} copy to Trash",
+            "Move {n} copies to Trash",
+            photos as u64,
+            &[],
+        ),
+        Finder::Similar if files > photos => ngettext_f(
+            // Translators: {n} is a number of photos, {files} how many files they are stored as (always more than {n}).
+            "Move {n} photo ({files} files) to Trash",
+            "Move {n} photos ({files} files) to Trash",
+            photos as u64,
+            &[("files", &files.to_string())],
+        ),
+        Finder::Similar => ngettext_f(
+            "Move {n} photo to Trash",
+            "Move {n} photos to Trash",
+            photos as u64,
+            &[],
+        ),
+    }
+}
+
+/// How many of a set stay.
+fn kept_label(kept: usize, of: usize) -> String {
+    ngettext_f(
+        // Translators: {n} photos of a set of {total} stay; the rest go to Trash.
+        "Keeping {n} of {total}",
+        "Keeping {n} of {total}",
+        kept as u64,
+        &[("total", &of.to_string())],
+    )
+}
+
+/// What a card's photo is stored as, when that is more than one file.
+fn stored_as(photo: &PhotoItem) -> Option<String> {
+    let n = photo.group_size;
+    (n > 1).then(|| {
+        if photo.has_raw {
+            ngettext_f(
+                // Translators: a shot stored as a camera RAW file and others, such as its JPEG.
+                "RAW + {n} more file",
+                "RAW + {n} more files",
+                u64::from(n - 1),
+                &[],
+            )
+        } else {
+            ngettext_f("{n} file", "{n} files", u64::from(n), &[])
+        }
+    })
+}
+
+/// What happens to a card's photo, under its toggle.
+fn outcome_label(keep: bool) -> String {
+    if keep {
+        // Translators: a photo in the duplicates review that stays.
+        pgettext("duplicates", "Kept")
+    } else {
+        // Translators: a photo in the duplicates review that goes to Trash.
+        pgettext("duplicates", "Moves to Trash")
+    }
+}
+
 /// The uids of every copy not kept.
 fn doomed(toggles: &SetToggles) -> Vec<String> {
     toggles
@@ -431,8 +521,14 @@ fn doomed(toggles: &SetToggles) -> Vec<String> {
         .collect()
 }
 
-/// One copy: its thumbnail, its file name, and whether to keep it.
-fn copy_card(ui: &Rc<Ui>, photo: &PhotoItem, keep: bool) -> (gtk4::Box, gtk4::ToggleButton) {
+/// One copy: its thumbnail, its file name, and whether to keep it. A similar
+/// shot stored as several files says so, since all of them go with it.
+fn copy_card(
+    ui: &Rc<Ui>,
+    photo: &PhotoItem,
+    keep: bool,
+    finder: Finder,
+) -> (gtk4::Box, gtk4::ToggleButton) {
     let picture = gtk4::Picture::builder()
         .content_fit(gtk4::ContentFit::Cover)
         .can_shrink(true)
@@ -464,11 +560,88 @@ fn copy_card(ui: &Rc<Ui>, photo: &PhotoItem, keep: bool) -> (gtk4::Box, gtk4::To
         .active(keep)
         .build();
     toggle.add_css_class("pill");
+    let outcome = gtk4::Label::builder().label(outcome_label(keep)).build();
+    outcome.add_css_class("caption");
+    if !keep {
+        outcome.add_css_class("error");
+    }
+    let outcome_t = outcome.clone();
+    toggle.connect_toggled(move |toggle| {
+        outcome_t.set_label(&outcome_label(toggle.is_active()));
+        if toggle.is_active() {
+            outcome_t.remove_css_class("error");
+        } else {
+            outcome_t.add_css_class("error");
+        }
+    });
 
     let card = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
     card.set_size_request(COPY_SIZE, -1);
     card.append(&overlay);
     card.append(&label);
+    if finder == Finder::Similar
+        && let Some(files) = stored_as(photo)
+    {
+        let files = gtk4::Label::builder().label(files).build();
+        files.add_css_class("caption");
+        files.add_css_class("dim-label");
+        card.append(&files);
+    }
     card.append(&toggle);
+    card.append(&outcome);
     (card, toggle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shot(files: u32, has_raw: bool) -> PhotoItem {
+        PhotoItem {
+            uid: "vol~shot".into(),
+            capture_time: 0,
+            thumb_path: None,
+            name: None,
+            ratio: None,
+            no_thumb: false,
+            kind: PhotoKind::Photo,
+            favorite: false,
+            group_size: files,
+            has_raw,
+            place_id: None,
+        }
+    }
+
+    /// One RAW+JPEG shot marked and another kept: the footer counts both.
+    #[test]
+    fn the_footer_counts_files_when_a_shot_is_several() {
+        let raw_jpeg = shot(2, true);
+        let files = files_of([&raw_jpeg].into_iter(), Finder::Similar);
+        assert_eq!(files, 2);
+        assert_eq!(
+            trash_label(Finder::Similar, 1, files),
+            "Move 1 photo (2 files) to Trash"
+        );
+        assert_eq!(trash_label(Finder::Similar, 2, 2), "Move 2 photos to Trash");
+    }
+
+    /// An exact copy is one file, whatever its shot holds.
+    #[test]
+    fn an_exact_copy_is_one_file() {
+        let raw_jpeg = shot(2, true);
+        assert_eq!(files_of([&raw_jpeg].into_iter(), Finder::Exact), 1);
+        assert_eq!(trash_label(Finder::Exact, 1, 1), "Move 1 copy to Trash");
+    }
+
+    #[test]
+    fn a_card_names_what_its_shot_is_stored_as() {
+        assert_eq!(stored_as(&shot(1, false)), None);
+        assert_eq!(stored_as(&shot(0, false)), None);
+        assert_eq!(
+            stored_as(&shot(2, true)).as_deref(),
+            Some("RAW + 1 more file")
+        );
+        assert_eq!(stored_as(&shot(3, false)).as_deref(), Some("3 files"));
+        assert_eq!(kept_label(1, 4), "Keeping 1 of 4");
+    }
 }

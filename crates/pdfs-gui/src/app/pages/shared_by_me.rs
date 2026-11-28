@@ -466,6 +466,16 @@ fn rebind_rows(ui: &Rc<Ui>, uids: &HashSet<String>) {
 /// node by uid, so every shared item can be managed from here.
 fn shared_by_me_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
     let mut menu = ActionMenu::new();
+    let now = glib::real_time() / 1_000_000;
+    let link = find_item(&ui.shared_by_me.items, &entry.uid).and_then(|item| item.link);
+    // An expired link has nothing to copy or open; what it needs is a new
+    // expiry, which the Share dialog's link settings give it.
+    if link.as_ref().is_some_and(|link| link_expired(link, now)) {
+        let (ui_c, entry_c) = (ui.clone(), entry.clone());
+        menu.item(&gettext("Edit Link Expiry…"), move || {
+            open_share_dialog(&ui_c, &entry_c)
+        });
+    }
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
     menu.item(&gettext("Manage Access…"), move || {
         open_share_dialog(&ui_c, &entry_c)
@@ -481,9 +491,7 @@ fn shared_by_me_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
             show_in_my_files(&ui_c, &entry_c)
         });
     }
-    let now = glib::real_time() / 1_000_000;
-    let url = find_item(&ui.shared_by_me.items, &entry.uid)
-        .and_then(|item| item.link)
+    let url = link
         .filter(|link| !link_expired(link, now))
         .and_then(|link| link.url);
     if let Some(url) = url {
