@@ -111,6 +111,12 @@ digest of what it sent (52).
   first pass, and whenever the change feed lost track (#53).
 
 ### Fixed
+- **A write right after another can no longer bring back old bytes or cut the file short.** When
+  an upload landed just as the next edit to the same file was queued, the file could keep the
+  size of the upload that landed. A write opened next then started at that size, not the queued
+  edit's. If the landed size was larger, a gap the write left past the edit was filled from the
+  older revision instead of zeros. If it was smaller, the file was cut at that size. Seen in
+  the echoes simulation about once in 40 runs under CPU load (B308).
 - **A file kept offline and then deleted can be made online only again.** Deleting or trashing a
   file left its entry under Settings → Storage → Available offline, and making it online only
   failed with "could not resolve", because its path no longer led anywhere. Deleting a file now

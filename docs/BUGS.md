@@ -319,6 +319,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B308](#b308--a-write-opened-over-a-queued-edit-took-the-trees-older-size) | A write opened over a queued edit took the tree's older size |
 | [B295](#b295--a-resize-the-scratch-file-refused-still-succeeded) | A resize the scratch file refused still succeeded |
 | [B293](#b293--a-large-trash-never-lists-and-empty-trash-never-empties-it) | A large trash never lists, and Empty Trash never empties it |
 | [B292](#b292--two-programs-changing-settings-at-once-lose-one-of-the-changes) | Two programs changing settings at once lose one of the changes |
@@ -409,6 +410,46 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B308 — A write opened over a queued edit took the tree's older size
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-28, looping `one_client_with_stale_hashes_and_reordered_echoes` seed 4 under
+`stress-ng --cpu 4 --cpu-load 70` while chasing B307. Three runs of 89 failed with `liveness: the
+queues did not drain within 6s`, none with B307's 20 s stall. Run 45 ended with `a.txt` holding
+`mnopqrstcdefhijk…` where the model has `mnopqrst\0\0\0\0hijk…`, and run 33 with `f.txt` cut at 62
+bytes of 81.
+**Where:** `crates/pdfs-vfs/src/files.rs` (`Files::install_writer`) and
+`crates/pdfs-fuse/src/drain/revision.rs` (`Core::place_landed`)
+
+**Repro:** Create `a.txt` with 23 bytes and let its upload start. As it lands, open `a.txt` with
+`O_TRUNC`, write 8 bytes and close. Then open it again and write 4 bytes at offset 12.
+
+**Cause.** Two steps, each harmless alone:
+
+- `place_landed` asks `rebaseline_pending` whether a write is queued, and if none is, puts the node
+  it read back into the tree. A write queued between the two stamps its own size first, and the
+  landed node then puts the old size back. The tree said 23 bytes while the queued edit held 8.
+- `install_writer` copies the queued blob into the new handle's scratch file and marks `[0, 8)` as
+  written, but it started the handle at the tree's size. With 23, the write at 12 left `[8, 12)`
+  unmarked, and the commit filled it from the 23-byte revision instead of zeros. Run 33 was the
+  same with a tree size below the queued edit's, so the handle was cut short.
+
+**Fix.** A write open over a queued edit starts at the edit's length, since the blob is the whole
+file. `place_landed` applies queued sizes to the node it read back before putting it in the tree,
+as listings already do.
+
+**Verified:** `a_write_open_over_a_queued_edit_takes_the_edits_length` in `pdfs-vfs` fails
+without the fix (`left: 23, right: 16`) and passes with it. The seed-4 loop under load has not
+been rerun on the fix yet.
+
+The third failure, run 59, is not this one. There the edit to `a.txt` landed only as a conflict
+copy ("based on revision rev2, remote now at rev5"), so the file on Drive kept its 23-byte
+revision. That is how [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy)
+looks, and the race in `place_landed` above may also leave a queued write with an old baseline.
+Not checked.
+
+---
 
 ### B307 — A write in the echoes simulation can wait 20 s for a Drive call that never answers
 
