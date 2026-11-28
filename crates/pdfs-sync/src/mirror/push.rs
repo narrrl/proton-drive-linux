@@ -331,11 +331,14 @@ impl Syncer {
                 let _ = self.store.sync_entry_remove(folder_id, rel);
                 continue;
             };
-            if let Err(e) = self
+            let intent = self.issue_effect(folder_id, rel, effect::TRASH);
+            let result = self
                 .rt
                 .block_on(self.drive.trash_nodes(&[uid]))
-                .and_then(batch::into_unit)
-            {
+                .and_then(batch::into_unit);
+            let error = result.as_ref().err().map(ToString::to_string);
+            self.settle_effect(intent.as_ref(), error.as_deref());
+            if let Err(e) = result {
                 warn!(rel, error = %e, "sync: trash remote failed");
                 self.log_activity(ActivityKind::Trash, base_name(rel), e.to_string(), false);
                 outcome.failed(&format!("{rel}: {e}"));

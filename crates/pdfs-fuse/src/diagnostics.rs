@@ -19,11 +19,13 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use pdfs_core::control::{
-    AdmissionLoad, Diagnostics, DriveCallStat, InflightRequest, ServiceState, UploadPathStat,
-    WorkerState,
+    AdmissionLoad, Diagnostics, DriveCallStat, EffectIntent, EffectReport, InflightRequest,
+    ServiceState, UploadPathStat, WorkerState,
 };
 
 use pdfs_core::lifecycle::ServiceBoard;
+use pdfs_core::timestamp::now_secs;
+use pdfs_store::db::StoredIntent;
 
 use super::Core;
 
@@ -146,6 +148,7 @@ impl Core {
             })
             .unwrap_or_default();
         inflight.sort_by_key(|request| std::cmp::Reverse(request.age_secs));
+        let (pending_ops, effects) = self.database_quickly().unzip();
 
         Diagnostics {
             uptime_secs: STARTED.elapsed().as_secs(),
@@ -167,7 +170,8 @@ impl Core {
             inflight,
             control_handlers: super::control::active_handlers(),
             control_handler_limit: super::control::handler_limit(),
-            pending_ops: self.pending_ops_quickly(),
+            pending_ops,
+            effects,
             sync: Some(self.sync.engine.report()),
             services: self
                 .services
@@ -230,23 +234,47 @@ impl Core {
         }
     }
 
-    /// Queued mutations, or `None` when the database did not answer within
-    /// [`PENDING_COUNT_DEADLINE`] or an earlier probe is still waiting on it.
+    /// Queued mutations and the mirror effects not settled yet, or `None`
+    /// when the database did not answer within [`DATABASE_DEADLINE`] or an
+    /// earlier probe is still waiting on it.
     ///
     /// The supervisor asks for a report every tick. One thread per report
     /// would pile up behind a database that never answers, so a second probe
     /// is not started until the first one has returned.
-    fn pending_ops_quickly(&self) -> Option<u64> {
+    fn database_quickly(&self) -> Option<(u64, EffectReport)> {
         let db = self.db.clone();
         probe_once(
             &self.services,
             &self.pending_probe,
-            PENDING_COUNT_DEADLINE,
+            DATABASE_DEADLINE,
             move || {
                 let counts = db.pending_op_counts().ok()?;
-                Some(counts.uploads.max(0) as u64 + counts.changes.max(0) as u64)
+                let pending = counts.uploads.max(0) as u64 + counts.changes.max(0) as u64;
+                let intents = db.sync_intents(None).ok()?;
+                Some((pending, effect_report(intents, now_secs())))
             },
         )
+    }
+}
+
+/// The report of the unsettled `intents`, oldest first, at `now`.
+fn effect_report(mut intents: Vec<StoredIntent>, now: i64) -> EffectReport {
+    intents.sort_by_key(|intent| (intent.issued_at, intent.id));
+    EffectReport {
+        count: intents.len(),
+        oldest: intents
+            .into_iter()
+            .take(EffectReport::SHOWN)
+            .map(|intent| EffectIntent {
+                folder_id: intent.folder_id,
+                rel_path: intent.rel_path,
+                kind: intent.kind,
+                state: intent.state,
+                attempts: intent.attempts,
+                age_secs: u64::try_from(now - intent.issued_at).unwrap_or(0),
+                last_error: intent.last_error,
+            })
+            .collect(),
     }
 }
 
@@ -282,11 +310,48 @@ fn probe_once<T: Send + 'static>(
 }
 
 /// How long the report waits for the database before reporting without it.
-const PENDING_COUNT_DEADLINE: Duration = Duration::from_millis(500);
+const DATABASE_DEADLINE: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report counts every unsettled effect but lists only the oldest,
+    /// so a folder with thousands of failed uploads stays readable.
+    #[test]
+    fn the_effect_report_lists_the_oldest_and_counts_them_all() {
+        let intent = |id: i64, issued_at: i64| StoredIntent {
+            id,
+            folder_id: 1,
+            rel_path: format!("f{id}"),
+            kind: "trash".into(),
+            state: "retry".into(),
+            attempts: 2,
+            issued_at,
+            last_error: Some("offline".into()),
+            sent_sha1s: Vec::new(),
+        };
+        let total = EffectReport::SHOWN as i64 + 5;
+        let intents = (0..total).map(|id| intent(id, 1_000 - id)).collect();
+        let report = effect_report(intents, 1_100);
+        assert_eq!(report.count, total as usize);
+        assert_eq!(report.oldest.len(), EffectReport::SHOWN);
+        let first = &report.oldest[0];
+        assert_eq!(first.rel_path, format!("f{}", total - 1));
+        assert_eq!(first.age_secs, 100 + total as u64 - 1);
+        assert_eq!(first.last_error.as_deref(), Some("offline"));
+        assert!(
+            report
+                .oldest
+                .windows(2)
+                .all(|pair| pair[0].age_secs >= pair[1].age_secs)
+        );
+        // A clock that went back reads as just sent, not as a wrap.
+        assert_eq!(
+            effect_report(vec![intent(1, 2_000)], 1_000).oldest[0].age_secs,
+            0
+        );
+    }
 
     /// The request name is read off the wire format, so it must match both
     /// shapes serde produces.

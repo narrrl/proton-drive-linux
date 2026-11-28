@@ -35,6 +35,11 @@ digest of what it sent (52).
   its own directories, keyring entry, kernel keys and mountpoint, so a test account can run
   alongside the account you use. `scripts/live-bench.py` uses it to time one edit, from the
   write to the new revision on Proton Drive.
+- **`pdfs diagnostics` lists the sync effects that have not settled.** An upload, download,
+  folder or deletion a synced folder's pass sent and has not heard a success for is listed,
+  oldest first, with how many times it was sent, how long ago, and its last error. Deletions on
+  either side are now recorded like the other effects, so one that keeps failing says so in the
+  journal too. The JSON report has them as `effects`.
 - **`pdfs diagnostics` says how many uploads went up in one request.** It counts the uploads
   since start that took the one-request path for small files and those that went up in blocks,
   with their failures and times. If small files stop taking the one-request path, because

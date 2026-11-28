@@ -900,7 +900,11 @@ impl Syncer {
                         continue;
                     }
                     outcome.local_changes += 1;
-                    if let Err(e) = removed_locally(std::fs::remove_file(&path)) {
+                    let intent = self.issue_effect(folder_id, rel, effect::DELETE_LOCAL);
+                    let removed = removed_locally(std::fs::remove_file(&path));
+                    let error = removed.as_ref().err().map(ToString::to_string);
+                    self.settle_effect(intent.as_ref(), error.as_deref());
+                    if let Err(e) = removed {
                         warn!(rel, error = %e, "sync: remove local file failed");
                         self.log_activity(
                             ActivityKind::Trash,
@@ -925,12 +929,15 @@ impl Syncer {
                         continue;
                     }
                     let remote = r.expect("remote deletion requires a remote file");
+                    let intent = self.issue_effect(folder_id, rel, effect::TRASH);
                     let step = Instant::now();
                     let trashed = self
                         .rt
                         .block_on(self.drive.trash_nodes(std::slice::from_ref(&remote.uid)))
                         .and_then(batch::into_unit);
                     self.trace_call(Call::Trash, step.elapsed());
+                    let error = trashed.as_ref().err().map(ToString::to_string);
+                    self.settle_effect(intent.as_ref(), error.as_deref());
                     if let Err(e) = trashed {
                         warn!(rel, error = %e, "sync: trash remote failed");
                         self.log_activity(
@@ -978,8 +985,21 @@ impl Syncer {
                 .store
                 .sync_entries(folder_id)
                 .map_err(|e| format!("reload baseline: {e:?}"))?;
+            let intents: HashMap<String, StoredIntent> = delete_local_dirs
+                .iter()
+                .filter_map(|rel| {
+                    let intent = self.issue_effect(folder_id, rel, effect::DELETE_LOCAL)?;
+                    Some((rel.clone(), intent))
+                })
+                .collect();
             for removal in remove_local_dirs(local_root, delete_local_dirs, &mut current) {
                 outcome.local_changes += 1;
+                // Kept is settled too: nothing is left to do about it.
+                let (rel, error) = match &removal {
+                    DirRemoval::Removed(rel) | DirRemoval::Kept(rel, _) => (rel, None),
+                    DirRemoval::Failed(rel, e) => (rel, Some(e.to_string())),
+                };
+                self.settle_effect(intents.get(rel), error.as_deref());
                 match removal {
                     DirRemoval::Removed(rel) => {
                         let _ = self.store.sync_entry_remove(folder_id, &rel);
@@ -1035,12 +1055,15 @@ impl Syncer {
                 );
                 continue;
             }
+            let intent = self.issue_effect(folder_id, &rel, effect::TRASH);
             let step = Instant::now();
             let trashed = self
                 .rt
                 .block_on(self.drive.trash_nodes(&[uid]))
                 .and_then(batch::into_unit);
             self.trace_call(Call::Trash, step.elapsed());
+            let error = trashed.as_ref().err().map(ToString::to_string);
+            self.settle_effect(intent.as_ref(), error.as_deref());
             if let Err(e) = trashed {
                 warn!(rel, error = %e, "sync: trash remote folder failed");
                 self.log_activity(ActivityKind::Trash, base_name(&rel), e.to_string(), false);

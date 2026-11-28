@@ -2196,6 +2196,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The mirror effects not settled yet, from `pdfs diagnostics`.
+    fn effects(daemon: &Daemon) -> Vec<control::EffectIntent> {
+        let Ok(Response::Diagnostics { diagnostics }) = daemon.request(&Request::Diagnostics)
+        else {
+            panic!("no diagnostics");
+        };
+        diagnostics.effects.map(|e| e.oldest).unwrap_or_default()
+    }
+
+    /// A deletion a mirror pass sends is recorded like any other effect, and
+    /// `pdfs diagnostics` lists it until it lands: a trash on Drive while its
+    /// answer is outstanding, and a removal from disk.
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_deletion_is_an_effect_until_it_lands() {
+        let drive = FakeDrive::new();
+        let dir = scratch("deletion-effect");
+        let (daemon, folder, _client) = start_mirror(
+            &drive,
+            &dir,
+            &[
+                ("a.txt", b"one"),
+                ("b.txt", b"two"),
+                ("c.txt", b"three"),
+                ("d.txt", b"four"),
+            ],
+        );
+        quiet_pass(&daemon, folder).expect("a quiet pass is traced");
+        let uid = drive.lookup("mirrored/a.txt").unwrap();
+        let held = daemon.client.hold_next_trash(&uid);
+        std::fs::remove_file(dir.join("local").join("a.txt")).unwrap();
+        assert!(wait_until(Duration::from_secs(60), || held.reached()));
+        let listed = effects(&daemon);
+        assert!(
+            listed.iter().any(|e| e.folder_id == folder
+                && e.rel_path == "a.txt"
+                && e.kind == "trash"
+                && e.state == "issued"),
+            "{listed:#?}"
+        );
+        drop(held);
+        assert!(wait_until(Duration::from_secs(60), || {
+            drive.lookup("mirrored/a.txt").is_none() && effects(&daemon).is_empty()
+        }));
+
+        drive.device().trash("mirrored/b.txt");
+        assert!(wait_until(Duration::from_secs(60), || {
+            !dir.join("local").join("b.txt").exists()
+        }));
+        assert!(
+            wait_until(Duration::from_secs(30), || effects(&daemon).is_empty()),
+            "{:#?}",
+            effects(&daemon)
+        );
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A restart owes the disk a walk in full, since nothing watched it
     /// meanwhile, and owes Drive nothing: its event stream resumes from the
     /// cursor (`root`).

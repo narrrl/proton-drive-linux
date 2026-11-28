@@ -22,6 +22,14 @@ use std::fmt;
 /// Failures in a row after which an effect is reported as blocked.
 pub const BLOCKED_AFTER: u32 = 5;
 
+/// The kind of intent for a file or folder removed from disk because Drive
+/// deleted it. The other kinds are named by [`Pending::intent`](crate::model::Pending::intent).
+pub const DELETE_LOCAL: &str = "delete-local";
+
+/// The kind of intent for a file or folder moved to Drive's trash because it
+/// was deleted on disk.
+pub const TRASH: &str = "trash";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectState {
     /// Sent, or about to be; no result yet.
