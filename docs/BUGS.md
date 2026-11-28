@@ -68,6 +68,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B307](#b307--a-write-in-the-echoes-simulation-can-wait-20-s-for-a-drive-call-that-never-answers) | A write in the echoes simulation can wait 20 s for a Drive call that never answers | Cause not found; seen once in CI |
 | [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy) | On a slow link, a file's last write can land only in a conflict copy | Cause not found; seen once in CI |
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
@@ -408,6 +409,31 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B307 — A write in the echoes simulation can wait 20 s for a Drive call that never answers
+
+**Status:** Open
+**Found:** 2026-11-28, CI on #210 ([run](https://github.com/narrrl/proton-drive-linux/actions/runs/46140440107)):
+`one_client_with_stale_hashes_and_reordered_echoes`, profile `one-client-echoes` seed 4, failed
+with `liveness: client 0: write c.bin at 25 (4 bytes) took 20.961719651s, over 2s`. #210
+changes only the GUI, and the same seed passed 28 times locally on `cf2632a`. In the same run,
+`three_clients_one_writer_each` seed 2 failed with `truncate c.bin to 12 took 2.089572866s`, which is
+just over the budget and looks like runner load.
+**Where:** not located; a foreground call bounded by `INTERACTIVE_CALL_TIMEOUT` in
+`crates/pdfs-fuse/src/link.rs`
+
+**Repro:** The client creates `c.bin`, writes to it, renames `d` over it, and lets the queue
+settle. The next write into `c.bin` then succeeds, but only after 21 s.
+
+**Cause.** Not known. 21 s is the 20 s `INTERACTIVE_CALL_TIMEOUT` plus about a second, so a
+call the write waited on got no answer from the fake Drive and timed out. The echoes profile
+delays, duplicates and reorders events, but it never drops a reply or stalls a call. So the
+call either waited on something held elsewhere, or the fake left it without an answer.
+
+**Fix.** Not done. Needs a reproduction under load with the state directory and `daemon.log`
+of a failing run, which the simulation keeps.
+
+---
 
 ### B306 — A change made as its node's create lands is refused with "Permission denied"
 
