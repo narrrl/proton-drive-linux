@@ -35,6 +35,11 @@ digest of what it sent (52).
   its own directories, keyring entry, kernel keys and mountpoint, so a test account can run
   alongside the account you use. `scripts/live-bench.py` uses it to time one edit, from the
   write to the new revision on Proton Drive.
+- **`pdfs diagnostics` says how many uploads went up in one request.** It counts the uploads
+  since start that took the one-request path for small files and those that went up in blocks,
+  with their failures and times. If small files stop taking the one-request path, because
+  `small_uploads` is off or Proton Drive refuses it, this shows it. The JSON report has them as
+  `upload_paths`.
 - **`pdfs diagnostics` counts every call the daemon makes to Proton Drive.** Per kind of call it
   shows how many were made since start, how many failed, and their total and longest time. The
   JSON report has them as `drive_calls`.

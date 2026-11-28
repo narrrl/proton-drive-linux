@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use pdfs_core::control::{
-    AdmissionLoad, Diagnostics, DriveCallStat, InflightRequest, ServiceState, WorkerState,
+    AdmissionLoad, Diagnostics, DriveCallStat, InflightRequest, ServiceState, UploadPathStat,
+    WorkerState,
 };
 
 use pdfs_core::lifecycle::ServiceBoard;
@@ -198,6 +199,17 @@ impl Core {
                     errors: stat.errors,
                     total_ms: u64::try_from(stat.total.as_millis()).unwrap_or(u64::MAX),
                     longest_ms: u64::try_from(stat.longest.as_millis()).unwrap_or(u64::MAX),
+                })
+                .collect(),
+            upload_paths: pdfs_core::uploads::UPLOAD_PATHS
+                .snapshot()
+                .into_iter()
+                .map(|stat| UploadPathStat {
+                    path: stat.path.to_owned(),
+                    count: stat.count,
+                    errors: stat.errors,
+                    total_ms: stat.total_ms,
+                    longest_ms: stat.longest_ms,
                 })
                 .collect(),
             admission: self
