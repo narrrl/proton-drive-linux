@@ -18,6 +18,11 @@ sends is recorded until its result is in (51), and an upload that heard no answe
 digest of what it sent (52).
 
 ### Added
+- **Small files go up to Proton Drive in one request.** A file whose encrypted size is under
+  128 KiB, and a new revision of one, is now sent in a single request instead of a draft, its
+  block and a commit. This covers synced folders and the drive mount. On a test account, a first
+  sync of 200 small files ran 58% faster, and 50 edits of them 97% faster. Larger files go up in
+  blocks as before. `proton-sdk` and `proton-drive-rs` are now 0.12.7.
 - **`small_uploads` in `config.json` turns off the one-request upload for small files.** It is
   on by default. Set it to `false` to send every file as a draft, its blocks and a commit, as
   before. The service reads it at start. See [Configuration](CONFIGURATION.md#small_uploads).
