@@ -68,6 +68,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B310](#b310--a-write-soon-after-a-create-landed-was-kept-as-a-conflict-copy-of-it) | A write soon after a create landed was kept as a conflict copy of it | Cause not found; seen once in CI |
 | [B307](#b307--a-write-in-the-echoes-simulation-can-wait-20-s-for-a-drive-call-that-never-answers) | A write in the echoes simulation can wait 20 s for a Drive call that never answers | Cause not found; seen once in CI |
 | [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy) | On a slow link, a file's last write can land only in a conflict copy | Cause not found; seen once in CI |
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
@@ -412,6 +413,32 @@ a live account since.
 
 Newest first.
 
+### B310 — A write soon after a create landed was kept as a conflict copy of it
+
+**Status:** Open
+**Found:** 2026-11-28, CI on `main` at `d79c26f`
+([run](https://github.com/narrrl/proton-drive-linux/actions/runs/46152926170), artifact
+`simulation-diagnostics`): `one_client_on_a_good_link` seed 5. `e.md` was created with 28
+bytes, and 0.6 s later `write e.md at 27 (47 bytes)` took 111 ms. The write landed only as
+`e (sync-conflict …).md`, and `e.md` kept its 28 bytes. The daemon logged `the remote revision
+changed under the queued write (expected 28 bytes at mtime 1795875819, found 28 at
+1795875820)`. Seed 5 passed 30 runs locally on the same commit, and 25 on `9667b7d`.
+**Where:** not located; the write's baseline, from `Files::install_writer` through
+`Core::remote_baseline`, against `placeholder_base` in `crates/pdfs-fuse/src/drain.rs`
+
+**Cause.** Not known. The baseline has no revision id and the placeholder's local mtime, one
+second before the stamp Drive gave the create. That is the base of a write opened over the
+create's placeholder (B113). But the create had landed long before the write, and the tree
+should have had Drive's node with its revision id by then. `placeholder_base` maps exactly this
+base to the create's revision, but only while the `placeholders` entry exists. Either the tree
+still had the placeholder's stamp, or the entry was gone or never written. The log does not say
+which.
+
+**Fix.** Not done. A debug log of a failing run would show the write open's base
+(`write open took the base the file has now`) and whether adoption saw a placeholder.
+
+---
+
 ### B309 — A file renamed while its create was read back went back to its old name
 
 **Status:** Fixed
@@ -440,8 +467,7 @@ folder, like a queued rename.
 holds the adoption's read-back until the rename has landed. It fails without the fix (the mount
 shows `d`) and passes with it.
 
-The CI failure of seed 5 itself (`e.md` kept only as a conflict copy) is not explained. Its
-`daemon.log` did not reach the CI output, and 30 local runs without debug logging passed.
+The CI failure of seed 5 itself is a different bug, B310.
 
 ---
 
