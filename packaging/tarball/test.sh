@@ -63,6 +63,7 @@ grep -qx "Exec=\"$prefix/bin/pdfs-tray\"" "$tray" || fail "the tray's Exec= was 
 grep -qx "ExecStart=\"$prefix/bin/pdfs\" daemon" "$unit" || fail "ExecStart= was not rewritten: $(grep ^ExecStart= "$unit")"
 [ -f "$prefix/share/locale/de/LC_MESSAGES/pdfs.mo" ] || fail "no translations"
 [ -f "$prefix/share/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg" ] || fail "no icon"
+[ -f "$prefix/share/icons/hicolor/scalable/status/io.narl.proton-drive-linux-tray-synced-symbolic.svg" ] || fail "no tray icons"
 [ -f "$prefix/share/bash-completion/completions/pdfs" ] || fail "no bash completion"
 [ -f "$prefix/share/proton-drive-linux/basemap-v1.pmtiles" ] || fail "no Places basemap"
 [ ! -e "$prefix/share/proton-drive-linux/managed-updates" ] || fail "the update check must stay on offer"

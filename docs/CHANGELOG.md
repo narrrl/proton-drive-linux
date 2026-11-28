@@ -80,6 +80,10 @@ digest of what it sent (52).
   any more.
 
 ### Changed
+- **The tray has its own icons.** They are the app's folder, solid when everything is up to date,
+  with a badge for syncing, paused, a failing change or an expired sign-in, and hollow when
+  offline or stopped. They used to be stock icons from the desktop theme. They take the panel's
+  text colour like other tray icons, and the packages install them into the hicolor theme.
 - **An upload into a folder and an edit of a synced file make fewer requests.** The key that
   hashes a folder's file names is now read once per folder, not once per upload. A synced
   folder no longer reads a file again before it sends an edit. It checks that nobody else
@@ -111,6 +115,9 @@ digest of what it sent (52).
   first pass, and whenever the change feed lost track (#53).
 
 ### Fixed
+- **A file renamed just as it reached Proton Drive keeps its new name.** If the rename landed
+  while the app was reading the new file back, the folder could show the old name again, and a
+  later rename over the new name waited and then failed (B309).
 - **A write right after another can no longer bring back old bytes or cut the file short.** When
   an upload landed just as the next edit to the same file was queued, the file could keep the
   size of the upload that landed. A write opened next then started at that size, not the queued
