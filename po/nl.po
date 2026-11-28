@@ -274,8 +274,8 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/photos.rs:3117
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:509
 #: crates/pdfs-gui/src/app/pages/shared.rs:952
-#: crates/pdfs-gui/src/app/pages/shared.rs:1033
-#: crates/pdfs-gui/src/app/pages/shared.rs:1074
+#: crates/pdfs-gui/src/app/pages/shared.rs:1161
+#: crates/pdfs-gui/src/app/pages/shared.rs:1202
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:551
 #: crates/pdfs-gui/src/app/pages/status.rs:641
 #: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:249
@@ -444,6 +444,7 @@ msgid "Copy Image"
 msgstr "Afbeelding kopiëren"
 
 #: crates/pdfs-gui/src/app/main.rs:1667
+#: crates/pdfs-gui/src/app/pages/shared.rs:1135
 #: crates/pdfs-gui/src/app/pages/status.rs:867
 msgid "Close"
 msgstr "Sluiten"
@@ -1425,8 +1426,8 @@ msgstr "Kon albums niet laden"
 #: crates/pdfs-gui/src/app/pages/photos.rs:4811
 #: crates/pdfs-gui/src/app/pages/places.rs:105
 #: crates/pdfs-gui/src/app/pages/shared.rs:710
-#: crates/pdfs-gui/src/app/pages/shared.rs:1012
-#: crates/pdfs-gui/src/app/pages/shared.rs:1128
+#: crates/pdfs-gui/src/app/pages/shared.rs:1086
+#: crates/pdfs-gui/src/app/pages/shared.rs:1256
 #: crates/pdfs-gui/src/app/pages/status.rs:814
 #: crates/pdfs-gui/src/app/pages/status.rs:1755
 #: crates/pdfs-gui/src/app/pages/takeout.rs:513
@@ -2657,7 +2658,7 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/devices.rs:1130
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:394
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:302
-#: crates/pdfs-gui/src/app/pages/shared.rs:1034
+#: crates/pdfs-gui/src/app/pages/shared.rs:1162
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:641
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:883
 msgid "Remove"
@@ -4856,7 +4857,7 @@ msgid "Or pick kinds of files:"
 msgstr "Of kies soorten bestanden:"
 
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:510
-#: crates/pdfs-gui/src/app/pages/shared.rs:1075
+#: crates/pdfs-gui/src/app/pages/shared.rs:1203
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:76
 msgid "Save"
 msgstr "Opslaan"
@@ -5214,22 +5215,51 @@ msgctxt "verb"
 msgid "Leave"
 msgstr "Verlaten"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:966
+#: crates/pdfs-gui/src/app/pages/shared.rs:973
 msgid "Couldn't leave the shared item"
 msgstr "Kon het gedeelde item niet verlaten"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:972
+#: crates/pdfs-gui/src/app/pages/shared.rs:976
+#, rust-format
+msgid "Left {went} of {n} Shared Item"
+msgid_plural "Left {went} of {n} Shared Items"
+msgstr[0] "{went} van {n} gedeeld item verlaten"
+msgstr[1] "{went} van {n} gedeelde items verlaten"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:992
 #, rust-format
 msgid "Left {n} shared item"
 msgid_plural "Left {n} shared items"
 msgstr[0] "{n} gedeeld item verlaten"
 msgstr[1] "{n} gedeelde items verlaten"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1026
+#. Translators: {error} is the reason the service gave.
+#: crates/pdfs-gui/src/app/pages/shared.rs:1115
+#, rust-format
+msgid "Refused: {error}"
+msgstr "Geweigerd: {error}"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1117
+msgid "The service didn't answer. The page shows whether it went through."
+msgstr "De dienst antwoordde niet. De pagina toont of het gelukt is."
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1119
+msgid "Not tried yet"
+msgstr "Nog niet geprobeerd"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1132
+msgid "These items did not go through:"
+msgstr "Deze items zijn niet gelukt:"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1136
+msgid "Try Again"
+msgstr "Opnieuw proberen"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1154
 msgid "Remove Saved Link?"
 msgstr "Opgeslagen link verwijderen?"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1029
+#: crates/pdfs-gui/src/app/pages/shared.rs:1157
 #, rust-format
 msgid ""
 "Remove “{name}” from your saved links? The shared item itself is not "
@@ -5238,41 +5268,41 @@ msgstr ""
 "“{name}” uit je opgeslagen links verwijderen? Het gedeelde item zelf blijft "
 "ongewijzigd."
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1047
+#: crates/pdfs-gui/src/app/pages/shared.rs:1175
 msgid "Link removed"
 msgstr "Link verwijderd"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1048
+#: crates/pdfs-gui/src/app/pages/shared.rs:1176
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:736
 msgid "Couldn't remove the link"
 msgstr "Kon de link niet verwijderen"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1059
+#: crates/pdfs-gui/src/app/pages/shared.rs:1187
 msgid "Save Link"
 msgstr "Link opslaan"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1060
+#: crates/pdfs-gui/src/app/pages/shared.rs:1188
 msgid "Paste a Proton Drive public link to save it here."
 msgstr "Plak een openbare Proton Drive-link om die hier op te slaan."
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1064
+#: crates/pdfs-gui/src/app/pages/shared.rs:1192
 msgid "Public link URL"
 msgstr "URL van openbare link"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1068
+#: crates/pdfs-gui/src/app/pages/shared.rs:1196
 msgid "Password (if the link has one)"
 msgstr "Wachtwoord (als de link er een heeft)"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1088
-#: crates/pdfs-gui/src/app/pages/shared.rs:1101
+#: crates/pdfs-gui/src/app/pages/shared.rs:1216
+#: crates/pdfs-gui/src/app/pages/shared.rs:1229
 msgid "Couldn't save the link"
 msgstr "Kon de link niet opslaan"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1089
+#: crates/pdfs-gui/src/app/pages/shared.rs:1217
 msgid "A URL is required."
 msgstr "Een URL is vereist."
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1100
+#: crates/pdfs-gui/src/app/pages/shared.rs:1228
 msgid "Link saved"
 msgstr "Link opgeslagen"
 
@@ -5431,9 +5461,16 @@ msgid_plural "Stopped sharing {n} items"
 msgstr[0] "Delen van {n} item gestopt"
 msgstr[1] "Delen van {n} items gestopt"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:576
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:583
 msgid "Couldn't stop sharing"
 msgstr "Kon delen niet stoppen"
+
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:586
+#, rust-format
+msgid "Stopped Sharing {went} of {n} Item"
+msgid_plural "Stopped Sharing {went} of {n} Items"
+msgstr[0] "Delen gestopt voor {went} van {n} item"
+msgstr[1] "Delen gestopt voor {went} van {n} items"
 
 #: crates/pdfs-gui/src/app/pages/status.rs:188
 msgid "Startup"
