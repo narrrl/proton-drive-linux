@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-28 10:47+0100\n"
+"POT-Creation-Date: 2026-11-28 12:01+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: French\n"
@@ -1445,9 +1445,9 @@ msgstr "Impossible de charger les albums"
 #: crates/pdfs-gui/src/app/pages/takeout.rs:535
 #: crates/pdfs-gui/src/app/pages/takeout.rs:759
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:523
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:929
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:964
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1002
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1089
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1124
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1162
 #: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:170
 #: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:381
 msgid "The Proton Drive service didn't respond."
@@ -2670,7 +2670,6 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:302
 #: crates/pdfs-gui/src/app/pages/shared.rs:1162
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:641
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:883
 msgid "Remove"
 msgstr "Retirer"
 
@@ -3710,6 +3709,7 @@ msgid "Email or username"
 msgstr "Adresse électronique ou nom d’utilisateur"
 
 #: crates/pdfs-gui/src/app/pages/login.rs:35
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:966
 msgid "Password"
 msgstr "Mot de passe"
 
@@ -7115,6 +7115,7 @@ msgid "Anyone with the link ({role})"
 msgstr "Toute personne disposant du lien ({role})"
 
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:678
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:905
 msgid "password-protected"
 msgstr "protégé par mot de passe"
 
@@ -7143,7 +7144,7 @@ msgid "Public link removed"
 msgstr "Lien public supprimé"
 
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:753
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:814
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:946
 msgid "Link role"
 msgstr "Rôle du lien"
 
@@ -7152,71 +7153,101 @@ msgid "Password (optional)"
 msgstr "Mot de passe (facultatif)"
 
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:759
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:837
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:952
 msgid "Expires"
 msgstr "Expiration"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:760
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:763
+msgid "The new link"
+msgstr "Le nouveau lien"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:768
 msgid "Create Public Link"
 msgstr "Créer un lien public"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:807
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:900
+msgid "Anyone with the link can edit"
+msgstr "Toute personne disposant du lien peut modifier"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:902
+msgid "Anyone with the link can view"
+msgstr "Toute personne disposant du lien peut consulter"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:907
+msgid "no password"
+msgstr "sans mot de passe"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:911
+msgid "never expires"
+msgstr "n’expire jamais"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:938
 msgid "Link settings"
 msgstr "Paramètres du lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:809
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:940
 msgid ""
-"Change who can edit, the password or the expiry. The link stays the same."
+"Change who can edit, the password or the expiry, then save. The link stays "
+"the same."
 msgstr ""
-"Modifiez qui peut modifier, le mot de passe ou l’expiration. Le lien reste "
-"le même."
+"Modifiez qui peut modifier, le mot de passe ou l’expiration, puis "
+"enregistrez. Le lien reste le même."
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:856
-msgid "New password"
-msgstr "Nouveau mot de passe"
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:958
+msgid "Require a password"
+msgstr "Exiger un mot de passe"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:858
-msgid "Add a password"
-msgstr "Ajouter un mot de passe"
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:964
+msgid "New password (optional)"
+msgstr "Nouveau mot de passe (facultatif)"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:888
-msgid "Remove the password"
-msgstr "Supprimer le mot de passe"
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:974
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:995
+msgid "No changes"
+msgstr "Aucune modification"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:890
-msgid "Anyone with the link can open it without a password."
-msgstr "Toute personne disposant du lien peut l’ouvrir sans mot de passe."
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:979
+msgid "Save Link Settings"
+msgstr "Enregistrer les paramètres du lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:922
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1000
+msgid "After saving"
+msgstr "Après l’enregistrement"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1005
+msgid "Enter a password to save"
+msgstr "Saisissez un mot de passe pour enregistrer"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1082
 msgid "Link updated"
 msgstr "Lien mis à jour"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:924
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:928
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1084
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1088
 msgid "Couldn't change the link"
 msgstr "Impossible de modifier le lien"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:955
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1115
 msgid "Public link created"
 msgstr "Lien public créé"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:959
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:963
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1119
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1123
 msgid "Couldn't create the link"
 msgstr "Impossible de créer le lien"
 
 #. Translators: a public link past its expiry date.
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1015
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1175
 msgid "expired"
 msgstr "expiré"
 
 #. Translators: strftime format for a link's expiry date; "%x" is the locale's date, such as "09/23/26".
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1018
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1178
 msgid "%x"
 msgstr "%x"
 
 #. Translators: {date} is the date a public link stops working.
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1025
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1185
 #, rust-format
 msgid "expires {date}"
 msgstr "expire le {date}"
@@ -7735,6 +7766,12 @@ msgstr "{count} a"
 #, rust-format
 msgid "cannot reach the Proton Drive daemon: {error}"
 msgstr "impossible de joindre le démon Proton Drive : {error}"
+
+#~ msgid "Add a password"
+#~ msgstr "Ajouter un mot de passe"
+
+#~ msgid "Anyone with the link can open it without a password."
+#~ msgstr "Toute personne disposant du lien peut l’ouvrir sans mot de passe."
 
 #, rust-format
 #~ msgid "Restore “{name}”"
