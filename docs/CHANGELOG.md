@@ -141,6 +141,12 @@ digest of what it sent (52).
   card shows what its shot is stored as, such as "RAW + 1 more file". Each card says whether the
   photo stays or moves to Trash, and each set's heading says how many of the set stay. A set wider
   than the window still shows what happens to it.
+- **The search window shows recent Drive files only to the account that opened them.** Before, an
+  empty search listed the last files opened from any account signed in on this computer. Now
+  each Drive file is remembered with its account. Recent Drive files from before this change are
+  no longer shown, because nobody can say whose they are. Preferences → Apps adds "Remember
+  recent files" and "Clear recent files", and a clear takes effect the next time the window
+  opens. See [Configuration](CONFIGURATION.md#prompt) for `remember_recent`.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different

@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 3.10.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-28 12:12+0100\n"
+"POT-Creation-Date: 2026-11-28 12:19+0100\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -115,7 +115,8 @@ msgstr ""
 #. from the mount service.
 #: crates/pdfs-gui/src/app/main.rs:1330
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:948
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:284
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:301
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:363
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:175
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:212
 #: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:401
@@ -248,7 +249,7 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/login.rs:643
 #: crates/pdfs-gui/src/app/pages/photos.rs:1109
 #: crates/pdfs-gui/src/app/pages/photos.rs:3117
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:509
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:588
 #: crates/pdfs-gui/src/app/pages/shared.rs:952
 #: crates/pdfs-gui/src/app/pages/shared.rs:1161
 #: crates/pdfs-gui/src/app/pages/shared.rs:1202
@@ -487,7 +488,7 @@ msgstr ""
 
 #: crates/pdfs-gui/src/app/main.rs:2023
 #: crates/pdfs-gui/src/app/pages/status.rs:364
-#: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:579
+#: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:584
 #: crates/pdfs-gui/src/main.rs:498 crates/pdfs-gui/src/main.rs:540
 msgid "Connecting…"
 msgstr ""
@@ -2570,7 +2571,7 @@ msgid ""
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/devices.rs:1130
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:394
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:473
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:302
 #: crates/pdfs-gui/src/app/pages/shared.rs:1162
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:641
@@ -2985,7 +2986,7 @@ msgid "About Sync Modes"
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/locations.rs:189
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:39
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:42
 #: crates/pdfs-gui/src/prompt.rs:65
 msgid "Folders"
 msgstr ""
@@ -4555,178 +4556,209 @@ msgstr ""
 msgid "Map data © {naturalearth} (public domain) and {geonames} (CC BY 4.0)"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:35
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:38
 msgid "Text"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:36
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:39
 #: crates/pdfs-gui/src/prompt.rs:66
 msgid "Documents"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:37
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:40
 #: crates/pdfs-gui/src/prompt.rs:67
 msgid "Images"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:38
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:41
 msgid "Audio and Video"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:40
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:43
 msgid "Everything"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:46
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:49
 msgid "Add Rule…"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:51
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:54
 msgid "Open Files With"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:53
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:56
 msgid ""
 "For files opened from Proton Drive and the search launcher. The first rule "
 "that matches a file decides; other files open in their default app."
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:59
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:62
 msgid "Other files (empty: default app)"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:73
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:76
 msgid "Opens as"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:75
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:78
 msgid "Window"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:76
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:79
 msgid "Your Launcher"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:77
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:80
 msgid "fzf in a Terminal"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:81
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:84
 msgid "Launcher command (empty: find one)"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:91
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:94
 msgid "Results shown"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:102
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:105
 msgid "Show icons"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:103
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:106
 msgid "When the launcher can show them"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:106
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:109
+msgid "Remember recent files"
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:111
+msgid ""
+"List what you opened before you type, and rank it higher in results. Off, "
+"the list is cleared."
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:115
+#: crates/pdfs-gui/src/app/pages/takeout.rs:264
+msgid "Clear"
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:119
+msgid "Clear recent files"
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:121
+msgid "The search window forgets what it opened. Your files are not touched."
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:126
 msgid "Search Launcher"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:108
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:128
 msgid ""
 "How “pdfs-prompt” shows search results, for example from a keyboard "
 "shortcut. Your launcher can be any program that reads choices like dmenu, "
 "such as rofi, wofi, fuzzel or bemenu."
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:118
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:140
 msgid "Apps"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:144
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:169
 #, rust-format
 msgid "Terminal (empty: {terminal})"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:147
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:172
 msgid "Terminal"
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:286
+msgid "Recent files cleared"
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:303
+msgid "Couldn't clear recent files"
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:365
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:177
 msgid "Couldn't save the setting"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:306
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:385
 msgid "A quote is not closed in the command"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:314
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:393
 #, rust-format
 msgid "“{program}” isn't installed; saved anyway"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:348
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:427
 msgid "No rules: every file opens in its default app"
 msgstr ""
 
 #. Translators: {command} is a command line such as "nvim".
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:370
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:449
 #, rust-format
 msgid "{command}, in a terminal"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:385
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:464
 #, rust-format
 msgid "“{program}” isn't installed"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:392
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:471
 msgid "Move Up"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:393
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:472
 msgid "Move Down"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:451
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:530
 msgid "Files, such as *.md, *.txt"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:477
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:556
 msgid "Command, such as nvim or code --wait"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:482
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:561
 msgid "Run in a terminal"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:483
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:562
 msgid "For programs that run in a terminal, such as vim"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:497
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:576
 msgid "Or pick kinds of files:"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:510
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:589
 #: crates/pdfs-gui/src/app/pages/shared.rs:1203
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:76
 msgid "Save"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:523
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:602
 msgid "Edit Rule"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:525
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:604
 msgid "New Rule"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:547
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:626
 msgid "A quote is not closed in the command."
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:551
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:630
 #, rust-format
 msgid "“{program}” isn't installed."
 msgstr ""
@@ -5719,7 +5751,7 @@ msgid "Up to date"
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/status.rs:1589
-#: crates/pdfs-gui/src/hud/mod.rs:592 crates/pdfs-gui/src/hud/mod.rs:606
+#: crates/pdfs-gui/src/hud/mod.rs:606 crates/pdfs-gui/src/hud/mod.rs:620
 msgid "Proton Drive isn't running"
 msgstr ""
 
@@ -5936,10 +5968,6 @@ msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/takeout.rs:259
 msgid "Archives to import"
-msgstr ""
-
-#: crates/pdfs-gui/src/app/pages/takeout.rs:264
-msgid "Clear"
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/takeout.rs:265
@@ -6339,7 +6367,7 @@ msgid "Nothing else was in this folder when it was deleted."
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/trash.rs:687
-#: crates/pdfs-gui/src/hud/mod.rs:227 crates/pdfs-gui/src/hud/mod.rs:852
+#: crates/pdfs-gui/src/hud/mod.rs:227 crates/pdfs-gui/src/hud/mod.rs:866
 msgid "No results"
 msgstr ""
 
@@ -7099,56 +7127,56 @@ msgstr ""
 msgid "↑↓ navigate · ↵ open · Tab filter"
 msgstr ""
 
-#: crates/pdfs-gui/src/hud/mod.rs:854
+#: crates/pdfs-gui/src/hud/mod.rs:868
 msgid "Search your Drive"
 msgstr ""
 
-#: crates/pdfs-gui/src/hud/mod.rs:859
+#: crates/pdfs-gui/src/hud/mod.rs:873
 msgid "Still indexing this computer — local results will fill in shortly."
 msgstr ""
 
-#: crates/pdfs-gui/src/hud/mod.rs:861
+#: crates/pdfs-gui/src/hud/mod.rs:875
 msgid "Try a different search, or another filter."
 msgstr ""
 
-#: crates/pdfs-gui/src/hud/mod.rs:863
+#: crates/pdfs-gui/src/hud/mod.rs:877
 msgid "Start typing to search Proton Drive and the files on this computer."
 msgstr ""
 
-#: crates/pdfs-gui/src/hud/mod.rs:890
+#: crates/pdfs-gui/src/hud/mod.rs:904
 msgid "No pinned files"
 msgstr ""
 
-#: crates/pdfs-gui/src/hud/mod.rs:891
+#: crates/pdfs-gui/src/hud/mod.rs:905
 #, rust-format
 msgid "{n} pinned file"
 msgid_plural "{n} pinned files"
 msgstr[0] ""
 msgstr[1] ""
 
-#: crates/pdfs-gui/src/hud/mod.rs:904
+#: crates/pdfs-gui/src/hud/mod.rs:918
 #, rust-format
 msgid "{drive} in Drive · {local} on this computer · indexing…"
 msgstr ""
 
 #. Translators: result counts in the footer; {drive} and {local} are numbers.
-#: crates/pdfs-gui/src/hud/mod.rs:909
+#: crates/pdfs-gui/src/hud/mod.rs:923
 #, rust-format
 msgid "{drive} in Drive · {local} on this computer"
 msgstr ""
 
 #. Translators: {name} is a file name.
-#: crates/pdfs-gui/src/hud/mod.rs:1040
+#: crates/pdfs-gui/src/hud/mod.rs:1054
 #, rust-format
 msgid "Opening {name}…"
 msgstr ""
 
-#: crates/pdfs-gui/src/hud/mod.rs:1080
+#: crates/pdfs-gui/src/hud/mod.rs:1094
 #, rust-format
 msgid "Could not open: {message}"
 msgstr ""
 
-#: crates/pdfs-gui/src/hud/mod.rs:1084
+#: crates/pdfs-gui/src/hud/mod.rs:1098
 msgid "Couldn't reach Proton Drive"
 msgstr ""
 

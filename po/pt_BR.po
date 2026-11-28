@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-28 12:12+0100\n"
+"POT-Creation-Date: 2026-11-28 12:19+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Portuguese (Brazil)\n"
@@ -112,7 +112,8 @@ msgstr "Sincronização"
 #. from the mount service.
 #: crates/pdfs-gui/src/app/main.rs:1330
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:948
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:284
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:301
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:363
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:175
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:212
 #: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:401
@@ -271,7 +272,7 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/login.rs:643
 #: crates/pdfs-gui/src/app/pages/photos.rs:1109
 #: crates/pdfs-gui/src/app/pages/photos.rs:3117
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:509
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:588
 #: crates/pdfs-gui/src/app/pages/shared.rs:952
 #: crates/pdfs-gui/src/app/pages/shared.rs:1161
 #: crates/pdfs-gui/src/app/pages/shared.rs:1202
@@ -517,7 +518,7 @@ msgstr ""
 
 #: crates/pdfs-gui/src/app/main.rs:2023
 #: crates/pdfs-gui/src/app/pages/status.rs:364
-#: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:579
+#: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:584
 #: crates/pdfs-gui/src/main.rs:498 crates/pdfs-gui/src/main.rs:540
 msgid "Connecting…"
 msgstr "Conectando…"
@@ -2656,7 +2657,7 @@ msgstr ""
 "daqui."
 
 #: crates/pdfs-gui/src/app/pages/devices.rs:1130
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:394
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:473
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:302
 #: crates/pdfs-gui/src/app/pages/shared.rs:1162
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:641
@@ -3104,7 +3105,7 @@ msgid "About Sync Modes"
 msgstr "Sobre os modos de sincronização"
 
 #: crates/pdfs-gui/src/app/pages/locations.rs:189
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:39
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:42
 #: crates/pdfs-gui/src/prompt.rs:65
 msgid "Folders"
 msgstr "Pastas"
@@ -4767,37 +4768,37 @@ msgid "Map data © {naturalearth} (public domain) and {geonames} (CC BY 4.0)"
 msgstr ""
 "Dados do mapa © {naturalearth} (domínio público) e {geonames} (CC BY 4.0)"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:35
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:38
 msgid "Text"
 msgstr "Texto"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:36
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:39
 #: crates/pdfs-gui/src/prompt.rs:66
 msgid "Documents"
 msgstr "Documentos"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:37
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:40
 #: crates/pdfs-gui/src/prompt.rs:67
 msgid "Images"
 msgstr "Imagens"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:38
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:41
 msgid "Audio and Video"
 msgstr "Áudio e vídeo"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:40
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:43
 msgid "Everything"
 msgstr "Tudo"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:46
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:49
 msgid "Add Rule…"
 msgstr "Adicionar regra…"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:51
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:54
 msgid "Open Files With"
 msgstr "Abrir arquivos com"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:53
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:56
 msgid ""
 "For files opened from Proton Drive and the search launcher. The first rule "
 "that matches a file decides; other files open in their default app."
@@ -4806,47 +4807,73 @@ msgstr ""
 "primeira regra que combina com um arquivo decide; os outros arquivos abrem "
 "no app padrão."
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:59
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:62
 msgid "Other files (empty: default app)"
 msgstr "Outros arquivos (vazio: app padrão)"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:73
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:76
 msgid "Opens as"
 msgstr "Abre como"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:75
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:78
 msgid "Window"
 msgstr "Janela"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:76
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:79
 msgid "Your Launcher"
 msgstr "Seu iniciador"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:77
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:80
 msgid "fzf in a Terminal"
 msgstr "fzf em um terminal"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:81
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:84
 msgid "Launcher command (empty: find one)"
 msgstr "Comando do iniciador (vazio: encontrar um)"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:91
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:94
 msgid "Results shown"
 msgstr "Resultados exibidos"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:102
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:105
 msgid "Show icons"
 msgstr "Mostrar ícones"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:103
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:106
 msgid "When the launcher can show them"
 msgstr "Quando o iniciador consegue mostrá-los"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:106
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:109
+msgid "Remember recent files"
+msgstr "Lembrar arquivos recentes"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:111
+msgid ""
+"List what you opened before you type, and rank it higher in results. Off, "
+"the list is cleared."
+msgstr ""
+"Mostra o que você abriu antes de digitar e o coloca mais acima nos "
+"resultados. Desativado, a lista é limpa."
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:115
+#: crates/pdfs-gui/src/app/pages/takeout.rs:264
+msgid "Clear"
+msgstr "Limpar"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:119
+msgid "Clear recent files"
+msgstr "Limpar arquivos recentes"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:121
+msgid "The search window forgets what it opened. Your files are not touched."
+msgstr ""
+"A janela de pesquisa esquece o que abriu. Seus arquivos não são alterados."
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:126
 msgid "Search Launcher"
 msgstr "Iniciador de pesquisa"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:108
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:128
 msgid ""
 "How “pdfs-prompt” shows search results, for example from a keyboard "
 "shortcut. Your launcher can be any program that reads choices like dmenu, "
@@ -4856,95 +4883,103 @@ msgstr ""
 "atalho de teclado. Seu iniciador pode ser qualquer programa que leia opções "
 "como o dmenu, como rofi, wofi, fuzzel ou bemenu."
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:118
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:140
 msgid "Apps"
 msgstr "Apps"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:144
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:169
 #, rust-format
 msgid "Terminal (empty: {terminal})"
 msgstr "Terminal (vazio: {terminal})"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:147
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:172
 msgid "Terminal"
 msgstr "Terminal"
 
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:286
+msgid "Recent files cleared"
+msgstr "Arquivos recentes limpos"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:303
+msgid "Couldn't clear recent files"
+msgstr "Não foi possível limpar os arquivos recentes"
+
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:365
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:177
 msgid "Couldn't save the setting"
 msgstr "Não foi possível salvar a configuração"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:306
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:385
 msgid "A quote is not closed in the command"
 msgstr "Uma aspa não foi fechada no comando"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:314
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:393
 #, rust-format
 msgid "“{program}” isn't installed; saved anyway"
 msgstr "“{program}” não está instalado; salvo mesmo assim"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:348
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:427
 msgid "No rules: every file opens in its default app"
 msgstr "Sem regras: cada arquivo abre no app padrão"
 
 #. Translators: {command} is a command line such as "nvim".
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:370
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:449
 #, rust-format
 msgid "{command}, in a terminal"
 msgstr "{command}, em um terminal"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:385
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:464
 #, rust-format
 msgid "“{program}” isn't installed"
 msgstr "“{program}” não está instalado"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:392
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:471
 msgid "Move Up"
 msgstr "Mover para cima"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:393
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:472
 msgid "Move Down"
 msgstr "Mover para baixo"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:451
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:530
 msgid "Files, such as *.md, *.txt"
 msgstr "Arquivos, como *.md, *.txt"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:477
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:556
 msgid "Command, such as nvim or code --wait"
 msgstr "Comando, como nvim ou code --wait"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:482
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:561
 msgid "Run in a terminal"
 msgstr "Executar em um terminal"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:483
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:562
 msgid "For programs that run in a terminal, such as vim"
 msgstr "Para programas que rodam em um terminal, como o vim"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:497
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:576
 msgid "Or pick kinds of files:"
 msgstr "Ou escolha tipos de arquivo:"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:510
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:589
 #: crates/pdfs-gui/src/app/pages/shared.rs:1203
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:76
 msgid "Save"
 msgstr "Salvar"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:523
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:602
 msgid "Edit Rule"
 msgstr "Editar regra"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:525
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:604
 msgid "New Rule"
 msgstr "Nova regra"
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:547
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:626
 msgid "A quote is not closed in the command."
 msgstr "Uma aspa não foi fechada no comando."
 
-#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:551
+#: crates/pdfs-gui/src/app/pages/preferences_apps.rs:630
 #, rust-format
 msgid "“{program}” isn't installed."
 msgstr "“{program}” não está instalado."
@@ -5980,7 +6015,7 @@ msgid "Up to date"
 msgstr "Atualizado"
 
 #: crates/pdfs-gui/src/app/pages/status.rs:1589
-#: crates/pdfs-gui/src/hud/mod.rs:592 crates/pdfs-gui/src/hud/mod.rs:606
+#: crates/pdfs-gui/src/hud/mod.rs:606 crates/pdfs-gui/src/hud/mod.rs:620
 msgid "Proton Drive isn't running"
 msgstr "O Proton Drive não está em execução"
 
@@ -6214,10 +6249,6 @@ msgstr "Escolher arquivos…"
 #: crates/pdfs-gui/src/app/pages/takeout.rs:259
 msgid "Archives to import"
 msgstr "Arquivos compactados a importar"
-
-#: crates/pdfs-gui/src/app/pages/takeout.rs:264
-msgid "Clear"
-msgstr "Limpar"
 
 #: crates/pdfs-gui/src/app/pages/takeout.rs:265
 msgid "Remove every staged archive"
@@ -6641,7 +6672,7 @@ msgid "Nothing else was in this folder when it was deleted."
 msgstr "Não havia mais nada nesta pasta quando ela foi excluída."
 
 #: crates/pdfs-gui/src/app/pages/trash.rs:687
-#: crates/pdfs-gui/src/hud/mod.rs:227 crates/pdfs-gui/src/hud/mod.rs:852
+#: crates/pdfs-gui/src/hud/mod.rs:227 crates/pdfs-gui/src/hud/mod.rs:866
 msgid "No results"
 msgstr "Nenhum resultado"
 
@@ -7424,59 +7455,59 @@ msgstr "Inicie o Proton Drive para pesquisar seus arquivos."
 msgid "↑↓ navigate · ↵ open · Tab filter"
 msgstr "↑↓ navegar · ↵ abrir · Tab filtrar"
 
-#: crates/pdfs-gui/src/hud/mod.rs:854
+#: crates/pdfs-gui/src/hud/mod.rs:868
 msgid "Search your Drive"
 msgstr "Pesquisar no seu Drive"
 
-#: crates/pdfs-gui/src/hud/mod.rs:859
+#: crates/pdfs-gui/src/hud/mod.rs:873
 msgid "Still indexing this computer — local results will fill in shortly."
 msgstr ""
 "Ainda indexando este computador — os resultados locais aparecerão em breve."
 
-#: crates/pdfs-gui/src/hud/mod.rs:861
+#: crates/pdfs-gui/src/hud/mod.rs:875
 msgid "Try a different search, or another filter."
 msgstr "Tente uma pesquisa diferente ou outro filtro."
 
-#: crates/pdfs-gui/src/hud/mod.rs:863
+#: crates/pdfs-gui/src/hud/mod.rs:877
 msgid "Start typing to search Proton Drive and the files on this computer."
 msgstr ""
 "Comece a digitar para pesquisar no Proton Drive e nos arquivos deste "
 "computador."
 
-#: crates/pdfs-gui/src/hud/mod.rs:890
+#: crates/pdfs-gui/src/hud/mod.rs:904
 msgid "No pinned files"
 msgstr "Nenhum arquivo fixado"
 
-#: crates/pdfs-gui/src/hud/mod.rs:891
+#: crates/pdfs-gui/src/hud/mod.rs:905
 #, rust-format
 msgid "{n} pinned file"
 msgid_plural "{n} pinned files"
 msgstr[0] "{n} arquivo fixado"
 msgstr[1] "{n} arquivos fixados"
 
-#: crates/pdfs-gui/src/hud/mod.rs:904
+#: crates/pdfs-gui/src/hud/mod.rs:918
 #, rust-format
 msgid "{drive} in Drive · {local} on this computer · indexing…"
 msgstr "{drive} no Drive · {local} neste computador · indexando…"
 
 #. Translators: result counts in the footer; {drive} and {local} are numbers.
-#: crates/pdfs-gui/src/hud/mod.rs:909
+#: crates/pdfs-gui/src/hud/mod.rs:923
 #, rust-format
 msgid "{drive} in Drive · {local} on this computer"
 msgstr "{drive} no Drive · {local} neste computador"
 
 #. Translators: {name} is a file name.
-#: crates/pdfs-gui/src/hud/mod.rs:1040
+#: crates/pdfs-gui/src/hud/mod.rs:1054
 #, rust-format
 msgid "Opening {name}…"
 msgstr "Abrindo {name}…"
 
-#: crates/pdfs-gui/src/hud/mod.rs:1080
+#: crates/pdfs-gui/src/hud/mod.rs:1094
 #, rust-format
 msgid "Could not open: {message}"
 msgstr "Não foi possível abrir: {message}"
 
-#: crates/pdfs-gui/src/hud/mod.rs:1084
+#: crates/pdfs-gui/src/hud/mod.rs:1098
 msgid "Couldn't reach Proton Drive"
 msgstr "Não foi possível acessar o Proton Drive"
 

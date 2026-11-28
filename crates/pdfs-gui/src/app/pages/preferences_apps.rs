@@ -24,6 +24,9 @@ pub(crate) struct AppsPrefs {
     prompt_terminal_row: adw::EntryRow,
     limit_row: adw::SpinRow,
     icons_row: adw::SwitchRow,
+    remember_row: adw::SwitchRow,
+    clear_row: adw::ActionRow,
+    clear_button: gtk4::Button,
 }
 
 /// The launcher modes in the order the combo row lists them.
@@ -102,6 +105,23 @@ pub(crate) fn build_apps_prefs() -> AppsPrefs {
         .title(gettext("Show icons"))
         .subtitle(gettext("When the launcher can show them"))
         .build();
+    let remember_row = adw::SwitchRow::builder()
+        .title(gettext("Remember recent files"))
+        .subtitle(gettext(
+            "List what you opened before you type, and rank it higher in results. Off, the list is cleared.",
+        ))
+        .build();
+    let clear_button = gtk4::Button::builder()
+        .label(gettext("Clear"))
+        .valign(gtk4::Align::Center)
+        .build();
+    let clear_row = adw::ActionRow::builder()
+        .title(gettext("Clear recent files"))
+        .subtitle(gettext(
+            "The search window forgets what it opened. Your files are not touched.",
+        ))
+        .build();
+    clear_row.add_suffix(&clear_button);
     let launcher = adw::PreferencesGroup::builder()
         .title(gettext("Search Launcher"))
         .description(gettext(
@@ -113,6 +133,8 @@ pub(crate) fn build_apps_prefs() -> AppsPrefs {
     launcher.add(&prompt_terminal_row);
     launcher.add(&limit_row);
     launcher.add(&icons_row);
+    launcher.add(&remember_row);
+    launcher.add(&clear_row);
 
     let page = adw::PreferencesPage::builder()
         .title(gettext("Apps"))
@@ -133,6 +155,9 @@ pub(crate) fn build_apps_prefs() -> AppsPrefs {
         prompt_terminal_row,
         limit_row,
         icons_row,
+        remember_row,
+        clear_row,
+        clear_button,
     }
 }
 
@@ -183,6 +208,7 @@ pub(crate) fn wire_apps_prefs(ui: &Rc<Ui>, widgets: AppsPrefs) {
         .set_text(&format_command(prompt.terminal.as_deref().unwrap_or(&[])));
     w.limit_row.set_value(prompt.resolved_menu_limit() as f64);
     w.icons_row.set_active(prompt.resolved_menu_icons());
+    w.remember_row.set_active(prompt.resolved_remember_recent());
     show_mode_rows(w, mode);
     ui.status.settings_suppress.set(suppress);
 
@@ -239,6 +265,56 @@ pub(crate) fn wire_apps_prefs(ui: &Rc<Ui>, widgets: AppsPrefs) {
             prompt_of(config).menu_icons = (!on).then_some(false)
         });
     });
+    let a = apps.clone();
+    w.remember_row.connect_active_notify(move |row| {
+        if a.ui.status.settings_suppress.get() {
+            return;
+        }
+        let on = row.is_active();
+        // The window clears the list itself the next time it opens; clearing
+        // here as well means nothing waits on disk until then.
+        if !on {
+            clear_history(&a);
+        }
+        save(&a, move |config| {
+            prompt_of(config).remember_recent = (!on).then_some(false)
+        });
+    });
+    let a = apps.clone();
+    w.clear_button.connect_clicked(move |_| {
+        if clear_history(&a) {
+            prefs_toast(&a.ui, &gettext("Recent files cleared"));
+        }
+    });
+}
+
+/// Delete the search window's history. It reads the file again each time it
+/// opens. Says whether that worked.
+fn clear_history(apps: &Rc<Apps>) -> bool {
+    match std::fs::remove_file(history_path(&apps.ui)) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            prefs_toast(
+                &apps.ui,
+                &gettext_f(
+                    "{what}: {detail}",
+                    &[
+                        ("what", &gettext("Couldn't clear recent files")),
+                        ("detail", &e.to_string()),
+                    ],
+                ),
+            );
+            false
+        }
+    }
+}
+
+/// Where the search window keeps what it opened (`hud/history.rs`).
+fn history_path(ui: &Ui) -> std::path::PathBuf {
+    ui.dirs
+        .state_dir()
+        .join(pdfs_core::menu::PROMPT_HISTORY_FILE)
 }
 
 /// Show only the rows the chosen launcher mode uses.
@@ -247,6 +323,9 @@ fn show_mode_rows(w: &AppsPrefs, mode: PromptMode) {
     w.icons_row.set_visible(mode == PromptMode::Dmenu);
     w.prompt_terminal_row.set_visible(mode == PromptMode::Fzf);
     w.limit_row.set_visible(mode != PromptMode::Gtk);
+    // Only the search window keeps a history.
+    w.remember_row.set_visible(mode == PromptMode::Gtk);
+    w.clear_row.set_visible(mode == PromptMode::Gtk);
 }
 
 /// The `open_with` section, created when absent.

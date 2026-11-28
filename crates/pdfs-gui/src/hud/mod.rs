@@ -286,13 +286,16 @@ pub(crate) fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
             thumbs: Thumbs::new(socket.clone()),
             // A visit recorded elsewhere, or the first load finishing, adds
             // to the recent list the user may be looking at.
-            history: History::start(dirs.state_dir().join("prompt-history.json"), move || {
-                if let Some(ui) = weak.upgrade()
-                    && ui.showing_suggestions()
-                {
-                    ui.render();
-                }
-            }),
+            history: History::start(
+                dirs.state_dir().join(pdfs_core::menu::PROMPT_HISTORY_FILE),
+                move || {
+                    if let Some(ui) = weak.upgrade()
+                        && ui.showing_suggestions()
+                    {
+                        ui.render();
+                    }
+                },
+            ),
             socket,
             mountpoint: RefCell::new(dirs.default_mountpoint()),
             opener: RefCell::new(dirs.load_config().resolved_open_with()),
@@ -536,6 +539,8 @@ impl Ui {
                 let config = dirs.load_config();
                 set_proton_theme(config.proton_theme.unwrap_or(false));
                 *self.opener.borrow_mut() = config.resolved_open_with();
+                self.history
+                    .refresh(config.resolved_prompt().resolved_remember_recent());
             }
             self.history.prune();
             // Supersede replies from the previous showing before clearing the
@@ -581,13 +586,22 @@ impl Ui {
         let ui = self.clone();
         glib::spawn_future_local(async move {
             match rx.recv().await {
-                Ok(Ok(Response::Status { mountpoint, .. })) => {
+                Ok(Ok(Response::Status {
+                    mountpoint,
+                    username,
+                    ..
+                })) => {
+                    // Recent Drive files are shown only to the account that
+                    // opened them; asked again each time the window opens.
+                    ui.history
+                        .set_account((!username.is_empty()).then_some(username));
                     *ui.mountpoint.borrow_mut() = PathBuf::from(mountpoint);
                     ui.entry.set_sensitive(true);
                     ui.stack.set_visible_child_name("results");
                     ui.load_suggestions();
                 }
                 _ => {
+                    ui.history.set_account(None);
                     ui.entry.set_sensitive(false);
                     ui.hint.set_label(&gettext("Proton Drive isn't running"));
                     ui.stack.set_visible_child_name("offline");

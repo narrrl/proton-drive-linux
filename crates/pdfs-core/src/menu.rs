@@ -139,6 +139,11 @@ pub struct PromptConfig {
     /// false for a launcher that advertises support but is themed without them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu_icons: Option<bool>,
+    /// Remember what the search window opens, to list it before a search and
+    /// rank it higher in one. Defaults to true. Off, the history is cleared
+    /// the next time the window opens and nothing more is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_recent: Option<bool>,
 }
 
 /// Which front end the prompt presents.
@@ -158,6 +163,11 @@ pub enum PromptMode {
 /// than the GTK prompt's cap because filtering happens launcher-side.
 pub const DEFAULT_MENU_LIMIT: usize = 50;
 
+/// The search window's history of what it opened, in the state directory.
+/// The app deletes it to clear the list; the window reads it again each time
+/// it opens.
+pub const PROMPT_HISTORY_FILE: &str = "prompt-history.json";
+
 impl PromptConfig {
     pub fn resolved_mode(&self) -> PromptMode {
         self.mode.unwrap_or_default()
@@ -169,6 +179,10 @@ impl PromptConfig {
 
     pub fn resolved_menu_icons(&self) -> bool {
         self.menu_icons.unwrap_or(true)
+    }
+
+    pub fn resolved_remember_recent(&self) -> bool {
+        self.remember_recent.unwrap_or(true)
     }
 }
 
