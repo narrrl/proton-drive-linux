@@ -125,6 +125,12 @@ digest of what it sent (52).
     again. Before, the sign-in page appeared while the sign-in was still saved.
   - If Proton did not confirm that the session ended, a notice says where in your Proton account
     you can end it.
+- **A public link's settings change only when you save them.** Before, choosing Editor changed
+  the link at once, so anyone holding a viewer link could edit before the password you were about
+  to add was set. Removing the password also took effect at once. Now the role, the password and
+  the expiry are sent together by "Save Link Settings". Above that button is a line that says how
+  the link will work. Closing the dialog sends nothing. When you create a link, Enter in the
+  password field moves on to Expires instead of creating the link.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different

@@ -757,11 +757,45 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             let expiry_names: Vec<String> =
                 LINK_EXPIRY.iter().map(|(name, _)| gettext(name)).collect();
             let (expiry_row, expiry_drop) = dropdown_row(&gettext("Expires"), &expiry_names, 0);
+            // How the link will work, right above the button that makes it.
+            let now = glib::real_time() / 1_000_000;
+            let summary = adw::ActionRow::builder()
+                .title(gettext("The new link"))
+                .subtitle(link_policy(false, false, None, now))
+                .use_markup(false)
+                .build();
+            summary.add_css_class("property");
             let create = group_button(&gettext("Create Public Link"));
 
-            // Enter in the password field creates the link.
-            let btn = create.clone();
-            pw_row.connect_entry_activated(move |_| btn.emit_clicked());
+            let refresh: Rc<dyn Fn()> = {
+                let (summary, role_drop, pw_row, expiry_drop) = (
+                    summary.clone(),
+                    role_drop.clone(),
+                    pw_row.clone(),
+                    expiry_drop.clone(),
+                );
+                Rc::new(move || {
+                    let now = glib::real_time() / 1_000_000;
+                    summary.set_subtitle(&link_policy(
+                        role_drop.selected() == 1,
+                        !pw_row.text().is_empty(),
+                        link_expiry_at(expiry_drop.selected(), now),
+                        now,
+                    ));
+                })
+            };
+            let r = refresh.clone();
+            role_drop.connect_selected_notify(move |_| r());
+            let r = refresh.clone();
+            pw_row.connect_changed(move |_| r());
+            expiry_drop.connect_selected_notify(move |_| refresh());
+
+            // Enter in the password field moves on to the expiry, which comes
+            // next: creating the link there would skip it.
+            let next = expiry_drop.clone();
+            pw_row.connect_entry_activated(move |_| {
+                next.grab_focus();
+            });
 
             let state_c = Rc::downgrade(state);
             let pw_for = pw_row.clone();
@@ -787,123 +821,249 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             state.link_group.add(&role_row);
             state.link_group.add(&pw_row);
             state.link_group.add(&expiry_row);
+            state.link_group.add(&summary);
             state.link_group.add(&create);
             rows.push(role_row.upcast());
             rows.push(pw_row.upcast());
             rows.push(expiry_row.upcast());
+            rows.push(summary.upcast());
             rows.push(create.upcast());
         }
     }
     *state.link_rows.borrow_mut() = rows;
 }
 
-/// The settings of an existing link, collapsed under one row. Each control
-/// applies at once, the way a member's role does. While a change is on its way
-/// the whole row is insensitive: the daemon fills in what a change keeps from
-/// the link as it stands, so two changes in flight could undo each other.
+/// What the owner has chosen in an existing link's settings and not saved yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkDraft {
+    /// Anyone with the link can edit.
+    pub(crate) editor: bool,
+    /// The chosen entry of [`link_expiry_choices`].
+    pub(crate) expiry: u32,
+    /// The link asks for a password.
+    pub(crate) protect: bool,
+    /// A new password; empty keeps the one the link has.
+    pub(crate) password: String,
+}
+
+impl LinkDraft {
+    /// The draft that changes nothing about `link`.
+    pub(crate) fn of(link: &PublicLinkInfo) -> Self {
+        Self {
+            editor: link.role == "editor",
+            expiry: 0,
+            protect: link.has_password,
+            password: String::new(),
+        }
+    }
+}
+
+/// The one update that saving a [`LinkDraft`] sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkEdit {
+    pub(crate) role: Option<String>,
+    pub(crate) password: LinkChange<String>,
+    pub(crate) expires: LinkChange<i64>,
+}
+
+/// What saving `draft` would ask of `link`: `Ok(None)` when it changes
+/// nothing, `Err(())` when it cannot be saved yet. That is a password asked for
+/// on a link that has none, with no password typed.
+pub(crate) fn link_edit(
+    link: &PublicLinkInfo,
+    draft: &LinkDraft,
+    now: i64,
+) -> Result<Option<LinkEdit>, ()> {
+    let role = (draft.editor != (link.role == "editor"))
+        .then(|| if draft.editor { "editor" } else { "viewer" }.to_string());
+    let password = match (draft.protect, draft.password.is_empty(), link.has_password) {
+        (false, _, true) => LinkChange::Remove,
+        (false, _, false) | (true, true, true) => LinkChange::Keep,
+        (true, true, false) => return Err(()),
+        (true, false, _) => LinkChange::Set(draft.password.clone()),
+    };
+    let expires = link_expiry_change(draft.expiry, link.expires, now);
+    let edit = LinkEdit {
+        role,
+        password,
+        expires,
+    };
+    let unchanged = edit.role.is_none()
+        && edit.password == LinkChange::Keep
+        && edit.expires == LinkChange::Keep;
+    Ok((!unchanged).then_some(edit))
+}
+
+/// How a link works, in one line: who can do what, the password, the expiry.
+pub(crate) fn link_policy(editor: bool, password: bool, expires: Option<i64>, now: i64) -> String {
+    let mut parts = vec![if editor {
+        gettext("Anyone with the link can edit")
+    } else {
+        gettext("Anyone with the link can view")
+    }];
+    parts.push(if password {
+        gettext("password-protected")
+    } else {
+        gettext("no password")
+    });
+    parts.push(match expires {
+        Some(at) => link_expiry_label(at, now),
+        None => gettext("never expires"),
+    });
+    parts.join(" · ")
+}
+
+/// How `link` works once `edit` is saved.
+fn link_policy_after(
+    link: &PublicLinkInfo,
+    draft: &LinkDraft,
+    edit: &LinkEdit,
+    now: i64,
+) -> String {
+    let expires = match edit.expires {
+        LinkChange::Keep => link.expires,
+        LinkChange::Remove => None,
+        LinkChange::Set(at) => Some(at),
+    };
+    link_policy(draft.editor, draft.protect, expires, now)
+}
+
+/// The settings of an existing link, collapsed under one row. Nothing reaches
+/// Drive until Save: an owner turning a viewer link into an editor link with a
+/// password must not hand out editing before the password is set, so every
+/// change goes in one update. Closing the dialog drops what was not saved.
 fn link_settings_row(state: &Rc<ShareDialog>, link: &PublicLinkInfo) -> adw::ExpanderRow {
     let now = glib::real_time() / 1_000_000;
     let expander = adw::ExpanderRow::builder()
         .title(gettext("Link settings"))
         .subtitle(gettext(
-            "Change who can edit, the password or the expiry. The link stays the same.",
+            "Change who can edit, the password or the expiry, then save. The link stays the same.",
         ))
         .build();
+    let draft = Rc::new(RefCell::new(LinkDraft::of(link)));
 
-    let selected_role = u32::from(link.role == "editor");
-    let (role_row, role_drop) = dropdown_row(&gettext("Link role"), &link_roles(), selected_role);
-    let (state_w, expander_w, id) = (Rc::downgrade(state), expander.clone(), link.id.clone());
-    role_drop.connect_selected_notify(move |d| {
-        let Some(state) = state_w.upgrade() else {
-            return;
-        };
-        let role = if d.selected() == 1 {
-            "editor"
-        } else {
-            "viewer"
-        };
-        let request = state.target.update_link(
-            id.clone(),
-            Some(role.into()),
-            LinkChange::Keep,
-            LinkChange::Keep,
-        );
-        share_dialog_update_link(&state, request, &expander_w);
-    });
+    let (role_row, role_drop) = dropdown_row(
+        &gettext("Link role"),
+        &link_roles(),
+        u32::from(draft.borrow().editor),
+    );
     expander.add_row(&role_row);
-
-    let current = link.expires;
-    let (expiry_row, expiry_drop) =
-        dropdown_row(&gettext("Expires"), &link_expiry_choices(current, now), 0);
-    let (state_w, expander_w, id) = (Rc::downgrade(state), expander.clone(), link.id.clone());
-    expiry_drop.connect_selected_notify(move |d| {
-        let Some(state) = state_w.upgrade() else {
-            return;
-        };
-        let expires = link_expiry_change(d.selected(), current, glib::real_time() / 1_000_000);
-        if expires == LinkChange::Keep {
-            return;
-        }
-        let request = state
-            .target
-            .update_link(id.clone(), None, LinkChange::Keep, expires);
-        share_dialog_update_link(&state, request, &expander_w);
-    });
+    let (expiry_row, expiry_drop) = dropdown_row(
+        &gettext("Expires"),
+        &link_expiry_choices(link.expires, now),
+        0,
+    );
     expander.add_row(&expiry_row);
-
+    let protect = adw::SwitchRow::builder()
+        .title(gettext("Require a password"))
+        .active(link.has_password)
+        .build();
+    expander.add_row(&protect);
     let pw_row = adw::PasswordEntryRow::builder()
         .title(if link.has_password {
-            gettext("New password")
+            gettext("New password (optional)")
         } else {
-            gettext("Add a password")
+            gettext("Password")
         })
-        .show_apply_button(true)
+        .visible(link.has_password)
         .build();
-    let (state_w, expander_w, id) = (Rc::downgrade(state), expander.clone(), link.id.clone());
-    pw_row.connect_apply(move |row| {
+    expander.add_row(&pw_row);
+
+    // What the link will do once saved, right above the one action that sends it.
+    let summary = adw::ActionRow::builder()
+        .title(gettext("No changes"))
+        .use_markup(false)
+        .build();
+    summary.add_css_class("property");
+    let save = gtk4::Button::builder()
+        .label(gettext("Save Link Settings"))
+        .valign(gtk4::Align::Center)
+        .sensitive(false)
+        .build();
+    save.add_css_class("suggested-action");
+    summary.add_suffix(&save);
+    expander.add_row(&summary);
+
+    let refresh: Rc<dyn Fn()> = {
+        let (draft, link, summary, save) =
+            (draft.clone(), link.clone(), summary.clone(), save.clone());
+        Rc::new(move || {
+            let draft = draft.borrow();
+            let now = glib::real_time() / 1_000_000;
+            match link_edit(&link, &draft, now) {
+                Ok(None) => {
+                    summary.set_title(&gettext("No changes"));
+                    summary.set_subtitle("");
+                    save.set_sensitive(false);
+                }
+                Ok(Some(edit)) => {
+                    summary.set_title(&gettext("After saving"));
+                    summary.set_subtitle(&link_policy_after(&link, &draft, &edit, now));
+                    save.set_sensitive(true);
+                }
+                Err(()) => {
+                    summary.set_title(&gettext("Enter a password to save"));
+                    summary.set_subtitle("");
+                    save.set_sensitive(false);
+                }
+            }
+        })
+    };
+    {
+        let (draft, refresh) = (draft.clone(), refresh.clone());
+        role_drop.connect_selected_notify(move |d| {
+            draft.borrow_mut().editor = d.selected() == 1;
+            refresh();
+        });
+    }
+    {
+        let (draft, refresh) = (draft.clone(), refresh.clone());
+        expiry_drop.connect_selected_notify(move |d| {
+            draft.borrow_mut().expiry = d.selected();
+            refresh();
+        });
+    }
+    {
+        let (draft, refresh, pw_row) = (draft.clone(), refresh.clone(), pw_row.clone());
+        protect.connect_active_notify(move |s| {
+            draft.borrow_mut().protect = s.is_active();
+            pw_row.set_visible(s.is_active());
+            if s.is_active() {
+                pw_row.grab_focus();
+            }
+            refresh();
+        });
+    }
+    {
+        let (draft, refresh) = (draft.clone(), refresh.clone());
+        pw_row.connect_changed(move |row| {
+            draft.borrow_mut().password = row.text().to_string();
+            refresh();
+        });
+    }
+    {
+        let save = save.clone();
+        pw_row.connect_entry_activated(move |_| {
+            if save.is_sensitive() {
+                save.emit_clicked();
+            }
+        });
+    }
+    let (state_w, expander_w, link) = (Rc::downgrade(state), expander.clone(), link.clone());
+    save.connect_clicked(move |_| {
         let Some(state) = state_w.upgrade() else {
             return;
         };
-        let password = row.text().to_string();
-        if password.is_empty() {
+        let Ok(Some(edit)) = link_edit(&link, &draft.borrow(), glib::real_time() / 1_000_000)
+        else {
             return;
-        }
-        let request = state.target.update_link(
-            id.clone(),
-            None,
-            LinkChange::Set(password),
-            LinkChange::Keep,
-        );
+        };
+        let request =
+            state
+                .target
+                .update_link(link.id.clone(), edit.role, edit.password, edit.expires);
         share_dialog_update_link(&state, request, &expander_w);
     });
-    expander.add_row(&pw_row);
-
-    if link.has_password {
-        let remove = gtk4::Button::builder()
-            .label(gettext("Remove"))
-            .valign(gtk4::Align::Center)
-            .build();
-        remove.add_css_class("flat");
-        let row = adw::ActionRow::builder()
-            .title(gettext("Remove the password"))
-            .subtitle(gettext(
-                "Anyone with the link can open it without a password.",
-            ))
-            .build();
-        row.add_suffix(&remove);
-        let (state_w, expander_w, id) = (Rc::downgrade(state), expander.clone(), link.id.clone());
-        remove.connect_clicked(move |_| {
-            let Some(state) = state_w.upgrade() else {
-                return;
-            };
-            let request =
-                state
-                    .target
-                    .update_link(id.clone(), None, LinkChange::Remove, LinkChange::Keep);
-            share_dialog_update_link(&state, request, &expander_w);
-        });
-        expander.add_row(&row);
-    }
     expander
 }
 
@@ -1081,6 +1241,97 @@ mod tests {
         assert_eq!(
             link_expiry_change(2, at, now),
             LinkChange::Set(now + 86_400)
+        );
+    }
+
+    fn viewer_link(has_password: bool, expires: Option<i64>) -> PublicLinkInfo {
+        PublicLinkInfo {
+            id: "link".into(),
+            url: Some("https://drive.proton.me/urls/X#y".into()),
+            role: "viewer".into(),
+            expires,
+            has_password,
+            created: 0,
+        }
+    }
+
+    #[test]
+    fn an_untouched_draft_sends_nothing() {
+        let link = viewer_link(true, Some(2_000_000_000));
+        assert_eq!(link_edit(&link, &LinkDraft::of(&link), 1_000), Ok(None));
+    }
+
+    /// Editor and a password go in one update, so link holders never get edit
+    /// access without the password.
+    #[test]
+    fn editor_and_a_password_are_saved_together() {
+        let link = viewer_link(false, None);
+        let draft = LinkDraft {
+            editor: true,
+            protect: true,
+            password: "hunter2".into(),
+            ..LinkDraft::of(&link)
+        };
+        assert_eq!(
+            link_edit(&link, &draft, 1_000),
+            Ok(Some(LinkEdit {
+                role: Some("editor".into()),
+                password: LinkChange::Set("hunter2".into()),
+                expires: LinkChange::Keep,
+            }))
+        );
+    }
+
+    #[test]
+    fn asking_for_a_password_without_one_cannot_be_saved() {
+        let link = viewer_link(false, None);
+        let draft = LinkDraft {
+            editor: true,
+            protect: true,
+            ..LinkDraft::of(&link)
+        };
+        assert_eq!(link_edit(&link, &draft, 1_000), Err(()));
+    }
+
+    #[test]
+    fn a_kept_password_stays_and_a_dropped_one_goes() {
+        let link = viewer_link(true, None);
+        let keep = LinkDraft {
+            expiry: 2,
+            ..LinkDraft::of(&link)
+        };
+        assert_eq!(
+            link_edit(&link, &keep, 1_000).unwrap().unwrap().password,
+            LinkChange::Keep
+        );
+        let drop = LinkDraft {
+            protect: false,
+            password: "typed then switched off".into(),
+            ..LinkDraft::of(&link)
+        };
+        assert_eq!(
+            link_edit(&link, &drop, 1_000),
+            Ok(Some(LinkEdit {
+                role: None,
+                password: LinkChange::Remove,
+                expires: LinkChange::Keep,
+            }))
+        );
+    }
+
+    #[test]
+    fn the_summary_shows_the_policy_after_saving() {
+        let link = viewer_link(true, Some(2_000_000_000));
+        let draft = LinkDraft {
+            editor: true,
+            expiry: 1,
+            protect: false,
+            ..LinkDraft::of(&link)
+        };
+        let edit = link_edit(&link, &draft, 1_000).unwrap().unwrap();
+        assert_eq!(
+            link_policy_after(&link, &draft, &edit, 1_000),
+            "Anyone with the link can edit · no password · never expires"
         );
     }
 
