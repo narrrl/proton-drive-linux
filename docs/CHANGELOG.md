@@ -106,6 +106,12 @@ digest of what it sent (52).
   record of it and refused the change: a write was kept in staging instead of being sent, and a
   folder made inside a new folder failed. The check now reads the database in one consistent
   view.
+- **The Trash page acts on what is selected, and says so when it cannot.** Inside a trashed
+  folder, its items went to the trash with it, and only the folder can be restored. Restore now
+  reads "Restore Folder “Projects”" there. Delete Permanently, from the bar or the
+  Delete key, no longer deletes the whole folder for a selected item inside it. It explains that
+  only the whole folder can be deleted, from the top of the trash. Restore on a row that groups
+  the items deleted from one folder now shows how many items it restores.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different

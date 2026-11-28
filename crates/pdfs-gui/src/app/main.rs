@@ -548,6 +548,8 @@ fn build_window(app: &adw::Application) {
             subtitle: trash_widgets.subtitle.clone(),
             selection_bar: trash_widgets.selection_bar.clone(),
             selection_label: trash_widgets.selection_label.clone(),
+            restore_selected: trash_widgets.restore_selected.clone(),
+            delete_selected: trash_widgets.delete_selected.clone(),
             loader: Loader::new(&trash_widgets.content),
             back: trash_widgets.back.clone(),
             crumb: trash_widgets.crumb.clone(),
