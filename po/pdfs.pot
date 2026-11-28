@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 3.10.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-28 10:46+0100\n"
+"POT-Creation-Date: 2026-11-28 10:47+0100\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -420,6 +420,7 @@ msgid "Copy Image"
 msgstr ""
 
 #: crates/pdfs-gui/src/app/main.rs:1667
+#: crates/pdfs-gui/src/app/pages/login.rs:780
 #: crates/pdfs-gui/src/app/pages/shared.rs:1135
 #: crates/pdfs-gui/src/app/pages/status.rs:867
 msgid "Close"
@@ -3690,13 +3691,13 @@ msgstr ""
 msgid "Continue"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/login.rs:702
+#: crates/pdfs-gui/src/app/pages/login.rs:704
 msgid ""
 "Proton Drive will disconnect and stop syncing until you sign in again. Files "
 "already on this computer stay where they are."
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/login.rs:706
+#: crates/pdfs-gui/src/app/pages/login.rs:709
 #, rust-format
 msgid ""
 "{n} change is not on Proton Drive yet. It stays on this computer and is sent "
@@ -3708,11 +3709,43 @@ msgstr[0] ""
 msgstr[1] ""
 
 #: crates/pdfs-gui/src/app/pages/login.rs:715
+msgid ""
+"The Proton Drive service didn't answer, so it isn't known whether changes "
+"are still waiting to be sent. Any that are stay on this computer and are "
+"sent after you sign in again."
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/login.rs:723
 msgid "Sign Out?"
 msgstr ""
 
-#: crates/pdfs-gui/src/app/pages/login.rs:717
+#: crates/pdfs-gui/src/app/pages/login.rs:725
 msgid "Sign Out"
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/login.rs:760
+msgid ""
+"Signed out on this computer. Proton didn't confirm that the session ended; "
+"you can end it in your Proton account's security settings."
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/login.rs:773
+msgid "Sign-In Still Saved"
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/login.rs:776
+#, rust-format
+msgid ""
+"Proton Drive stopped, but your sign-in couldn't be removed from this "
+"computer: {error}\n"
+"\n"
+"Until it is removed, Proton Drive may sign in again at the next start. "
+"Unlock your keyring, then try again."
+msgstr ""
+
+#: crates/pdfs-gui/src/app/pages/login.rs:781
+#: crates/pdfs-gui/src/app/pages/shared.rs:1136
+msgid "Try Again"
 msgstr ""
 
 #. Translators: badge on a photo tile whose shot includes a raw camera file.
@@ -5012,10 +5045,6 @@ msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/shared.rs:1132
 msgid "These items did not go through:"
-msgstr ""
-
-#: crates/pdfs-gui/src/app/pages/shared.rs:1136
-msgid "Try Again"
 msgstr ""
 
 #: crates/pdfs-gui/src/app/pages/shared.rs:1154
