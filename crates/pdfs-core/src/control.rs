@@ -1171,6 +1171,15 @@ pub struct PendingOpInfo {
     /// Carries file content that [`Request::ExportPendingOp`] can save.
     #[serde(default)]
     pub exportable: bool,
+    /// The node the op changes. A discard drops every op queued on the same
+    /// node (see [`Request::DiscardPendingOp`]), so this tells which rows go
+    /// together. Empty from a daemon that predates the field.
+    #[serde(default)]
+    pub node: String,
+    /// The node was made on this computer and Drive has never had it. A
+    /// discard removes it here, rather than putting back what Drive has.
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 /// Why Drive refused a queued change (in [`PendingOpInfo`]). The change stays

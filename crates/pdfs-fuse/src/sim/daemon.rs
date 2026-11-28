@@ -1332,6 +1332,23 @@ mod tests {
         std::fs::remove_file(mnt.join("gone.txt")).unwrap();
         std::fs::write(mnt.join("new.txt"), b"new").unwrap();
         std::fs::create_dir(mnt.join("dir")).unwrap();
+        std::fs::rename(mnt.join("edit.txt"), mnt.join("edited.txt")).unwrap();
+
+        // The queue says which changes share a node, so the app can name
+        // every change a discard drops, and which nodes Drive never had.
+        let queued = daemon.pending().unwrap();
+        let on = |name: &str| -> Vec<&PendingOpInfo> {
+            queued.iter().filter(|op| op.path.ends_with(name)).collect()
+        };
+        let edited = on("edited.txt");
+        assert_eq!(edited.len(), 2, "an edit and a rename: {queued:?}");
+        assert!(!edited[0].node.is_empty() && edited[0].node == edited[1].node);
+        assert!(edited.iter().all(|op| !op.local_only));
+        assert!(on("new.txt").iter().all(|op| op.local_only), "{queued:?}");
+        assert!(
+            on("moved.txt").iter().all(|op| !op.local_only),
+            "{queued:?}"
+        );
 
         // Discarding one change drops the others queued on its node.
         for _ in 0..10 {
