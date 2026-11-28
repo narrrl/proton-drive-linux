@@ -194,6 +194,22 @@ impl Core {
         Ok(name)
     }
 
+    /// Drop the pins recorded under `path`, the path a front end lists a pin
+    /// by, when their node is gone. A deleted node leaves no path to resolve,
+    /// so [`unpin`](Self::unpin) cannot find it, and the pin would stay listed
+    /// as kept offline for good. Returns whether any pin was dropped.
+    pub(super) fn unpin_stale(&self, path: &str) -> CoreResult<bool> {
+        let uids = self
+            .cache
+            .remove_pins_at(path)
+            .map_err(|e| CoreError::from_api(&e, "unpin"))?;
+        for uid in uids.iter().filter_map(|s| parse_uid(s)) {
+            self.cache.evict(&uid);
+            self.evict_reader(&uid);
+        }
+        Ok(!uids.is_empty())
+    }
+
     /// Whether the node at `ino` is kept offline because a folder above it is
     /// pinned, whether or not it is also pinned on its own.
     pub(super) fn pinned_by_folder(&self, ino: u64) -> bool {

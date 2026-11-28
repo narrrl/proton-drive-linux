@@ -1900,6 +1900,13 @@ impl ContentCache {
         Ok(())
     }
 
+    /// Drop every pin recorded under `path`. Returns the uids it dropped,
+    /// whose blobs the caller evicts. For a pin whose node is gone, so its
+    /// path no longer resolves to a uid.
+    pub fn remove_pins_at(&self, path: &str) -> Result<Vec<String>> {
+        self.db.pin_remove_by_path(path)
+    }
+
     /// All pins (files and recursive folders), ordered by uid.
     pub fn list_pins(&self) -> Vec<Pin> {
         self.db

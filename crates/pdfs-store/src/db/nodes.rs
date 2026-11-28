@@ -259,6 +259,9 @@ impl Db {
         if let Some(rowid) = rowid {
             tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
         }
+        // A pin outlives its node otherwise, listed as kept offline with no
+        // path left to unpin it by.
+        tx.execute("DELETE FROM pins WHERE uid = ?1", params![uid])?;
         tx.commit()?;
         Ok(())
     }
@@ -299,6 +302,9 @@ impl Db {
         if let Some(rowid) = rowid {
             tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
         }
+        // A pin outlives its node otherwise, listed as kept offline with no
+        // path left to unpin it by.
+        tx.execute("DELETE FROM pins WHERE uid = ?1", params![uid])?;
         tx.execute("DELETE FROM pending_op WHERE id = ?1", params![op_id])?;
         if let Some(name) = name {
             wake_ops_waiting_for_tx(&tx, &name)?;

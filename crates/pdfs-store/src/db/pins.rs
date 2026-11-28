@@ -38,6 +38,21 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Drop every pin recorded under `path`. Returns the uids it dropped.
+    ///
+    /// For a pin whose node is gone: the path no longer resolves to a uid, and
+    /// the recorded path is all that is left to name the pin by.
+    pub fn pin_remove_by_path(&self, path: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("DELETE FROM pins WHERE path = ?1 RETURNING uid")?;
+        let rows = stmt.query_map(params![path], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Every directly-pinned entry, ordered by uid.
     pub fn pin_list(&self) -> Result<Vec<PinRow>> {
         let conn = self.read()?;
