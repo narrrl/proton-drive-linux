@@ -1340,10 +1340,20 @@ mod tests {
         let on = |name: &str| -> Vec<&PendingOpInfo> {
             queued.iter().filter(|op| op.path.ends_with(name)).collect()
         };
-        let edited = on("edited.txt");
-        assert_eq!(edited.len(), 2, "an edit and a rename: {queued:?}");
-        assert!(!edited[0].node.is_empty() && edited[0].node == edited[1].node);
-        assert!(edited.iter().all(|op| !op.local_only));
+        // By node, not by path: the path an op shows may still be the old
+        // name for a moment after the rename.
+        let edit = queued
+            .iter()
+            .find(|op| op.kind == "revision")
+            .expect("the edit is queued");
+        let same: Vec<&str> = queued
+            .iter()
+            .filter(|op| op.node == edit.node)
+            .map(|op| op.kind.as_str())
+            .collect();
+        assert!(!edit.node.is_empty());
+        assert_eq!(same, ["revision", "rename"], "{queued:?}");
+        assert!(!edit.local_only);
         assert!(on("new.txt").iter().all(|op| op.local_only), "{queued:?}");
         assert!(
             on("moved.txt").iter().all(|op| !op.local_only),
