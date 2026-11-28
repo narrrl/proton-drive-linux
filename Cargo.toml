@@ -15,8 +15,8 @@ keywords = ["proton", "drive", "fuse", "sync", "linux"]
 categories = ["filesystem", "command-line-utilities"]
 
 [workspace.dependencies]
-proton-sdk = { version = "0.12.7" }
-proton-drive-rs = { version = "0.12.7" }
+proton-sdk = { version = "0.12.8" }
+proton-drive-rs = { version = "0.12.8" }
 proton-gallery-app-rs = "0.1.0"
 proton-gallery-rs = "0.1.5"
 proton-map-rs = "0.1.0"

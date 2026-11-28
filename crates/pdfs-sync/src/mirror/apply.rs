@@ -521,9 +521,13 @@ impl Syncer {
     /// folder may have committed a revision since, and uploading over it would
     /// leave that edit only in the revision history. So Drive is asked first,
     /// and a file that moved on is left for the next pass, which keeps the
-    /// local edit as a conflict copy (B249). A revision committed between this
-    /// check and the upload's own draft is not caught here; the read-back after
-    /// the upload catches one committed after it.
+    /// local edit as a conflict copy (B249). A revision committed after the
+    /// upload is caught by the read-back.
+    ///
+    /// When the pass knows the revision id, the check rides on the read of the
+    /// file the upload makes for its keys (`upload_new_revision_over`), and the
+    /// revision is created over that id, so Drive refuses one committed in
+    /// between. A baseline without an id still reads the node first.
     pub(super) async fn upload_revision(
         &self,
         folder_id: i64,
@@ -536,22 +540,16 @@ impl Syncer {
         let Some(file) = open_to_upload(&path, rel)? else {
             return Ok(Applied::Vanished);
         };
-        let current = self
-            .drive
-            .enumerate_nodes(std::slice::from_ref(uid))
-            .await
-            .map_err(|e| format!("check {rel} on Drive: {e}"))?;
-        match current.first() {
-            Some(node) if !node.trashed && seen.still_current(node) => {}
-            Some(node) if !node.trashed => {
-                return Err(format!(
-                    "{rel} changed on Drive since this pass looked; it is compared again on the next pass"
-                ));
-            }
-            _ => {
-                return Err(format!(
-                    "{rel} is no longer on Drive where this pass saw it; it is compared again on the next pass"
-                ));
+        if seen.revision.is_none() {
+            let current = self
+                .drive
+                .enumerate_nodes(std::slice::from_ref(uid))
+                .await
+                .map_err(|e| format!("check {rel} on Drive: {e}"))?;
+            match current.first() {
+                Some(node) if !node.trashed && seen.still_current(node) => {}
+                Some(node) if !node.trashed => return Err(moved_on_drive(rel)),
+                _ => return Err(gone_from_drive(rel)),
             }
         }
         let meta = file.metadata().map_err(|e| format!("stat {rel}: {e}"))?;
@@ -569,13 +567,27 @@ impl Syncer {
                 meta.len(),
             ),
         ));
-        if let Err(e) = self
-            .drive
-            .upload_new_revision_from(uid, reader, meta.len() as i64, thumbnails, Some(mtime))
-            .await
-        {
-            self.note_sent(folder_id, rel, "upload-revision", &sent.digest());
-            return Err(format!("upload revision {rel}: {e}"));
+        let size = meta.len() as i64;
+        let uploaded = match seen.revision.as_deref() {
+            Some(expected) => self
+                .drive
+                .upload_new_revision_over(uid, expected, reader, size, thumbnails, Some(mtime))
+                .await
+                .map(Some),
+            None => self
+                .drive
+                .upload_new_revision_from(uid, reader, size, thumbnails, Some(mtime))
+                .await
+                .map(|()| None),
+        };
+        match uploaded {
+            Ok(None | Some(pdfs_drive::RevisionUpload::Sealed(_))) => {}
+            Ok(Some(pdfs_drive::RevisionUpload::Moved)) => return Err(moved_on_drive(rel)),
+            Ok(Some(pdfs_drive::RevisionUpload::Trashed)) => return Err(gone_from_drive(rel)),
+            Err(e) => {
+                self.note_sent(folder_id, rel, "upload-revision", &sent.digest());
+                return Err(format!("upload revision {rel}: {e}"));
+            }
         }
         warn_if_torn(rel, &path, streamed);
         let remote = self
@@ -744,4 +756,17 @@ impl Syncer {
             )
             .map_err(|e| format!("baseline {rel}: {e:?}"))
     }
+}
+
+/// Why a revision was not sent: Drive's file moved on since the pass looked.
+fn moved_on_drive(rel: &str) -> String {
+    format!("{rel} changed on Drive since this pass looked; it is compared again on the next pass")
+}
+
+/// Why a revision was not sent: the file is no longer on Drive where the pass
+/// saw it.
+fn gone_from_drive(rel: &str) -> String {
+    format!(
+        "{rel} is no longer on Drive where this pass saw it; it is compared again on the next pass"
+    )
 }

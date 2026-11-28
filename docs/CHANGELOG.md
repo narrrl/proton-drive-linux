@@ -55,6 +55,11 @@ digest of what it sent (52).
   any more.
 
 ### Changed
+- **An upload into a folder and an edit of a synced file make fewer requests.** The key that
+  hashes a folder's file names is now read once per folder, not once per upload. A synced
+  folder no longer reads a file again before it sends an edit. It checks that nobody else
+  changed the file through the read the upload already makes, and it still sends nothing over
+  a revision it has not seen. `proton-sdk` and `proton-drive-rs` are now 0.12.8.
 - **A sync pass over a quiet folder no longer reads the whole folder on disk.** While the
   filesystem watcher has been running without a break, a pass reads again only the folders and
   files it reported changed, and takes the rest from the pass before. The whole folder is still

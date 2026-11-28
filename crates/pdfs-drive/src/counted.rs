@@ -23,7 +23,7 @@ use proton_drive_rs::{
     Thumbnail, ThumbnailType, TrashedNode,
 };
 
-use crate::{DriveApi, NodeOutcomes, OutcomeStream, RevisionRead};
+use crate::{DriveApi, NodeOutcomes, OutcomeStream, RevisionRead, RevisionUpload};
 
 /// Every kind of call [`DriveApi`] makes, one per method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,6 +384,30 @@ impl DriveApi for Counted {
             DriveCall::UploadNewRevision,
             self.inner.upload_new_revision_from_dyn(
                 file_uid,
+                reader,
+                intended_size,
+                thumbnails,
+                last_modification_time,
+            ),
+        )
+        .await
+    }
+
+    async fn upload_new_revision_over_dyn(
+        &self,
+        file_uid: &NodeUid,
+        expected: &str,
+        reader: &mut (dyn Read + Send),
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<i64>,
+    ) -> Result<RevisionUpload> {
+        // Counted with the other revision uploads: it is one, with its check.
+        self.timed(
+            DriveCall::UploadNewRevision,
+            self.inner.upload_new_revision_over_dyn(
+                file_uid,
+                expected,
                 reader,
                 intended_size,
                 thumbnails,
