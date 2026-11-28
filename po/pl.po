@@ -278,8 +278,8 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/photos.rs:3117
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:509
 #: crates/pdfs-gui/src/app/pages/shared.rs:952
-#: crates/pdfs-gui/src/app/pages/shared.rs:1033
-#: crates/pdfs-gui/src/app/pages/shared.rs:1074
+#: crates/pdfs-gui/src/app/pages/shared.rs:1161
+#: crates/pdfs-gui/src/app/pages/shared.rs:1202
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:551
 #: crates/pdfs-gui/src/app/pages/status.rs:641
 #: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:249
@@ -448,6 +448,7 @@ msgid "Copy Image"
 msgstr "Skopiuj obraz"
 
 #: crates/pdfs-gui/src/app/main.rs:1667
+#: crates/pdfs-gui/src/app/pages/shared.rs:1135
 #: crates/pdfs-gui/src/app/pages/status.rs:867
 msgid "Close"
 msgstr "Zamknij"
@@ -1460,8 +1461,8 @@ msgstr "Nie można wczytać albumów"
 #: crates/pdfs-gui/src/app/pages/photos.rs:4811
 #: crates/pdfs-gui/src/app/pages/places.rs:105
 #: crates/pdfs-gui/src/app/pages/shared.rs:710
-#: crates/pdfs-gui/src/app/pages/shared.rs:1012
-#: crates/pdfs-gui/src/app/pages/shared.rs:1128
+#: crates/pdfs-gui/src/app/pages/shared.rs:1086
+#: crates/pdfs-gui/src/app/pages/shared.rs:1256
 #: crates/pdfs-gui/src/app/pages/status.rs:814
 #: crates/pdfs-gui/src/app/pages/status.rs:1755
 #: crates/pdfs-gui/src/app/pages/takeout.rs:513
@@ -2720,7 +2721,7 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/devices.rs:1130
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:394
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:302
-#: crates/pdfs-gui/src/app/pages/shared.rs:1034
+#: crates/pdfs-gui/src/app/pages/shared.rs:1162
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:641
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:883
 msgid "Remove"
@@ -4940,7 +4941,7 @@ msgid "Or pick kinds of files:"
 msgstr "Albo wybierz rodzaje plików:"
 
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:510
-#: crates/pdfs-gui/src/app/pages/shared.rs:1075
+#: crates/pdfs-gui/src/app/pages/shared.rs:1203
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:76
 msgid "Save"
 msgstr "Zapisz"
@@ -5301,11 +5302,19 @@ msgctxt "verb"
 msgid "Leave"
 msgstr "Opuść"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:966
+#: crates/pdfs-gui/src/app/pages/shared.rs:973
 msgid "Couldn't leave the shared item"
 msgstr "Nie można opuścić udostępnionego elementu"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:972
+#: crates/pdfs-gui/src/app/pages/shared.rs:976
+#, rust-format
+msgid "Left {went} of {n} Shared Item"
+msgid_plural "Left {went} of {n} Shared Items"
+msgstr[0] "Opuszczono {went} z {n} udostępnionego elementu"
+msgstr[1] "Opuszczono {went} z {n} udostępnionych elementów"
+msgstr[2] "Opuszczono {went} z {n} udostępnionych elementów"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:992
 #, rust-format
 msgid "Left {n} shared item"
 msgid_plural "Left {n} shared items"
@@ -5313,11 +5322,33 @@ msgstr[0] "Opuszczono udostępnione elementy: {n}"
 msgstr[1] "Opuszczono udostępnione elementy: {n}"
 msgstr[2] "Opuszczono udostępnione elementy: {n}"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1026
+#. Translators: {error} is the reason the service gave.
+#: crates/pdfs-gui/src/app/pages/shared.rs:1115
+#, rust-format
+msgid "Refused: {error}"
+msgstr "Odrzucono: {error}"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1117
+msgid "The service didn't answer. The page shows whether it went through."
+msgstr "Usługa nie odpowiedziała. Strona pokazuje, czy się udało."
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1119
+msgid "Not tried yet"
+msgstr "Jeszcze nie próbowano"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1132
+msgid "These items did not go through:"
+msgstr "Te elementy nie zostały przetworzone:"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1136
+msgid "Try Again"
+msgstr "Spróbuj ponownie"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1154
 msgid "Remove Saved Link?"
 msgstr "Usunąć zapisany odnośnik?"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1029
+#: crates/pdfs-gui/src/app/pages/shared.rs:1157
 #, rust-format
 msgid ""
 "Remove “{name}” from your saved links? The shared item itself is not "
@@ -5326,41 +5357,41 @@ msgstr ""
 "Usunąć „{name}” z zapisanych odnośników? Sam udostępniony element pozostanie "
 "bez zmian."
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1047
+#: crates/pdfs-gui/src/app/pages/shared.rs:1175
 msgid "Link removed"
 msgstr "Usunięto odnośnik"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1048
+#: crates/pdfs-gui/src/app/pages/shared.rs:1176
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:736
 msgid "Couldn't remove the link"
 msgstr "Nie można usunąć odnośnika"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1059
+#: crates/pdfs-gui/src/app/pages/shared.rs:1187
 msgid "Save Link"
 msgstr "Zapisz odnośnik"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1060
+#: crates/pdfs-gui/src/app/pages/shared.rs:1188
 msgid "Paste a Proton Drive public link to save it here."
 msgstr "Proszę wkleić publiczny odnośnik Proton Drive, aby go tutaj zapisać."
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1064
+#: crates/pdfs-gui/src/app/pages/shared.rs:1192
 msgid "Public link URL"
 msgstr "Adres URL publicznego odnośnika"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1068
+#: crates/pdfs-gui/src/app/pages/shared.rs:1196
 msgid "Password (if the link has one)"
 msgstr "Hasło (jeśli odnośnik je ma)"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1088
-#: crates/pdfs-gui/src/app/pages/shared.rs:1101
+#: crates/pdfs-gui/src/app/pages/shared.rs:1216
+#: crates/pdfs-gui/src/app/pages/shared.rs:1229
 msgid "Couldn't save the link"
 msgstr "Nie można zapisać odnośnika"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1089
+#: crates/pdfs-gui/src/app/pages/shared.rs:1217
 msgid "A URL is required."
 msgstr "Adres URL jest wymagany."
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1100
+#: crates/pdfs-gui/src/app/pages/shared.rs:1228
 msgid "Link saved"
 msgstr "Zapisano odnośnik"
 
@@ -5523,9 +5554,17 @@ msgstr[0] "Zakończono udostępnianie elementów: {n}"
 msgstr[1] "Zakończono udostępnianie elementów: {n}"
 msgstr[2] "Zakończono udostępnianie elementów: {n}"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:576
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:583
 msgid "Couldn't stop sharing"
 msgstr "Nie można zakończyć udostępniania"
+
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:586
+#, rust-format
+msgid "Stopped Sharing {went} of {n} Item"
+msgid_plural "Stopped Sharing {went} of {n} Items"
+msgstr[0] "Zatrzymano udostępnianie {went} z {n} elementu"
+msgstr[1] "Zatrzymano udostępnianie {went} z {n} elementów"
+msgstr[2] "Zatrzymano udostępnianie {went} z {n} elementów"
 
 #: crates/pdfs-gui/src/app/pages/status.rs:188
 msgid "Startup"

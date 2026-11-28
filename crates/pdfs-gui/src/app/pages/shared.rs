@@ -955,16 +955,36 @@ pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, entries: &[DirEntry]) {
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
     let ui_c = ui.clone();
-    let uids: Vec<String> = entries.iter().map(|e| e.uid.clone()).collect();
+    let targets: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| (e.name.clone(), e.uid.clone()))
+        .collect();
     dialog.connect_response(Some("leave"), move |_, _| {
-        let count = uids.len();
+        let count = targets.len();
+        let items = targets
+            .iter()
+            .map(|(name, uid)| BatchItem {
+                name: name.clone(),
+                uid: uid.clone(),
+                request: |uid| Request::LeaveShared { uid },
+            })
+            .collect();
+        let text = BatchText {
+            failed: gettext_noop("Couldn't leave the shared item"),
+            partial: |went, total| {
+                ngettext_f(
+                    "Left {went} of {n} Shared Item",
+                    "Left {went} of {n} Shared Items",
+                    total,
+                    &[("went", &went.to_string())],
+                )
+            },
+        };
         run_requests(
             &ui_c,
-            uids.iter()
-                .map(|uid| Request::LeaveShared { uid: uid.clone() })
-                .collect(),
-            gettext_noop("Couldn't leave the shared item"),
-            move |ui| {
+            items,
+            text,
+            Rc::new(move |ui| {
                 load_shared(ui);
                 toast(
                     ui,
@@ -975,48 +995,156 @@ pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, entries: &[DirEntry]) {
                         &[],
                     ),
                 );
-            },
+            }),
         );
     });
     dialog.present(ui_window(ui).as_ref());
 }
 
-/// Send `requests` one after the other, stopping at the first failure, which
-/// is reported under `failed` (an untranslated msgid). `done` runs once all
-/// succeeded. After a failure the page on screen is reloaded instead, since
-/// the requests before it went through.
-pub(crate) fn run_requests(
-    ui: &Rc<Ui>,
-    requests: Vec<Request>,
-    failed: &'static str,
-    done: impl FnOnce(&Rc<Ui>) + 'static,
-) {
+/// What became of one request of a batch.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Outcome {
+    Done,
+    /// The service refused it, with this message.
+    Failed(String),
+    /// The service did not answer, so it may or may not have happened.
+    Unknown,
+    /// Not sent: the service had stopped answering before its turn.
+    NotTried,
+}
+
+/// One item of a batch: its name, as the summary lists it, and the uid its
+/// request acts on. A retry sends the request again, so it is built from the
+/// uid each time.
+pub(crate) struct BatchItem {
+    pub(crate) name: String,
+    pub(crate) uid: String,
+    pub(crate) request: fn(String) -> Request,
+}
+
+/// What runs once every item of a batch went through. Kept for a retry.
+pub(crate) type BatchDone = Rc<dyn Fn(&Rc<Ui>)>;
+
+/// The texts a batch reports with.
+#[derive(Clone, Copy)]
+pub(crate) struct BatchText {
+    /// The failure title, an untranslated msgid.
+    pub(crate) failed: &'static str,
+    /// The heading of a batch that partly went through, from how many items
+    /// went through and how many there were.
+    pub(crate) partial: fn(u64, u64) -> String,
+}
+
+/// Send each request in turn. `done` runs once all succeeded.
+///
+/// A request the service refuses does not stop the others, since each item
+/// stands on its own. Once the service stops answering, the rest are not
+/// sent. When any item did not go through, the page on screen is reloaded,
+/// so a lost reply shows its real state, and a summary names every item that
+/// did not, with a way to try those again. A batch of one reports as before,
+/// with a toast.
+pub(crate) fn run_requests(ui: &Rc<Ui>, items: Vec<BatchItem>, text: BatchText, done: BatchDone) {
     ui.busy_begin();
     let ui = ui.clone();
     let socket = ui.dirs.control_socket();
     glib::spawn_future_local(async move {
-        for req in requests {
-            let result = spawn_request(socket.clone(), req).recv().await;
-            let error = match result {
-                Ok(Ok(Response::Ok { .. })) => continue,
-                Ok(Ok(Response::Error { message, kind })) => Some((message, kind)),
-                _ => None,
-            };
-            ui.busy_end();
-            reload_current_page(&ui);
-            match error {
-                Some((message, kind)) => toast_failure(&ui, &gettext(failed), &message, kind),
+        let mut outcomes = Vec::with_capacity(items.len());
+        let mut first_error = None;
+        let mut answering = true;
+        for item in &items {
+            if !answering {
+                outcomes.push(Outcome::NotTried);
+                continue;
+            }
+            let result = spawn_request(socket.clone(), (item.request)(item.uid.clone()))
+                .recv()
+                .await;
+            outcomes.push(match result {
+                Ok(Ok(Response::Ok { .. })) => Outcome::Done,
+                Ok(Ok(Response::Error { message, kind })) => {
+                    first_error.get_or_insert((message.clone(), kind));
+                    Outcome::Failed(message)
+                }
+                _ => {
+                    answering = false;
+                    Outcome::Unknown
+                }
+            });
+        }
+        ui.busy_end();
+        if outcomes.iter().all(|outcome| *outcome == Outcome::Done) {
+            done(&ui);
+            return;
+        }
+        reload_current_page(&ui);
+        if items.len() == 1 {
+            match first_error {
+                Some((message, kind)) => toast_failure(&ui, &gettext(text.failed), &message, kind),
                 None => toast_error(
                     &ui,
-                    &gettext(failed),
+                    &gettext(text.failed),
                     &gettext("The Proton Drive service didn't respond."),
                 ),
             }
             return;
         }
-        ui.busy_end();
-        done(&ui);
+        present_batch_summary(&ui, items, outcomes, text, done);
     });
+}
+
+/// Name every item of a batch that did not go through, and offer to try
+/// them again.
+fn present_batch_summary(
+    ui: &Rc<Ui>,
+    items: Vec<BatchItem>,
+    outcomes: Vec<Outcome>,
+    text: BatchText,
+    done: BatchDone,
+) {
+    let total = items.len() as u64;
+    let went = outcomes.iter().filter(|o| **o == Outcome::Done).count() as u64;
+    let list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let mut again = Vec::new();
+    for (item, outcome) in items.into_iter().zip(&outcomes) {
+        let state = match outcome {
+            Outcome::Done => continue,
+            // Translators: {error} is the reason the service gave.
+            Outcome::Failed(error) => gettext_f("Refused: {error}", &[("error", error)]),
+            Outcome::Unknown => {
+                gettext("The service didn't answer. The page shows whether it went through.")
+            }
+            Outcome::NotTried => gettext("Not tried yet"),
+        };
+        list.append(
+            &adw::ActionRow::builder()
+                .title(glib::markup_escape_text(&item.name).as_str())
+                .subtitle(glib::markup_escape_text(&state).as_str())
+                .subtitle_lines(3)
+                .build(),
+        );
+        again.push(item);
+    }
+    let dialog = adw::AlertDialog::builder()
+        .heading((text.partial)(went, total))
+        .body(gettext("These items did not go through:"))
+        .extra_child(&list)
+        .build();
+    dialog.add_response("close", &gettext("Close"));
+    dialog.add_response("again", &gettext("Try Again"));
+    dialog.set_response_appearance("again", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
+    let ui_c = ui.clone();
+    let again = RefCell::new(Some(again));
+    dialog.connect_response(Some("again"), move |_, _| {
+        if let Some(items) = again.borrow_mut().take() {
+            run_requests(&ui_c, items, text, done.clone());
+        }
+    });
+    dialog.present(ui_window(ui).as_ref());
 }
 
 /// Confirm, then remove a saved link. The shared item itself is untouched.

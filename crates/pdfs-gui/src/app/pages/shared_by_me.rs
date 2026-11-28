@@ -564,21 +564,41 @@ pub(crate) fn prompt_stop_sharing(ui: &Rc<Ui>, entries: &[DirEntry]) {
             &[],
         ),
     };
-    let uids: Vec<String> = entries.iter().map(|e| e.uid.clone()).collect();
+    let targets: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| (e.name.clone(), e.uid.clone()))
+        .collect();
     dialog.connect_response(Some("stop"), move |_, _| {
         let done = done.clone();
-        let stopped = uids.clone();
+        let stopped: Vec<String> = targets.iter().map(|(_, uid)| uid.clone()).collect();
+        let items = targets
+            .iter()
+            .map(|(name, uid)| BatchItem {
+                name: name.clone(),
+                uid: uid.clone(),
+                request: |uid| Request::StopSharingByUid { uid },
+            })
+            .collect();
+        let text = BatchText {
+            failed: gettext_noop("Couldn't stop sharing"),
+            partial: |went, total| {
+                ngettext_f(
+                    "Stopped Sharing {went} of {n} Item",
+                    "Stopped Sharing {went} of {n} Items",
+                    total,
+                    &[("went", &went.to_string())],
+                )
+            },
+        };
         run_requests(
             &ui_c,
-            uids.iter()
-                .map(|uid| Request::StopSharingByUid { uid: uid.clone() })
-                .collect(),
-            gettext_noop("Couldn't stop sharing"),
-            move |ui| {
+            items,
+            text,
+            Rc::new(move |ui| {
                 forget_shared_by_me(ui, &stopped);
                 reload_listing(ui);
                 toast(ui, &done);
-            },
+            }),
         );
     });
     dialog.present(ui_window(ui).as_ref());
