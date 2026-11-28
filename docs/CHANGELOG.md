@@ -118,6 +118,13 @@ digest of what it sent (52).
   tried. If any did not go through, a summary names it, with the reason or "not tried yet", and
   offers to try only those again. If the service stopped answering, the page is reloaded first,
   so it shows which items really changed.
+- **Sign Out says what it could not finish.**
+  - If the service did not answer, the confirmation no longer reads as if no changes were waiting.
+    It says that this is not known.
+  - If your sign-in could not be removed from the keyring, a dialog says so and offers to try
+    again. Before, the sign-in page appeared while the sign-in was still saved.
+  - If Proton did not confirm that the session ended, a notice says where in your Proton account
+    you can end it.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different

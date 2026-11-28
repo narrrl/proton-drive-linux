@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-28 10:46+0100\n"
+"POT-Creation-Date: 2026-11-28 10:47+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Polish\n"
@@ -448,6 +448,7 @@ msgid "Copy Image"
 msgstr "Skopiuj obraz"
 
 #: crates/pdfs-gui/src/app/main.rs:1667
+#: crates/pdfs-gui/src/app/pages/login.rs:780
 #: crates/pdfs-gui/src/app/pages/shared.rs:1135
 #: crates/pdfs-gui/src/app/pages/status.rs:867
 msgid "Close"
@@ -3956,7 +3957,7 @@ msgstr "Otwórz stronę weryfikacji"
 msgid "Continue"
 msgstr "Kontynuuj"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:702
+#: crates/pdfs-gui/src/app/pages/login.rs:704
 msgid ""
 "Proton Drive will disconnect and stop syncing until you sign in again. Files "
 "already on this computer stay where they are."
@@ -3964,7 +3965,7 @@ msgstr ""
 "Proton Drive rozłączy się i przestanie synchronizować do czasu ponownego "
 "zalogowania. Pliki znajdujące się już na tym komputerze pozostaną na miejscu."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:706
+#: crates/pdfs-gui/src/app/pages/login.rs:709
 #, rust-format
 msgid ""
 "{n} change is not on Proton Drive yet. It stays on this computer and is sent "
@@ -3983,12 +3984,54 @@ msgstr[2] ""
 "zostaną wysłane po ponownym zalogowaniu."
 
 #: crates/pdfs-gui/src/app/pages/login.rs:715
+msgid ""
+"The Proton Drive service didn't answer, so it isn't known whether changes "
+"are still waiting to be sent. Any that are stay on this computer and are "
+"sent after you sign in again."
+msgstr ""
+"Usługa Proton Drive nie odpowiedziała, więc nie wiadomo, czy jakieś zmiany "
+"wciąż czekają na wysłanie. Takie zmiany zostają na tym komputerze i zostaną "
+"wysłane po ponownym zalogowaniu."
+
+#: crates/pdfs-gui/src/app/pages/login.rs:723
 msgid "Sign Out?"
 msgstr "Wylogować się?"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:717
+#: crates/pdfs-gui/src/app/pages/login.rs:725
 msgid "Sign Out"
 msgstr "Wyloguj się"
+
+#: crates/pdfs-gui/src/app/pages/login.rs:760
+msgid ""
+"Signed out on this computer. Proton didn't confirm that the session ended; "
+"you can end it in your Proton account's security settings."
+msgstr ""
+"Wylogowano na tym komputerze. Proton nie potwierdził zakończenia sesji; "
+"możesz ją zakończyć w ustawieniach bezpieczeństwa konta Proton."
+
+#: crates/pdfs-gui/src/app/pages/login.rs:773
+msgid "Sign-In Still Saved"
+msgstr "Logowanie nadal zapisane"
+
+#: crates/pdfs-gui/src/app/pages/login.rs:776
+#, rust-format
+msgid ""
+"Proton Drive stopped, but your sign-in couldn't be removed from this "
+"computer: {error}\n"
+"\n"
+"Until it is removed, Proton Drive may sign in again at the next start. "
+"Unlock your keyring, then try again."
+msgstr ""
+"Proton Drive został zatrzymany, ale nie udało się usunąć Twojego logowania z "
+"tego komputera: {error}\n"
+"\n"
+"Dopóki nie zostanie usunięte, Proton Drive może zalogować się ponownie przy "
+"następnym uruchomieniu. Odblokuj pęk kluczy i spróbuj ponownie."
+
+#: crates/pdfs-gui/src/app/pages/login.rs:781
+#: crates/pdfs-gui/src/app/pages/shared.rs:1136
+msgid "Try Again"
+msgstr "Spróbuj ponownie"
 
 #. Translators: badge on a photo tile whose shot includes a raw camera file.
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:211
@@ -5339,10 +5382,6 @@ msgstr "Jeszcze nie próbowano"
 #: crates/pdfs-gui/src/app/pages/shared.rs:1132
 msgid "These items did not go through:"
 msgstr "Te elementy nie zostały przetworzone:"
-
-#: crates/pdfs-gui/src/app/pages/shared.rs:1136
-msgid "Try Again"
-msgstr "Spróbuj ponownie"
 
 #: crates/pdfs-gui/src/app/pages/shared.rs:1154
 msgid "Remove Saved Link?"

@@ -682,32 +682,40 @@ pub(crate) fn sign_out(ui: &Rc<Ui>) {
     let rx = spawn_request(ui.dirs.control_socket(), Request::Status);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        // `None` when the service did not answer: then nobody knows whether
+        // changes are still waiting, which is not the same as none.
         let queued = match rx.recv().await {
             Ok(Ok(Response::Status {
                 pending_uploads,
                 pending_changes,
                 parked_uploads,
                 ..
-            })) => pending_uploads + pending_changes + parked_uploads,
-            _ => 0,
+            })) => Some(pending_uploads + pending_changes + parked_uploads),
+            _ => None,
         };
         confirm_sign_out(&ui, queued);
     });
 }
 
-fn confirm_sign_out(ui: &Rc<Ui>, queued: u64) {
+fn confirm_sign_out(ui: &Rc<Ui>, queued: Option<u64>) {
     let Some(window) = ui_window(ui) else { return };
     let ui = ui.clone();
     let mut body = gettext(
         "Proton Drive will disconnect and stop syncing until you sign in again. Files already on this computer stay where they are.",
     );
-    if queued > 0 {
-        let warning = ngettext_f(
+    let warning = match queued {
+        Some(0) => None,
+        Some(queued) => Some(ngettext_f(
             "{n} change is not on Proton Drive yet. It stays on this computer and is sent after you sign in again.",
             "{n} changes are not on Proton Drive yet. They stay on this computer and are sent after you sign in again.",
             queued,
             &[],
-        );
+        )),
+        None => Some(gettext(
+            "The Proton Drive service didn't answer, so it isn't known whether changes are still waiting to be sent. Any that are stay on this computer and are sent after you sign in again.",
+        )),
+    };
+    if let Some(warning) = warning {
         body = format!("{warning}\n\n{body}");
     }
     confirm_destructive(
@@ -720,22 +728,63 @@ fn confirm_sign_out(ui: &Rc<Ui>, queued: u64) {
             if let Some(galleries) = galleries {
                 galleries.reset();
             }
-            // systemctl and the keyring both block, so run them on a worker.
-            let ui = ui.clone();
-            glib::spawn_future_local(async move {
-                let result = gio::spawn_blocking(|| {
-                    service::disable_stop();
-                    auth::logout().map(|_| ()).map_err(|e| e.to_string())
-                })
-                .await;
-                if let Ok(Err(e)) = result {
-                    tracing::error!("logout failed: {e}");
-                }
-                *ui.session.borrow_mut() = None;
-                refresh(&ui);
-            });
+            sign_out_now(&ui);
         },
     );
+}
+
+/// Stop the service and forget the stored session, then say what happened.
+///
+/// Two parts can fail on their own. Proton may not confirm that the session
+/// ended, which leaves it listed in the account's security settings until it
+/// expires. Removing the sign-in from the keyring may fail, which leaves this
+/// computer signed in at the next start. The first is a notice, the second
+/// needs the user, so it stays on screen with a way to try again.
+fn sign_out_now(ui: &Rc<Ui>) {
+    // systemctl and the keyring both block, so run them on a worker.
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(|| {
+            service::disable_stop();
+            auth::logout().map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("the sign-out worker stopped".into()));
+        *ui.session.borrow_mut() = None;
+        refresh(&ui);
+        match result {
+            Ok(true) => {}
+            Ok(false) => toast(
+                &ui,
+                &gettext(
+                    "Signed out on this computer. Proton didn't confirm that the session ended; you can end it in your Proton account's security settings.",
+                ),
+            ),
+            Err(error) => {
+                tracing::error!("logout failed: {error}");
+                present_sign_out_failure(&ui, &error);
+            }
+        }
+    });
+}
+
+fn present_sign_out_failure(ui: &Rc<Ui>, error: &str) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Sign-In Still Saved"))
+        // Translators: {error} is the reason the keyring gave.
+        .body(gettext_f(
+            "Proton Drive stopped, but your sign-in couldn't be removed from this computer: {error}\n\nUntil it is removed, Proton Drive may sign in again at the next start. Unlock your keyring, then try again.",
+            &[("error", error)],
+        ))
+        .build();
+    dialog.add_response("close", &gettext("Close"));
+    dialog.add_response("again", &gettext("Try Again"));
+    dialog.set_response_appearance("again", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("again"));
+    dialog.set_close_response("close");
+    let ui_c = ui.clone();
+    dialog.connect_response(Some("again"), move |_, _| sign_out_now(&ui_c));
+    dialog.present(ui_window(ui).as_ref());
 }
 
 #[cfg(test)]
