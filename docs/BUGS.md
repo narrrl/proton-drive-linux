@@ -108,6 +108,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B306](#b306--a-change-made-as-its-nodes-create-lands-is-refused-with-permission-denied) | A change made as its node's create lands is refused with "Permission denied" |
 | [B305](#b305--a-mirrored-file-whose-upload-went-unanswered-gets-a-conflict-copy-of-its-own-edit) | A mirrored file whose upload went unanswered gets a conflict copy of its own edit |
 | [B304](#b304--a-write-released-while-its-files-create-lands-is-kept-as-a-conflict-copy) | A write released while its file's create lands is kept as a conflict copy |
 | [B303](#b303--a-file-made-where-a-withdrawn-create-was-listed-refuses-every-write) | A file made where a withdrawn create was listed refuses every write |
@@ -407,6 +408,32 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B306 — A change made as its node's create lands is refused with "Permission denied"
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-28, from two simulation failures on #204, a GUI-only change.
+`one_client_with_stale_hashes_and_reordered_echoes` seed 5: `write e.md` was kept in staging
+with "access changed before the staged write could be queued", and the queues did not drain.
+`a_move_blocked_by_trash_can_be_retried_after_restore`: `mkdir source/nested` right after
+`mkdir source` failed with `EACCES`. The evidence logging from #177 said
+`refused=Unknown persisted=Ok(Some(Owner)) live=[Owner]`. By the time the evidence was read,
+both authorities called the node writable.
+**Where:** `Db::effective_node_access` in `crates/pdfs-store/src/db/share_access.rs`
+
+**Cause.** B174's fix was incomplete. It finds a stand-in's row by local id, then checks that a
+row with the uid it found exists, then walks the ancestors. Each statement on a pooled reader is
+its own read, so each sees whatever was last committed. When a create landed between the first
+two, the first statement found the stand-in uid and the second checked a row that by then had
+Drive's uid. The answer was "no such node", which is `WriteAuthority::Unknown`, and the change
+was refused.
+
+**Fix.** The statements run in one read transaction, so they see one snapshot.
+
+**Verified:** `a_stand_in_is_never_missing_while_its_create_lands` lands 300 creates on a
+file-backed database while another thread asks for the stand-in's access. Without the fix it read
+the stand-in as missing 37 to 47 times in each of four runs. With the fix it read none in five
+runs.
 
 ### B305 — A mirrored file whose upload went unanswered gets a conflict copy of its own edit
 
@@ -4114,7 +4141,7 @@ tree does (B173's gap). A rename in between asked by the stand-in the tree still
 row under it, and was refused.
 
 **Fix.** A stand-in is looked up by its local id, so it finds its row before and after the
-create lands.
+create lands. The lookup still left a gap while the create landed, closed by B306.
 
 **Test:** `a_stand_in_keeps_its_access_once_its_create_has_landed` in
 `crates/pdfs-core/src/db/tests.rs`.

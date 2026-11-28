@@ -3726,6 +3726,66 @@ fn a_stand_in_keeps_its_access_once_its_create_has_landed() {
     );
 }
 
+/// A stand-in asked about while its create lands is never missing: the
+/// lookup that turns it into the landed row's uid and the check on that row
+/// see one state of the database (`docs/BUGS.md` B306).
+#[test]
+fn a_stand_in_is_never_missing_while_its_create_lands() {
+    let path = std::env::temp_dir().join(format!("pdfs-db-landing-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let db = Db::open(&path).unwrap();
+    db.upsert_node(&folder("parent", None, "My Files")).unwrap();
+    let parent = uid("parent").to_string();
+    let current = std::sync::Mutex::new(None::<NodeUid>);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let missing = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let Some(stand_in) = current.lock().unwrap().clone() else {
+                    std::thread::yield_now();
+                    continue;
+                };
+                if db.effective_node_access(&stand_in).unwrap().is_none() {
+                    missing.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        for n in 0..300 {
+            let name = format!("new-{n}.txt");
+            let lid = db.add_local_row(&parent, &name, false, 1).unwrap();
+            let local = local_uid(lid);
+            let stand_in = NodeUid::new(VolumeId::from("local"), LinkId::from(lid.to_string()));
+            let mut node = file(&format!("new-{n}"), "parent", &name, 1);
+            node.uid = stand_in.clone();
+            db.upsert_node(&node).unwrap();
+            let (id, _) = db
+                .enqueue_op(&op_on(OP_CREATE, &local, Some(&parent)))
+                .unwrap();
+            *current.lock().unwrap() = Some(stand_in);
+            db.claim_next_due_op(1).unwrap().unwrap();
+            let real = uid(&format!("real-{n}")).to_string();
+            db.finish_create(
+                id,
+                Some("/staging/create"),
+                &landing(&local, &real, &parent, &name),
+                |_| None,
+            )
+            .unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        missing.into_inner(),
+        0,
+        "a landing stand-in read as missing"
+    );
+}
+
 #[test]
 fn a_stand_in_folder_stays_listed_once_its_create_has_landed() {
     let db = Db::open_in_memory().unwrap();

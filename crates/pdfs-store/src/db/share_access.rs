@@ -100,8 +100,13 @@ impl Db {
     /// so it still does once its create has landed and the row has the uid
     /// Drive gave it. The tree learns that uid a moment later, and a rename in
     /// between was refused (`docs/BUGS.md` B174).
+    ///
+    /// Every statement reads one snapshot. Apart, a create that landed between
+    /// finding the row's uid and checking the row left the stand-in with no
+    /// row at all, and the change was refused (B306).
     pub fn effective_node_access(&self, uid: &NodeUid) -> Result<Option<Access>> {
-        let conn = self.read()?;
+        let reader = self.read()?;
+        let conn = reader.unchecked_transaction()?;
         let key = uid.to_string();
         let key = match super::local_lid(&key) {
             Some(lid) => conn
