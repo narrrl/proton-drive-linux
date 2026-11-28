@@ -2400,6 +2400,41 @@ pub struct Diagnostics {
     /// Empty from a daemon that predates the field.
     #[serde(default)]
     pub admission: Vec<AdmissionLoad>,
+    /// The mirror effects not settled yet: sent and waiting for an answer,
+    /// left unsure by a stop, or failed. `None` when the database did not
+    /// answer in time, or from a daemon that predates the field.
+    #[serde(default)]
+    pub effects: Option<EffectReport>,
+}
+
+/// The mirror effects not settled yet, in [`Diagnostics::effects`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectReport {
+    /// How many there are.
+    pub count: usize,
+    /// The oldest of them, at most [`EffectReport::SHOWN`].
+    pub oldest: Vec<EffectIntent>,
+}
+
+impl EffectReport {
+    /// How many effects a report lists.
+    pub const SHOWN: usize = 20;
+}
+
+/// One mirror effect not settled yet, in [`EffectReport::oldest`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectIntent {
+    pub folder_id: i64,
+    pub rel_path: String,
+    /// What it does, such as `upload`, `download` or `trash`.
+    pub kind: String,
+    /// `issued`, `unsure`, `retry` or `blocked`.
+    pub state: String,
+    /// How many times it was sent.
+    pub attempts: u32,
+    /// How long ago it was last sent.
+    pub age_secs: u64,
+    pub last_error: Option<String>,
 }
 
 /// One class of background step in the daemon's admission, in

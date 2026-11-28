@@ -331,7 +331,12 @@ What the parts mean:
   from; the apply step checks whether each already landed before it sends it. **`retried`**
   counts effects sent again after a failure, and **`superseded`** counts unsettled effects of
   earlier passes that were no longer needed. A `sync: an effect keeps failing` line names an
-  upload, download or folder that failed five times in a row.
+  upload, download, folder or deletion that failed five times in a row.
+  The `sync effects not settled` lines in `pdfs diagnostics` list the oldest of these effects
+  now, one per line, for example
+  `folder 2 trash Old/report.pdf: retry, sent 3 times, 12m4s ago (timed out)`. `issued` means
+  sent and waiting for an answer, `unsure` means a stopped daemon sent it and the next pass has
+  not looked yet, and `retry` or `blocked` means it failed.
 
 Please include these lines when you report a slow folder.
 

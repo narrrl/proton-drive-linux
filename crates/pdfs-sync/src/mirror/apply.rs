@@ -137,15 +137,24 @@ impl Syncer {
     /// Write the intent of `op` before it is sent (`effect`). In shadow: a
     /// failure to write it is logged, and the op is sent anyway.
     fn issue_intent(&self, folder_id: i64, op: &Pending) -> Option<StoredIntent> {
-        let (intent, before) = match self.store.sync_intent_issue(
-            folder_id,
-            op.rel(),
-            op.intent(),
-            now_secs(),
-        ) {
+        self.issue_effect(folder_id, op.rel(), op.intent())
+    }
+
+    /// Write the intent of an effect of `kind` on `rel` before it is sent,
+    /// for the ops that are not a [`Pending`], such as a deletion.
+    pub(super) fn issue_effect(
+        &self,
+        folder_id: i64,
+        rel: &str,
+        kind: &'static str,
+    ) -> Option<StoredIntent> {
+        let (intent, before) = match self
+            .store
+            .sync_intent_issue(folder_id, rel, kind, now_secs())
+        {
             Ok(issued) => issued,
             Err(e) => {
-                debug!(id = folder_id, rel = op.rel(), error = ?e, "sync: cannot record an intent");
+                debug!(id = folder_id, rel, error = ?e, "sync: cannot record an intent");
                 return None;
             }
         };
@@ -156,8 +165,8 @@ impl Syncer {
                 self.trace_count(Count::UnsureResent, 1);
                 info!(
                     id = folder_id,
-                    rel = op.rel(),
-                    kind = op.intent(),
+                    rel,
+                    kind,
                     attempts = intent.attempts,
                     "sync: sending again an effect a stopped daemon may have made"
                 );
@@ -170,17 +179,22 @@ impl Syncer {
         Some(intent)
     }
 
-    /// Settle or keep `intent` by how its op ended.
-    fn settle_intent(&self, intent: &StoredIntent, op: &Pending, result: &Result<Applied, String>) {
-        let written = match result {
-            Ok(_) => self.store.sync_intent_settle(intent.id),
-            Err(e) => {
+    /// Settle `intent` when its effect succeeded (`error` is `None`), or
+    /// keep it with the failure. No intent, when it could not be written,
+    /// does nothing.
+    pub(super) fn settle_effect(&self, intent: Option<&StoredIntent>, error: Option<&str>) {
+        let Some(intent) = intent else {
+            return;
+        };
+        let written = match error {
+            None => self.store.sync_intent_settle(intent.id),
+            Some(e) => {
                 let state = effect::failed(intent.attempts);
                 if state == EffectState::Blocked && intent.state != EffectState::Blocked.name() {
                     warn!(
                         id = intent.folder_id,
-                        rel = op.rel(),
-                        kind = op.intent(),
+                        rel = %intent.rel_path,
+                        kind = %intent.kind,
                         attempts = intent.attempts,
                         error = %e,
                         "sync: an effect keeps failing"
@@ -190,7 +204,12 @@ impl Syncer {
             }
         };
         if let Err(e) = written {
-            debug!(id = intent.folder_id, rel = op.rel(), error = ?e, "sync: cannot settle an intent");
+            debug!(
+                id = intent.folder_id,
+                rel = %intent.rel_path,
+                error = ?e,
+                "sync: cannot settle an intent"
+            );
         }
     }
 
@@ -294,9 +313,7 @@ impl Syncer {
         let step = Instant::now();
         let result = self.apply_one(folder_id, local_root, &op).await;
         self.trace_call(op.call(), step.elapsed());
-        if let Some(intent) = intent {
-            self.settle_intent(&intent, &op, &result);
-        }
+        self.settle_effect(intent.as_ref(), result.as_ref().err().map(String::as_str));
         self.progress_finished(folder_id);
         let name = base_name(op.rel());
         match &result {

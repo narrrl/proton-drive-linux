@@ -262,7 +262,10 @@ made again reaches Drive within a minute; the second fails without the inode che
 
 The second reducer, `pdfs_sync::effect`, follows one effect a mirror pass sends: a folder made on
 Drive, an upload, a new revision, a download, an adopted file or a conflict copy (the `Pending`
-ops). Before an op is sent, its intent is written to `sync_intent` (schema 51): one row per
+ops), and the deletions a pass makes: `trash` for a file or folder moved to Drive's trash because
+it went from disk, `delete-local` for one removed from disk because Drive deleted it. A folder Drive
+deleted that still holds something Drive never had is kept, and its intent settles: nothing is left
+to do about it. Before an op is sent, its intent is written to `sync_intent` (schema 51): one row per
 folder, path and kind, with the number of attempts and the time it was last sent. Its result
 decides what happens next:
 
@@ -302,13 +305,19 @@ that went unanswered.
 
 Otherwise nothing reads the intents to decide what to send. The apply step's own checks still
 decide whether an effect that may have landed is sent again (B266 for a create, B39 for a
-download). Deletions on either side are not recorded yet. Trace counts: `unsure resent`,
-`retried`, `superseded`.
+download). Trace counts: `unsure resent`, `retried`, `superseded`.
+
+`pdfs diagnostics` lists the intents not settled yet, oldest first (at most 20, with the count of
+all of them), with their kind, state, attempts, age and last error. The list is the
+`effects` field of the JSON report.
 
 **Tests:**
 - the `effect::tests` unit tests;
 - DB: `an_effect_intent_is_kept_until_it_is_settled_or_its_folder_changes`, and
   `an_upload_notes_each_digest_it_sent_once`;
+- sim `a_deletion_is_an_effect_until_it_lands`: a trash held on its way to Drive is listed
+  `issued` in `pdfs diagnostics`, and the list is empty once it lands, and once a file Drive
+  deleted is gone from disk;
 - sim `an_effect_left_unsure_by_a_stop_is_sent_again_or_settled`: of two uploads a stopped daemon
   left unsure, the one still needed is sent again and the other is settled;
 - sim `a_mirror_create_whose_reply_was_lost_is_adopted_after_a_restart_and_its_edit_lands`:

@@ -289,6 +289,29 @@ pub(super) fn admission_line(load: &pdfs_core::control::AdmissionLoad) -> String
     line
 }
 
+/// One mirror effect not settled yet in `pdfs diagnostics`:
+/// `folder 3 upload docs/a.txt: retry, sent 2 times, 5m0s ago (timed out)`.
+pub(super) fn effect_line(intent: &pdfs_core::control::EffectIntent) -> String {
+    let times = if intent.attempts == 1 {
+        "time"
+    } else {
+        "times"
+    };
+    let mut line = format!(
+        "folder {} {} {}: {}, sent {} {times}, {} ago",
+        intent.folder_id,
+        intent.kind,
+        intent.rel_path,
+        intent.state,
+        intent.attempts,
+        human_secs(intent.age_secs),
+    );
+    if let Some(error) = &intent.last_error {
+        line.push_str(&format!(" ({error})"));
+    }
+    line
+}
+
 /// A wait, in ms below a second, where most admission waits fall.
 fn wait_ms(ms: u64) -> String {
     if ms < 1000 {
@@ -396,6 +419,19 @@ pub(super) fn cmd_diagnostics() -> Result<()> {
                         "  {:<38} {:>7} files {:>5} failed  {:>9} ms total {:>7} ms longest",
                         stat.path, stat.count, stat.errors, stat.total_ms, stat.longest_ms,
                     );
+                }
+            }
+            match &d.effects {
+                None => {}
+                Some(effects) if effects.count == 0 => println!("sync effects not settled: none"),
+                Some(effects) => {
+                    println!("sync effects not settled: {} (oldest first)", effects.count);
+                    for intent in &effects.oldest {
+                        println!("  {}", effect_line(intent));
+                    }
+                    if effects.count > effects.oldest.len() {
+                        println!("  and {} more", effects.count - effects.oldest.len());
+                    }
                 }
             }
             if d.inflight.is_empty() {
@@ -526,9 +562,36 @@ pub(super) fn cmd_cache_inspect(deep: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use pdfs_core::control::AdmissionLoad;
+    use pdfs_core::control::{AdmissionLoad, EffectIntent};
 
-    use super::admission_line;
+    use super::{admission_line, effect_line};
+
+    #[test]
+    fn an_effect_line_says_what_waits_and_why() {
+        let intent = EffectIntent {
+            folder_id: 3,
+            rel_path: "docs/a.txt".into(),
+            kind: "upload".into(),
+            state: "retry".into(),
+            attempts: 2,
+            age_secs: 300,
+            last_error: Some("timed out".into()),
+        };
+        assert_eq!(
+            effect_line(&intent),
+            "folder 3 upload docs/a.txt: retry, sent 2 times, 5m0s ago (timed out)"
+        );
+        let sent = EffectIntent {
+            state: "issued".into(),
+            attempts: 1,
+            last_error: None,
+            ..intent
+        };
+        assert_eq!(
+            effect_line(&sent),
+            "folder 3 upload docs/a.txt: issued, sent 1 time, 5m0s ago"
+        );
+    }
 
     #[test]
     fn an_admission_line_says_who_waits_and_for_how_long() {
