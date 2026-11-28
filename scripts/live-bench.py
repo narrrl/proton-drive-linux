@@ -472,6 +472,28 @@ class Passes:
         return done
 
 
+def upload_paths(pdfs: Pdfs) -> dict[str, int]:
+    """Uploads since the daemon started, by the path the SDK took (`small` or
+    `blocks`), as `pdfs diagnostics` counts them. Empty from an older build."""
+    value = pdfs.json("diagnostics")
+
+    def find(node: object) -> list | None:
+        if isinstance(node, dict):
+            if isinstance(node.get("upload_paths"), list):
+                return node["upload_paths"]
+            for child in node.values():
+                found = find(child)
+                if found is not None:
+                    return found
+        return None
+
+    return {stat["path"]: stat["count"] for stat in find(value) or []}
+
+
+def since_then(now: dict[str, int], then: dict[str, int]) -> dict[str, int]:
+    return {path: count - then.get(path, 0) for path, count in now.items()}
+
+
 def phase_result(
     files: int, wall: float, cpu: float, requests: dict[str, int], passes: Passes, since: int
 ) -> dict:
@@ -503,6 +525,7 @@ def bench_small(
     try:
         stale = {json.dumps(t, sort_keys=True) for t in sync_state(pdfs).get("traces", [])}
         requests = Requests(work / "daemon.log")
+        paths_before = upload_paths(pdfs)
         cpu = cpu_seconds(daemon_pid)
         started = time.monotonic()
         pdfs.run("sync", "attach", "--to", name, str(local))
@@ -517,6 +540,8 @@ def bench_small(
         first = phase_result(
             uploads, done - started, cpu_seconds(daemon_pid) - cpu, requests.take(), passes, 0
         )
+        paths_after = upload_paths(pdfs)
+        first["upload_paths"] = since_then(paths_after, paths_before)
 
         edits = min(args.edits, files)
         edited = rng.sample(paths, edits)
@@ -531,6 +556,7 @@ def bench_small(
         edit = phase_result(
             edits, done - started, cpu_seconds(daemon_pid) - cpu, requests.take(), passes, since
         )
+        edit["upload_paths"] = since_then(upload_paths(pdfs), paths_after)
         # The counts say the edits were sent; a few read back say they landed.
         for path in edited[:3]:
             remote_path = f"{name}/{path.relative_to(local)}"
@@ -570,6 +596,9 @@ def print_small(result: dict) -> None:
             f"{r['requests_per_file']} requests/file over {r['passes']} passes"
         )
         print(f"           requests: {sent}")
+        if r.get("upload_paths"):
+            split = ", ".join(f"{k} {v}" for k, v in sorted(r["upload_paths"].items()))
+            print(f"           uploads by path: {split}")
 
 
 def refuse_without_instances(binary: str) -> None:

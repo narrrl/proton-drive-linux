@@ -389,6 +389,15 @@ pub(super) fn cmd_diagnostics() -> Result<()> {
                     );
                 }
             }
+            if d.upload_paths.iter().any(|stat| stat.count > 0) {
+                println!("uploads since start, by path:");
+                for stat in &d.upload_paths {
+                    println!(
+                        "  {:<38} {:>7} files {:>5} failed  {:>9} ms total {:>7} ms longest",
+                        stat.path, stat.count, stat.errors, stat.total_ms, stat.longest_ms,
+                    );
+                }
+            }
             if d.inflight.is_empty() {
                 println!("in-flight requests: none");
             } else {

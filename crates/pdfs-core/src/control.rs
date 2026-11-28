@@ -2374,6 +2374,11 @@ pub struct Diagnostics {
     /// field.
     #[serde(default)]
     pub drive_calls: Vec<DriveCallStat>,
+    /// Uploads since start, by how the SDK sent their content: `small` in one
+    /// request, `blocks` as a draft, its blocks and a commit. Empty from a
+    /// daemon that predates the field.
+    #[serde(default)]
+    pub upload_paths: Vec<UploadPathStat>,
     /// The daemon's long-lived threads, in start order, and whether each is
     /// still running. Empty from a daemon that predates the field.
     #[serde(default)]
@@ -2427,6 +2432,17 @@ pub struct ServiceState {
 pub struct DriveCallStat {
     /// The client method, such as `enumerate_folder_children_node_uids`.
     pub call: String,
+    pub count: u64,
+    pub errors: u64,
+    pub total_ms: u64,
+    pub longest_ms: u64,
+}
+
+/// Uploads that took one path, in [`Diagnostics::upload_paths`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct UploadPathStat {
+    /// `small` or `blocks`.
+    pub path: String,
     pub count: u64,
     pub errors: u64,
     pub total_ms: u64,

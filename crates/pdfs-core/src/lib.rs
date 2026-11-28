@@ -30,6 +30,7 @@ pub mod timestamp;
 pub mod transfers;
 pub mod tray;
 pub mod update;
+pub mod uploads;
 
 // Photo logic shared with Proton Gallery through the proton-rs crates.
 pub use proton_gallery_rs::{exiftime, places, similar, takeout};

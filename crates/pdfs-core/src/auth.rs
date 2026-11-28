@@ -38,7 +38,6 @@ use proton_sdk::error::ProtonError;
 use proton_sdk::http::Tokens;
 use proton_sdk::login::{self, LoginError, Step};
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
-use proton_sdk::telemetry::TracingTelemetry;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -771,7 +770,7 @@ async fn migrate_legacy(
 ///   default.
 fn tune(client: ProtonDriveClient, passphrases: &KeyPassphrases) -> ProtonDriveClient {
     let client = client
-        .with_telemetry(TracingTelemetry::shared())
+        .with_telemetry(crate::uploads::telemetry())
         .with_small_file_upload(true);
     match AppDirs::new().and_then(|dirs| crate::sdkcache::SdkCache::shared(&dirs)) {
         Ok(cache) => {
