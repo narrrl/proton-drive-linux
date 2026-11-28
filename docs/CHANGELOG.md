@@ -136,6 +136,11 @@ digest of what it sent (52).
   shows the address, and reopening the dialog hides it again. An expired link offers no Copy;
   "Edit Expiry" opens its settings instead. In Shared by me, an expired link's menu leads with
   "Edit Link Expiry…".
+- **Find Similar Photos counts files as well as photos.** A shot stored as a RAW and a JPEG moves
+  both to Trash. The footer now reads, for example, "Move 1 photo (2 files) to Trash", and each
+  card shows what its shot is stored as, such as "RAW + 1 more file". Each card says whether the
+  photo stays or moves to Trash, and each set's heading says how many of the set stay. A set wider
+  than the window still shows what happens to it.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different

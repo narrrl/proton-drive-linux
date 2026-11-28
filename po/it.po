@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-28 12:06+0100\n"
+"POT-Creation-Date: 2026-11-28 12:12+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Italian\n"
@@ -2016,6 +2016,7 @@ msgstr[1] "{n} cartelle"
 #. Translators: a count of images and videos that can have a thumbnail.
 #: crates/pdfs-gui/src/app/pages/browser.rs:1819
 #: crates/pdfs-gui/src/app/pages/browser.rs:3538
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:498
 #: crates/pdfs-gui/src/i18n.rs:303
 #, rust-format
 msgid "{n} file"
@@ -3009,14 +3010,14 @@ msgstr ""
 "deselezioni. Le foto che non tieni vengono spostate nel cestino, da dove "
 "puoi ripristinarle."
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:321
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:322
 #, rust-format
 msgid "{date}, {n} copy"
 msgid_plural "{date}, {n} copies"
 msgstr[0] "{date}, {n} copia"
 msgstr[1] "{date}, {n} copie"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:328
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:329
 #: crates/pdfs-gui/src/app/pages/photos.rs:4217
 #, rust-format
 msgid "{date}, {n} photo"
@@ -3024,21 +3025,57 @@ msgid_plural "{date}, {n} photos"
 msgstr[0] "{date}, {n} foto"
 msgstr[1] "{date}, {n} foto"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:362
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:453
 #, rust-format
 msgid "Move {n} copy to Trash"
 msgid_plural "Move {n} copies to Trash"
 msgstr[0] "Sposta {n} copia nel cestino"
 msgstr[1] "Sposta {n} copie nel cestino"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:368
+#. Translators: {n} is a number of photos, {files} how many files they are stored as (always more than {n}).
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:460
+#, rust-format
+msgid "Move {n} photo ({files} files) to Trash"
+msgid_plural "Move {n} photos ({files} files) to Trash"
+msgstr[0] "Sposta {n} foto ({files} file) nel cestino"
+msgstr[1] "Sposta {n} foto ({files} file) nel cestino"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:466
 #, rust-format
 msgid "Move {n} photo to Trash"
 msgid_plural "Move {n} photos to Trash"
 msgstr[0] "Sposta {n} foto nel cestino"
 msgstr[1] "Sposta {n} foto nel cestino"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:463
+#. Translators: {n} photos of a set of {total} stay; the rest go to Trash.
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:478
+#, rust-format
+msgid "Keeping {n} of {total}"
+msgid_plural "Keeping {n} of {total}"
+msgstr[0] "{n} di {total} tenuta"
+msgstr[1] "{n} di {total} tenute"
+
+#. Translators: a shot stored as a camera RAW file and others, such as its JPEG.
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:492
+#, rust-format
+msgid "RAW + {n} more file"
+msgid_plural "RAW + {n} more files"
+msgstr[0] "RAW + {n} altro file"
+msgstr[1] "RAW + altri {n} file"
+
+#. Translators: a photo in the duplicates review that stays.
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:507
+msgctxt "duplicates"
+msgid "Kept"
+msgstr "Tenuta"
+
+#. Translators: a photo in the duplicates review that goes to Trash.
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:510
+msgctxt "duplicates"
+msgid "Moves to Trash"
+msgstr "Va nel cestino"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:559
 msgid "Keep"
 msgstr "Tieni"
 
