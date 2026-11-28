@@ -14,6 +14,10 @@ pub(crate) struct TrashState {
     /// The bottom bar acting on the selection; revealed while anything is selected.
     pub(crate) selection_bar: gtk4::Revealer,
     pub(crate) selection_label: gtk4::Label,
+    /// The bar's actions, labelled for what they act on (see
+    /// [`sync_trash_selection`]).
+    pub(crate) restore_selected: gtk4::Button,
+    pub(crate) delete_selected: gtk4::Button,
     /// Runs the loads; the rows stay up while one runs.
     pub(crate) loader: Rc<Loader>,
     /// Back, the breadcrumb and the search entry over the list.
@@ -312,11 +316,13 @@ fn trash_entry_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
         && !in_trash(ui, &entry.uid)
         && let Some(folder) = outer_folder(ui)
     {
-        // Went to the trash with the folder, so only the folder goes back.
+        // Went to the trash with the folder, so only the folder goes back,
+        // and only the folder can be deleted for good.
+        menu.labelled_section(&gettext("Deleted with its folder"));
         let ui_c = ui.clone();
         let label = gettext_f(
             // Translators: {name} is a folder name.
-            "Restore “{name}”",
+            "Restore Folder “{name}”",
             &[("name", &folder.name)],
         );
         menu.item(&label, move || {
@@ -324,8 +330,16 @@ fn trash_entry_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
         });
         return menu;
     }
+    let restore = match location_key(&entry.uid) {
+        // A location row stands for everything deleted from that folder.
+        Some(_) => {
+            let n = trashed_targets(ui, std::slice::from_ref(entry)).len() as u64;
+            ngettext_f("Restore {n} Item", "Restore {n} Items", n, &[])
+        }
+        None => pgettext("verb", "Restore"),
+    };
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
-    menu.item(&pgettext("verb", "Restore"), move || {
+    menu.item(&restore, move || {
         restore_entries(&ui_c, std::slice::from_ref(&entry_c))
     });
     menu.section();
@@ -374,18 +388,52 @@ fn trash_background_menu(ui: &Rc<Ui>) -> ActionMenu {
     menu
 }
 
-/// Reveal the selection bar while anything is selected and count what is.
+/// Reveal the selection bar while anything is selected, count what is, and
+/// label its actions for what they act on, which is not always the selection.
 fn sync_trash_selection(ui: &Rc<Ui>) {
     let count = ui.trash.files.selection.selection().size() as usize;
     ui.trash.selection_bar.set_reveal_child(count > 0);
-    if count > 0 {
-        ui.trash.selection_label.set_label(&ngettext_f(
-            "{n} item selected",
-            "{n} items selected",
-            count as u64,
-            &[],
-        ));
+    if count == 0 {
+        return;
     }
+    ui.trash.selection_label.set_label(&ngettext_f(
+        "{n} item selected",
+        "{n} items selected",
+        count as u64,
+        &[],
+    ));
+    let selected = ui.trash.files.selected();
+    let targets = {
+        let all = ui.trash.all.borrow();
+        resolve_targets(&all, outer_folder(ui).as_ref(), &selected)
+    };
+    let (restore, deletable) = match (&targets.inherited, targets.own.len()) {
+        (Some(folder), 0) => (
+            // Translators: {name} is a folder name.
+            gettext_f("Restore Folder “{name}”", &[("name", &folder.name)]),
+            false,
+        ),
+        (inherited, own) if inherited.is_some() || own != count => {
+            let n = (own + usize::from(inherited.is_some())) as u64;
+            (
+                ngettext_f("Restore {n} Item", "Restore {n} Items", n, &[]),
+                own > 0,
+            )
+        }
+        _ => (pgettext("verb", "Restore"), true),
+    };
+    ui.trash.restore_selected.set_label(&restore);
+    let delete = &ui.trash.delete_selected;
+    delete.set_sensitive(deletable);
+    delete.set_tooltip_text(
+        (!deletable)
+            .then(|| {
+                gettext(
+                    "These went to the trash with their folder. Only the whole folder can be deleted permanently, from the top of the trash.",
+                )
+            })
+            .as_deref(),
+    );
 }
 
 /// Fetch the trash listing and repaint the page.
@@ -727,14 +775,24 @@ fn outer_folder(ui: &Ui) -> Option<DirEntry> {
     ui.trash.all.borrow().iter().find(|e| e.uid == uid).cloned()
 }
 
-/// What acting on `entries` acts on: a location row stands for everything
-/// deleted from that folder, and an item that went with its folder for the
-/// folder. Each node once.
-fn trashed_targets(ui: &Ui, entries: &[DirEntry]) -> Vec<DirEntry> {
-    let all = ui.trash.all.borrow();
-    let outer = outer_folder(ui);
+/// What acting on a selection acts on.
+#[derive(Debug, Default, PartialEq)]
+struct Targets {
+    /// The trashed items themselves: each selected item that is in the trash
+    /// on its own, and for a location row everything deleted from that folder.
+    own: Vec<DirEntry>,
+    /// The open trashed folder, when the selection holds items that went to
+    /// the trash with it. They can only go back with the folder, so a restore
+    /// restores it. A permanent deletion does not: deleting the folder for
+    /// good takes an explicit choice of the folder itself.
+    inherited: Option<DirEntry>,
+}
+
+/// Resolve `entries` against the trash listing `all`, inside `outer` when a
+/// trashed folder is open. Each node once.
+fn resolve_targets(all: &[DirEntry], outer: Option<&DirEntry>, entries: &[DirEntry]) -> Targets {
     let mut seen = HashSet::new();
-    let mut targets = Vec::new();
+    let mut targets = Targets::default();
     for entry in entries {
         let picked: Vec<DirEntry> = if let Some(key) = location_key(&entry.uid) {
             all.iter()
@@ -744,15 +802,36 @@ fn trashed_targets(ui: &Ui, entries: &[DirEntry]) -> Vec<DirEntry> {
         } else if all.iter().any(|e| e.uid == entry.uid) {
             vec![entry.clone()]
         } else {
-            outer.clone().into_iter().collect()
+            if targets.inherited.is_none() {
+                targets.inherited = outer.cloned();
+            }
+            Vec::new()
         };
         for target in picked {
             if seen.insert(target.uid.clone()) {
-                targets.push(target);
+                targets.own.push(target);
             }
         }
     }
+    // The folder may be selected too, at a level that shows it.
+    if let Some(folder) = &targets.inherited
+        && seen.contains(&folder.uid)
+    {
+        targets.inherited = None;
+    }
     targets
+}
+
+/// What a restore of `entries` restores: the items, and the open folder for
+/// those that went to the trash with it.
+fn trashed_targets(ui: &Ui, entries: &[DirEntry]) -> Vec<DirEntry> {
+    let targets = {
+        let all = ui.trash.all.borrow();
+        resolve_targets(&all, outer_folder(ui).as_ref(), entries)
+    };
+    let mut restore = targets.own;
+    restore.extend(targets.inherited);
+    restore
 }
 
 /// Rebuild the path bar for `nav`: "Trash", then each place down to the
@@ -850,9 +929,26 @@ fn common_origin(entries: &[DirEntry]) -> Option<String> {
 }
 
 /// Confirm, then permanently delete trashed entries. Irreversible, so it asks.
+///
+/// Only what was selected is deleted. An item that went to the trash with its
+/// folder cannot be deleted on its own, and is not taken to mean its folder.
 pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entries: &[DirEntry]) {
-    let entries = &trashed_targets(ui, entries)[..];
+    let targets = {
+        let all = ui.trash.all.borrow();
+        resolve_targets(&all, outer_folder(ui).as_ref(), entries)
+    };
+    let entries = &targets.own[..];
     if entries.is_empty() {
+        if let Some(folder) = targets.inherited {
+            toast(
+                ui,
+                // Translators: {name} is a folder name.
+                &gettext_f(
+                    "These went to the trash with “{name}”. Delete the whole folder from the top of the trash.",
+                    &[("name", &folder.name)],
+                ),
+            );
+        }
         return;
     }
     let win = ui_window(ui);
@@ -971,6 +1067,55 @@ mod tests {
             trashed_parent: Some(parent.into()),
             ..trashed(name, 5, 1, None)
         }
+    }
+
+    fn uids(entries: &[DirEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.uid.as_str()).collect()
+    }
+
+    #[test]
+    fn an_item_deleted_with_its_folder_restores_the_folder_and_deletes_nothing() {
+        let projects = DirEntry {
+            is_dir: true,
+            ..trashed("projects", 5, 1, Some("Work"))
+        };
+        let all = vec![projects.clone()];
+        // Two siblings inside the open trashed folder: neither is in the trash
+        // on its own.
+        let a = trashed("a.txt", 5, 1, None);
+        let b = trashed("b.txt", 5, 1, None);
+
+        let targets = resolve_targets(&all, Some(&projects), &[a, b]);
+
+        assert!(targets.own.is_empty(), "nothing of its own to delete");
+        assert_eq!(targets.inherited, Some(projects));
+    }
+
+    #[test]
+    fn a_location_row_stands_for_every_item_deleted_from_that_folder() {
+        let all = vec![
+            trashed("one", 3, 1, Some("Work")),
+            trashed("two", 2, 1, Some("Work")),
+            trashed("other", 1, 1, Some("Home")),
+            inside("nested", "one"),
+        ];
+        let row = location_row(Some("Work".into()));
+
+        let targets = resolve_targets(&all, None, &[row]);
+
+        assert_eq!(uids(&targets.own), ["one", "two"]);
+        assert_eq!(targets.inherited, None);
+    }
+
+    #[test]
+    fn a_selected_item_counts_once_and_stays_itself() {
+        let all = vec![trashed("one", 3, 1, Some("Work"))];
+        let one = all[0].clone();
+
+        let targets = resolve_targets(&all, None, &[one.clone(), one]);
+
+        assert_eq!(uids(&targets.own), ["one"]);
+        assert_eq!(targets.inherited, None);
     }
 
     #[test]
