@@ -130,11 +130,25 @@ pub(super) fn answer(ask: &Ask<'_>, request: CtlRequest) -> CtlResponse {
         },
         CtlRequest::RemoveSyncFolder { id, delete_remote } => {
             match core.remove_sync_folder(id, delete_remote) {
-                Ok(()) => {
+                Ok(None) => {
                     core.profile().touch_profile();
                     CtlResponse::Ok {
-                        message: "removed synced folder".to_string(),
+                        message: if delete_remote {
+                            "removed synced folder and moved its folder in Proton Drive to the trash"
+                        } else {
+                            "removed synced folder"
+                        }
+                        .to_string(),
                     }
+                }
+                // The folder no longer syncs, but its copy in Proton Drive is
+                // still there. That is not what was asked, so it is an error,
+                // and the message says which half happened.
+                Ok(Some(trash_error)) => {
+                    core.profile().touch_profile();
+                    CtlResponse::error(CoreError::remote(format!(
+                        "stopped syncing the folder, but its folder in Proton Drive was not moved to the trash: {trash_error}"
+                    )))
                 }
                 Err(e) => CtlResponse::error(e),
             }

@@ -765,9 +765,18 @@ impl Core {
         jobs
     }
 
-    /// Remove a synced folder from the sync set. `delete_remote` also deletes its
-    /// folder under the device root; otherwise the cloud copy is left in place.
-    pub(crate) fn remove_sync_folder(&self, id: i64, delete_remote: bool) -> CoreResult<()> {
+    /// Remove a synced folder from the sync set. `delete_remote` also moves its
+    /// folder under the device root to the trash; otherwise the cloud copy is
+    /// left in place.
+    ///
+    /// The folder is out of the sync set before the trash is asked, so a trash
+    /// that fails does not fail the removal. It comes back as `Some(error)`,
+    /// for the caller to say that the cloud copy is still there.
+    pub(crate) fn remove_sync_folder(
+        &self,
+        id: i64,
+        delete_remote: bool,
+    ) -> CoreResult<Option<String>> {
         let lock = self.sync.lock(id);
         // A pass holds the lock for as long as it runs, hours on a large
         // folder. Ask it to stop at its next checkpoint rather than wait it
@@ -823,16 +832,24 @@ impl Core {
         self.clear_sync_folder_paused(id);
         // Stop watching the folder we just dropped.
         let _ = self.sync.tx.send(sync::SyncMsg::Rewatch);
-        if delete_remote
-            && let Some(uid) = parse_uid(&folder.remote_uid)
-            && let Err(e) = self
-                .rt
-                .block_on(self.drive.trash_nodes(&[uid]))
-                .and_then(batch::into_unit)
-        {
-            warn!(id, error = %e, "delete remote device folder failed");
+        if !delete_remote {
+            return Ok(None);
         }
-        Ok(())
+        let Some(uid) = parse_uid(&folder.remote_uid) else {
+            warn!(id, remote = %folder.remote_uid, "delete remote device folder: bad uid");
+            return Ok(Some(format!("bad folder id {}", folder.remote_uid)));
+        };
+        match self
+            .rt
+            .block_on(self.drive.trash_nodes(&[uid]))
+            .and_then(batch::into_unit)
+        {
+            Ok(()) => Ok(None),
+            Err(e) => {
+                warn!(id, error = %e, "delete remote device folder failed");
+                Ok(Some(e.to_string()))
+            }
+        }
     }
 
     /// Trigger a reconcile: one folder by id, or every folder when `id` is `None`.

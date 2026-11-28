@@ -91,6 +91,12 @@ digest of what it sent (52).
   first pass, and whenever the change feed lost track (#53).
 
 ### Fixed
+- **Stopping a sync with "Also delete from Proton Drive" says that it deletes, and says so when
+  the deletion failed.** With the switch on, the dialog now reads "Stop Syncing and Delete
+  Folder?" and its button "Stop Syncing and Delete". If the folder stopped syncing but its folder
+  in Proton Drive could not be moved to the trash, for example while offline, the app and
+  `pdfs sync rm --delete-remote` now report an error that says so. Before, they reported plain
+  success, and the copy in Proton Drive stayed without a word.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different
