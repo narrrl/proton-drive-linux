@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-28 12:01+0100\n"
+"POT-Creation-Date: 2026-11-28 12:06+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Italian\n"
@@ -275,7 +275,7 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/shared.rs:952
 #: crates/pdfs-gui/src/app/pages/shared.rs:1161
 #: crates/pdfs-gui/src/app/pages/shared.rs:1202
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:551
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:559
 #: crates/pdfs-gui/src/app/pages/status.rs:641
 #: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:249
 #: crates/pdfs-gui/src/app/pages/takeout.rs:484
@@ -316,7 +316,7 @@ msgstr "Cerca in Drive"
 #: crates/pdfs-gui/src/app/pages/devices.rs:571
 #: crates/pdfs-gui/src/app/pages/drive_galleries.rs:949
 #: crates/pdfs-gui/src/app/pages/shared.rs:590
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:528
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:536
 #: crates/pdfs-gui/src/app/pages/trash.rs:380
 msgid "Refresh"
 msgstr "Aggiorna"
@@ -1050,7 +1050,7 @@ msgstr "Impossibile creare un collegamento a {name}"
 #. Translators: {name} is a file or folder name.
 #. Translators: {name} is the item's name.
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:213
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:559
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:567
 #, rust-format
 msgid "Stopped sharing {name}"
 msgstr "Condivisione di {name} interrotta"
@@ -1439,9 +1439,9 @@ msgstr "Impossibile caricare gli album"
 #: crates/pdfs-gui/src/app/pages/takeout.rs:535
 #: crates/pdfs-gui/src/app/pages/takeout.rs:759
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:523
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1089
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1124
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1162
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1144
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1179
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1217
 #: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:170
 #: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:381
 msgid "The Proton Drive service didn't respond."
@@ -1452,7 +1452,7 @@ msgstr "Il servizio di Proton Drive non ha risposto."
 #: crates/pdfs-gui/src/app/pages/devices.rs:547
 #: crates/pdfs-gui/src/app/pages/photos.rs:4438
 #: crates/pdfs-gui/src/app/pages/shared.rs:545
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:476
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:486
 #: crates/pdfs-gui/src/app/widgets/details.rs:157
 #: crates/pdfs-gui/src/app/widgets/details.rs:413
 #: crates/pdfs-gui/src/hud/preview.rs:277
@@ -1735,7 +1735,7 @@ msgstr "Dimensione icone"
 #: crates/pdfs-gui/src/app/pages/devices.rs:556
 #: crates/pdfs-gui/src/app/pages/photos.rs:3019
 #: crates/pdfs-gui/src/app/pages/shared.rs:569
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:509
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:517
 #: crates/pdfs-gui/src/app/pages/trash.rs:356
 #, rust-format
 msgid "{n} selected"
@@ -1877,7 +1877,7 @@ msgstr "Condividi…"
 
 #: crates/pdfs-gui/src/app/pages/browser.rs:941
 #: crates/pdfs-gui/src/app/pages/shared.rs:895
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:492
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:500
 #: crates/pdfs-gui/src/app/widgets/details.rs:130
 msgid "Copy Link"
 msgstr "Copia collegamento"
@@ -1913,7 +1913,7 @@ msgstr "Nuova cartella…"
 #: crates/pdfs-gui/src/app/pages/browser.rs:1027
 #: crates/pdfs-gui/src/app/pages/devices.rs:567
 #: crates/pdfs-gui/src/app/pages/shared.rs:586
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:524
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:532
 #: crates/pdfs-gui/src/app/pages/trash.rs:376
 msgid "Select All"
 msgstr "Seleziona tutto"
@@ -1934,8 +1934,8 @@ msgstr "«Apri con» richiede che il servizio di Proton Drive sia in esecuzione.
 #: crates/pdfs-gui/src/app/pages/browser.rs:1091
 #: crates/pdfs-gui/src/app/pages/shared.rs:897
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:215
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:494
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:707
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:502
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:747
 msgid "Link copied"
 msgstr "Collegamento copiato"
 
@@ -3700,7 +3700,7 @@ msgid "Email or username"
 msgstr "Email o nome utente"
 
 #: crates/pdfs-gui/src/app/pages/login.rs:35
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:966
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1021
 msgid "Password"
 msgstr "Password"
 
@@ -5098,7 +5098,7 @@ msgid "Nothing has been added to this shared folder yet."
 msgstr "Non è stato ancora aggiunto nulla a questa cartella condivisa."
 
 #: crates/pdfs-gui/src/app/pages/shared.rs:551
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:480
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:490
 msgid "Show in My Files"
 msgstr "Mostra in I miei file"
 
@@ -5318,7 +5318,7 @@ msgid "Link removed"
 msgstr "Collegamento rimosso"
 
 #: crates/pdfs-gui/src/app/pages/shared.rs:1176
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:736
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:776
 msgid "Couldn't remove the link"
 msgstr "Impossibile rimuovere il collegamento"
 
@@ -5377,7 +5377,7 @@ msgid "People"
 msgstr "Persone"
 
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:198
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:698
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:738
 msgid "Copy link"
 msgstr "Copia collegamento"
 
@@ -5453,20 +5453,24 @@ msgstr "Nessun elemento corrispondente"
 msgid "None of your shared items match this filter."
 msgstr "Nessuno dei tuoi elementi condivisi corrisponde a questo filtro."
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:470
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:475
+msgid "Edit Link Expiry…"
+msgstr "Modifica la scadenza del collegamento…"
+
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:480
 msgid "Manage Access…"
 msgstr "Gestisci accesso…"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:496
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:504
 msgid "Open Link"
 msgstr "Apri collegamento"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:500
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:515
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:508
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:523
 msgid "Stop Sharing…"
 msgstr "Interrompi condivisione…"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:537
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:545
 #, rust-format
 msgid ""
 "Everyone you invited loses access to “{name}”, pending invitations are "
@@ -5475,7 +5479,7 @@ msgstr ""
 "Tutte le persone invitate perdono l'accesso a “{name}”, gli inviti in "
 "sospeso vengono ritirati e il suo collegamento pubblico smette di funzionare."
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:541
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:549
 #, rust-format
 msgid ""
 "Everyone you invited loses access to {n} item, pending invitations are "
@@ -5491,26 +5495,26 @@ msgstr[1] ""
 "sospeso vengono ritirati e i loro collegamenti pubblici smettono di "
 "funzionare."
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:548
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:556
 msgid "Stop Sharing?"
 msgstr "Interrompere la condivisione?"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:552
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:560
 msgid "Stop Sharing"
 msgstr "Interrompi condivisione"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:561
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:569
 #, rust-format
 msgid "Stopped sharing {n} item"
 msgid_plural "Stopped sharing {n} items"
 msgstr[0] "Condivisione di {n} elemento interrotta"
 msgstr[1] "Condivisione di {n} elementi interrotta"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:583
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:591
 msgid "Couldn't stop sharing"
 msgstr "Impossibile interrompere la condivisione"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:586
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:594
 #, rust-format
 msgid "Stopped Sharing {went} of {n} Item"
 msgid_plural "Stopped Sharing {went} of {n} Items"
@@ -7023,7 +7027,6 @@ msgid "People with access"
 msgstr "Persone con accesso"
 
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:400
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:686
 msgid "Public link"
 msgstr "Collegamento pubblico"
 
@@ -7081,26 +7084,28 @@ msgstr "Accesso rimosso"
 msgid "Couldn't remove access"
 msgstr "Impossibile rimuovere l'accesso"
 
-#. Translators: {role} is the link's role, such as "Viewer".
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:675
-#, rust-format
-msgid "Anyone with the link ({role})"
-msgstr "Chiunque abbia il collegamento ({role})"
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:704
+msgid "Edit Expiry"
+msgstr "Modifica scadenza"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:678
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:905
-msgid "password-protected"
-msgstr "protetto da password"
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:716
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:731
+msgid "Show link address"
+msgstr "Mostra l’indirizzo del collegamento"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:714
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:729
+msgid "Hide link address"
+msgstr "Nascondi l’indirizzo del collegamento"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:754
 msgid "Remove link"
 msgstr "Rimuovi collegamento"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:728
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:768
 msgid "Remove Public Link?"
 msgstr "Rimuovere il collegamento pubblico?"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:729
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:769
 msgid ""
 "The link stops working for everyone who has it. A new link will have a "
 "different address."
@@ -7108,57 +7113,73 @@ msgstr ""
 "Il collegamento smette di funzionare per chiunque lo abbia. Un nuovo "
 "collegamento avrà un indirizzo diverso."
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:730
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:770
 msgid "Remove Link"
 msgstr "Rimuovi collegamento"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:735
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:775
 msgid "Public link removed"
 msgstr "Collegamento pubblico rimosso"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:753
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:946
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:793
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1001
 msgid "Link role"
 msgstr "Ruolo del collegamento"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:755
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:795
 msgid "Password (optional)"
 msgstr "Password (facoltativa)"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:759
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:952
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:799
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1007
 msgid "Expires"
 msgstr "Scadenza"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:763
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:803
 msgid "The new link"
 msgstr "Il nuovo collegamento"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:768
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:808
 msgid "Create Public Link"
 msgstr "Crea collegamento pubblico"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:900
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:941
+msgid "Expired public link"
+msgstr "Collegamento pubblico scaduto"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:942
+msgid "Public editor link"
+msgstr "Collegamento pubblico per la modifica"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:943
+msgid "Public viewer link"
+msgstr "Collegamento pubblico per la visualizzazione"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:950
 msgid "Anyone with the link can edit"
 msgstr "Chiunque abbia il collegamento può modificare"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:902
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:952
 msgid "Anyone with the link can view"
 msgstr "Chiunque abbia il collegamento può visualizzare"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:907
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:955
+msgid "password-protected"
+msgstr "protetto da password"
+
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:957
 msgid "no password"
 msgstr "nessuna password"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:911
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:961
 msgid "never expires"
 msgstr "non scade mai"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:938
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:993
 msgid "Link settings"
 msgstr "Impostazioni del collegamento"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:940
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:995
 msgid ""
 "Change who can edit, the password or the expiry, then save. The link stays "
 "the same."
@@ -7166,61 +7187,61 @@ msgstr ""
 "Cambia chi può modificare, la password o la scadenza, poi salva. Il "
 "collegamento resta lo stesso."
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:958
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1013
 msgid "Require a password"
 msgstr "Richiedi una password"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:964
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1019
 msgid "New password (optional)"
 msgstr "Nuova password (facoltativa)"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:974
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:995
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1029
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1050
 msgid "No changes"
 msgstr "Nessuna modifica"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:979
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1034
 msgid "Save Link Settings"
 msgstr "Salva impostazioni del collegamento"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1000
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1055
 msgid "After saving"
 msgstr "Dopo il salvataggio"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1005
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1060
 msgid "Enter a password to save"
 msgstr "Inserisci una password per salvare"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1082
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1137
 msgid "Link updated"
 msgstr "Collegamento aggiornato"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1084
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1088
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1139
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1143
 msgid "Couldn't change the link"
 msgstr "Impossibile modificare il collegamento"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1115
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1170
 msgid "Public link created"
 msgstr "Collegamento pubblico creato"
 
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1119
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1123
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1174
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1178
 msgid "Couldn't create the link"
 msgstr "Impossibile creare il collegamento"
 
 #. Translators: a public link past its expiry date.
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1175
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1230
 msgid "expired"
 msgstr "scaduto"
 
 #. Translators: strftime format for a link's expiry date; "%x" is the locale's date, such as "09/23/26".
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1178
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1233
 msgid "%x"
 msgstr "%x"
 
 #. Translators: {date} is the date a public link stops working.
-#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1185
+#: crates/pdfs-gui/src/app/widgets/share_dialog.rs:1240
 #, rust-format
 msgid "expires {date}"
 msgstr "scade il {date}"
@@ -7738,6 +7759,10 @@ msgstr "{count} a"
 #, rust-format
 msgid "cannot reach the Proton Drive daemon: {error}"
 msgstr "impossibile raggiungere il demone di Proton Drive: {error}"
+
+#, rust-format
+#~ msgid "Anyone with the link ({role})"
+#~ msgstr "Chiunque abbia il collegamento ({role})"
 
 #~ msgid "Add a password"
 #~ msgstr "Aggiungi una password"

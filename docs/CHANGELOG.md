@@ -131,6 +131,11 @@ digest of what it sent (52).
   the expiry are sent together by "Save Link Settings". Above that button is a line that says how
   the link will work. Closing the dialog sends nothing. When you create a link, Enter in the
   password field moves on to Expires instead of creating the link.
+- **The Share dialog no longer shows a public link's address until you ask.** The row is titled by
+  what the link does, for example "Public viewer link", with how it works below. The eye button
+  shows the address, and reopening the dialog hides it again. An expired link offers no Copy;
+  "Edit Expiry" opens its settings instead. In Shared by me, an expired link's menu leads with
+  "Edit Link Expiry…".
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different
