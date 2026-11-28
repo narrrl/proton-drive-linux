@@ -67,7 +67,7 @@ use proton_drive_rs::{
 use sha1::{Digest as _, Sha1};
 
 use super::rng::Rng;
-use crate::{DriveApi, NodeOutcomes, OutcomeStream, RevisionRead};
+use crate::{DriveApi, NodeOutcomes, OutcomeStream, RevisionRead, RevisionUpload, SealedUpload};
 
 /// The volume every fake node lives on.
 pub const VOLUME: &str = "simvol";
@@ -1529,6 +1529,57 @@ impl DriveApi for FakeClient {
             *self.0.lose_read.lock() = Some(file_uid.clone());
         }
         Ok(())
+    }
+
+    async fn upload_new_revision_over_dyn(
+        &self,
+        file_uid: &NodeUid,
+        expected: &str,
+        reader: &mut (dyn Read + Send),
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<i64>,
+    ) -> Result<RevisionUpload> {
+        // The SDK reads the file's link for its keys and checks the revision
+        // on that read, so it is held, lags and counts like any other read.
+        self.wait_if_held(&self.0.hold, std::slice::from_ref(file_uid))
+            .await;
+        let lag = self.lag();
+        let seen = self
+            .request(false, |server| {
+                Ok(server
+                    .visible(file_uid, lag, Instant::now())
+                    .map(|remote| (remote.trashed, remote.file.map(|file| file.revision))))
+            })
+            .await?;
+        match seen {
+            None => return Err(api(ResponseCode::DoesNotExist, "file not found")),
+            Some((true, _)) => return Ok(RevisionUpload::Trashed),
+            Some((false, revision)) if revision.as_deref() != Some(expected) => {
+                return Ok(RevisionUpload::Moved);
+            }
+            Some(_) => {}
+        }
+        self.upload_new_revision_from_dyn(
+            file_uid,
+            reader,
+            intended_size,
+            thumbnails,
+            last_modification_time,
+        )
+        .await?;
+        let revision_id = self
+            .0
+            .drive
+            .server
+            .lock()
+            .current(file_uid)
+            .and_then(|remote| remote.file.as_ref().map(|file| file.revision.clone()))
+            .unwrap_or_default();
+        Ok(RevisionUpload::Sealed(SealedUpload {
+            node_uid: file_uid.clone(),
+            revision_id,
+        }))
     }
 
     async fn open_revision(&self, uid: &NodeUid) -> Result<Arc<dyn RevisionRead>> {

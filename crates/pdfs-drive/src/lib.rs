@@ -33,6 +33,8 @@ use proton_drive_rs::{
     NodeMoveItem, ProtonDriveClient, RevisionReader, Thumbnail, ThumbnailType, TrashedNode,
 };
 
+pub use proton_drive_rs::{RevisionUpload, SealedUpload};
+
 pub mod counted;
 pub mod digest;
 
@@ -119,6 +121,18 @@ pub trait DriveApi: Send + Sync {
         thumbnails: Vec<Thumbnail>,
         last_modification_time: Option<i64>,
     ) -> Result<()>;
+
+    /// A new revision of `file_uid`, only over the revision `expected`. See
+    /// [`ProtonDriveClient::upload_new_revision_over`].
+    async fn upload_new_revision_over_dyn(
+        &self,
+        file_uid: &NodeUid,
+        expected: &str,
+        reader: &mut (dyn Read + Send),
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<i64>,
+    ) -> Result<RevisionUpload>;
 
     async fn open_revision(&self, uid: &NodeUid) -> Result<Arc<dyn RevisionRead>>;
 
@@ -279,6 +293,26 @@ impl dyn DriveApi {
     ) -> Result<()> {
         self.upload_new_revision_from_dyn(
             file_uid,
+            &mut reader,
+            intended_size,
+            thumbnails,
+            last_modification_time,
+        )
+        .await
+    }
+
+    pub async fn upload_new_revision_over<R: Read + Send>(
+        &self,
+        file_uid: &NodeUid,
+        expected: &str,
+        mut reader: R,
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<i64>,
+    ) -> Result<RevisionUpload> {
+        self.upload_new_revision_over_dyn(
+            file_uid,
+            expected,
             &mut reader,
             intended_size,
             thumbnails,
@@ -460,6 +494,27 @@ impl DriveApi for ProtonDriveClient {
         ProtonDriveClient::upload_new_revision_from(
             self,
             file_uid,
+            reader,
+            intended_size,
+            thumbnails,
+            last_modification_time.and_then(pdfs_core::timestamp::modification_time),
+        )
+        .await
+    }
+
+    async fn upload_new_revision_over_dyn(
+        &self,
+        file_uid: &NodeUid,
+        expected: &str,
+        reader: &mut (dyn Read + Send),
+        intended_size: i64,
+        thumbnails: Vec<Thumbnail>,
+        last_modification_time: Option<i64>,
+    ) -> Result<RevisionUpload> {
+        ProtonDriveClient::upload_new_revision_over(
+            self,
+            file_uid,
+            expected,
             reader,
             intended_size,
             thumbnails,
