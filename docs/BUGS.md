@@ -443,11 +443,12 @@ as listings already do.
 without the fix (`left: 23, right: 16`) and passes with it. The seed-4 loop under load has not
 been rerun on the fix yet.
 
-The third failure, run 59, is not this one. There the edit to `a.txt` landed only as a conflict
-copy ("based on revision rev2, remote now at rev5"), so the file on Drive kept its 23-byte
-revision. That is how [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy)
-looks, and the race in `place_landed` above may also leave a queued write with an old baseline.
-Not checked.
+The third failure, run 59, is likely the same cause by another route. The edit to `a.txt`
+landed only as a conflict copy ("based on revision rev2, remote now at rev5"). The handle had
+started at the tree's 23 bytes over the queued 8, so the hole at `[8, 12)` was unauthored and
+the write was queued with `complete: false`. `is_own_self_supersede` only chains a complete write
+onto a revision this daemon sealed, so the incomplete one forked. With the length fixed, the hole
+counts as written and the write is complete.
 
 ---
 
