@@ -37,6 +37,7 @@ impl Core {
                     .filter(|path| !path.is_empty())
                     .or_else(|| op.name.clone())
                     .unwrap_or_else(|| op.uid.clone());
+                let local_only = parse_node_uid(&op.uid).is_some_and(|uid| is_local_uid(&uid));
                 PendingOpInfo {
                     id: op.id,
                     kind: op.kind,
@@ -49,6 +50,8 @@ impl Core {
                     failing: op.attempts >= FAILING_ATTEMPTS || issues.contains_key(&op.id),
                     issue: issues.get(&op.id).map(|issue| SyncIssue::parse(issue)),
                     exportable,
+                    node: op.uid,
+                    local_only,
                 }
             })
             .collect())

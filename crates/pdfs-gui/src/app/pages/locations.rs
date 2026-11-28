@@ -671,15 +671,34 @@ fn repaint_queue(ui: &Rc<Ui>, items: &[PendingOpInfo]) {
         .map(|now| now.to_unix())
         .unwrap_or_default();
     let mut rows = queue.rows.borrow_mut();
-    for op in items.into_iter().take(QUEUE_ROWS_SHOWN) {
-        let row = queue_row(ui, op, now);
+    for op in items.iter().copied().take(QUEUE_ROWS_SHOWN) {
+        let scope = discard_scope(op, &items);
+        let row = queue_row(ui, op, &scope, now);
         queue.group.add(&row);
         rows.push(row);
     }
 }
 
-fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
-    let (icon, action) = match op.kind.as_str() {
+/// The queued ops a discard of `op` drops: every op on the same node, `op`
+/// first and the rest in queue order. The daemon drops them all, since each
+/// was made on top of the one before.
+fn discard_scope<'a>(op: &'a PendingOpInfo, all: &[&'a PendingOpInfo]) -> Vec<&'a PendingOpInfo> {
+    let mut scope = vec![op];
+    if !op.node.is_empty() {
+        let mut others: Vec<&PendingOpInfo> = all
+            .iter()
+            .copied()
+            .filter(|other| other.node == op.node && other.id != op.id)
+            .collect();
+        others.sort_by_key(|other| other.id);
+        scope.extend(others);
+    }
+    scope
+}
+
+/// A queued op's kind, as an icon and a short action.
+fn op_action(kind: &str) -> (&'static str, String) {
+    match kind {
         "revision" => ("pdfs-upload-symbolic", gettext("Upload changes")),
         "create" => ("pdfs-upload-symbolic", gettext("Upload new file")),
         "mkdir" => ("folder-new-symbolic", gettext("Create folder")),
@@ -687,7 +706,28 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
         "trash" => ("user-trash-symbolic", gettext("Move to trash")),
         // Translators: a queued change of an unknown kind.
         _ => ("pdfs-sync-symbolic", pgettext("noun", "Change")),
-    };
+    }
+}
+
+/// What the discard dialog needs to say about one discard.
+#[derive(Clone)]
+struct DiscardScope {
+    id: i64,
+    path: String,
+    /// The op whose content can be exported, if any of them carries some.
+    exportable: Option<i64>,
+    local_only: bool,
+    /// Each dropped op's action, the asked one first.
+    actions: Vec<String>,
+}
+
+fn queue_row(
+    ui: &Rc<Ui>,
+    op: &PendingOpInfo,
+    scope: &[&PendingOpInfo],
+    now: i64,
+) -> adw::ActionRow {
+    let (icon, action) = op_action(&op.kind);
     let state = match (op.parked, op.next_attempt_at) {
         (true, _) => gettext("waiting for the app writing it to finish"),
         (false, Some(at)) if at > now && op.attempts > 0 => {
@@ -769,10 +809,15 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
             .build();
         discard.add_css_class("flat");
         let ui = ui.clone();
-        let id = op.id;
-        let path = op.path.clone();
-        let exportable = op.exportable;
-        discard.connect_clicked(move |_| prompt_discard_queued(&ui, id, &path, exportable));
+        let scope = DiscardScope {
+            id: op.id,
+            path: op.path.clone(),
+            // The newest content is the version the user would lose.
+            exportable: scope.iter().rev().find(|op| op.exportable).map(|op| op.id),
+            local_only: op.local_only,
+            actions: scope.iter().map(|op| op_action(&op.kind).1).collect(),
+        };
+        discard.connect_clicked(move |_| prompt_discard_queued(&ui, &scope));
         row.add_suffix(&discard);
     }
     row
@@ -844,35 +889,77 @@ fn prompt_export_queued(ui: &Rc<Ui>, id: i64, name: &str) {
 }
 
 /// Confirm, then have the daemon drop a queued change and undo it here.
-fn prompt_discard_queued(ui: &Rc<Ui>, id: i64, path: &str, exportable: bool) {
-    let body = if exportable {
-        // Translators: {path} is the file whose queued change would be dropped.
+///
+/// The daemon drops every change queued on the same file or folder, so the
+/// dialog lists them all, says whether the item goes back to how Proton Drive
+/// has it or disappears from this computer, and offers the export first.
+fn prompt_discard_queued(ui: &Rc<Ui>, scope: &DiscardScope) {
+    let name = Path::new(&scope.path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| scope.path.clone());
+    let count = scope.actions.len() as u64;
+    let outcome = if scope.local_only {
+        // Translators: {path} is a file or folder made on this computer that never reached Proton Drive.
         gettext_f(
-            "Your changes to {path} are undone here and never reach Proton Drive. Export the file first to keep your version.",
-            &[("path", path)],
+            "{path} was made on this computer and is not on Proton Drive yet. Discarding removes it from this computer.",
+            &[("path", &scope.path)],
         )
     } else {
-        // Translators: {path} is the file or folder whose queued change would be dropped.
+        // Translators: {path} is a file or folder that is on Proton Drive.
         gettext_f(
-            "The change to {path} is undone here and never reaches Proton Drive.",
-            &[("path", path)],
+            "{path} goes back to how it is on Proton Drive, and the changes below are undone here.",
+            &[("path", &scope.path)],
         )
     };
+    let body = if scope.exportable.is_some() {
+        format!(
+            "{outcome}\n\n{}",
+            gettext("Export the file first to keep your version.")
+        )
+    } else {
+        outcome
+    };
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Discard Change?"))
+        // Translators: {name} is the file or folder name, {n} how many queued changes a discard drops.
+        .heading(ngettext_f(
+            "Discard the Change to “{name}”?",
+            "Discard {n} Changes to “{name}”?",
+            count,
+            &[("name", &name)],
+        ))
         .body(body)
         .build();
+    let list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    for action in &scope.actions {
+        list.append(&adw::ActionRow::builder().title(action.as_str()).build());
+    }
+    dialog.set_extra_child(Some(&list));
     dialog.add_response("cancel", &gettext("Cancel"));
-    dialog.add_response("discard", &gettext("Discard"));
+    if scope.exportable.is_some() {
+        dialog.add_response("export", &gettext("Export My Version…"));
+    }
+    dialog.add_response(
+        "discard",
+        &ngettext_f("Discard Change", "Discard {n} Changes", count, &[]),
+    );
     dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
     let window = ui_window(ui);
     let ui = ui.clone();
-    dialog.connect_response(None, move |_, resp| {
-        if resp == "discard" {
-            discard_queued(&ui, id);
+    let scope = scope.clone();
+    dialog.connect_response(None, move |_, resp| match resp {
+        "discard" => discard_queued(&ui, scope.id),
+        "export" => {
+            if let Some(id) = scope.exportable {
+                prompt_export_queued(&ui, id, &name);
+            }
         }
+        _ => {}
     });
     dialog.present(window.as_ref());
 }
@@ -1785,6 +1872,51 @@ pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued(id: i64, kind: &str, node: &str) -> PendingOpInfo {
+        PendingOpInfo {
+            id,
+            kind: kind.into(),
+            path: "Docs/report.odt".into(),
+            attempts: 0,
+            last_error: None,
+            queued_at: 0,
+            next_attempt_at: None,
+            parked: false,
+            failing: true,
+            issue: None,
+            exportable: kind == "revision",
+            node: node.into(),
+            local_only: false,
+        }
+    }
+
+    #[test]
+    fn a_discard_names_every_change_queued_on_the_same_node() {
+        let rename = queued(9, "rename", "vol~a");
+        let edit = queued(4, "revision", "vol~a");
+        let other = queued(5, "revision", "vol~b");
+        let all = [&rename, &edit, &other];
+
+        let scope: Vec<i64> = discard_scope(&rename, &all)
+            .iter()
+            .map(|op| op.id)
+            .collect();
+        assert_eq!(
+            scope,
+            [9, 4],
+            "the asked change first, then the rest by age"
+        );
+    }
+
+    #[test]
+    fn a_discard_from_an_older_daemon_names_only_its_own_change() {
+        let rename = queued(9, "rename", "");
+        let edit = queued(4, "revision", "");
+        let all = [&rename, &edit];
+
+        assert_eq!(discard_scope(&rename, &all).len(), 1);
+    }
 
     fn spec(kind: MountKind, mode: MountMode, mounted: bool) -> MountSpec {
         MountSpec {

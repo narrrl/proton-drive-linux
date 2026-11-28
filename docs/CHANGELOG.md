@@ -97,6 +97,10 @@ digest of what it sent (52).
   in Proton Drive could not be moved to the trash, for example while offline, the app and
   `pdfs sync rm --delete-remote` now report an error that says so. Before, they reported plain
   success, and the copy in Proton Drive stayed without a word.
+- **Discarding a queued change lists every change it undoes.** A discard drops every change
+  queued on the same file or folder, but the dialog spoke of one change. It now lists them all,
+  says whether the item goes back to how Proton Drive has it or is removed from this computer,
+  and offers "Export My Version…" when the change carries file content.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different
