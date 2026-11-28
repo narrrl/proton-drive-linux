@@ -101,6 +101,11 @@ digest of what it sent (52).
   queued on the same file or folder, but the dialog spoke of one change. It now lists them all,
   says whether the item goes back to how Proton Drive has it or is removed from this computer,
   and offers "Export My Version…" when the change carries file content.
+- **A file or folder changed just as its upload finishes is no longer refused with "Permission
+  denied".** For a moment after Proton Drive took a new file or folder, the mount could find no
+  record of it and refused the change: a write was kept in staging instead of being sent, and a
+  folder made inside a new folder failed. The check now reads the database in one consistent
+  view.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different
