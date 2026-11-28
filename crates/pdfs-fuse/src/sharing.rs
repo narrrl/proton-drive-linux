@@ -645,6 +645,17 @@ impl Sharing {
         Ok(items)
     }
 
+    /// Whether Drive lists `uid` among the nodes this account shared. That list
+    /// is the account's own word that the node is its share, so it stands in
+    /// for the residency proof a node never browsed to cannot give.
+    pub(crate) fn shared_by_me(&self, uid: &NodeUid) -> CoreResult<bool> {
+        let uids = self
+            .rt
+            .block_on(self.client.enumerate_shared_by_me_node_uids())
+            .map_err(|e| CoreError::from_api(&e, "enumerate shared-by-me"))?;
+        Ok(uids.contains(uid))
+    }
+
     /// Best-effort mountpoint-relative path for a node already interned in the live
     /// tree, by walking parent inodes to the root. `None` when the node has never
     /// been seen through the mount (e.g. shared but not browsed to this session) —

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use pdfs_core::config::AppDirs;
+use pdfs_core::control::ErrorKind;
 use pdfs_core::control::{
     ActivityKind, Event, HEARTBEAT, PhotoMonth, RefreshScope, Request as CtlRequest,
     Response as CtlResponse, Topic, TransferDirection, TrashFailure,
@@ -647,8 +648,23 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::Unpin { path }) => match route_keep(core, mountpoint, &path) {
-            Ok((routed, rel)) => match routed.unpin(&rel) {
+        Ok(CtlRequest::Unpin { path }) => {
+            let unpinned = route_keep(core, mountpoint, &path)
+                .and_then(|(routed, rel)| routed.unpin(&rel))
+                .or_else(|e| match e.kind {
+                    // The node is gone, and its pin with it unless the pin
+                    // was left behind; drop that one by the path it is listed
+                    // under.
+                    ErrorKind::NotFound => match core.unpin_stale(&path) {
+                        Ok(true) => Ok(Path::new(&path)
+                            .file_name()
+                            .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned())),
+                        Ok(false) => Err(e),
+                        Err(stale) => Err(stale),
+                    },
+                    _ => Err(e),
+                });
+            match unpinned {
                 Ok(name) => {
                     core.profile().touch_profile();
                     CtlResponse::Ok {
@@ -656,9 +672,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     }
                 }
                 Err(e) => CtlResponse::error(e),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
+            }
+        }
         Ok(CtlRequest::ListPins) => CtlResponse::Pins {
             pins: core.list_pins(),
         },

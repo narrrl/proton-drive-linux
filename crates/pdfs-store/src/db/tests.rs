@@ -5842,6 +5842,40 @@ fn pin_add_list_remove_roundtrip() {
 }
 
 #[test]
+fn deleting_a_node_drops_its_pin() {
+    // A pin that outlived its node stayed listed as kept offline, and the path
+    // it was listed by no longer resolved, so it could not be unpinned.
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("gone", "root", "gone.mkv", 1))
+        .unwrap();
+    db.upsert_node(&file("kept", "root", "kept.mkv", 1))
+        .unwrap();
+    let du = |l: &str| uid(l).to_string();
+    db.pin_add(&du("gone"), "gone.mkv", false).unwrap();
+    db.pin_add(&du("kept"), "kept.mkv", false).unwrap();
+
+    db.delete_node(&uid("gone")).unwrap();
+
+    let pins: Vec<String> = db.pin_list().unwrap().into_iter().map(|p| p.uid).collect();
+    assert_eq!(pins, vec![du("kept")]);
+}
+
+#[test]
+fn a_pin_left_behind_is_removed_by_its_path() {
+    let db = Db::open_in_memory().unwrap();
+    db.pin_add("vol~gone", "Videos/gone.mkv", false).unwrap();
+    db.pin_add("vol~kept", "Videos/kept.mkv", false).unwrap();
+
+    assert_eq!(
+        db.pin_remove_by_path("Videos/gone.mkv").unwrap(),
+        vec!["vol~gone".to_string()]
+    );
+    assert!(db.pin_remove_by_path("Videos/gone.mkv").unwrap().is_empty());
+    assert_eq!(db.pin_list().unwrap().len(), 1);
+}
+
+#[test]
 fn is_pinned_direct_without_node_row() {
     // A direct pin counts even when the node was never hydrated into `nodes`.
     let db = Db::open_in_memory().unwrap();

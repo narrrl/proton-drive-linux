@@ -11,6 +11,17 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **A file kept offline and then deleted can be made online only again.** Deleting or trashing a
+  file left its entry under Settings → Storage → Available offline, and making it online only
+  failed with "could not resolve", because its path no longer led anywhere. Deleting a file now
+  drops the entry with it, and an entry already left behind is removed by the path it is listed
+  under. The app also stops asking for that file's thumbnail every second.
+- **A share can be stopped from Shared by me when its file was never opened here.** Stopping the
+  share, or changing its people or link, failed with "node is not present in any location" for a
+  file in a folder this computer had not loaded. Drive's own list of what you shared now counts as
+  proof that the file is yours.
+
 ## [4.0.0] — 2026-11-28
 
 4.0.0 splits the daemon into services that each own their state. The sync engine, the mounted

@@ -9,12 +9,13 @@
 use std::path::Path;
 
 use pdfs_core::CoreResult;
+use pdfs_core::control::ErrorKind;
 use pdfs_core::control::{ActivityKind, Request as CtlRequest, Response as CtlResponse};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 
 use super::rel_to_mount;
-use crate::Core;
 use crate::sharing::StopSharingOutcome;
+use crate::{Core, parse_uid};
 
 /// The requests [`answer`] serves, as a pattern, so the control socket's
 /// match hands exactly these over and the compiler still checks that it covers
@@ -73,13 +74,22 @@ impl Target {
         })
     }
 
-    /// A node named by its uid, which one of this daemon's locations, or the
-    /// Photos timeline, must show to be this account's.
+    /// A node named by its uid, which one of this daemon's locations, the
+    /// Photos timeline, or Drive's list of what this account shared must show
+    /// to be this account's. The last covers a node shared from elsewhere and
+    /// never browsed to here: Shared by me lists it, and without it the share
+    /// could not be managed, nor stopped, from this computer.
     fn uid(core: &Core, uid: String) -> Self {
-        Self {
-            node: core.resolve_shareable(&uid),
-            label: uid,
-        }
+        let node = core.resolve_shareable(&uid).or_else(|e| {
+            if e.kind != ErrorKind::NotFound {
+                return Err(e);
+            }
+            match parse_uid(&uid) {
+                Some(node) if core.sharing.shared_by_me(&node)? => Ok(node),
+                _ => Err(e),
+            }
+        });
+        Self { node, label: uid }
     }
 }
 
