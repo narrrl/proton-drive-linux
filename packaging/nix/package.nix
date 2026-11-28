@@ -103,6 +103,7 @@ rustPlatform.buildRustPackage {
       $out/etc/xdg/autostart/io.narl.proton-drive-linux-tray.desktop
     install -Dm644 packaging/io.narl.proton-drive-linux.svg \
       $out/share/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
+    install -Dm644 -t $out/share/icons/hicolor/scalable/status crates/pdfs-gui/resources/icons/tray/*.svg
     substituteInPlace $out/share/applications/io.narl.proton-drive-linux.desktop \
       --replace-fail "Exec=pdfs-app" "Exec=$out/bin/pdfs-app"
     substituteInPlace $out/etc/xdg/autostart/io.narl.proton-drive-linux-tray.desktop \

@@ -80,6 +80,13 @@ Which program opens a file you pick is set under **Preferences → Apps → Open
 offline. Its menu opens the app or `~/ProtonDrive`, pauses or resumes sync, and stops or connects
 the service.
 
+![The tray icons on a dark and a light panel](../images/tray-icons.png)
+
+The icon is the app's folder. A solid folder is up to date. A badge in its corner says it is
+syncing, paused, needs a look (a failing change), or needs you to sign in again (a lock). A hollow
+folder means it is offline and showing cached files, and with a cross that the service is not
+running or nobody is signed in. The icons take the panel's text colour.
+
 - **GNOME** shows tray icons only with the
   [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/).
   KDE Plasma and most other desktops show it without help.

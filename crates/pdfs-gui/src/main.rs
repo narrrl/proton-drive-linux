@@ -28,6 +28,7 @@ use pdfs_core::control::{
 use pdfs_core::service;
 
 mod i18n;
+mod tray_icons;
 use i18n::{gettext, gettext_f, ngettext_f};
 
 /// How long the tray lets a burst of events arrive before it repaints. Progress
@@ -54,17 +55,19 @@ enum Phase {
 }
 
 impl Phase {
-    /// A stock symbolic icon for the phase. Stock names follow the panel's
-    /// theme and colour, and need nothing installed beside the binary.
+    /// The tray's own symbolic icon for the phase ([`tray_icons`]). Symbolic
+    /// icons take the panel's text colour.
     fn icon(self) -> &'static str {
         match self {
-            Phase::Synced => "folder-remote-symbolic",
-            Phase::Syncing => "view-refresh-symbolic",
-            Phase::Paused => "media-playback-pause-symbolic",
-            Phase::Offline => "network-offline-symbolic",
-            Phase::Attention => "dialog-warning-symbolic",
-            Phase::SessionExpired => "dialog-password-symbolic",
-            Phase::Disconnected | Phase::SignedOut => "network-offline-symbolic",
+            Phase::Synced => "io.narl.proton-drive-linux-tray-synced-symbolic",
+            Phase::Syncing => "io.narl.proton-drive-linux-tray-syncing-symbolic",
+            Phase::Paused => "io.narl.proton-drive-linux-tray-paused-symbolic",
+            Phase::Offline => "io.narl.proton-drive-linux-tray-offline-symbolic",
+            Phase::Attention => "io.narl.proton-drive-linux-tray-attention-symbolic",
+            Phase::SessionExpired => "io.narl.proton-drive-linux-tray-session-expired-symbolic",
+            Phase::Disconnected | Phase::SignedOut => {
+                "io.narl.proton-drive-linux-tray-disconnected-symbolic"
+            }
         }
     }
 }
@@ -154,6 +157,9 @@ fn sync_line(items: &[TransferItem], jobs: &[JobItem]) -> String {
 struct DriveTray {
     state: DriveState,
     socket: PathBuf,
+    /// Where [`tray_icons::install`] put the icons, or empty when it could
+    /// not, which leaves the panel to the installed theme.
+    icon_theme_path: String,
 }
 
 /// Ask the daemon for its status, falling back to the stored session so the
@@ -422,6 +428,10 @@ impl Tray for DriveTray {
         self.state.phase.icon().into()
     }
 
+    fn icon_theme_path(&self) -> String {
+        self.icon_theme_path.clone()
+    }
+
     fn attention_icon_name(&self) -> String {
         self.icon_name()
     }
@@ -608,9 +618,18 @@ fn main() -> Result<()> {
     let socket = dirs.control_socket();
     let default_mountpoint = dirs.default_mountpoint();
 
+    let icons = dirs.cache_dir().join("tray-icons");
+    let icon_theme_path = match tray_icons::install(&icons) {
+        Ok(()) => icons.to_string_lossy().into_owned(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not write the tray icons; using the installed theme");
+            String::new()
+        }
+    };
     let tray = DriveTray {
         state: poll_state(&socket, &default_mountpoint),
         socket: socket.clone(),
+        icon_theme_path,
     };
 
     // The tray autostarts with the session and can beat the desktop's SNI
@@ -680,14 +699,42 @@ mod tests {
     }
 
     #[test]
+    fn every_phase_has_an_icon_the_tray_ships() {
+        for phase in [
+            Phase::Synced,
+            Phase::Syncing,
+            Phase::Paused,
+            Phase::Offline,
+            Phase::Attention,
+            Phase::SessionExpired,
+            Phase::Disconnected,
+            Phase::SignedOut,
+        ] {
+            assert!(
+                tray_icons::ICONS
+                    .iter()
+                    .any(|(name, _)| *name == phase.icon()),
+                "{phase:?}"
+            );
+        }
+    }
+
+    #[test]
     fn attention_states_supply_the_icon_the_tray_requests() {
         let mut tray = DriveTray {
             state: status_state(&status(""), &[], &[], Path::new("/m")),
             socket: PathBuf::new(),
+            icon_theme_path: String::new(),
         };
         for (phase, icon) in [
-            (Phase::Attention, "dialog-warning-symbolic"),
-            (Phase::SessionExpired, "dialog-password-symbolic"),
+            (
+                Phase::Attention,
+                "io.narl.proton-drive-linux-tray-attention-symbolic",
+            ),
+            (
+                Phase::SessionExpired,
+                "io.narl.proton-drive-linux-tray-session-expired-symbolic",
+            ),
         ] {
             tray.state.phase = phase;
             assert_eq!(tray.status(), Status::NeedsAttention);

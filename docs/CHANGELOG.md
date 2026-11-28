@@ -80,6 +80,10 @@ digest of what it sent (52).
   any more.
 
 ### Changed
+- **The tray has its own icons.** They are the app's folder, solid when everything is up to date,
+  with a badge for syncing, paused, a failing change or an expired sign-in, and hollow when
+  offline or stopped. They used to be stock icons from the desktop theme. They take the panel's
+  text colour like other tray icons, and the packages install them into the hicolor theme.
 - **An upload into a folder and an edit of a synced file make fewer requests.** The key that
   hashes a folder's file names is now read once per folder, not once per upload. A synced
   folder no longer reads a file again before it sends an edit. It checks that nobody else

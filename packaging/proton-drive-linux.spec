@@ -119,6 +119,8 @@ install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux-tray.desktop \
   %{buildroot}%{_sysconfdir}/xdg/autostart/io.narl.proton-drive-linux-tray.desktop
 install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux.svg \
   %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
+install -D -m0644 -t %{buildroot}%{_datadir}/icons/hicolor/scalable/status \
+  %{src}/crates/pdfs-gui/resources/icons/tray/*.svg
 install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux.policy \
   %{buildroot}/usr/share/polkit-1/actions/io.narl.proton-drive-linux.policy
 install -D -m0644 %{src}/packaging/proton-drive.service \
@@ -166,6 +168,7 @@ fi
 %{_datadir}/applications/io.narl.proton-drive-linux.desktop
 %{_sysconfdir}/xdg/autostart/io.narl.proton-drive-linux-tray.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
+%{_datadir}/icons/hicolor/scalable/status/io.narl.proton-drive-linux-tray-*-symbolic.svg
 /usr/lib/systemd/user/proton-drive.service
 %{_datadir}/polkit-1/actions/io.narl.proton-drive-linux.policy
 %{_datadir}/locale/*/LC_MESSAGES/pdfs.mo
