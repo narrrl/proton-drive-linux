@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-28 10:46+0100\n"
+"POT-Creation-Date: 2026-11-28 10:47+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Portuguese (Brazil)\n"
@@ -273,8 +273,8 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/photos.rs:3117
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:509
 #: crates/pdfs-gui/src/app/pages/shared.rs:952
-#: crates/pdfs-gui/src/app/pages/shared.rs:1033
-#: crates/pdfs-gui/src/app/pages/shared.rs:1074
+#: crates/pdfs-gui/src/app/pages/shared.rs:1161
+#: crates/pdfs-gui/src/app/pages/shared.rs:1202
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:551
 #: crates/pdfs-gui/src/app/pages/status.rs:641
 #: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:249
@@ -443,6 +443,8 @@ msgid "Copy Image"
 msgstr "Copiar imagem"
 
 #: crates/pdfs-gui/src/app/main.rs:1667
+#: crates/pdfs-gui/src/app/pages/login.rs:780
+#: crates/pdfs-gui/src/app/pages/shared.rs:1135
 #: crates/pdfs-gui/src/app/pages/status.rs:867
 msgid "Close"
 msgstr "Fechar"
@@ -1426,8 +1428,8 @@ msgstr "Não foi possível carregar os álbuns"
 #: crates/pdfs-gui/src/app/pages/photos.rs:4811
 #: crates/pdfs-gui/src/app/pages/places.rs:105
 #: crates/pdfs-gui/src/app/pages/shared.rs:710
-#: crates/pdfs-gui/src/app/pages/shared.rs:1012
-#: crates/pdfs-gui/src/app/pages/shared.rs:1128
+#: crates/pdfs-gui/src/app/pages/shared.rs:1086
+#: crates/pdfs-gui/src/app/pages/shared.rs:1256
 #: crates/pdfs-gui/src/app/pages/status.rs:814
 #: crates/pdfs-gui/src/app/pages/status.rs:1755
 #: crates/pdfs-gui/src/app/pages/takeout.rs:513
@@ -2655,7 +2657,7 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/devices.rs:1130
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:394
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:302
-#: crates/pdfs-gui/src/app/pages/shared.rs:1034
+#: crates/pdfs-gui/src/app/pages/shared.rs:1162
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:641
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:883
 msgid "Remove"
@@ -3876,7 +3878,7 @@ msgstr "Abrir página de verificação"
 msgid "Continue"
 msgstr "Continuar"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:702
+#: crates/pdfs-gui/src/app/pages/login.rs:704
 msgid ""
 "Proton Drive will disconnect and stop syncing until you sign in again. Files "
 "already on this computer stay where they are."
@@ -3884,7 +3886,7 @@ msgstr ""
 "O Proton Drive será desconectado e deixará de sincronizar até você entrar "
 "novamente. Os arquivos que já estão neste computador permanecem onde estão."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:706
+#: crates/pdfs-gui/src/app/pages/login.rs:709
 #, rust-format
 msgid ""
 "{n} change is not on Proton Drive yet. It stays on this computer and is sent "
@@ -3900,12 +3902,54 @@ msgstr[1] ""
 "e serão enviadas quando você entrar novamente."
 
 #: crates/pdfs-gui/src/app/pages/login.rs:715
+msgid ""
+"The Proton Drive service didn't answer, so it isn't known whether changes "
+"are still waiting to be sent. Any that are stay on this computer and are "
+"sent after you sign in again."
+msgstr ""
+"O serviço do Proton Drive não respondeu, então não se sabe se ainda há "
+"alterações esperando para serem enviadas. As que houver ficam neste "
+"computador e são enviadas quando você entrar novamente."
+
+#: crates/pdfs-gui/src/app/pages/login.rs:723
 msgid "Sign Out?"
 msgstr "Sair?"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:717
+#: crates/pdfs-gui/src/app/pages/login.rs:725
 msgid "Sign Out"
 msgstr "Sair"
+
+#: crates/pdfs-gui/src/app/pages/login.rs:760
+msgid ""
+"Signed out on this computer. Proton didn't confirm that the session ended; "
+"you can end it in your Proton account's security settings."
+msgstr ""
+"Você saiu neste computador. O Proton não confirmou que a sessão terminou; "
+"você pode encerrá-la nas configurações de segurança da sua conta Proton."
+
+#: crates/pdfs-gui/src/app/pages/login.rs:773
+msgid "Sign-In Still Saved"
+msgstr "Login ainda salvo"
+
+#: crates/pdfs-gui/src/app/pages/login.rs:776
+#, rust-format
+msgid ""
+"Proton Drive stopped, but your sign-in couldn't be removed from this "
+"computer: {error}\n"
+"\n"
+"Until it is removed, Proton Drive may sign in again at the next start. "
+"Unlock your keyring, then try again."
+msgstr ""
+"O Proton Drive parou, mas não foi possível remover seu login deste "
+"computador: {error}\n"
+"\n"
+"Enquanto ele não for removido, o Proton Drive pode entrar novamente na "
+"próxima inicialização. Desbloqueie seu chaveiro e tente novamente."
+
+#: crates/pdfs-gui/src/app/pages/login.rs:781
+#: crates/pdfs-gui/src/app/pages/shared.rs:1136
+msgid "Try Again"
+msgstr "Tentar novamente"
 
 #. Translators: badge on a photo tile whose shot includes a raw camera file.
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:211
@@ -4846,7 +4890,7 @@ msgid "Or pick kinds of files:"
 msgstr "Ou escolha tipos de arquivo:"
 
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:510
-#: crates/pdfs-gui/src/app/pages/shared.rs:1075
+#: crates/pdfs-gui/src/app/pages/shared.rs:1203
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:76
 msgid "Save"
 msgstr "Salvar"
@@ -5202,22 +5246,47 @@ msgctxt "verb"
 msgid "Leave"
 msgstr "Sair"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:966
+#: crates/pdfs-gui/src/app/pages/shared.rs:973
 msgid "Couldn't leave the shared item"
 msgstr "Não foi possível sair do item compartilhado"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:972
+#: crates/pdfs-gui/src/app/pages/shared.rs:976
+#, rust-format
+msgid "Left {went} of {n} Shared Item"
+msgid_plural "Left {went} of {n} Shared Items"
+msgstr[0] "Você saiu de {went} de {n} item compartilhado"
+msgstr[1] "Você saiu de {went} de {n} itens compartilhados"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:992
 #, rust-format
 msgid "Left {n} shared item"
 msgid_plural "Left {n} shared items"
 msgstr[0] "Você saiu de {n} item compartilhado"
 msgstr[1] "Você saiu de {n} itens compartilhados"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1026
+#. Translators: {error} is the reason the service gave.
+#: crates/pdfs-gui/src/app/pages/shared.rs:1115
+#, rust-format
+msgid "Refused: {error}"
+msgstr "Recusado: {error}"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1117
+msgid "The service didn't answer. The page shows whether it went through."
+msgstr "O serviço não respondeu. A página mostra se deu certo."
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1119
+msgid "Not tried yet"
+msgstr "Ainda não tentado"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1132
+msgid "These items did not go through:"
+msgstr "Estes itens não foram concluídos:"
+
+#: crates/pdfs-gui/src/app/pages/shared.rs:1154
 msgid "Remove Saved Link?"
 msgstr "Remover o link salvo?"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1029
+#: crates/pdfs-gui/src/app/pages/shared.rs:1157
 #, rust-format
 msgid ""
 "Remove “{name}” from your saved links? The shared item itself is not "
@@ -5226,41 +5295,41 @@ msgstr ""
 "Remover “{name}” dos seus links salvos? O item compartilhado em si não é "
 "afetado."
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1047
+#: crates/pdfs-gui/src/app/pages/shared.rs:1175
 msgid "Link removed"
 msgstr "Link removido"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1048
+#: crates/pdfs-gui/src/app/pages/shared.rs:1176
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:736
 msgid "Couldn't remove the link"
 msgstr "Não foi possível remover o link"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1059
+#: crates/pdfs-gui/src/app/pages/shared.rs:1187
 msgid "Save Link"
 msgstr "Salvar link"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1060
+#: crates/pdfs-gui/src/app/pages/shared.rs:1188
 msgid "Paste a Proton Drive public link to save it here."
 msgstr "Cole um link público do Proton Drive para salvá-lo aqui."
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1064
+#: crates/pdfs-gui/src/app/pages/shared.rs:1192
 msgid "Public link URL"
 msgstr "URL do link público"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1068
+#: crates/pdfs-gui/src/app/pages/shared.rs:1196
 msgid "Password (if the link has one)"
 msgstr "Senha (se o link tiver uma)"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1088
-#: crates/pdfs-gui/src/app/pages/shared.rs:1101
+#: crates/pdfs-gui/src/app/pages/shared.rs:1216
+#: crates/pdfs-gui/src/app/pages/shared.rs:1229
 msgid "Couldn't save the link"
 msgstr "Não foi possível salvar o link"
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1089
+#: crates/pdfs-gui/src/app/pages/shared.rs:1217
 msgid "A URL is required."
 msgstr "Uma URL é obrigatória."
 
-#: crates/pdfs-gui/src/app/pages/shared.rs:1100
+#: crates/pdfs-gui/src/app/pages/shared.rs:1228
 msgid "Link saved"
 msgstr "Link salvo"
 
@@ -5416,9 +5485,16 @@ msgid_plural "Stopped sharing {n} items"
 msgstr[0] "{n} item deixou de ser compartilhado"
 msgstr[1] "{n} itens deixaram de ser compartilhados"
 
-#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:576
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:583
 msgid "Couldn't stop sharing"
 msgstr "Não foi possível parar de compartilhar"
+
+#: crates/pdfs-gui/src/app/pages/shared_by_me.rs:586
+#, rust-format
+msgid "Stopped Sharing {went} of {n} Item"
+msgid_plural "Stopped Sharing {went} of {n} Items"
+msgstr[0] "Compartilhamento interrompido para {went} de {n} item"
+msgstr[1] "Compartilhamento interrompido para {went} de {n} itens"
 
 #: crates/pdfs-gui/src/app/pages/status.rs:188
 msgid "Startup"

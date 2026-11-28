@@ -112,6 +112,19 @@ digest of what it sent (52).
   Delete key, no longer deletes the whole folder for a selected item inside it. It explains that
   only the whole folder can be deleted, from the top of the trash. Restore on a row that groups
   the items deleted from one folder now shows how many items it restores.
+- **Stopping sharing or leaving several items says which ones did not go through.** The app
+  sent one request per item and stopped at the first failure, with a generic error, so the items
+  before it had already stopped sharing and the ones after it were never tried. Now every item is
+  tried. If any did not go through, a summary names it, with the reason or "not tried yet", and
+  offers to try only those again. If the service stopped answering, the page is reloaded first,
+  so it shows which items really changed.
+- **Sign Out says what it could not finish.**
+  - If the service did not answer, the confirmation no longer reads as if no changes were waiting.
+    It says that this is not known.
+  - If your sign-in could not be removed from the keyring, a dialog says so and offers to try
+    again. Before, the sign-in page appeared while the sign-in was still saved.
+  - If Proton did not confirm that the session ended, a notice says where in your Proton account
+    you can end it.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different
