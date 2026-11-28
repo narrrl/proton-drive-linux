@@ -320,6 +320,14 @@ impl<H: FilesHost> Files<H> {
                     }
                 }
             }
+            // A queued revision is the whole file, so its length is the
+            // file's, whatever the tree says. The tree can be behind it: an
+            // upload that lands as the next write queues puts its own size
+            // back over the one that write stamped. Taken from the tree, a
+            // longer length left the copied bytes past the blob unauthored,
+            // and the commit refilled them from the older revision. A
+            // shorter one cut the file at that length (docs/BUGS.md B308).
+            let len = pending_base.as_ref().map_or(base.size, |p| p.meta.len);
             let fh = st.open.open_writer(ino, || {
                 WriteHandle {
                     ino,
@@ -329,7 +337,7 @@ impl<H: FilesHost> Files<H> {
                     written: initial_written,
                     // Starts at the current size; reads in [0, base_size)
                     // come from the base until overwritten.
-                    len: base.size,
+                    len,
                     base_size: base.size,
                     base_mtime: base.mtime,
                     base_revision_id: base.revision_id.clone(),
@@ -975,6 +983,49 @@ mod tests {
         }
         assert!(matches!(fx.files.open(ino, true), Err(FileError::Io)));
         assert_eq!(fx.open_count(ino), 0);
+    }
+
+    /// A queued edit is the whole file, so a write open over it starts at the
+    /// edit's length even when the tree still has an older, longer size.
+    /// Started at the tree's 23 bytes, the hole a write past the edit leaves
+    /// was refilled from the older revision at commit (B308).
+    #[test]
+    fn a_write_open_over_a_queued_edit_takes_the_edits_length() {
+        let fx = Fixture::new();
+        let ino = fx.add("f", false);
+        // The tree has the revision that landed as the edit was queued.
+        if let NodeKind::File { claimed_size, .. } =
+            &mut fx.state().entries.get_mut(&ino).unwrap().node.kind
+        {
+            *claimed_size = Some(23);
+        }
+        let path = fx._dir.0.join("queued");
+        std::fs::write(&path, b"mnopqrst").unwrap();
+        fx.writes.pending.lock().insert(
+            uid("f"),
+            PendingRevision {
+                path,
+                meta: StagedWrite {
+                    uid: uid("f").to_string(),
+                    len: 8,
+                    base_size: 23,
+                    base_mtime: 1,
+                    authored: vec![(0, 8)],
+                    complete: true,
+                    based_on: None,
+                },
+            },
+        );
+        let fh = fx.files.open(ino, true).unwrap();
+        fx.files.write(ino, fh, 12, b"hijk").unwrap();
+        let st = fx.state();
+        let handle = st.open.by_fh(fh).unwrap();
+        assert_eq!(handle.len, 16);
+        // Everything is the user's: the edit, the hole and the write.
+        assert_eq!(handle.written.0, vec![(0, 16)]);
+        let mut bytes = vec![0; 16];
+        std::os::unix::fs::FileExt::read_exact_at(&*handle.file, &mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"mnopqrst\0\0\0\0hijk");
     }
 
     /// A write open over a partial queued edit has to fill its gaps from

@@ -627,6 +627,12 @@ impl Core {
                 .db
                 .has_pending_op(&uid.to_string(), OP_RENAME)
                 .unwrap_or(false);
+        // A write queued since the check above has stamped its size on the
+        // tree already, and the node read back must not put the landed size
+        // back over it. Listings do the same (B308).
+        let mut landed = [node.clone()];
+        self.stamp_pending_sizes(&mut landed);
+        let [node] = landed;
         self.for_each_state(|st| {
             let moved = placed_in(st, uid) != before;
             let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino)) else {
