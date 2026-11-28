@@ -4485,6 +4485,57 @@ mod tests {
         id
     }
 
+    /// Stop syncing with "Also delete from Proton Drive" on, while Drive cannot
+    /// be reached. The folder stops syncing, but its copy in Proton Drive
+    /// stays. The reply was a plain success, so the app said "Stopped syncing
+    /// folder" and nothing told the user the cloud copy was still there.
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn stopping_sync_says_so_when_its_drive_folder_could_not_be_deleted() {
+        let drive = FakeDrive::new();
+        let dir = scratch("stop-sync-delete-offline");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let local = dir.join("docs");
+        let id = sync_folder(&daemon, &local, "mirror");
+        std::fs::write(local.join("keep.txt"), b"keep").unwrap();
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        let on_drive = || {
+            drive.tree().iter().any(|(path, entry)| {
+                path.ends_with("docs/keep.txt") && *entry == Entry::File(Arc::new(b"keep".to_vec()))
+            })
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || on_drive()
+                && listed_folder(&daemon, id).is_some_and(|f| f.state == "idle")),
+            "the folder synced: {:?}",
+            listed_folder(&daemon, id)
+        );
+
+        daemon.client.set_online(false);
+        let error = daemon
+            .request(&Request::RemoveSyncFolder {
+                id,
+                delete_remote: true,
+            })
+            .unwrap_err()
+            .to_string();
+        daemon.client.set_online(true);
+
+        assert!(
+            error.contains("stopped syncing the folder")
+                && error.contains("was not moved to the trash"),
+            "{error}"
+        );
+        assert!(
+            listed_folder(&daemon, id).is_none(),
+            "the folder still syncs"
+        );
+        assert!(on_drive(), "the copy in Proton Drive is gone after all");
+        assert_eq!(std::fs::read(local.join("keep.txt")).unwrap(), b"keep");
+        daemon.stop().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_move_out_of_an_on_demand_folder_refuses_a_file_still_open_for_writing() {

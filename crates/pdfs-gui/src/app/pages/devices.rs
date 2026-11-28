@@ -1007,19 +1007,53 @@ pub(crate) fn prompt_remove_sync_folder(
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
-    let ui = ui.clone();
-    dialog.connect_response(None, move |_, resp| {
-        if resp == "remove" {
-            run_devices_mutation(
-                &ui,
-                Request::RemoveSyncFolder {
-                    id,
-                    delete_remote: !attached && delete_remote.is_active(),
+    // With the switch on, the button does more than stop syncing, so it says
+    // so: the heading, the button and the outcome all name the deletion.
+    delete_remote.connect_active_notify({
+        let dialog = dialog.clone();
+        move |row| {
+            let deleting = row.is_active();
+            dialog.set_heading(Some(&if deleting {
+                gettext("Stop Syncing and Delete Folder?")
+            } else {
+                gettext("Stop Syncing Folder?")
+            }));
+            dialog.set_response_label(
+                "remove",
+                &if deleting {
+                    gettext("Stop Syncing and Delete")
+                } else {
+                    gettext("Stop Syncing")
                 },
-                &gettext("Stopped syncing folder"),
-                &gettext("Couldn't stop syncing the folder"),
             );
         }
+    });
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp != "remove" {
+            return;
+        }
+        let deleting = !attached && delete_remote.is_active();
+        let (done, failed) = if deleting {
+            (
+                gettext("Stopped syncing and moved the folder in Proton Drive to the trash"),
+                gettext("Couldn't stop syncing and delete the folder"),
+            )
+        } else {
+            (
+                gettext("Stopped syncing folder"),
+                gettext("Couldn't stop syncing the folder"),
+            )
+        };
+        run_devices_mutation(
+            &ui,
+            Request::RemoveSyncFolder {
+                id,
+                delete_remote: deleting,
+            },
+            &done,
+            &failed,
+        );
     });
     dialog.present(win.as_ref());
 }
