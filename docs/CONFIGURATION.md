@@ -196,6 +196,7 @@ Settings for `pdfs-prompt`.
 | `terminal` | first installed of foot, ghostty, kitty, alacritty, wezterm, xterm | Terminal for `fzf` mode. `{cmd}` is replaced by the command; without it, the command is appended |
 | `menu_limit` | `50` | Results shown in `dmenu` and `fzf` mode |
 | `menu_icons` | `true` | File-type icons in launchers that support them |
+| `remember_recent` | `true` | The `gtk` window remembers what it opens, in `prompt-history.json` under the state directory. It lists those files before a search and ranks them higher in one. A Drive file is shown only while the account that opened it is signed in. `false` clears the list the next time the window opens and keeps nothing more |
 
 ```json
 {

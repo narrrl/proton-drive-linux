@@ -500,6 +500,7 @@ fn build_window(app: &adw::Application) {
             restore: RefCell::new(None),
             crumb: browser_widgets.crumb.clone(),
             content: browser_widgets.content.clone(),
+            drop_hint: browser_widgets.drop_hint.clone(),
             status: browser_widgets.status.clone(),
             retry: browser_widgets.retry.clone(),
             split: browser_widgets.split.clone(),

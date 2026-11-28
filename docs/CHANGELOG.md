@@ -125,6 +125,33 @@ digest of what it sent (52).
     again. Before, the sign-in page appeared while the sign-in was still saved.
   - If Proton did not confirm that the session ended, a notice says where in your Proton account
     you can end it.
+- **A public link's settings change only when you save them.** Before, choosing Editor changed
+  the link at once, so anyone holding a viewer link could edit before the password you were about
+  to add was set. Removing the password also took effect at once. Now the role, the password and
+  the expiry are sent together by "Save Link Settings". Above that button is a line that says how
+  the link will work. Closing the dialog sends nothing. When you create a link, Enter in the
+  password field moves on to Expires instead of creating the link.
+- **The Share dialog no longer shows a public link's address until you ask.** The row is titled by
+  what the link does, for example "Public viewer link", with how it works below. The eye button
+  shows the address, and reopening the dialog hides it again. An expired link offers no Copy;
+  "Edit Expiry" opens its settings instead. In Shared by me, an expired link's menu leads with
+  "Edit Link Expiry…".
+- **Find Similar Photos counts files as well as photos.** A shot stored as a RAW and a JPEG moves
+  both to Trash. The footer now reads, for example, "Move 1 photo (2 files) to Trash", and each
+  card shows what its shot is stored as, such as "RAW + 1 more file". Each card says whether the
+  photo stays or moves to Trash, and each set's heading says how many of the set stay. A set wider
+  than the window still shows what happens to it.
+- **The search window shows recent Drive files only to the account that opened them.** Before, an
+  empty search listed the last files opened from any account signed in on this computer. Now
+  each Drive file is remembered with its account. Recent Drive files from before this change are
+  no longer shown, because nobody can say whose they are. Preferences → Apps adds "Remember
+  recent files" and "Clear recent files", and a clear takes effect the next time the window
+  opens. See [Configuration](CONFIGURATION.md#prompt) for `remember_recent`.
+- **Dragging onto a folder in Files says what the drop will do.** A label over the view reads, for
+  example, "Move 3 items to “Receipts”" for rows dragged within the app, and "Copy 3 items to
+  “Receipts”" for files dragged from a file manager browsing the drive. Files from elsewhere read
+  "Upload…". It also says how many items can't go there, such as the folder itself in a
+  selection.
 - **A mirrored file whose upload went unanswered no longer gets a conflict copy of its own
   edit.** Proton Drive can make a file and lose the answer. If the file was then written again
   before the next sync, for example while the daemon was stopped, that sync saw two different
